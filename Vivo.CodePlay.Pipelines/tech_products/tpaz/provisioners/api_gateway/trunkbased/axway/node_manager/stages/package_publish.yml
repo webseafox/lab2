@@ -1,0 +1,157 @@
+parameters:
+- name: gateway
+- name: environments
+  type: object
+
+stages:
+- stage: stage_package_publish
+  pool: $(PRIVATE_AGENT_DEFAULT)
+  displayName: Package & Publish
+  dependsOn:
+  - stage_build
+  variables:
+    VERSION_CURRENT: $[ stageDependencies.stage_build.job_set_version.outputs['set_version.APP_VERSION'] ]
+  jobs:
+  - ${{ each environment in parameters.environments }}:
+    - job: job_package_publish_${{ environment }}
+      displayName: ${{ environment }}
+      steps:
+      - checkout: none
+      - template: /tasks/artifacts/download_pipeline.yml
+        parameters:
+          artifactName: nodemanager
+          targetPath: $(Agent.TempDirectory)
+      - template: /tasks/nexus/download_file.yml
+        parameters:
+          repository: integracao-libfiles
+          remoteFileLocation: "files/jdbc-java/mysql-connector-j-8.0.33.jar"
+          displayName: "Download MySQL"
+          localFileLocation: $(Agent.TempDirectory)
+      - template: /tasks/nexus/download_file.yml
+        parameters:
+          repository: integracao-libfiles
+          remoteFileLocation: "files/apigateway/emt-scripts/$(EMT_SCRIPT_VERION)/emt-scripts-$(EMT_SCRIPT_VERION).tar.gz"
+          displayName: "Download EMT scripts"
+          localFileLocation: $(Agent.TempDirectory)
+          credentialsEnabled: false
+      - template: /tasks/nexus/download_file.yml
+        parameters:
+          repository: integracao-libfiles
+          remoteFileLocation: "files/apigateway/patchs/apigateway_$(AXWAY_VERSION)_patchs.tar"
+          displayName: "Download EMT scripts"
+          localFileLocation: $(Agent.TempDirectory)
+          credentialsEnabled: false
+      - task: Docker@2
+        displayName: Docker login
+        inputs:
+          containerRegistry: $(DOCKER_REGISTRY_SERVICE_CONNECTION_NAME)
+          command: login
+      - script: |
+          set +x
+
+          echo "##[command] Create emt/apigateway/..."
+          mkdir -p emt/apigateway/ext/lib
+          mkdir -p emt/apigateway/conf
+
+          echo "##[command] Copy MySQL connector..."
+          cp mysql-connector-j-8.0.33.jar emt/apigateway/ext/lib
+
+          echo "##[command] Create adminUsers.json..."
+          echo "${adm}" | base64 -d -w0 > emt/apigateway/conf/adminUsers.json
+
+          echo "##[command] Creare pass.txt..."
+          echo "${pass}" > pass.txt
+
+          if [[ "${APPLY_PATCH_ENABLE}" == "true" ]]; then
+            echo "##[command] Apply patchs"
+            tar -xvf apigateway_${AXWAY_VERSION}_patchs.tar && rm apigateway_${AXWAY_VERSION}_patchs.tar
+  
+            for patch in APIGateway_${AXWAY_VERSION}_Patch*.tgz; do
+              if [ -f "$patch" ]; then
+                tar -xzf "$patch" -C emt/apigateway && rm "$patch"
+                echo "##[command] Arquivo $patch extraído para emt/apigateway"
+              else
+                echo "##[command] Nenhum patch .tzg encontrado."
+              fi
+            done
+          
+          else
+            echo "##[command] Apply patchs disabled"
+          fi
+
+          echo "##[command] Check files"
+          ls -la
+          ls -laR emt/apigateway/
+
+          echo "##[group] Unpack EMT scripts..."
+          tar -zxvf emt-scripts-${emt_script_version}.tar.gz && rm emt-scripts-${emt_script_version}.tar.gz
+          echo "##[endgroup]"
+        displayName: Prepare - ${{ environment }}
+        workingDirectory: $(Agent.TempDirectory)
+        env:
+          adm: $(users/${{ environment }}/adm)
+          pass: $(images-cert/${{ environment }}/pass)
+          emt_script_version: $(EMT_SCRIPT_VERION)
+          AXWAY_VERSION: $(AXWAY_VERSION)
+          APPLY_PATCH_ENABLE: $(APPLY_PATCH_ENABLE)
+      - task: DownloadSecureFile@1
+        name: certFile
+        displayName: 'Download secure file DefaultDomain-cert-${{ parameters.gateway }}-${{ environment }}.pem'
+        inputs:
+          secureFile: 'DefaultDomain-cert-${{ parameters.gateway }}-${{ environment }}.pem'
+      - task: DownloadSecureFile@1
+        name: keyFile
+        displayName: 'Download secure file DefaultDomain-key-${{ parameters.gateway }}-${{ environment }}.pem'
+        inputs:
+          secureFile: 'DefaultDomain-key-${{ parameters.gateway }}-${{ environment }}.pem'
+      - script: |
+          set -e
+
+          echo "##[debug] FED_FILE.....................: ${FED_FILE}"
+          echo "##[debug] CERT_FILE....................: ${CERT_FILE}"
+          echo "##[debug] KEY_FILE.....................: ${KEY_FILE}"
+          echo "##[debug] PASS.........................: ${PASS}"
+          echo "##[debug] MERGE_DIR....................: ${MERGE_DIR}"
+          echo "##[debug] PARENT_IMAGE_NAME............: ${PARENT_IMAGE_NAME}"
+          echo "##[debug] DOCKER_IMAGE_OUT.............: ${DOCKER_IMAGE_OUT}"
+
+          ./build_anm_image.py \
+          --fed=${FED_FILE} \
+          --healthcheck \
+          --metrics \
+          --domain-key-pass-file=${PASS} \
+          --merge-dir=${MERGE_DIR} \
+          --domain-cert=${CERT_FILE} \
+          --domain-key=${KEY_FILE} \
+          --parent-image=${PARENT_IMAGE_NAME} \
+          --out-image=${DOCKER_IMAGE_OUT}
+        displayName: Build - ${{ environment }}
+        workingDirectory: $(Agent.TempDirectory)
+        env:
+          MERGE_DIR: $(Agent.TempDirectory)/emt/apigateway
+          FED_FILE: $(Agent.TempDirectory)/nodemanager-$(VERSION_CURRENT).$(API_GATEWAY_PACKAGE_TYPE)
+          CERT_FILE: $(certFile.secureFilePath)
+          KEY_FILE: $(keyFile.secureFilePath)
+          PASS: $(Agent.TempDirectory)/pass.txt
+          DOCKER_IMAGE_OUT: $(IMAGE_REGISTRY_API_GATEWAY)/$(IMAGE_NAME)-${{ environment }}:$(VERSION_CURRENT)
+          PARENT_IMAGE_NAME: $(PARENT_IMAGE_NAME)
+      - script: |
+          echo "##[debug] DOCKER_IMAGE.......: ${DOCKER_IMAGE}"
+          echo "##[command] docker push"
+          docker push ${DOCKER_IMAGE}
+
+          if [ $? -ne 0 ]; then
+            echo "##[error] Docker push failed. Exiting with error."
+            exit 1
+          fi
+        displayName: Docker push - ${{ environment }}
+        env:
+          DOCKER_IMAGE: $(IMAGE_REGISTRY_API_GATEWAY)/$(IMAGE_NAME)-${{ environment }}:$(VERSION_CURRENT)
+      - script: |
+          echo "##[command] docker rmi ${DOCKER_IMAGE}"
+          docker rmi ${DOCKER_IMAGE}
+        displayName: Docker clean up
+        condition: always()
+        continueOnError: true
+        env:
+          DOCKER_IMAGE: $(IMAGE_REGISTRY_API_GATEWAY)/$(IMAGE_NAME)-${{ environment }}:$(VERSION_CURRENT)

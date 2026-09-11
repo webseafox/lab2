@@ -1,0 +1,262 @@
+parameters:
+- name: environment
+- name: packageVersion
+- name: packageName
+- name: infrastructureType
+- name: deliveryModel
+
+stages:
+- stage: cd_deploy
+  displayName: "CD - Deploy ${{ parameters.environment }}"
+  condition: succeeded()
+  dependsOn:
+    - default_initializer_cd
+  ${{ if eq(parameters.environment, 'producao') }}:
+    pool:
+      $(PRIVATE_AGENT_PRODUCAO)
+  ${{ else }}:
+    pool:
+      $(AGENT_POOL_CD)
+
+  jobs:
+
+  - deployment: deploy
+    displayName: 'Deploy'
+    condition: and(
+      succeeded(),
+      or(
+      eq(variables['Build.SourceBranchName'],'master'),
+      eq(variables['Build.SourceBranchName'],'main'),
+      eq(variables['Build.SourceBranchName'],'prodlike'),
+      eq(variables['Build.SourceBranchName'],'preprod'),
+      eq(variables['Build.SourceBranchName'],'esteira1'),
+      eq(variables['Build.SourceBranchName'],'esteira2'),
+      eq(variables['Build.SourceBranchName'],'dev')))
+    environment:
+      name: deploy-${{ parameters.environment }}
+    continueOnError: true
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          ## -> Skip Download
+          - download: none
+
+          ## -> Checkout the source code.
+          - checkout: self
+            displayName: Checkout Source Code
+            name: checkout_source_code
+            clean: true
+            path: source_code
+            submodules: recursive
+
+          ## -> Rename Package
+          - task: Bash@3
+            displayName: 'Rename Package Name and Package Version'
+            name: packages
+            condition: succeeded()
+            continueOnError: false
+            inputs:
+              targetType: 'inline'
+              script: |
+                to_kebab_case() {
+                    echo "$1" | sed -r 's/([a-z])([A-Z])/\1-\L\2/g' | tr '[:upper:]' '[:lower:]' | tr '_' '-'
+                }
+
+                package_name="${{ parameters.packageName }}"
+                package_version="${{ parameters.packageVersion }}"
+
+                kebab_package_name=$(to_kebab_case "$package_name")
+                kebab_package_version=$(to_kebab_case "$package_version")
+
+                echo "##vso[task.setvariable variable=ORIGINAL_PACKAGE_NAME]$package_name"
+                echo "##vso[task.setvariable variable=ORIGINAL_PACKAGE_VERSION]$package_version"
+                echo "##vso[task.setvariable variable=KEBAB_CASE_PACKAGE_NAME]$kebab_package_name"
+                echo "##vso[task.setvariable variable=KEBAB_CASE_PACKAGE_VERSION]$kebab_package_version"
+
+                echo "Package name: $package_name"
+                echo "Package version: $package_version"
+                echo "Package name (kebab case): $kebab_package_name"
+                echo "Package version (kebab case): $kebab_package_version"
+
+          ## -> Download a Universal Package
+          - task: UniversalPackages@0
+            displayName: Download a Universal Package
+            condition: succeeded()
+            continueOnError: false
+            inputs:
+              command: download
+              vstsFeed: "3d53bc62-8749-4931-ae46-a443b73bc87a"
+              vstsFeedPackage: "$(KEBAB_CASE_PACKAGE_NAME)"
+              vstsPackageVersion: "1.0.0-${{ parameters.packageVersion }}"
+              downloadDirectory: "$(Pipeline.Workspace)"
+
+          ## -> Get Package Name
+          - task: Bash@3
+            displayName: 'Get Package Data'
+            condition: succeeded()
+            continueOnError: false
+            inputs:
+              targetType: 'inline'
+              script: |
+                artifactPath="$(Pipeline.Workspace)/$(KEBAB_CASE_PACKAGE_NAME)"
+                artifact=$(ls -1 "$artifactPath" | head -n 1)
+                basePath="Documents/deploy/azure_deployment"
+
+                echo "##[debug] Package Name: $(KEBAB_CASE_PACKAGE_NAME)"
+                echo "##[debug] Package Version: 1.0.0-${{ parameters.packageVersion }}"
+                echo "##[debug] Artifact: $artifact"
+                echo "##[debug] Environment: ${{ parameters.environment }}"
+                echo "##[debug] Delivery Model: ${{ parameters.deliveryModel }}"
+                echo "##[debug] Base Path: $basePath"
+
+                echo "##vso[task.setvariable variable=ARTIFACT_ID]${{ parameters.packageName }}"
+                echo "##vso[task.setvariable variable=ARTIFACT_FILE]$artifact"
+                echo "##vso[task.setvariable variable=ARTIFACT_PATH]$artifactPath"
+                echo "##vso[task.setvariable variable=BASE_PATH]$basePath"
+
+          # Extract files
+          - task: ExtractFiles@1
+            displayName: "Extract Files"
+            condition: succeeded()
+            continueOnError: false
+            inputs:
+              archiveFilePatterns: '$(ARTIFACT_PATH)/$(ARTIFACT_FILE)'
+              destinationFolder: '$(ARTIFACT_PATH)/artifacts'
+              cleanDestinationFolder: true
+
+          ## -> Copying artifacts to remote server    
+          - task: CopyFilesOverSSH@0
+            displayName: 'Copying artifacts to remote server BRTLVBGY0081SL'
+            condition: succeeded()
+            continueOnError: false
+            inputs:
+              sshEndpoint: 'hip_ets_srv1_homolog'
+              sourceFolder: '$(ARTIFACT_PATH)/artifacts'
+              contents: '**/*.{hip,ets}'
+              targetFolder: '$(BASE_PATH)'
+              cleanTargetFolder: true
+              readyTimeout: '20000'
+
+          ## -> Copying artifacts to remote server    
+          - task: CopyFilesOverSSH@0
+            displayName: 'Copying artifacts to remote server BRTLVBGY0085SL'
+            condition: succeeded()
+            continueOnError: false
+            inputs:
+              sshEndpoint: 'hip_ets_srv2_homolog'
+              sourceFolder: '$(ARTIFACT_PATH)/artifacts'
+              contents: '**/*.{hip,ets}'
+              targetFolder: '$(BASE_PATH)'
+              cleanTargetFolder: true
+              readyTimeout: '20000'
+          
+          ## -> BRTLVBGY0081SL - Deploy
+          - task: SSH@0
+            displayName: SSH BRTLVBGY0081SL - Deploy
+            condition: succeeded()
+            continueOnError: false
+            inputs:
+              sshEndpoint: hip_ets_srv1_homolog
+              runOptions: 'commands'
+              readyTimeout: '20000'
+              commands: |
+                echo ##[debug] SSH is connected! HOSTNAME: %COMPUTERNAME%
+                echo Base path: $(BASE_PATH)
+
+                for %f in ("$(BASE_PATH)/*") do (if "%f"=="VIVO-Input-Email-Fatura.hip" ( copy /Y "$(BASE_PATH)\%f" "F:\pb\Atlys\batchInputEmailDinamico\doc1\HIP-teste\" ) else if "%f"=="CargaDashBoard.hip" ( copy /Y "$(BASE_PATH)\%f" "F:\pb\Carga\Insumos\InputDashBoard\hip\" ) else if "%f"=="input-sms-atlys.hip" ( copy /Y "$(BASE_PATH)\%f" "F:\pb\Atlys\batchInputSMSCicloAtlys\doc1\HIP-Teste\" ) else if "%f"=="vivoxml.hip" ( copy /Y "$(BASE_PATH)\%f" "F:\pb\Carga\cargaxml\hip\" ) else if "%f"=="vivoafp.hip" ( copy /Y "$(BASE_PATH)\%f" "F:\pb\Carga\cargaafp\bkp-HIP\" && copy /Y "$(BASE_PATH)\%f" "E:\pb\atlys\batchGeracaoAfp\doc1\hip\" ) else if "%f"=="vivo.ets" ( copy /Y "$(BASE_PATH)\%f" "F:\pb\Carga\cargaafp\recursos\" && copy /Y "$(BASE_PATH)\%f" "F:\pb\Carga\cargaxml\resources\" && copy /Y "$(BASE_PATH)\%f" "E:\VIVO\appdoc1\recurso\" && copy /Y "$(BASE_PATH)\%f" "E:\pb\atlys\batchGeracaoAfp\recurso\" ) )
+
+                echo vivo.ets
+                dir F:\pb\Carga\cargaafp\recursos
+                dir F:\pb\Carga\cargaxml\resources
+                dir E:\VIVO\appdoc1\recurso
+                dir E:\pb\atlys\batchGeracaoAfp\recurso
+
+                echo vivoafp.hip
+                dir F:\pb\Carga\cargaafp\bkp-HIP
+                dir E:\pb\atlys\batchGeracaoAfp\doc1\hip
+
+                echo VIVO-Input-Email-Fatura.hip
+                dir F:\pb\Atlys\batchInputEmailDinamico\doc1\HIP-teste
+                
+                echo CargaDashBoard.hip
+                dir F:\pb\Carga\Insumos\InputDashBoard\hip
+
+                echo input-sms-atlys.hip
+                dir F:\pb\Atlys\batchInputSMSCicloAtlys\doc1\HIP-Teste
+
+                echo vivoxml.hip
+                dir F:\pb\Carga\cargaxml\hip
+          
+          ## -> BRTLVBGY0085SL - Deploy
+          - task: SSH@0
+            displayName: SSH BRTLVBGY0085SL - Deploy
+            condition: succeeded()
+            continueOnError: false
+            inputs:
+              sshEndpoint: hip_ets_srv2_homolog
+              runOptions: 'commands'
+              readyTimeout: '20000'
+              commands: |
+                echo ##[debug] SSH is connected! HOSTNAME: %COMPUTERNAME%
+                echo Base path: $(BASE_PATH)
+
+                for %f in ("$(BASE_PATH)/*") do (if "%f"=="VIVO-Input-Email-Fatura.hip" ( copy /Y "$(BASE_PATH)\%f" "C:\Users\svi_conta\Documents\Ambiente\pb\atlys\batchGeracaoAfp\hip\" ) else if "%f"=="CargaDashBoard.hip" ( copy /Y "$(BASE_PATH)\%f" "C:\Users\svi_conta\Documents\Ambiente\pb1\Carga\cargaafp\Insumos\InputDashBoard\hip\" ) else if "%f"=="input-sms-atlys.hip" ( copy /Y "$(BASE_PATH)\%f" "C:\Users\svi_conta\Documents\Ambiente\pb\atlys\batchGeracaoAfp\hip\" ) else if "%f"=="vivoxml.hip" ( copy /Y "$(BASE_PATH)\%f" "C:\Users\svi_conta\Documents\Ambiente\pb1\Carga\cargaxml\resources\hip\" ) else if "%f"=="vivoafp.hip" ( copy /Y "$(BASE_PATH)\%f" "C:\Users\svi_conta\Documents\Ambiente\pb1\Carga\cargaafp\hip\" && copy /Y "$(BASE_PATH)\%f" "C:\Users\svi_conta\Documents\Ambiente\pb\atlys\batchGeracaoAfp\hip\" ) else if "%f"=="vivo.ets" ( copy /Y "$(BASE_PATH)\%f" "C:\Users\svi_conta\Documents\Ambiente\pb1\Carga\cargaxml\resources\" && copy /Y "$(BASE_PATH)\%f" "C:\Users\svi_conta\Documents\Ambiente\pb1\Carga\cargaafp\resources\" && copy /Y "$(BASE_PATH)\%f" "C:\Users\svi_conta\Documents\Ambiente\VIVO\appdoc1\resources\" && copy /Y "$(BASE_PATH)\%f" "C:\Users\svi_conta\Documents\Ambiente\pb\atlys\batchGeracaoAfp\resources\" ) )
+
+                echo vivo.ets
+                dir C:\Users\svi_conta\Documents\Ambiente\pb1\Carga\cargaxml\resources
+                dir C:\Users\svi_conta\Documents\Ambiente\pb1\Carga\cargaafp\resources
+                dir C:\Users\svi_conta\Documents\Ambiente\VIVO\appdoc1\resources
+                dir C:\Users\svi_conta\Documents\Ambiente\pb\atlys\batchGeracaoAfp\resources
+
+                echo vivoafp.hip
+                dir C:\Users\svi_conta\Documents\Ambiente\pb1\Carga\cargaafp\hip
+                dir C:\Users\svi_conta\Documents\Ambiente\pb\atlys\batchGeracaoAfp\hip
+
+                echo VIVO-Input-Email-Fatura.hip
+                dir C:\Users\svi_conta\Documents\Ambiente\pb\atlys\batchGeracaoAfp\hip
+                
+                echo CargaDashBoard.hip
+                dir C:\Users\svi_conta\Documents\Ambiente\pb1\Carga\cargaafp\Insumos\InputDashBoard\hip
+
+                echo input-sms-atlys.hip
+                dir C:\Users\svi_conta\Documents\Ambiente\pb\atlys\batchGeracaoAfp\hip
+
+                echo vivoxml.hip
+                dir C:\Users\svi_conta\Documents\Ambiente\pb1\Carga\cargaxml\resources\hip
+          
+          ## -> Check if the artifacts were deleted correctly
+          - task: SSH@0
+            displayName: Cleaning Remote Workspace BRTLVBGY0081SL
+            condition: always()
+            continueOnError: false
+            inputs:
+              sshEndpoint: hip_ets_srv1_homolog
+              runOptions: 'commands'
+              readyTimeout: '20000'
+              commands: |
+                dir C:\Users\svi_conta\Documents
+                cd C:\Users\svi_conta\Documents && rmdir /s /q deploy\
+                dir C:\Users\svi_conta\Documents
+
+          ## -> Check if the artifacts were deleted correctly
+          - task: SSH@0
+            displayName: Cleaning Remote Workspace BRTLVBGY0085SL
+            condition: always()
+            continueOnError: false
+            inputs:
+              sshEndpoint: hip_ets_srv2_homolog
+              runOptions: 'commands'
+              readyTimeout: '20000'
+              commands: |
+                dir C:\Users\svi_conta\Documents
+                cd C:\Users\svi_conta\Documents && rmdir /s /q deploy\
+                dir C:\Users\svi_conta\Documents
+
+          ## -> Cleaning all files in the workspace
+          - task: DeleteFiles@1
+            displayName: "Cleaning Up Workspace"
+            condition: always()
+            inputs:
+              sourcefolder: $(Pipeline.Workspace)
+              contents: '**/*' 

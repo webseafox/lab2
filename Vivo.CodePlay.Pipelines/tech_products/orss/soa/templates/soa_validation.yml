@@ -1,0 +1,92 @@
+steps:
+  - task: Bash@3
+    name: IdentifyCommitsAndExecutionType
+    displayName: 'Identify commits and type of execution'
+    inputs:
+      targetType: 'inline'
+      script: |
+        echo 'Fetch and Log'
+        git fetch
+        if [[ `echo $(Build.SourceBranch) | grep refs/tags` ]]
+        then
+          HASH_LIST=`git log -1 --pretty=format:'%h' $(Build.SourceBranch)`
+          EXECUTION_TYPE=DEPLOY
+          echo "##vso[task.setvariable variable=EXECUTION_TYPE;isOutput=true]$EXECUTION_TYPE"
+        else
+          SOURCE_BRANCH_NAME=`echo $(System.PullRequest.SourceBranch) | sed 's|refs/heads/||g'`
+          HASH_LIST=`git log --oneline --no-merges --pretty=format:'%h' origin/$(System.PullRequest.TargetBranchName)..origin/$SOURCE_BRANCH_NAME | sed '1!G;h;$!d' | paste -sd','`
+          EXECUTION_TYPE=BUILD
+          echo "##vso[task.setvariable variable=EXECUTION_TYPE;isOutput=true]$EXECUTION_TYPE"
+        fi
+          echo "##vso[task.setvariable variable=HASH_LIST;isOutput=true]$HASH_LIST"
+
+  - task: Bash@3
+    name: ValidationChangedFilesAndProject
+    displayName: 'Validating changed files and project'
+    inputs:
+      targetType: 'inline'
+      script: |
+        declare -a PROJECTS
+        declare -a FILES
+        IFS=','
+        for hash in $(IdentifyCommitsAndExecutionType.HASH_LIST)
+        do
+          if [[ $(IdentifyCommitsAndExecutionType.EXECUTION_TYPE) == BUILD ]]
+          then
+            echo "Tipo build..."
+            COMMIT=$(git show $hash --name-status --no-merges --pretty=format: | sed 's/\\t/,/g')
+            echo "$COMMIT" >> changes.txt
+          else
+            echo "Tipo deploy..."
+            COMMIT=$(git diff --name-status origin/master...$(Build.SourceBranch) -- . ':!.*' ':!pipeline')
+            echo "Commit: $COMMIT"
+          fi
+          PATHS=${COMMIT:1}
+          IFS='/'
+          read -r -a PATH_LIST <<< "$PATHS"
+          FILES+="${COMMIT:2}|"
+          echo "##vso[task.setvariable variable=FILES;isOutput=true]$FILES"
+          if [[ "${PROJECTS[@]}" != "${PATH_LIST[1]}" && "${PATH_LIST[0]:1}" != "Mocks" ]]
+          then
+            PARTITION=${PATH_LIST[0]:1}
+            echo "##vso[task.setvariable variable=PARTITION;isOutput=true]$PARTITION"
+            PROJECT=${PATH_LIST[1]}
+            echo "##vso[task.setvariable variable=PROJECT;isOutput=true]$PROJECT"
+            PROJECTS+=(${PATH_LIST[1]})
+          fi
+          if [[ ${#PROJECTS[@]} > 1 ]]
+          then
+            echo "##vso[task.logissue type=error]Não podem haver projetos/compostos diferentes alterados em uma mesma Pull Request."
+            echo "##vso[task.complete result=Failed;]"
+            exit 1
+          fi
+          ACTION=${COMMIT:0:1}
+          case $ACTION in
+          R)
+            echo -n "Artefato removido: $COMMIT"
+            ;;
+          D)
+            echo -n "Artefato deletado: $COMMIT"
+            ;;
+          M | A)
+            echo -n "Artefato modificado ou adicionado: $COMMIT"
+            ;;
+          esac
+        done
+
+  - task: Bash@3
+    displayName: 'Identify type of project'
+    inputs:
+      targetType: 'inline'
+      script: |
+        if [[ `echo $(ValidationChangedFilesAndProject.PARTITION) | grep resources` && `echo $(ValidationChangedFilesAndProject.PROJECT) | grep oramds` ]]
+        then
+          PROJECT_TYPE=METADATA_STORE
+          echo "##vso[task.setvariable variable=PROJECT_TYPE;isOutput=true]$PROJECT_TYPE"
+        else
+          cd $(ValidationChangedFilesAndProject.PARTITION)/$(ValidationChangedFilesAndProject.PROJECT)
+          COMPOSITE_VERSION=`find . -name composite.xml -exec grep -Po '(?<=revision=\")([0-9.]+)' {} \;`
+          echo "##vso[task.setvariable variable=COMPOSITE_VERSION;isOutput=true]$COMPOSITE_VERSION"
+          PROJECT_TYPE=COMPOSITE
+          echo "##vso[task.setvariable variable=PROJECT_TYPE;isOutput=true]$PROJECT_TYPE"
+        fi

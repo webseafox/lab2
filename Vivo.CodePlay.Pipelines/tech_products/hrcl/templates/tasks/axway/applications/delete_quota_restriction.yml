@@ -1,0 +1,49 @@
+parameters:
+- name: method
+- name: applicationID
+
+steps:
+- script: |
+    echo "##[debug] API_MANAGER_BASE_URL........: ${API_MANAGER_BASE_URL}"
+    echo "##[debug] APPLICATION_ID..............: ${APPLICATION_ID}"
+    echo "##[debug] METHOD......................: ${METHOD}"
+
+    echo "##[command] GET /applications/${APPLICATION_ID}/quota"
+    curl -s -k --request GET "${API_MANAGER_BASE_URL}/applications/${APPLICATION_ID}/quota" \
+    --user "${ADMIN_USERNAME}:${ADMIN_PASSWORD}" | jq -r 'select(.restrictions != []) // {}' > current_application_quota.json
+
+    jq 'if . == {} then error("Application quota not found") else . end | .' current_application_quota.json
+    retVal=$?
+
+    if [ $retVal -ne 0 ]; then
+      echo "##[warning] No quota was found to delete."
+      exit
+    fi
+
+    echo "##[debug] Removing quota restriction for method '${METHOD}'"
+    jq --arg method "${METHOD}" 'del(.restrictions[] | select(.method == $method))' current_application_quota.json > new_application_quota.json
+
+    jq 'if .restrictions == [] then error("Application Quota Restriction Is Empty") else . end | .' new_application_quota.json
+    retVal=$?
+
+    if [ $retVal -ne 0 ]; then
+      echo "##[command] DELETE /applications/${APPLICATION_ID}/quota"
+      curl -s -i -k --fail --request DELETE "${API_MANAGER_BASE_URL}/applications/${APPLICATION_ID}/quota" \
+      --user "${ADMIN_USERNAME}:${ADMIN_PASSWORD}"
+    else
+      echo "##[command] PUT /applications/${APPLICATION_ID}/quota"
+      REQUEST_BODY="$(jq -r -c '.' new_application_quota.json)"
+      echo "##[debug] REQUEST_BODY................: ${REQUEST_BODY}"
+
+      curl -s -i -k --request PUT "${API_MANAGER_BASE_URL}/applications/${APPLICATION_ID}/quota" \
+      --user "${ADMIN_USERNAME}:${ADMIN_PASSWORD}" \
+      --header "content-type: application/json" \
+      --data-raw "${REQUEST_BODY}"
+    fi
+  displayName: Delete Quota Restriction
+  env:
+    API_MANAGER_BASE_URL: $(API_MANAGER_BASE_URL)
+    ADMIN_USERNAME: $(ADMIN_USERNAME)
+    ADMIN_PASSWORD: $(ADMIN_PASSWORD)
+    APPLICATION_ID: ${{ parameters.applicationID }}
+    METHOD: ${{ parameters.method }}

@@ -1,0 +1,73 @@
+parameters:
+- name: fortifyExclusionRepository
+
+stages:
+- stage: security
+  displayName: "Security"
+  dependsOn: build_test
+  pool: $(PRIVATE_AGENT_DEFAULT)
+  jobs:
+  - job: app_config_keys
+    displayName: "Get AppSec Config Keys"
+    steps:
+    - template: /tasks/bash/welcome.yml
+    - template: /task_groups/security/get_appconfig_keys.yml
+
+  - job: fortify_scan
+    dependsOn: app_config_keys
+    variables: 
+      USE_FORTIFY: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_FORTIFY'] ]
+      USE_CONVISO: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_CONVISO'] ]
+      SKIP_SECURITY_GATE: $[ dependencies.app_config_keys.outputs['evaluate_flags.SKIP_SECURITY_GATE'] ]
+    condition: and(
+                succeeded(),
+                eq(variables.USE_FORTIFY, 'true'),
+                eq(variables.flowIsToReview, true),
+                not(startsWith(variables['Build.SourceBranch'], 'refs/tags/'))
+              )
+    displayName: "Fortify Scan"
+    steps:
+    - template: /task_groups/security/run_fortify_scan.yml
+      parameters:
+        gateCondition: and(
+                        succeeded(),
+                        ne(variables.skip_fortify_gate, true),
+                        ne(variables.USE_CONVISO, 'true')
+                      )
+        fortifyExclusionRepository: ${{ parameters.fortifyExclusionRepository }}
+        skipSecurityGate: $(SKIP_SECURITY_GATE)
+    - template: /tasks/telemetry/telemetry.yml
+
+  - job: conviso_sync
+    dependsOn:
+    - fortify_scan
+    - app_config_keys
+    variables: 
+      USE_CONVISO: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_CONVISO'] ]
+      SKIP_SECURITY_GATE: $[ dependencies.app_config_keys.outputs['evaluate_flags.SKIP_SECURITY_GATE'] ]
+    condition: and(
+                succeeded(),
+                eq(variables.USE_CONVISO, 'true')
+              )
+    displayName: "Conviso Sync"
+    steps:
+    - template: /task_groups/security/run_conviso_integration.yml
+      parameters:
+        skipSecurityGate: $(SKIP_SECURITY_GATE)
+    
+  - job: checkmarx_scan
+    dependsOn: app_config_keys
+    variables: 
+      USE_CHECKMARX: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_CHECKMARX'] ]
+      SKIP_SECURITY_GATE: $[ or(eq(dependencies.app_config_keys.outputs['evaluate_flags.SKIP_SECURITY_GATE'], 'true'), eq(variables.CHECKMARX_IGNORE_SECURITY_GATE, 'true')) ]
+    condition: and(
+                succeeded(),
+                eq(variables.USE_CHECKMARX, 'true'),
+                eq(variables.flowIsToReview, true),
+                not(startsWith(variables['Build.SourceBranch'], 'refs/tags/'))
+              )
+    displayName: "Checkmarx Scan"
+    steps:
+    - template: /task_groups/security/run_checkmarx_scan.yml
+      parameters:
+        skipSecurityGate: $(SKIP_SECURITY_GATE)

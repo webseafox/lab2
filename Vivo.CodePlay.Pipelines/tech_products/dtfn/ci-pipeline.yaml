@@ -1,0 +1,186 @@
+# ==================================================================
+# Pipeline: CI Databricks - DTFN
+# ------------------------------------------------------------------
+# Template de Integração Contínua do produto DTFN (Databricks).
+# Localização: tech_products/dtfn/ci-pipeline.yaml @ Vivo.CodePlay.Pipelines
+#
+# Estrutura:
+#   1. SecurityAnalysis - Fortify (SAST) + SCA (Dependency-Track)
+#   2. CI                - Exporta jobs, notebooks e pasta "vivo" de DEV
+#                          como artefatos (DatabricksJobs, DatabricksNotebooks,
+#                          DatabricksVivo), consumidos pela pipeline de CD.
+#
+# ATENÇÃO: este template não declara nenhum Variable Group. As variáveis
+# usadas no script de exportação ($(dev_token), $(dev_url)) precisam
+# continuar configuradas como Variables da própria pipeline no Azure
+# DevOps (aba Variables), fora do YAML — mesmo comportamento que a
+# pipeline já tinha antes desta conversão.
+# ==================================================================
+
+parameters:
+# ==================================================================
+# Infraestrutura e Ambiente
+# ==================================================================
+  - name: agentPoolCI
+    type: string
+    default: 'GeneralPurposeLinuxAgentsCI'
+    displayName: 'Pool de agentes para os jobs de segurança e exportação'
+
+# ==================================================================
+# Configurações de Segurança
+# ==================================================================
+  - name: fortifyExclusionRepository
+    type: string
+    default: 'FortifyExclusion'
+    displayName: 'Alias do repositório de exclusões do Fortify'
+
+  - name: enableFortifyExclusions
+    type: boolean
+    default: true
+    displayName: 'Usar exclusões do Fortify'
+
+  - name: convisoCompany
+    type: number
+    default: 430
+    displayName: 'Conviso Company ID'
+
+  - name: vivoFlow
+    type: string
+    default: 'DTFN_Preprod'
+    displayName: 'Fluxo Vivo para AppSec'
+
+# ==================================================================
+# Caminhos no repositório do produto
+# ==================================================================
+  - name: scriptsPath
+    type: string
+    default: 'scripts/ci-cd'
+    displayName: 'Diretório dos scripts de CI/CD no repositório do produto'
+
+# ==================================================================
+# Estágios do Pipeline
+# ==================================================================
+stages:
+
+# ==================================================================
+# Stage 1: SecurityAnalysis - SAST (Fortify) e SCA (Dependency-Track)
+# ==================================================================
+- stage: SecurityAnalysis
+  displayName: 'Análise de Segurança'
+  jobs:
+    - job: AppSecConfigKeys
+      displayName: 'Get AppSec Config Keys'
+      pool:
+        name: ${{ parameters.agentPoolCI }}
+      steps:
+        - template: /security/get_appconfig_keys_framework.yml@CodePlay
+          parameters:
+            azureSubscription: DevOpsSharedResources
+            appConfigurationEndpoint: https://appcs-azdevops-shared.azconfig.io
+
+    - job: FortifyScan
+      displayName: 'Fortify Scan'
+      dependsOn:
+        - AppSecConfigKeys
+      variables:
+        USE_FORTIFY: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.USE_FORTIFY'] ]
+        USE_CONVISO: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.USE_CONVISO'] ]
+        SKIP_SECURITY_GATE: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.SKIP_SECURITY_GATE'] ]
+        FORTIFY_LOCAL_SCANCENTRAL_VERSION: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.FORTIFY_LOCAL_SCANCENTRAL_VERSION'] ]
+      condition: and(succeeded(), eq(variables.USE_FORTIFY, 'true'))
+      pool:
+        name: ${{ parameters.agentPoolCI }}
+      steps:
+        - template: /security/define_appsec_app_version.yml@CodePlay
+
+        - template: /security/run_fortify_scan.yml
+          parameters:
+            fortifyExclusionRepository: ${{ parameters.fortifyExclusionRepository }}
+            enableFortifyExclusions: ${{ parameters.enableFortifyExclusions }}
+            appLanguage: 'other'
+            appVersion: "$(FORTIFY_APP_VERSION)"
+            vivoFlow: ${{ parameters.vivoFlow }}
+
+    # ------------------------------------------
+    # PREPARAÇÃO PARA O SCA
+    # ------------------------------------------
+    - job: PrepareSCAArtifact
+      displayName: 'Preparar Artefato para SCA'
+      dependsOn:
+        - AppSecConfigKeys
+      pool:
+        name: ${{ parameters.agentPoolCI }}
+      steps:
+        - checkout: self
+        - task: PublishBuildArtifacts@1
+          inputs:
+            pathToPublish: '$(Build.SourcesDirectory)'
+            artifactName: 'app'
+            publishLocation: 'Container'
+          displayName: 'Publicar Código Fonte como artefato app'
+
+    # ------------------------------------------
+    # SCAN SCA (Dependency-Track)
+    # ------------------------------------------
+    - job: SCAScan
+      displayName: 'SCA Scan'
+      dependsOn:
+        - AppSecConfigKeys
+        - PrepareSCAArtifact
+      variables:
+        USE_DEPENDENCY_TRACK: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.USE_DEPENDENCY_TRACK'] ]
+        AKV_DEVOPS_NAME: 'kv-azdevops-shared'
+        FORTIFY_APP_DEFAULT_VERSION: 'DevSecOps'
+      condition: and(succeeded(), eq(variables.USE_DEPENDENCY_TRACK, 'true'))
+      pool:
+        name: ${{ parameters.agentPoolCI }}
+      steps:
+        - template: /security/define_appsec_app_version.yml@CodePlay
+
+        - template: /security/run_sca_scan.yml@CodePlay
+          parameters:
+            appVersion: "$(FORTIFY_APP_VERSION)"
+            convisoCompany: ${{ parameters.convisoCompany }}
+            vivoFlow: ${{ parameters.vivoFlow }}
+
+# ==================================================================
+# Stage 2: CI - Exporta jobs, notebooks e pasta vivo do ambiente DEV
+# ==================================================================
+- stage: CI
+  displayName: 'Integração Contínua'
+  dependsOn:
+    - SecurityAnalysis
+  condition: succeeded()
+  jobs:
+    - job: ExportacaoJobseVivoeNotebooks
+      displayName: 'Exportar Jobs, Vivo e Notebooks'
+      pool:
+        name: ${{ parameters.agentPoolCI }}
+      steps:
+        - task: PythonScript@0
+          displayName: 'Validar Conexão com o Databricks DEV'
+          inputs:
+            scriptSource: filePath
+            scriptPath: ${{ parameters.scriptsPath }}/ci-validaconexao_dev.py
+            arguments: '--workspace-url https://$(dev_url).azuredatabricks.net --token $(dev_token)'
+
+        - task: PythonScript@0
+          displayName: 'Exportar e Formatar Jobs de DEV'
+          inputs:
+            scriptSource: filePath
+            scriptPath: ${{ parameters.scriptsPath }}/ci-exportarjobs_dev_v1.py
+            arguments: '--workspace-url https://$(dev_url).azuredatabricks.net --token $(dev_token)'
+
+        - task: PublishBuildArtifacts@1
+          displayName: 'Publicar Jobs como artefato'
+          inputs:
+            pathToPublish: '$(System.DefaultWorkingDirectory)/jobs'
+            artifactName: 'DatabricksJobs'
+            publishLocation: 'Container'
+
+        - task: PublishBuildArtifacts@1
+          displayName: 'Publicar Notebooks como artefato'
+          inputs:
+            pathToPublish: '$(System.DefaultWorkingDirectory)/databricks'
+            artifactName: 'DatabricksNotebooks'
+            publishLocation: 'Container'

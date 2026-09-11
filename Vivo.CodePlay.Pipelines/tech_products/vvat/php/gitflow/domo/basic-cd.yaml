@@ -1,0 +1,201 @@
+trigger:
+  branches:
+    include:
+      - 'master'
+      - 'main'
+      - 'codeplay'
+  paths:
+    include:
+      - .azuredevops/azure-pipeline-cd.yaml
+
+variables:
+- group: "azdo-team-project-variables"
+- group: "${{ variables['Build.Repository.Name'] }}"
+
+stages:
+- stage: Deploy
+  jobs:
+  - job: Helm
+    pool:
+      name: GeneralPurposeLinuxAgentsCD
+    steps:
+
+    - checkout: self
+      fetchDepth: 1
+      persistCredentials: true
+    
+    - task: Bash@3
+      displayName: 'Generate Helm Commands from Variable Group'
+      env:
+        AZURE_DEVOPS_EXT_PAT: $(System.AccessToken)
+      inputs:
+        targetType: 'inline'
+        script: |
+          echo "##[group]🔧 Descobrindo variáveis da Variable Group"
+          
+          VARIABLE_GROUP_NAME="$(Build.Repository.Name)"
+          echo "📛 Variable Group: $VARIABLE_GROUP_NAME"
+          
+          # Obter variáveis do grupo
+          GROUP_VARS_JSON=$(az pipelines variable-group list --group-name "$VARIABLE_GROUP_NAME" --query "[0].variables" -o json 2>/dev/null)
+
+          if [ -z "$GROUP_VARS_JSON" ] || [ "$GROUP_VARS_JSON" = "null" ] || [ "$GROUP_VARS_JSON" = "{}" ]; then
+            echo "❌ Variable Group não encontrado: $VARIABLE_GROUP_NAME"
+            exit 1
+          fi
+          
+          echo "✅ Variable Group localizado com $(echo "$GROUP_VARS_JSON" | jq 'keys | length') variáveis"
+          echo "##[endgroup]"
+          
+          echo "##[group]🚀 Gerando comandos Helm dinâmicos"
+          
+          HELM_ENV_COMMANDS=""
+          
+          # Processar cada variável da Variable Group
+          while IFS= read -r var_name; do
+            if [ -n "$var_name" ]; then
+              var_value=$(echo "$GROUP_VARS_JSON" | jq -r ".\"$var_name\".value // \"\"")
+              is_secret=$(echo "$GROUP_VARS_JSON" | jq -r ".\"$var_name\".isSecret // false")
+              
+              echo "🔍 $var_name (secret: $is_secret)"
+              
+              if [ "$is_secret" = "true" ]; then
+                # Para secrets: usar referência $(VAR_NAME) - será expandido depois
+                HELM_ENV_COMMANDS="$HELM_ENV_COMMANDS --set env.$var_name=\"\$($var_name)\""
+              elif [ -n "$var_value" ] && [ "$var_value" != "null" ]; then
+                # Para variáveis normais: usar valor literal
+                HELM_ENV_COMMANDS="$HELM_ENV_COMMANDS --set env.$var_name=\"$var_value\""
+              fi
+            fi
+          done <<< "$(echo "$GROUP_VARS_JSON" | jq -r 'keys[]')"
+          
+          echo "✅ Comandos gerados (${#HELM_ENV_COMMANDS} caracteres)"
+          echo "##[endgroup]"
+          
+          echo "##[group]💾 Salvando comandos para uso posterior"
+          
+          # Salvar comando para uso em tasks Helm reais
+          echo "##vso[task.setvariable variable=HELM_ENV_COMMANDS]$HELM_ENV_COMMANDS"
+          
+          echo "📋 Comando salvo na variável HELM_ENV_COMMANDS:"
+          echo "$HELM_ENV_COMMANDS"
+          echo ""
+          echo "💡 Para usar em uma task Helm real:"
+          echo "helm upgrade --install myapp chart \$HELM_ENV_COMMANDS"
+          echo "##[endgroup]"
+          
+          echo "##[group]🧪 Demonstração de uso"
+          
+          echo "📋 Comando gerado (pronto para usar em Helm):"
+          echo "$HELM_ENV_COMMANDS"
+          echo ""
+          
+          echo "🎯 Exemplo de uso em uma task Helm:"
+          echo "- task: HelmDeploy@0"
+          echo "  inputs:"
+          echo "    command: 'upgrade'"
+          echo "    chartType: 'FilePath'"
+          echo "    chartPath: './chart'"
+          echo "    releaseName: 'myapp'"
+          echo "    arguments: '$HELM_ENV_COMMANDS --set labels.team=integracao'"
+          echo ""
+          
+          echo "🚀 Ou via linha de comando:"
+          echo "helm upgrade --install myapp ./chart \\"
+          
+          # Mostrar comando sem tentar expandir (pois secrets podem não estar disponíveis aqui)
+          echo "$HELM_ENV_COMMANDS" | sed 's/--set/  --set/g' | sed 's/^  //'
+          echo "  --set labels.team=integracao \\"
+          echo "  --namespace mynamespace"
+          
+          echo ""
+          echo "💡 IMPORTANTE: As variáveis \$(VAR_NAME) serão automaticamente expandidas"
+          echo "   pelo Azure DevOps quando o comando for executado em uma task Helm real."
+          echo ""
+          echo "✅ SUCESSO! Comando universal gerado para qualquer Variable Group!"
+          echo "##[endgroup]"
+    
+    - task: YamlParseFromVivo@4
+      displayName: 'Get Metadata Info'
+      inputs:
+        type: 'file'
+        origin: $(Build.SourcesDirectory)/catalog-info.yaml
+        jpaths: |
+          var CATALOG_YAML_NAME = .metadata.name
+          var CATALOG_YAML_ACRONYM = .metadata.annotations['techarch.governance-app.acronym']
+          var CATALOG_YAML_K8S_NS = .metadata.annotations['vivo.io/kubernetes-k8s-namespace-dev']
+
+    - task: Bash@3
+      displayName: 'Get Version'
+      inputs:
+        targetType: 'inline'
+        script: |
+          VERSION=$(cat VERSION)
+          echo "##vso[task.setvariable variable=VERSION]$VERSION"
+
+    - task: DownloadSecureFile@1
+      # this task must have a name
+      name: kubeconfig
+      displayName: 'Download config from VVAT'
+      inputs:
+        secureFile: 'kubeconfig-vvat.yml'
+
+    - task: AzureKeyVault@2  
+      displayName: '[Helm ACR] Getting AKV credentials'
+      timeoutInMinutes: 1
+      retryCountOnTaskFailure: 3
+      inputs:
+        azureSubscription: DevOpsSharedResources
+        KeyVaultName: $(AKV_DEVOPS_NAME)
+        SecretsFilter: 'HELM-REGISTRY-ACR-USERNAME, HELM-REGISTRY-ACR-PASSWORD'
+    
+    - task: CmdLine@2
+      displayName: "[ACR] Helm upgrade"
+      env:
+        HOST: $(HELM_REGISTRY_ACR_NAME)
+        USERNAME: $(HELM-REGISTRY-ACR-USERNAME)
+        PASSWORD: $(HELM-REGISTRY-ACR-PASSWORD)
+        HTTP_PROXY: 'http://10.240.58.39:3128'
+        HTTPS_PROXY: 'http://10.240.58.39:3128'
+        NO_PROXY: 'localhost,0.0.0.0,127.0.0.1,10.244.0.0/16,192.168.0.0/16,10.129.178.173,nexus.telefonica.com.br,acrsharedservices01.azurecr.io,appcs-azdevops-shared.azconfig.io,scm.azurewebsites.net'
+      inputs:
+        script: |
+          source ~/.bashrc
+          echo "##[debug] HOST.......: ${HOST}"
+          echo "##[debug] USERNAME...: ${USERNAME}"
+          echo "##[debug] PASSWORD...: ************"
+          echo "##[debug] HTTP_PROXY.: ${HTTP_PROXY}"
+          echo "##[debug] HTTPS_PROXY: ${HTTPS_PROXY}"
+
+          helm registry login ${HOST} \
+            --username ${USERNAME} \
+            --password "${PASSWORD}"
+
+          helm upgrade --install $(CATALOG_YAML_NAME) \
+          oci://${HOST}/helm/devops/generic-php \
+          --version 1.0.1 \
+          --kubeconfig $(kubeconfig.secureFilePath) \
+          --namespace "$(CATALOG_YAML_K8S_NS)" \
+          --set fullnameOverride=$(CATALOG_YAML_NAME) \
+          $(HELM_ENV_COMMANDS) \
+          --set image.repository=${HOST}/${CATALOG_YAML_ACRONYM}/$(CATALOG_YAML_NAME) \
+          --set image.tag=${VERSION}-SNAPSHOT \
+          --set imagePullSecrets[0].name=acr-secret \
+          --set health.livenessProbe.path=/health.php \
+          --set health.readinessProbe.path=/health.php \
+          --set 'virtualService.http[0].match[0].uri.prefix=/domo' \
+          --set 'virtualService.http[0].rewrite.uri=/' \
+          --set 'virtualService.http[0].headers.request.set.X-Forwarded-Prefix=/domo' \
+          --set 'virtualService.http[0].headers.request.set.X-Script-Name=/domo' \
+          --history-max 5 \
+          --debug \
+          --atomic \
+          --wait \
+          --timeout 300s
+          
+          echo "##[group]🚀 Executando Helm com variáveis dinâmicas da Variable Group"
+          echo "📋 Variáveis detectadas automaticamente: $(HELM_ENV_COMMANDS)"
+          echo ""
+          
+          echo "##[endgroup]"
+          echo "✅ SUCESSO! Helm executado com TODAS as variáveis da Variable Group!"

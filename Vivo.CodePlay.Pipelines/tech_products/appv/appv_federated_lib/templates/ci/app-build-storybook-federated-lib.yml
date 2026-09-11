@@ -1,0 +1,241 @@
+stages:
+- stage: ci_build
+  displayName: "CI - Build"
+  pool:
+    name: GeneralPurposeLinuxAgentsCI
+  dependsOn:
+  - environment_init
+
+
+
+  ## -> Loads variables from other stages.
+  variables:
+  - name: NEXUS_DEPS_USR
+    value: $[ stageDependencies.nodejs_environment_init.environment.outputs['credentials.NEXUS_DEPS_USR'] ]
+  - name: NEXUS_DEPS_PSW
+    value: $[ stageDependencies.nodejs_environment_init.environment.outputs['credentials.NEXUS_DEPS_PSW'] ]
+  
+  jobs:      
+  - job: build
+    displayName: Build
+    steps:
+
+    ## -> Clean the pipeline workspace and checkout the code.
+    ## -> 6d15af64-176c-496d-b583-fd2ae21d4df4 is the decorator for checkout.
+    - task: 6d15af64-176c-496d-b583-fd2ae21d4df4@1
+      displayName: Checkout Code
+      name: checkout_code 
+      inputs:
+        repository: self
+        persistCredentials: "true"
+        clean: true
+
+    ## -> Checkout the last commit that was pushed to the repository. 
+    ## -> Set last commit HASH to a variable. 
+    - task: Bash@3
+      displayName: Checkout Last Commit
+      name: checkout_last_commit
+      condition: succeeded()
+      continueOnError: false
+      inputs:
+        targetType: inline
+        script: |
+          echo "##[debug] Checkout last commit from '$(Build.SourceBranchName)'"
+
+          git config pull.rebase true
+          git fetch -f --depth 1 origin $(Build.SourceBranchName):$(Build.SourceBranchName)
+          git checkout -f $(Build.SourceBranchName)
+          lastCommitHash=$(git rev-parse --short=6 HEAD)
+
+          echo "##[debug] Last commit short hash '$lastCommitHash'"
+          echo "##vso[task.setvariable variable=SHORT_HASH]$lastCommitHash"
+
+    ## -> Start of Bump Version section
+    ## -> If branch is master, use numeric system. e.g: 0.0.1, 2.0.0;
+    ## -> If branch is NOT master, use branch name + last commit hash. e.g: dev-1a2b;
+
+    ## -> Get current version and set to variables. 
+    ## -> For master, set a variable to increment version further on.
+    - task: CmdLine@2
+      displayName: Get Current Version
+      name: current_version_other
+      condition: succeeded()
+      continueOnError: false
+      inputs:
+        script: |
+          setVariables(){
+            eval result=$2
+            echo "##vso[task.setvariable variable=$1]$result"
+          }                              
+
+          currentVersion=$(DOCKER_CMD_EXTRACT_PACKAGE_JSON_VERSION)
+          setVariables "CURRENT_VERSION" $currentVersion
+          echo "##[debug] Source CURRENT_VERSION: '$currentVersion'"
+          setVariables "INCREMENT_VERSION" $(echo $currentVersion | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+          
+    ## -> Bump/Increment version and update increment variable. 
+    ## -> Only allows this for master branch and in CI steps. Do not allow manual pushes.
+    ## -> To disable set BUMP_VERSION_ENABLED in pipeline's library.
+    - task: semver-bump@1
+      displayName: Bump Version Master
+      name: bump_version
+      condition: and(
+        succeeded(),
+        or(
+        and(eq(variables.BUMP_VERSION_ENABLED, 'true'), eq(variables['Build.Reason'], 'IndividualCI')),
+        and(eq(variables.BUMP_VERSION_ENABLED, 'true'), eq(variables['Build.Reason'], 'BatchedCI')),
+        and(eq(False, true),eq(variables['Build.Reason'], 'Manual'))))
+      continueOnError: false
+      inputs:
+        VersionVariable: 'INCREMENT_VERSION'
+        IncrementLevel: 'patch'
+        targetType: inline
+
+    - task: AzureKeyVault@2  
+      displayName: 'Getting AKV credentials'
+      timeoutInMinutes: 1
+      retryCountOnTaskFailure: 5
+      inputs:    
+        azureSubscription: DevOpsSharedResources    
+        KeyVaultName: $(AKV_DEVOPS_NAME)
+        SecretsFilter: 'NEXUS-DEFAULT-USR, NEXUS-DEFAULT-PSW'
+
+    - bash: |
+         echo "##[debug]DEFAULT_NPMRC_TEMP_FILE_PATH.....: ${DEFAULT_NPMRC_TEMP_FILE_PATH}"
+
+         if [ -f .npmrc ]; then
+           cp .npmrc ${DEFAULT_NPMRC_TEMP_FILE_PATH}
+         else
+           echo "##vso[task.logissue type=error]O arquivo .npmrc não foi encontrado!"
+           echo "##[error]O arquivo .npmrc não foi encontrado!"
+           exit 1;
+         fi
+
+         echo ##vso[task.setvariable variable=NPM_CONFIG_USERCONFIG]${DEFAULT_NPMRC_TEMP_FILE_PATH}
+      displayName: "Setting up .npmrc"
+      workingDirectory: "${{ parameters.artifactDir }}"
+      env:
+        DEFAULT_NPMRC_TEMP_FILE_PATH: $(DEFAULT_NPMRC_TEMP_FILE_PATH)
+    - task: npmAuthenticate@0
+      inputs:
+        workingFile: $(DEFAULT_NPMRC_TEMP_FILE_PATH)
+      displayName: Set dependencies credentials (Azure Artifacts)
+      env:
+        HTTPS_PROXY: $(PROXY_AGENT_HTTPS)
+        HTTP_PROXY: $(PROXY_AGENT_HTTP)
+        NO_PROXY: $(PROXY_AGENT_NO_PROXY)
+
+    - bash: |
+        if [ -f .npmrc ]; then
+          auth_opt="email=vivo.devops.br@telefonica.com\nalways-auth=true"
+          auth=$(echo -n ${NEXUS_DEFAULT_USR}:${NEXUS_DEFAULT_PSW} | openssl base64)
+          repos=$(grep -o "registry=.*" .npmrc | cut -d':' -f2 | awk -v auth="$auth" '{print $0 ":_auth="auth""}')
+          { printf '\n'; echo -e "$repos\n$auth_opt"; } | tee -a >(cat >> .npmrc) > /dev/null
+          echo "##[debug]Credenciais configuradas!"
+        else
+          echo "##vso[task.logissue type=error]O arquivo .npmrc não foi encontrado!"
+          echo "##[error]O arquivo .npmrc não foi encontrado!"
+        exit 1;
+        fi
+
+      displayName: "Set dependencies credentials (Nexus)"
+      workingDirectory: $(DEFAULT_NPMRC_TEMP_PATH)
+      env:    
+        NEXUS_DEFAULT_USR: $(NEXUS-DEFAULT-USR)
+        NEXUS_DEFAULT_PSW: $(NEXUS-DEFAULT-PSW)  
+    ## -> Bump version in code and build code.
+
+    - task: Bash@3
+      displayName: getProjectName
+      condition: succeeded()
+      continueOnError: false
+      inputs:
+        targetType: inline
+        script: |
+          IFS='-'
+
+          # Lendo os campos separados
+          read -ra parts <<< "$(Build.Repository.Name)"
+
+          # Acessando as partes separadas
+          src=${parts[0]}
+          project=${parts[1]}
+
+          # Exibindo as partes
+          echo "Parte 1: $src"
+          echo "Parte 2: $project"
+
+          echo "##vso[task.setvariable variable=project]$project"
+
+    
+    # ==================================================================
+    # [Compliance] Verifica se o repositório está em conformidade com as políticas de configuração
+    # ==================================================================
+    - task: VivoDevOpsConfigCompliance@1
+      displayName: 'Check DevOps Config Compliance'
+      inputs:
+        policySets: |
+          image-definition-files
+
+    - task: Bash@3
+      displayName: Build Version
+      name: build_version
+      condition: and(succeeded(), eq(variables.new_version.NEW_VERSION, ''))
+      continueOnError: false
+      inputs:
+        targetType: inline
+        script: >
+        
+          echo "Project Name: $(project)"
+          
+          BUILDER_IMAGE_NAME="builder/node"
+
+          docker build -t $BUILDER_IMAGE_NAME -f .azuredevops/builder.Dockerfile .
+
+          
+          docker run --rm \
+              --user="$(DOCKER_CMD_USERNAME):$(DOCKER_CMD_GROUP)" \
+              --network host \
+              --log-driver none \
+              -e NPM_CONFIG_USERCONFIG="/tmp/.npmrc" \
+              -e HTTPS_PROXY=$(PROXY_AGENT_HTTPS) \
+              -e PUPPETEER_SKIP_DOWNLOAD=true \
+              -e HTTP_PROXY=$(PROXY_AGENT_HTTP) \
+              -e NO_PROXY=$(PROXY_AGENT_NO_PROXY) \
+              -e TZ="America/Sao_Paulo" \
+              -e SYSTEM_ACCESSTOKEN="$(System.AccessToken)" \
+              -e NEXUS_DEPS_USR="$(NEXUS_DEPS_USR)" \
+              -e NEXUS_DEPS_PSW="$(NEXUS_DEPS_PSW)" \
+              -e VITE_ENVIRONMENT=STAGING \
+              -e VITE_STORYBOOK_PATH="/fb-core/storybooks/$(project)/" \
+              -v $(pwd):/app \
+              -v $(DEFAULT_NPMRC_TEMP_FILE_PATH):/tmp/.npmrc \
+              -w $(DOCKER_WORKDIR) \
+              $BUILDER_IMAGE_NAME sh -c "yarn install --immutable && yarn build:storybook"
+                    
+
+          echo "##[debug] Build with version: $(new_version.NEW_VERSION)"
+
+          if [[ "${BUMP_VERSION_ENABLED}" == 'true' ]]; then
+            npm --no-git-tag-version version $(new_version.NEW_VERSION) --allow-same-version
+          fi
+          
+          
+          echo "##[debug] build command: yarn install --immutable && yarn build:storybook"
+
+    ## -> Copy files for staging area
+    - task: CopyFiles@2
+      name: t_copy_file
+      displayName: 'Copy to Staging Directory'
+      condition: succeeded()
+      continueOnError: false
+      inputs:
+        TargetFolder: '$(Build.ArtifactStagingDirectory)'
+        OverWrite: true
+        CleanTargetFolder: true
+        Contents: >
+          /storybook-static/
+
+          **/*
+
+          !.git/**/*

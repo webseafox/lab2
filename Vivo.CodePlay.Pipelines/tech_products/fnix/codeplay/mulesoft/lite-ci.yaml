@@ -1,0 +1,652 @@
+parameters:
+- name: helm_chart_name
+  displayName: Nome do Heml Chart dentro do repositorio 'devops-helm'
+  default: generic-java-microservice
+
+- name: helm_chart_version
+  default: 1.0.27
+
+- name: kube_config_name
+  default: kube-dev
+
+- name: helm_config_files_path
+  default: ./.azuredevops/config/dev
+
+- name: variable_groups
+  displayName: Lista de Variables Groups para complementar variaveis e segredos.
+  default: []
+  type: object
+
+
+variables:
+- name: System.debug
+  value: 'true'
+- ${{ each group_name in parameters.variable_groups }}:
+  - group: ${{ group_name }}
+
+stages:
+- stage:
+  displayName: 'Build'
+  pool: GeneralPurposeLinuxAgentsCI
+  jobs:
+  - job:
+    displayName: 'Jira Commit Integration'
+    steps:
+    - checkout: self
+      fetchDepth: 1
+
+    - task: Regex@4
+      displayName: 'Filter Commit Message'
+      inputs:
+        source: $(Build.SourceVersionMessage)
+        regex: '/^[^:]+ {0,}: {0,}(([^| ]+) {0,}\| {0,}([^| ]+) {0,}\| {0,}(.+) {0,})/gm'
+
+
+    - task: TypeScriptRunner@4
+      displayName: 'Get Commit Info'
+      condition: eq(variables['REGEX_HAS_MATCH'], 'true')
+      inputs:
+        azureDevOpsEndpoint: 'Azure DevOps Api Generic'
+        script: |- # typescript
+          const { BUILD_REPOSITORY_ID } = process.env;
+          const commits = await (await connection.getGitApi()).getCommits(BUILD_REPOSITORY_ID, {$top: 1});
+          
+          set_variable('COMMITTER_NAME)', commits[0].committer.name);
+          set_variable('COMMIT_DATE)', commits[0].committer.date);
+
+    # - task: KafkaProducer@0.0.16
+    #   displayName: 'Publicar informações no tópico'
+    #   condition: eq(variables['REGEX_HAS_MATCH'], 'true')
+    #   inputs:
+    #     kafkaOamEndpoint: 'KafkaEsteiraDigitalProd'
+    #     kafkaProducerClientId: 'esteira-digital-group'
+    #     kafkaServer: 'oauth.bootstrap.apps.ocp-kafka-prd.redecorp.br:443'
+    #     commitDate: $(COMMIT_DATE)
+    #     commitId: $(Build.SourceVersion)
+    #     commitMessage: $(Build.SourceVersionMessage)
+    #     committerName: $(COMMITTER_NAME)
+    #     repoName: $(Build.Repository.Name)
+    #     kafkaTopic: "integracao-azure-jira-branch-master"
+    #     debug: true
+
+  - job:
+    displayName: 'Build, Unit Test and Pack'
+    variables:
+    - name: ASDF_JDK_8
+      value: "adoptopenjdk-8.0.352+8"
+    - name: ASDF_JDK_11
+      value: "openjdk-11.0.2"
+    - name: ASDF_JDK_17
+      value: "openjdk-17.0.2"
+    - name: ASDF_JDK_21
+      value: "adoptopenjdk-21.0.4+7.0.LTS"
+
+    - name: ASDF_JDK_SAP17
+      value: "sapmachine-17.0.10"
+
+    - name: SONARQUBE_PROJECT_NAME
+      value: "$(System.TeamProject)-$(Build.Repository.Name)"
+
+    steps:
+    - checkout: self
+      fetchDepth: 1
+      persistCredentials: true
+
+    - task: AzureKeyVault@2
+      displayName: 'Secrets from AKV'
+      inputs:
+        RunAsPreJob: true
+        azureSubscription: "DevOpsSharedResources"
+        KeyVaultName: "kv-azdevops-shared"
+        SecretsFilter: >-
+          NEXUS-DEPS-USR,
+          NEXUS-DEPS-PSW,
+          SONARQUBE-TOKEN
+
+    - task: XmlParseFromVivo@4
+      displayName: 'Get pom.xml info'
+      inputs:
+        type: 'file'
+        origin: $(Build.SourcesDirectory)/pom.xml
+        jpaths: |
+          var POM_XML_VERSION = .project.version._text
+
+    - task: YamlParseFromVivo@4
+      displayName: 'Get Metadata Info'
+      inputs:
+        type: 'file'
+        origin: $(Build.SourcesDirectory)/catalog-info.yaml
+        jpaths: |
+          var CATALOG_YAML_ACRONYM = .metadata.annotations['techarch.governance-app.acronym']
+          var CATALOG_YAML_MODULE = .metadata.annotations['techarch.governance-app.module']
+          var CATALOG_YAML_JAVA_LANGUAGE_VERSION = .metadata.annotations['arqtech.telefonica.com.br/language-version']
+
+
+    - script: |- # shell
+        echo "##vso[build.addbuildtag]helm"
+        echo "##vso[build.addbuildtag]kubernetes"
+        echo "##vso[build.addbuildtag]vcr"
+        echo "##vso[build.addbuildtag]kube-config"
+        echo "##vso[build.addbuildtag]java-$(CATALOG_YAML_JAVA_LANGUAGE_VERSION)"
+        echo "##vso[build.addbuildtag]maven"
+        echo "##vso[build.addbuildtag]nexus"
+        echo "##vso[build.addbuildtag]ci-lite"
+        echo "##vso[build.addbuildtag]$(CATALOG_YAML_ACRONYM)"
+        echo "##vso[build.addbuildtag]$(CATALOG_YAML_MODULE)"
+      displayName: 'Set tags'
+
+    - task: NunjucksInline@4
+      displayName: 'Bind "ASDF_JAVA_VERSION"'
+      inputs:
+        sourceType: 'text'
+        source: |
+          var ASDF_JAVA_VERSION = {{ ASDF_JDK_$(CATALOG_YAML_JAVA_LANGUAGE_VERSION) }}
+
+    - script: | # shell
+        asdf install java $(ASDF_JAVA_VERSION)
+        asdf install maven 3.9.9
+        echo "##vso[task.setvariable variable=ASDF_MAVEN39_PATH]$(asdf where maven 3.9.9)"
+      displayName: 'Ensure tools versions'
+
+    - task: ListFilesAndFolders@4
+      displayName: 'Find Custom Maven Settings file'
+      inputs:
+        script: 'var://MAVEN_SETTINGS_FILES = **/*settings.xml'
+        dot: true
+
+    - task: PythonRunner@4
+      displayName: 'Ensure Maven Config'
+      inputs:
+        script: | # py
+          import os
+          set_variable('MAVEN_CUSTOM_SETTINGS',
+            (os.getenv('MAVEN_SETTINGS_FILES') or '/home/svc_devopscorp/.m2/settings.xml')
+            .split(',')[0]
+          )
+
+    - task: SemverIncrementCustomFromVivo@5
+      displayName: 'Semver Increment "patch"'
+      name: new_version
+      inputs:
+        currentversion: $(POM_XML_VERSION)
+        outputVariableName: "NEW_VERSION"
+        releaseType: "patch"
+        template: "${NEW_COERCED_VERSION}"
+
+    - task: Maven@3
+      displayName: "Maven versions:set"
+      env:
+        ASDF_JAVA_VERSION: $(ASDF_JAVA_VERSION)
+        NEXUS_DEPS_USR: $(NEXUS-DEPS-USR)
+        NEXUS_DEPS_PSW: $(NEXUS-DEPS-PSW)
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+      inputs:
+        options: >
+          -gs /home/svc_devopscorp/.m2/settings.xml
+          -s $(MAVEN_CUSTOM_SETTINGS)
+          -Dmaven.test.skip=true 
+          -DnewVersion=$(new_version.NEW_VERSION)
+          -DprocessAllModules
+          -DgenerateBackupPoms=false
+          -N versions:update-child-modules
+        mavenPomFile: $(Build.SourcesDirectory)/pom.xml
+        mavenOptions: "-Xmx3072m"
+        mavenVersionOption: 'Path'
+        mavenDirectory: $(ASDF_MAVEN39_PATH)
+        javaHomeOption: "JDKVersion"
+        goals: "versions:set"
+
+    - task: XmlParseFromVivo@4
+      displayName: 'Get New pom.xml info'
+      inputs:
+        type: 'file'
+        origin: $(Build.SourcesDirectory)/pom.xml
+        jpaths: |
+          var POM_XML_VERSION = .project.version._text
+
+    - task: Maven@3
+      displayName: 'Maven Build, Test & Package'
+      env:
+        ASDF_JAVA_VERSION: $(ASDF_JAVA_VERSION)
+        NEXUS_DEPS_USR: $(NEXUS-DEPS-USR)
+        NEXUS_DEPS_PSW: $(NEXUS-DEPS-PSW)
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+      inputs:
+        options: >-
+          -gs /home/svc_devopscorp/.m2/settings.xml
+          -s $(MAVEN_CUSTOM_SETTINGS)
+          -Dmaven.repo.local=/home/svc_devopscorp/.m2/repository
+        mavenPomFile: $(Build.SourcesDirectory)/pom.xml
+        mavenOptions: "-Xmx3072m"
+        mavenVersionOption: 'Path'
+        mavenDirectory: $(ASDF_MAVEN39_PATH)
+        javaHomeOption: "JDKVersion"
+        publishJUnitResults: false
+        testResultsFiles: $(Build.SourcesDirectory)/**/surefire-reports/TEST-*.xml
+        goals: "clean dependency:purge-local-repository install test"
+
+    - task: PublishTestResults@2
+      inputs:
+        testResultsFormat: 'JUnit'
+        testResultsFiles: '**/surefire-reports/TEST-*.xml'
+        mergeTestResults: true
+
+    - task: CopyFiles@2
+      displayName: 'Staging Artifacts'
+      inputs:
+        SourceFolder: "$(build.sourcesdirectory)"
+        TargetFolder: "$(Build.ArtifactStagingDirectory)"
+        Contents: |
+          **/target/classes/**
+          **/target/*.*ar
+          **/target/*.ejb
+          **/surefire-reports/TEST-*.xml
+          **/pom.xml
+          .azuredevops/**/*
+          .azuredevops/*
+          catalog-info.y*ml
+          pom.xml
+        CleanTargetFolder: true
+        OverWrite: true
+        flattenFolders: false
+
+    - task: PublishBuildArtifacts@1
+      displayName: "Push Artifacts"
+      inputs:
+        ArtifactName: bin
+
+- stage:
+  displayName: 'Push to Repositories'
+  pool: GeneralPurposeLinuxAgentsCI
+  jobs:
+  - job: docker
+    displayName: 'Push to Docker (SNAPSHOT)'
+    variables:
+    - name: HTTP_PROXY
+      value: 'http://10.240.58.39:3128'
+    - name: HTTPS_PROXY
+      value: 'http://10.240.58.39:3128'
+    - name: NO_PROXY
+      value: 
+        localhost,
+        0.0.0.0,
+        127.0.0.1,
+        10.244.0.0/16,
+        192.168.0.0/16,
+        10.129.178.173,
+        nexus.telefonica.com.br,
+        acrsharedservices01.azurecr.io,
+        appcs-azdevops-shared.azconfig.io,
+        vcr-docker.nexus.telefonica.com.br,
+        scm.azurewebsites.net
+
+    steps:
+    - checkout: none
+    - task: DownloadBuildArtifacts@1
+      displayName: 'Download Artifact'
+      inputs:
+        buildType: 'current'
+        downloadPath: $(System.ArtifactsDirectory)
+
+    - task: XmlParseFromVivo@4
+      displayName: 'Get Main Info'
+      inputs:
+        type: 'file'
+        origin: $(System.ArtifactsDirectory)/bin/pom.xml
+        jpaths: |
+          var POM_XML_VERSION = .project.version._text
+
+    - task: YamlParseFromVivo@4
+      displayName: 'Get Metadata Info'
+      inputs:
+        type: 'file'
+        origin: $(System.ArtifactsDirectory)/bin/catalog-info.yaml
+        jpaths: |-
+          var CATALOG_YAML_NAME = .metadata.name
+          var CATALOG_YAML_ACRONYM = .metadata.annotations['techarch.governance-app.acronym']
+
+    # ==================================================================
+    # [Compliance] Verifica se o repositório está em conformidade com as políticas de configuração
+    # ==================================================================
+    - task: VivoDevOpsConfigCompliance@1
+      displayName: 'Check DevOps Config Compliance'
+      inputs:
+        workDir: $(System.ArtifactsDirectory)/bin
+        policySets: |
+          image-definition-files
+
+    - task: Docker@2
+      displayName: 'Docker Build'
+      inputs:
+        containerRegistry: 'VCR-DOCKER'
+        command: build
+        repository: $(CATALOG_YAML_ACRONYM)/$(CATALOG_YAML_NAME)
+        Dockerfile: $(System.ArtifactsDirectory)/bin/.azuredevops/runtime.Dockerfile
+        buildContext: $(System.ArtifactsDirectory)/bin
+        arguments: >-
+          --no-cache 
+          --build-arg APPLICATION_NAME=$(CATALOG_YAML_NAME)
+          --build-arg APP_VERSION=$(POM_XML_VERSION) 
+          --build-arg APPLICATION_PATH=target 
+          --build-arg HTTP_PROXY="$(HTTP_PROXY)"
+          --build-arg HTTPS_PROXY="$(HTTPS_PROXY)"
+          --build-arg NO_PROXY="$(NO_PROXY)"
+
+        tags: >
+          $(POM_XML_VERSION)-SNAPSHOT
+
+    - task: Docker@2
+      displayName: 'Push to Docker (SNAPSHOT)'
+      inputs:
+        containerRegistry: 'VCR-DOCKER'
+        command: push
+        repository: $(CATALOG_YAML_ACRONYM)/$(CATALOG_YAML_NAME)
+        addPipelineData: true
+        addBaseImageData: true
+        tags: >
+          $(POM_XML_VERSION)-SNAPSHOT
+
+  - job:
+    dependsOn: docker
+    displayName: 'Push to Git (TAG)'
+    steps:
+    - checkout: self
+      persistCredentials: true
+
+    - task: DownloadBuildArtifacts@1
+      displayName: 'Download Artifact'
+      inputs:
+        buildType: 'current'
+        itemPattern: |
+          bin/pom.xml
+          bin/**/pom.xml
+        downloadPath: $(System.ArtifactsDirectory)
+
+    - task: XmlParseFromVivo@4
+      displayName: 'Get pom.xml info'
+      inputs:
+        type: 'file'
+        origin: $(System.ArtifactsDirectory)/bin/pom.xml
+        jpaths: |
+          var POM_XML_VERSION = .project.version._text
+
+    - task: Bash@3
+      displayName: 'Commit new version'
+      continueOnError: false
+      inputs:
+        targetType: inline
+        script: |- # shell
+          yes | cp -r -f $(System.ArtifactsDirectory)/bin/* ./
+          git add .
+          git commit -m "[skip ci] CodePlay bump version $(POM_XML_VERSION)"
+          git tag $(POM_XML_VERSION) -m "Version has been updated to $(POM_XML_VERSION)"
+          git push origin --tags HEAD:$(Build.SourceBranchName)
+
+          echo "##[command] yes | cp -r -f $(System.ArtifactsDirectory)/bin/* ./"
+          echo "##[command] git add ."
+          echo "##[command] git commit -m \"[skip ci] CodePlay bump version $(POM_XML_VERSION)\""
+          echo "##[command] git tag $(POM_XML_VERSION) -m \"Version has been updated to $(POM_XML_VERSION)\""
+          echo "##[command] git push origin --tags HEAD:$(Build.SourceBranchName)"
+
+- stage:
+  displayName: 'Deploy on (dev)'
+  pool: GeneralPurposeLinuxAgentsCI
+  variables:
+  - name: System.debug
+    value: "true"
+  jobs:
+  - deployment:
+    displayName: 'Deploy on (dev)'
+    # creates an environment if it doesn't exist
+    environment:
+      name: 'deploy-dev'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+            persistCredentials: true
+            fetchDepth: 1
+            path: self-files
+
+          - checkout: DeployConfig
+            persistCredentials: false
+            path: kube-files
+            fetchDepth: 1
+
+          - task: XmlParseFromVivo@4
+            displayName: 'Get Main Info'
+            inputs:
+              type: 'file'
+              origin: $(Pipeline.Workspace)/self-files/pom.xml
+              jpaths: |
+                var POM_XML_VERSION = .project.version._text
+
+          - task: YamlParseFromVivo@4
+            displayName: 'Get Metadata Info'
+            inputs:
+              type: 'file'
+              origin: $(Pipeline.Workspace)/self-files/catalog-info.yaml
+              jpaths: |-
+                var CATALOG_YAML_NAME = .metadata.name
+                var CATALOG_YAML_ACRONYM = .metadata.annotations['techarch.governance-app.acronym']
+                var CATALOG_YAML_K8S_NS = .metadata.annotations['vivo.io/kubernetes-k8s-namespace-dev']
+                var CATALOG_YAML_KUBE_ID = .metadata.annotations['backstage.io/kubernetes-id']
+
+          - task: AzureKeyVault@2
+            displayName: 'Getting AKV credentials'
+            timeoutInMinutes: 1
+            retryCountOnTaskFailure: 5
+            inputs:
+              azureSubscription: DevOpsSharedResources
+              KeyVaultName: kv-azdevops-shared
+              SecretsFilter: >-
+                NEXUS-DEPS-USR, NEXUS-DEPS-PSW,
+                DOCKER-REGISTRY-USERNAME, DOCKER-REGISTRY-PASSWORD
+
+          - task: DownloadSecureFile@1
+            # this task must have a name
+            name: kubeconfig
+            displayName: 'Download config from (dev)'
+            inputs:
+              secureFile: 'kube-dev'
+
+          - task: Bash@3
+            displayName: 'Download Charts'
+            continueOnError: False
+            inputs:
+              targetType: inline
+              workingDirectory: $(Pipeline.Workspace)/self-files
+              script: |- # shell
+                curl -O --user $(NEXUS-DEPS-USR):$(NEXUS-DEPS-PSW) \
+                  https://nexus.telefonica.com.br/repository/devops-helm/${{ parameters.helm_chart_name }}-${{ parameters.helm_chart_version}}.tgz
+
+                tar -zxvf ${{ parameters.helm_chart_name }}-${{ parameters.helm_chart_version}}.tgz
+                rm ${{ parameters.helm_chart_name }}-${{ parameters.helm_chart_version}}.tgz
+
+          - task: PlaceInFiles@4
+            displayName: "Apply config variables"
+            inputs:
+              globPattern: $(Pipeline.Workspace)/kube-files/${{ parameters.helm_config_files_path }}/*.y*ml
+              regex: '/\$\(([^\)]+)\)/gmi'
+
+          - script: |- # shell
+              kubectl get secrets vcr-devops \
+              --namespace $(CATALOG_YAML_K8S_NS) \
+              --kubeconfig="$(kubeconfig.secureFilePath)" \
+              --insecure-skip-tls-verify
+
+              echo "##vso[task.setvariable variable=EXISTING_SECRETS]$?"
+            displayName: Fetch Docker Secret
+
+          - script: >- # shell
+              kubectl create secret docker-registry vcr-devops
+              --docker-server="vcr-docker.nexus.telefonica.com.br" 
+              --docker-username="$(DOCKER-REGISTRY-USERNAME)" 
+              --docker-password="$(DOCKER-REGISTRY-PASSWORD)" 
+              --docker-email='arquiteturati@telefonica.com.br'
+              --namespace $(CATALOG_YAML_K8S_NS)
+              --kubeconfig="$(kubeconfig.secureFilePath)"
+              --insecure-skip-tls-verify
+            condition: eq(variables['EXISTING_SECRETS'], '1')
+            displayName: Create Docker Secret
+
+          # - script: >-
+          #     kubectl delete deployment $(CATALOG_YAML_NAME)
+          #     --namespace $(CATALOG_YAML_K8S_NS)
+          #     --kubeconfig="$(kubeconfig.secureFilePath)"
+          #     --insecure-skip-tls-verify
+          #   displayName: DELETE Deployment (TESTE)
+
+          - task: Bash@3
+            displayName: 'Helm upgrade on (dev)'
+            inputs:
+              targetType: inline
+              script: >- # shell
+                helm upgrade $(CATALOG_YAML_NAME) $(Pipeline.Workspace)/self-files/${{ parameters.helm_chart_name }}
+                --set "nameOverride=$(CATALOG_YAML_NAME)"
+                --set "fullnameOverride=$(CATALOG_YAML_NAME)"
+                --set "containerName=$(CATALOG_YAML_NAME)"
+                --set "image.repository=vcr-docker.nexus.telefonica.com.br/$(CATALOG_YAML_ACRONYM)/$(CATALOG_YAML_NAME)"
+                --set "image.tag=$(POM_XML_VERSION)-SNAPSHOT"
+                --set "imagePullSecrets[0].name=vcr-devops"
+                -f "$(Pipeline.Workspace)/kube-files/${{ parameters.helm_config_files_path }}/values.yml"
+                -f "$(Pipeline.Workspace)/kube-files/${{ parameters.helm_config_files_path }}/environments_variables.yml"
+                -f "$(Pipeline.Workspace)/kube-files/${{ parameters.helm_config_files_path }}/secrets.yaml"
+                --kubeconfig $(kubeconfig.secureFilePath)
+                --namespace "$(CATALOG_YAML_K8S_NS)"
+                --install
+                --insecure-skip-tls-verify
+                --output table
+                --history-max 5
+                --debug
+                --atomic
+                --wait
+                --timeout 300s
+
+                if [ $? -ne 0 ]; then
+                  echo "##[error] Helm upgrade failed! Verifique como está o status da release $(CATALOG_YAML_NAME) contido no namespace $(CATALOG_YAML_K8S_NS) do kubernetes/AKS desta aplicação ou seu deployment"
+                fi
+
+        on:
+          success:
+            steps:
+            - checkout: self
+              fetchDepth: 1
+
+            - task: XmlParseFromVivo@4
+              displayName: 'Get pom.xml info'
+              inputs:
+                type: 'file'
+                origin: $(Build.SourcesDirectory)/pom.xml
+                jpaths: |
+                  var POM_XML_VERSION = .project.version._text
+
+            - task: LoadFile@4
+              displayName: 'Load catalog-info.yaml'
+              inputs:
+                script: |
+                  CATALOG_YAML_CONTENT = $(Build.SourcesDirectory)/catalog-info.yaml
+
+            - task: YamlParseFromVivo@4
+              displayName: 'Get Metadata Info'
+              inputs:
+                type: 'file'
+                origin: $(Build.SourcesDirectory)/catalog-info.yaml
+                jpaths: |
+                  var CATALOG_YAML_NAME = .metadata.name
+                  var CATALOG_YAML_ACRONYM = .metadata.annotations['techarch.governance-app.acronym']
+                  var CATALOG_YAML_K8S_NS = .metadata.annotations['vivo.io/kubernetes-k8s-namespace-dev']
+
+            - task: CatchLogsToLocalDirectoryFromVivo@4
+              displayName: 'Dump logs and metas'
+              inputs:
+                dumpDir: $(Build.ArtifactStagingDirectory)/audit
+
+            - task: PublishBuildArtifacts@1
+              displayName: 'Push Logs to Artifacts'
+              inputs:
+                ArtifactName: audit
+                PathtoPublish: $(Build.ArtifactStagingDirectory)/audit
+
+            - task: VivoGovernance@1
+              displayName: 'Gov Notify "deploy"'
+              inputs:
+                breakglass: false
+                serverEndpoint: 'governanceapi'
+                operation: 'deploy'
+                component: $(CATALOG_YAML_NAME)
+                version: $(POM_XML_VERSION)
+                cluster: aks-$(CATALOG_YAML_ACRONYM)-dev
+                namespace: $(CATALOG_YAML_K8S_NS)
+                deployment: $(CATALOG_YAML_NAME)
+                environment: dev
+                catalogInfo: $(CATALOG_YAML_CONTENT)
+
+            - script: |
+                  echo "##[error]Erro na verificação de politicas de Governança da Vivo"
+                  echo ""
+                  echo "Em caso de erro HTTP 40x, por favor, verificar se o repositório"
+                  echo "deste código fonte foi criado manualmente ou por Platform Code."
+                  echo "Caso tenha sido criado manualmente, por favor, considere recriá-lo"
+                  echo "pelo PlatformCode. Se não for possível, desabilite a variável"
+                  echo "GOVAPP_INTEGRATION_ENABLED, declarando seu valor como false."
+                  echo "Dessa forma, o repositório não será avaliado e estará fora"
+                  echo "dos padrões de entrega da Vivo Telefônica."
+                  exit 1
+              displayName: "Debbuging Governance Validate"
+              condition: failed()
+
+          failure:
+            steps:
+            - checkout: self
+              fetchDepth: 1
+
+            - task: YamlParseFromVivo@4
+              displayName: 'Get Metadata Info'
+              name: catalog_info
+              inputs:
+                type: 'file'
+                origin: catalog-info.yaml
+                jpaths: |-
+                  var CATALOG_YAML_KUBE_ID = .metadata.annotations['backstage.io/kubernetes-id']
+                  var CATALOG_YAML_KUBE_NS = .metadata.annotations['vivo.io/kubernetes-k8s-namespace-dev']
+
+            - task: DownloadSecureFile@1
+              # this task must have a name
+              name: kubeconfig_failure
+              displayName: 'Download config from (${{ parameters.kube_config_name }})'
+              inputs:
+                secureFile: ${{ parameters.kube_config_name }}
+
+            - script: >- # shell
+                kubectl get pods 
+                --no-headers -o custom-columns=":metadata.name"
+                --kubeconfig="$(kubeconfig_failure.secureFilePath)" 
+                --insecure-skip-tls-verify | grep $(CATALOG_YAML_KUBE_ID)
+                | 
+                xargs -I {} 
+                kubectl logs -f {} 
+                --kubeconfig="$(kubeconfig_failure.secureFilePath)" 
+                --insecure-skip-tls-verify 
+              continueOnError: true
+              displayName: 'Fetch logs'
+
+            - script: >- # shell
+                kubectl get events $(CATALOG_YAML_KUBE_ID)
+                --kubeconfig="$(kubeconfig_failure.secureFilePath)" 
+                --insecure-skip-tls-verify 
+              continueOnError: true
+              displayName: 'Fetch events'
+
+            - task: CatchLogsToLocalDirectoryFromVivo@4
+              displayName: 'Dump logs and metas'
+              inputs:
+                dumpDir: $(Build.ArtifactStagingDirectory)/audit
+
+            - task: PublishBuildArtifacts@1
+              displayName: 'Push Logs to Artifacts'
+              inputs:
+                ArtifactName: audit
+                PathtoPublish: $(Build.ArtifactStagingDirectory)/audit
+

@@ -1,0 +1,137 @@
+# This YAML file defines a pipeline task for compressing and transferring files over SSH.
+
+parameters:
+  - name: sshEndpoint # The SSH endpoint to connect to for file transfer.
+  - name: sourceFolder # The folder containing the files to be compressed and transferred.
+  - name: targetFolder # The target folder on the remote server where the files will be transferred.
+  - name: targetEnvironment # The target environment where the files will be transferred.
+  - name: fileName # The name of the compressed archive file.
+  - name: compressedArchiveType # The type of compressed archive. Default is tar.gz.
+    default: tar.gz
+  - name: sourceFile
+    default: "*"
+  - name: backupTargetFolder # Flag to indicate if a backup of the target folder should be created before transfer. Default is true.
+    default: false
+  - name: cleanTargetFolder
+    default: false
+
+steps:
+  - script: |
+      echo "##[debug] sshEndpoint...............................................: ${{ parameters.sshEndpoint }}"
+      echo "##[debug] sourceFolder..............................................: ${{ parameters.sourceFolder }}"
+      echo "##[debug] targetFolder..............................................: ${{ parameters.targetFolder }}"
+      echo "##[debug] targetEnvironment.........................................: ${{ parameters.targetEnvironment }}"
+      echo "##[debug] fileName..................................................: ${{ parameters.fileName }}"
+      echo "##[debug] compressedArchiveType.....................................: ${{ parameters.compressedArchiveType }}"
+      echo "##[debug] sourceFile................................................: ${{ parameters.sourceFile }}"
+      echo "##[debug] backupTargetFolder........................................: ${{ parameters.backupTargetFolder }}"
+      echo "##[debug] cleanTargetFolder.........................................: ${{ parameters.cleanTargetFolder }}"
+    displayName: "File Transfer Show Parameters"
+
+  # Task to compress the files using the 'tar' command.
+  - task: CmdLine@2
+    displayName: "Compressing ${{ parameters.fileName }} files"
+    inputs:
+      workingDirectory: ${{ parameters.sourceFolder }}
+      script: |
+        echo "##[debug] COMPRESSED_ARCHIVE_NAME.............: ${{ parameters.fileName }}.${{ parameters.compressedArchiveType }}"
+        echo "##[debug] SOURCE_FOLDER.......................: ${{ parameters.sourceFolder }}"
+        echo "##[debug] SOURCE_FILE.........................: ${{ parameters.sourceFile }}"
+
+        echo "##[group]Compress Files"
+        echo "##[command]tar --add-file=.helmignore -czvf ${{ parameters.fileName }}.${{ parameters.compressedArchiveType }} ${{ parameters.sourceFile }}"
+        tar --add-file=.helmignore -czvf ${{ parameters.fileName }}.${{ parameters.compressedArchiveType }} ${{ parameters.sourceFile }}
+        echo "##[endgroup]"
+
+  - ${{ if eq(parameters.backupTargetFolder, true) }}:
+      - task: SSH@0
+        displayName: "Temporary Backup of the Target Folder"
+        inputs:
+          sshEndpoint: ${{ parameters.sshEndpoint }}
+          runOptions: "inline"
+          inline: |
+            TEMP_FOLDER=$(echo "${{ parameters.targetFolder }}" | sed 's|\(.*\)/|\1_temp-backup/|')
+
+            echo "##[debug] TARGET FOLDER ...............................................: ${{ parameters.targetFolder }}"
+            echo "##[debug] TARGET FOLDER TEMPORARY BACKUP ..............................: $TEMP_FOLDER"
+
+            echo "##[group]>> Deleting previous backup folder if exists ..."
+            echo "##[command]rm -rf $TEMP_FOLDER"
+            rm -rfv $TEMP_FOLDER
+            echo "##[endgroup]"
+
+            echo "##[group]>> Backup the target folder before transferring new files ..."
+            echo "##[command]cp -Rv ${{ parameters.targetFolder }} $TEMP_FOLDER"
+            cp -Rv ${{ parameters.targetFolder }} $TEMP_FOLDER
+            echo "##[endgroup]"
+          readyTimeout: "20000"
+          failOnStdErr: false
+
+  - ${{ if eq(parameters.cleanTargetFolder, true) }}:
+      - task: SSH@0
+        displayName: "Clean Target Folder"
+        inputs:
+          sshEndpoint: ${{ parameters.sshEndpoint }}
+          runOptions: "inline"
+          inline: |
+            echo "##[debug] TARGET FOLDER ...............................................: ${{ parameters.targetFolder }}"
+
+            echo "##[group]Clean the target folder"
+            echo "##[command]find ${{ parameters.targetFolder }} -mindepth 1 -delete"
+            find ${{ parameters.targetFolder }} -mindepth 1 -delete
+            echo "##[endgroup]"
+          readyTimeout: "20000"
+          failOnStdErr: false
+
+  # Task to transfer the compressed files over SSH.
+  - task: CopyFilesOverSSH@0
+    displayName: "Transferring ${{ parameters.fileName }} files to ${{ parameters.targetEnvironment }} environment"
+    inputs:
+      sshEndpoint: ${{ parameters.sshEndpoint }}
+      sourceFolder: ${{ parameters.sourceFolder }}
+      contents: "**/${{ parameters.fileName }}.${{ parameters.compressedArchiveType }}"
+      targetFolder: ${{ parameters.targetFolder }}
+      cleanTargetFolder: false
+      readyTimeout: "20000"
+      failOnEmptySource: true
+
+  # Task to extract the compressed file on the remote server.
+  - task: SSH@0
+    displayName: "Extract the compressed file"
+    inputs:
+      sshEndpoint: ${{ parameters.sshEndpoint }}
+      runOptions: "inline"
+      inline: |
+        echo "##[debug] FOLDER..............................: ${{ parameters.targetFolder }}"
+        echo "##[debug] COMPRESSED_ARCHIVE_NAME.............: ${{ parameters.fileName }}.${{ parameters.compressedArchiveType }}"
+
+        echo "##[group]Extract the compressed file"
+        echo "##[command]cd ${{ parameters.targetFolder }}"
+        cd ${{ parameters.targetFolder }}
+
+        echo "##[command]tar xvf ${{ parameters.fileName }}.${{ parameters.compressedArchiveType }}"
+        tar -xvf ${{ parameters.fileName }}.${{ parameters.compressedArchiveType }}
+        echo "##[endgroup]"
+
+        echo "##[command]rm -frv *.${{ parameters.compressedArchiveType }}"
+        rm -frv *.${{ parameters.compressedArchiveType }}
+      readyTimeout: "20000"
+      failOnStdErr: false
+
+  - ${{ if eq(parameters.backupTargetFolder, true) }}:
+      - task: SSH@0
+        displayName: "Deleting Temporary Backup Folder"
+        inputs:
+          sshEndpoint: ${{ parameters.sshEndpoint }}
+          runOptions: "inline"
+          inline: |
+            TEMP_FOLDER=$(echo "${{ parameters.targetFolder }}" | sed 's|\(.*\)/|\1_temp-backup/|')
+
+            echo "##[debug] TARGET FOLDER TEMPORARY BACKUP ..............................: $TEMP_FOLDER"
+
+            echo "##[group]>> Deleting Temporary Backup Folder ..."
+            echo "##[command]rm -rfv $TEMP_FOLDER"
+            rm -rfv $TEMP_FOLDER
+            echo "##[endgroup]"
+          readyTimeout: "20000"
+          failOnStdErr: false

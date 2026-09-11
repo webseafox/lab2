@@ -1,0 +1,823 @@
+﻿# ==================================================================
+# Pipeline: Deploy de Manifestos Kubernetes via kubectl
+# -----------------------------------------------------
+# Este pipeline realiza o deploy de manifestos Kubernetes diretamente via kubectl.
+# Para funcionalidades avançadas como Blue/Green, utilize o pipeline deploy-helm.
+# Custom Task: K8sUtilsFromVivo@3 -> https://dev.azure.com/telefonica-vivo-brasil/DVPS%20-%20DEVOPS/_git/azdo-task-kubernetes-utils
+# ==================================================================
+parameters:
+# ==================================================================
+# Parâmetros Gerais de Execução
+# ==================================================================
+- name: environment
+  displayName: 'Ambiente para publicar'
+  type: string
+  default: dev
+- name: version
+  displayName: 'Versão da aplicação'
+  type: string
+  default: getLatestVersion()
+- name: agentPool
+  displayName: 'Pool de execução do pipeline'
+  type: string
+  default: GeneralPurposeLinuxAgentsCD
+- name: branchingStrategy
+  type: string
+  default: 'trunkbased'
+  displayName: 'Estratégia de versionamento'
+  values:
+    - 'trunkbased'
+    - 'vivoflow'
+    - 'releaseflow'
+    - 'gitlabflow'
+    - 'gitlabflow-semantic'
+    - 'custom'
+    - 'monorepo'
+
+# ==================================================================
+# Configuração dos Manifestos Kubernetes
+# ==================================================================
+- name: manifestsPath
+  displayName: 'Caminho dos manifestos Kubernetes por ambiente'
+  type: object
+  default: 
+    dev: infra/dev
+    preprod: infra/preprod
+    prod: infra/prod
+
+# ==================================================================
+# Substituição de Imagem/Versão
+# ==================================================================
+- name: enableImageTagReplacement
+  displayName: 'Habilitar substituição automática de image tag'
+  type: boolean
+  default: true
+- name: imageTagToken
+  displayName: 'Token a ser substituído pela versão (ex: __VERSION__)'
+  type: string
+  default: ''
+
+# ==================================================================
+# Substituição de Tokens em Manifesto de Secret
+# ==================================================================
+# ATENÇÃO: Esta funcionalidade é contra-indicada para configurações gerais.
+# Use Azure Key Vault quando possível. Reserve esta funcionalidade para
+# cenários onde o Secret precisa ser gerenciado diretamente via manifesto.
+# Ref: https://wikicorp.telefonica.com.br/spaces/AC/pages/495251243/
+#
+# Permite manter um manifesto de Secret no repositório com tokens/placeholders
+# que são substituídos em runtime com valores de um Variable Group.
+# A substituição é feita em arquivo temporário por segurança
+# (evita commit acidental de valores sensíveis no repositório).
+#
+# Ordem de aplicação no Deploy:
+# 1. Secret (este arquivo, com tokens substituídos)
+# 2. Manifestos gerais (manifestsPath)
+#
+- name: usePlaceholdersSecretManifest
+  displayName: 'Habilitar substituição de tokens em manifesto de Secret'
+  type: boolean
+  default: false
+- name: placeholdersSecretManifestFile
+  displayName: 'Caminho do manifesto de Secret com tokens por ambiente'
+  type: object
+  default:
+    dev: .azuredevops/config/dev/secret.yaml
+    preprod: .azuredevops/config/preprod/secret.yaml
+    prod: .azuredevops/config/prod/secret.yaml
+- name: placeholderVariableGroupName
+  displayName: 'Nome do Variable Group com os valores dos tokens do Secret'
+  type: string
+  default: ''
+- name: placeholderPrefix
+  displayName: 'Prefixo dos tokens no manifesto de Secret (ex: $())'
+  type: string
+  default: '$('
+- name: placeholderSuffix
+  displayName: 'Sufixo dos tokens no manifesto de Secret (ex: ))'
+  type: string
+  default: ')'
+
+# ==================================================================
+# Commit do Manifesto Atualizado
+# ==================================================================
+- name: enableManifestCommit
+  displayName: 'Habilitar commit do manifesto com versão atualizada'
+  type: boolean
+  default: true
+- name: manifestCommitMessage
+  displayName: 'Mensagem do commit do manifesto'
+  type: string
+  default: '[skip ci] Update manifest with new version'
+
+# ==================================================================
+# Configuração AKS (Azure Kubernetes Service)
+# ==================================================================
+- name: useAKSManagedIdentity
+  displayName: 'Usar Managed Identity do AKS'
+  type: boolean
+  default: true
+- name: aksServiceConnection
+  displayName: 'Service Connection Azure para AKS'
+  type: object
+  default: 
+    dev: "aks-$(SIGLA)-brsouth-dev"
+    preprod: "aks-$(SIGLA)-brsouth-preprod"
+    prod: "aks-$(SIGLA)-brsouth-prod"
+- name: aksResourceGroup
+  displayName: 'Resource Group do AKS'
+  type: object
+  default: 
+    dev: "rg-aks-$(SIGLA)-brsouth-dev"
+    preprod: "rg-aks-$(SIGLA)-brsouth-preprod"
+    prod: "rg-aks-$(SIGLA)-brsouth-prod"
+- name: aksClusterName
+  displayName: 'Nome do Cluster AKS'
+  type: object
+  default: 
+    dev: "aks-$(SIGLA)-brsouth-dev"
+    preprod: "aks-$(SIGLA)-brsouth-preprod"
+    prod: "aks-$(SIGLA)-brsouth-prod"
+
+# ==================================================================
+# Configuração Kubeconfig (Service Connection)
+# ==================================================================
+- name: useKubeconfig
+  displayName: 'Usar Kubeconfig do Kubernetes'
+  type: boolean
+  default: false
+- name: kubeconfigServiceConnection
+  displayName: 'Service Connection Kubernetes com Kubeconfig'
+  type: object
+  default: 
+    dev: "$(SIGLA)-dev"
+    preprod: "$(SIGLA)-preprod"
+    prod: "$(SIGLA)-prod"
+
+# ==================================================================
+# Configuração de Secret Docker (apenas para clusters on-premise)
+# ==================================================================
+# Este secret é criado APENAS quando useKubeconfig=true (clusters on-premise).
+# AKS já possui integração nativa com ACR via Managed Identity.
+# As credenciais são obtidas automaticamente do Key Vault kv-azdevops-shared.
+- name: createDockerConfigSecret
+  displayName: 'Criar Secret para Pull de Imagens Docker (apenas on-premise)'
+  type: string
+  default: 'none'
+  values:
+    - none    # Não criar (já existe no cluster ou AKS com Managed Identity)
+    - nexus   # Criar para Nexus
+    - acr     # Criar para ACR
+
+# ==================================================================
+# Configuração de Docker Registry (para pull de imagens)
+# ==================================================================
+- name: dockerRegistryACR
+  displayName: 'URL do Docker Registry ACR'
+  type: string
+  default: 'acrsharedservices01.azurecr.io'
+- name: dockerRegistryNexus
+  displayName: 'URL do Docker Registry Nexus'
+  type: string
+  default: 'vcr-docker.nexus.telefonica.com.br'
+- name: dockerRegistryEmail
+  displayName: 'Email para o Docker Registry'
+  type: string
+  default: 'arquiteturati@telefonica.com.br'
+
+# ==================================================================
+# Kubernetes Namespace
+# ==================================================================
+- name: k8sNamespace
+  displayName: 'Namespace do Kubernetes'
+  type: object
+  default: 
+    dev: "$(SIGLA)-dev"
+    preprod: "$(SIGLA)-preprod"
+    prod: "$(SIGLA)-prod"
+
+# ==================================================================
+# Dry-Run (Simulação do Deploy)
+# ==================================================================
+# Executa o pipeline em modo simulado, sem aplicar mudanças no cluster.
+- name: enableDryRun
+  displayName: 'Habilitar Dry-Run (simulação do deploy)'
+  type: boolean
+  default: false
+
+# ==================================================================
+# Variáveis Internas do Pipeline
+# ==================================================================
+variables:
+- ${{ if and(eq(parameters.usePlaceholdersSecretManifest, true), ne(parameters.placeholderVariableGroupName, '')) }}:
+  - group: ${{ parameters.placeholderVariableGroupName }}
+- name: SIGLA
+  value: $[ lower(split(variables['System.TeamProject'],' ')[0]) ]
+- name: ENVIRONMENT
+  value: ${{ parameters.environment }}
+- name: MANIFESTS_FILE
+  value: $(Agent.TempDirectory)/manifests.yaml
+- ${{ if eq(parameters.enableDryRun, true) }}:
+  - name: DRY_RUN_LABEL
+    value: '[DRY RUN ATIVADO]'
+- ${{ if eq(parameters.enableDryRun, false) }}:
+  - name: DRY_RUN_LABEL
+    value: ''
+# ==================================================================
+# Estágios do Pipeline
+# ==================================================================
+stages:
+  # Stage Preparatório: Valida e exibe diffs dos manifestos
+  - stage: Preparation
+    displayName: 'Preparação - Validar Manifestos (${{ parameters.environment }})'
+    pool: ${{ parameters.agentPool }}
+    jobs:
+    - job: Preparation
+      displayName: 'Validar Manifestos e Diffs'
+      steps:
+        - task: VivoUtilsFromVivo@1
+          displayName: 'Show Pipeline Parameters'
+          condition: eq(variables['System.Debug'], 'true')
+          inputs:
+            command: 'show-pipeline-parameters'
+            parameters: '${{ convertToJson(parameters) }}'
+
+        - task: VivoUtilsFromVivo@1
+          displayName: 'Validar Parâmetros de Ambiente'
+          inputs:
+            command: 'validate-environment-parameters'
+            parameters: '${{ convertToJson(parameters) }}'
+            environment: '${{ parameters.environment }}'
+
+        - script: |
+            echo "##vso[build.addbuildtag]kubectl"
+            echo "##vso[build.addbuildtag]kubernetes"
+            echo "##vso[build.addbuildtag]deploy-kubectl"
+          displayName: 'Definir tags'
+        
+        - checkout: self
+          fetchDepth: 1
+
+        - task: VersionManagerVivo@8
+          inputs:
+            command: 'setDeployVersion'
+            branchingStrategy: ${{ parameters.branchingStrategy }}
+            version: ${{ parameters.version }}
+          displayName: 'Definir Versão do Deploy'
+          name: VersionManagerVivo
+
+        - script: |         
+            echo "##vso[build.updatebuildnumber]deploy-${VERSION}-${ENVIRONMENT}"
+            echo "##vso[build.addbuildtag]version-${VERSION}"
+            echo "##vso[build.addbuildtag]environment-${ENVIRONMENT}"
+          displayName: 'Definir Número da Execução da Pipeline e Tags'
+          env:
+            VERSION: $(VersionManagerVivo.DEPLOY_VERSION)
+            ENVIRONMENT: ${{ parameters.environment }}
+
+        # Login no cluster
+        - ${{ if eq(parameters.useAKSManagedIdentity, true) }}:
+          - task: Kubernetes@1
+            displayName: 'Login no AKS'
+            inputs:
+              connectionType: 'Azure Resource Manager'
+              azureSubscriptionEndpoint: ${{ parameters.aksServiceConnection[parameters.environment] }}
+              azureResourceGroup: ${{ parameters.aksResourceGroup[parameters.environment] }}
+              kubernetesCluster: ${{ parameters.aksClusterName[parameters.environment] }}
+              namespace: ${{ parameters.k8sNamespace[parameters.environment] }}
+              command: 'login'
+
+        - ${{ if eq(parameters.useKubeconfig, true) }}:
+          - task: Kubernetes@1
+            displayName: 'Login no Kubernetes via Kubeconfig'
+            inputs:
+              connectionType: 'Kubernetes Service Connection'
+              kubernetesServiceEndpoint: ${{ parameters.kubeconfigServiceConnection[parameters.environment] }}
+              namespace: ${{ parameters.k8sNamespace[parameters.environment] }}
+              command: 'login'
+
+        # Validar manifestos
+        - task: Bash@3
+          displayName: 'Validar manifestos'
+          inputs:
+            targetType: 'inline'
+            script: |
+              set -euo pipefail
+
+              REPO_ROOT="$(cd "${BUILD_SOURCESDIRECTORY}" && pwd -P)"
+              MANIFESTS_RELATIVE_PATH_TRIMMED="$(printf '%s' "${MANIFESTS_RELATIVE_PATH}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+
+              if [[ -z "${MANIFESTS_RELATIVE_PATH_TRIMMED}" ]]; then
+                echo "##[error] O parâmetro manifestsPath['${ENVIRONMENT}'] é obrigatório e deve apontar para um subdiretório dentro do repositório."
+                exit 1
+              fi
+
+              if [[ "${MANIFESTS_RELATIVE_PATH_TRIMMED}" = /* ]]; then
+                echo "##[error] O parâmetro manifestsPath['${ENVIRONMENT}'] deve ser um caminho relativo. Valor recebido: ${MANIFESTS_RELATIVE_PATH_TRIMMED}"
+                exit 1
+              fi
+
+              if [[ "${MANIFESTS_RELATIVE_PATH_TRIMMED}" == '.' || "${MANIFESTS_RELATIVE_PATH_TRIMMED}" == './' ]]; then
+                echo "##[error] O parâmetro manifestsPath['${ENVIRONMENT}'] não pode apontar para a raiz do repositório. Informe um subdiretório, por exemplo: infra/${ENVIRONMENT}"
+                exit 1
+              fi
+
+              if [[ "${MANIFESTS_RELATIVE_PATH_TRIMMED}" == *'..'* ]]; then
+                echo "##[error] O parâmetro manifestsPath['${ENVIRONMENT}'] não pode conter '..'. Valor recebido: ${MANIFESTS_RELATIVE_PATH_TRIMMED}"
+                exit 1
+              fi
+
+              MANIFESTS_PATH_CANDIDATE="${REPO_ROOT}/${MANIFESTS_RELATIVE_PATH_TRIMMED}"
+              
+              if [[ ! -d "${MANIFESTS_PATH_CANDIDATE}" ]]; then
+                echo "##[error] Diretório de manifestos não encontrado: ${MANIFESTS_PATH_CANDIDATE}"
+                exit 1
+              fi
+
+              MANIFESTS_PATH_REAL="$(cd "${MANIFESTS_PATH_CANDIDATE}" && pwd -P)"
+
+              if [[ "${MANIFESTS_PATH_REAL}" == "${REPO_ROOT}" ]]; then
+                echo "##[error] O parâmetro manifestsPath['${ENVIRONMENT}'] resolveu para a raiz do repositório (${REPO_ROOT}). Informe um subdiretório específico com os manifestos."
+                exit 1
+              fi
+
+              case "${MANIFESTS_PATH_REAL}" in
+                "${REPO_ROOT}"/*) ;;
+                *)
+                  echo "##[error] O parâmetro manifestsPath['${ENVIRONMENT}'] deve resolver para um diretório dentro do repositório. Valor resolvido: ${MANIFESTS_PATH_REAL}"
+                  exit 1
+                  ;;
+              esac
+
+              MANIFEST_COUNT=$(find "${MANIFESTS_PATH_REAL}" -type f \( -name "*.yaml" -o -name "*.yml" \) | wc -l)
+              if [[ ${MANIFEST_COUNT} -eq 0 ]]; then
+                echo "##[error] Nenhum manifesto YAML encontrado em: ${MANIFESTS_PATH_REAL}"
+                exit 1
+              fi
+
+              echo "##[section] Diretório validado: ${MANIFESTS_PATH_REAL}"
+              echo "##[section] ✅ Encontrados ${MANIFEST_COUNT} arquivo(s) de manifesto"
+          env:
+            BUILD_SOURCESDIRECTORY: "$(Build.SourcesDirectory)"
+            ENVIRONMENT: "${{ parameters.environment }}"
+            MANIFESTS_RELATIVE_PATH: "${{ parameters.manifestsPath[parameters.environment] }}"
+
+        # Substituir tag de imagem
+        - ${{ if eq(parameters.enableImageTagReplacement, true) }}:
+          - task: K8sUtilsFromVivo@3
+            displayName: 'Substituir tag de imagem nos manifestos'
+            inputs:
+              command: 'update-manifest-image'
+              manifestPath: $(Build.SourcesDirectory)/${{ parameters.manifestsPath[parameters.environment] }}
+              newTag: $(VersionManagerVivo.DEPLOY_VERSION)
+              oldTag: ${{ parameters.imageTagToken }}
+              updateAll: true
+
+        
+
+        # Preparar manifesto de Secret com substituição de tokens (opcional)
+        # A substituição é feita em arquivo temporário por segurança
+        # (evita exposição de valores sensíveis no repositório)
+        - ${{ if eq(parameters.usePlaceholdersSecretManifest, true) }}:
+          - script: |
+              echo "##vso[task.logissue type=warning]usePlaceholdersSecretManifest está habilitado. Esta funcionalidade é contra-indicada para configurações gerais. Use Azure Key Vault quando possível: https://wikicorp.telefonica.com.br/spaces/AC/pages/495251243/"
+            displayName: 'Aviso: usePlaceholdersSecretManifest habilitado'
+
+          - task: Bash@3
+            displayName: 'Copiar manifesto de Secret para substituição'
+            inputs:
+              targetType: 'inline'
+              script: |
+                set -euo pipefail
+                echo "##[debug] Criando cópia temporária do manifesto de Secret"
+                echo "##[debug] Origem: ${BUILD_SOURCESDIRECTORY}/${{ parameters.placeholdersSecretManifestFile[parameters.environment] }}"
+                echo "##[debug] Destino: ${AGENT_TEMPDIRECTORY}/replaced_secret_manifest.yaml"
+                cp "${BUILD_SOURCESDIRECTORY}/${{ parameters.placeholdersSecretManifestFile[parameters.environment] }}" \
+                   "${AGENT_TEMPDIRECTORY}/replaced_secret_manifest.yaml"
+
+          - task: replacetokens@6
+            displayName: 'Substituir tokens no manifesto de Secret'
+            inputs:
+              targetFiles: '$(Agent.TempDirectory)/replaced_secret_manifest.yaml'
+              tokenPattern: 'custom'
+              tokenPrefix: '${{ parameters.placeholderPrefix }}'
+              tokenSuffix: '${{ parameters.placeholderSuffix }}'
+              verbosity: detailed
+              actionOnNoFiles: warn
+
+          
+
+        # Consolidar manifestos para validação
+        - task: Bash@3
+          displayName: 'Consolidar manifestos'
+          inputs:
+            targetType: 'inline'
+            script: |
+              set -euo pipefail
+              > "${MANIFESTS_FILE}"
+              find "${MANIFESTS_PATH}" -type f \( -name "*.yaml" -o -name "*.yml" \) | sort | while read -r file; do
+                cat "$file" >> "${MANIFESTS_FILE}"
+                printf '\n---\n' >> "${MANIFESTS_FILE}"
+              done
+          env:
+            MANIFESTS_PATH: "$(Build.SourcesDirectory)/${{ parameters.manifestsPath[parameters.environment] }}"
+            MANIFESTS_FILE: "$(MANIFESTS_FILE)"
+
+        # Adicionar Secret ao manifesto consolidado para visibilidade no diff/debug
+        # Valores sensíveis são automaticamente redigidos pelo debug-k8s-manifests (kind: Secret → [REDACTED])
+        - ${{ if eq(parameters.usePlaceholdersSecretManifest, true) }}:
+          - task: Bash@3
+            displayName: 'Adicionar Secret ao manifesto consolidado'
+            inputs:
+              targetType: 'inline'
+              script: |
+                set -euo pipefail
+                cat "$(Agent.TempDirectory)/replaced_secret_manifest.yaml" >> "$(Agent.TempDirectory)/manifests.yaml"
+                printf '\n---\n' >> "$(Agent.TempDirectory)/manifests.yaml"
+
+        
+
+        - task: K8sUtilsFromVivo@3
+          displayName: 'Debug manifestos'
+          condition: always()
+          inputs:
+            command: 'debug-k8s-manifests'
+            debugK8sManifestPath: $(MANIFESTS_FILE)
+        
+        - task: K8sUtilsFromVivo@3
+          displayName: 'Extrair imagens dos manifestos'
+          name: ExtractImages
+          inputs:
+            command: 'list-k8s-images'
+            templatesPath: $(MANIFESTS_FILE)
+            imagesVariableName: 'K8S_IMAGES'
+
+        - task: K8sUtilsFromVivo@3
+          displayName: 'Extrair URLs dos manifestos'
+          name: ExtractUrls
+          inputs:
+            command: 'extract-k8s-url'
+            templatesPath: $(MANIFESTS_FILE)
+
+        - task: K8sUtilsFromVivo@3
+          displayName: 'Comparar diffs (kubectl diff)'
+          continueOnError: true
+          inputs:
+            command: 'kubectl-diff'
+            manifestPath: $(MANIFESTS_FILE)
+            namespace: ${{ parameters.k8sNamespace[parameters.environment] }}
+
+
+  # Stage Deploy: Aplica os manifestos
+  - stage: Deploy
+    displayName: 'Deploy - kubectl apply (${{ parameters.environment }})'
+    dependsOn: Preparation
+    pool: ${{ parameters.agentPool }}
+    jobs:
+    - deployment: 'kubectlDeployment'
+      displayName: Deploy em ${{ parameters.environment }}
+      environment:
+        name: deploy-${{ parameters.environment }}
+      variables:
+        - name: K8S_IMAGES
+          value: $[ stageDependencies.Preparation.Preparation.outputs['ExtractImages.K8S_IMAGES'] ]
+        - name: K8S_APP_URL_LIST
+          value: $[ stageDependencies.Preparation.Preparation.outputs['ExtractUrls.K8S_APP_URL_LIST'] ]
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+              - checkout: self
+                fetchDepth: 1
+                persistCredentials: true
+
+              - task: Bash@3
+                displayName: 'Validar caminho dos manifestos'
+                inputs:
+                  targetType: 'inline'
+                  script: |
+                    set -euo pipefail
+
+                    REPO_ROOT="$(cd "${BUILD_SOURCESDIRECTORY}" && pwd -P)"
+                    MANIFESTS_RELATIVE_PATH_TRIMMED="$(printf '%s' "${MANIFESTS_RELATIVE_PATH}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+
+                    if [[ -z "${MANIFESTS_RELATIVE_PATH_TRIMMED}" ]]; then
+                      echo "##[error] O parâmetro manifestsPath['${ENVIRONMENT}'] é obrigatório e deve apontar para um subdiretório dentro do repositório."
+                      exit 1
+                    fi
+
+                    if [[ "${MANIFESTS_RELATIVE_PATH_TRIMMED}" = /* ]]; then
+                      echo "##[error] O parâmetro manifestsPath['${ENVIRONMENT}'] deve ser um caminho relativo. Valor recebido: ${MANIFESTS_RELATIVE_PATH_TRIMMED}"
+                      exit 1
+                    fi
+
+                    if [[ "${MANIFESTS_RELATIVE_PATH_TRIMMED}" == '.' || "${MANIFESTS_RELATIVE_PATH_TRIMMED}" == './' ]]; then
+                      echo "##[error] O parâmetro manifestsPath['${ENVIRONMENT}'] não pode apontar para a raiz do repositório. Informe um subdiretório, por exemplo: infra/${ENVIRONMENT}"
+                      exit 1
+                    fi
+
+                    if [[ "${MANIFESTS_RELATIVE_PATH_TRIMMED}" == *'..'* ]]; then
+                      echo "##[error] O parâmetro manifestsPath['${ENVIRONMENT}'] não pode conter '..'. Valor recebido: ${MANIFESTS_RELATIVE_PATH_TRIMMED}"
+                      exit 1
+                    fi
+
+                    MANIFESTS_PATH_CANDIDATE="${REPO_ROOT}/${MANIFESTS_RELATIVE_PATH_TRIMMED}"
+
+                    if [[ ! -d "${MANIFESTS_PATH_CANDIDATE}" ]]; then
+                      echo "##[error] Diretório de manifestos não encontrado: ${MANIFESTS_PATH_CANDIDATE}"
+                      exit 1
+                    fi
+
+                    MANIFESTS_PATH_REAL="$(cd "${MANIFESTS_PATH_CANDIDATE}" && pwd -P)"
+
+                    if [[ "${MANIFESTS_PATH_REAL}" == "${REPO_ROOT}" ]]; then
+                      echo "##[error] O parâmetro manifestsPath['${ENVIRONMENT}'] resolveu para a raiz do repositório (${REPO_ROOT}). Informe um subdiretório específico com os manifestos."
+                      exit 1
+                    fi
+
+                    case "${MANIFESTS_PATH_REAL}" in
+                      "${REPO_ROOT}"/*) ;;
+                      *)
+                        echo "##[error] O parâmetro manifestsPath['${ENVIRONMENT}'] deve resolver para um diretório dentro do repositório. Valor resolvido: ${MANIFESTS_PATH_REAL}"
+                        exit 1
+                        ;;
+                    esac
+
+                    echo "##[section] ✅ Caminho dos manifestos validado: ${MANIFESTS_PATH_REAL}"
+                env:
+                  BUILD_SOURCESDIRECTORY: "$(Build.SourcesDirectory)"
+                  ENVIRONMENT: "${{ parameters.environment }}"
+                  MANIFESTS_RELATIVE_PATH: "${{ parameters.manifestsPath[parameters.environment] }}"
+
+              - task: VersionManagerVivo@8
+                inputs:
+                  command: 'setDeployVersion'
+                  branchingStrategy: ${{ parameters.branchingStrategy }}
+                  version: ${{ parameters.version }}
+                displayName: 'Definir Versão do Deploy'
+                name: VersionManagerVivo
+
+              - script: |         
+                  echo "##vso[build.updatebuildnumber]deploy-${VERSION}-${ENVIRONMENT}"
+                displayName: 'Atualizar Pipeline Execution Number'
+                env:
+                  VERSION: $(VersionManagerVivo.DEPLOY_VERSION)
+                  ENVIRONMENT: ${{ parameters.environment }}
+
+              # Login no cluster
+              - ${{ if eq(parameters.useAKSManagedIdentity, true) }}:
+                - task: Kubernetes@1
+                  displayName: 'Login no AKS'
+                  inputs:
+                    connectionType: 'Azure Resource Manager'
+                    azureSubscriptionEndpoint: ${{ parameters.aksServiceConnection[parameters.environment] }}
+                    azureResourceGroup: ${{ parameters.aksResourceGroup[parameters.environment] }}
+                    kubernetesCluster: ${{ parameters.aksClusterName[parameters.environment] }}
+                    namespace: ${{ parameters.k8sNamespace[parameters.environment] }}
+                    command: 'login'
+
+              - ${{ if eq(parameters.useKubeconfig, true) }}:
+                - task: Kubernetes@1
+                  displayName: 'Login no Kubernetes via Kubeconfig'
+                  inputs:
+                    connectionType: 'Kubernetes Service Connection'
+                    kubernetesServiceEndpoint: ${{ parameters.kubeconfigServiceConnection[parameters.environment] }}
+                    namespace: ${{ parameters.k8sNamespace[parameters.environment] }}
+                    command: 'login'
+
+              # Criar Secret para Pull de Imagens Docker (use apenas para clusters on-premise ou outras clouds)
+              - ${{ if ne(parameters.createDockerConfigSecret, 'none') }}:
+                - task: AzureKeyVault@2
+                  displayName: 'Obter credenciais do Registry ${{ parameters.createDockerConfigSecret }}'
+                  timeoutInMinutes: 1
+                  retryCountOnTaskFailure: 5
+                  inputs:
+                    azureSubscription: DevOpsSharedResources
+                    KeyVaultName: kv-azdevops-shared
+                    ${{ if eq(parameters.createDockerConfigSecret, 'nexus') }}:
+                      SecretsFilter: DOCKER-REGISTRY-USERNAME, DOCKER-REGISTRY-PASSWORD
+                    ${{ if eq(parameters.createDockerConfigSecret, 'acr') }}:
+                      SecretsFilter: DOCKER-REGISTRY-ACR-USERNAME, DOCKER-REGISTRY-ACR-PASSWORD
+
+
+                - task: K8sUtilsFromVivo@3
+                  displayName: 'Criar Secret para Pull de Imagens (${{ parameters.createDockerConfigSecret }})'
+                  inputs:
+                    command: 'create-secret-k8s-pull'
+                    enableSecretCreation: true
+                    ${{ if eq(parameters.createDockerConfigSecret, 'nexus') }}:
+                      registryType: 'nexus'
+                      dockerUsername: $(DOCKER-REGISTRY-USERNAME)
+                      dockerPassword: $(DOCKER-REGISTRY-PASSWORD)
+                      dockerServer: ${{ parameters.dockerRegistryNexus }}
+                      dockerEmail: ${{ parameters.dockerRegistryEmail }}
+                    ${{ if eq(parameters.createDockerConfigSecret, 'acr') }}:
+                      registryType: 'acr'
+                      dockerUsername: $(DOCKER-REGISTRY-ACR-USERNAME)
+                      dockerPassword: $(DOCKER-REGISTRY-ACR-PASSWORD)
+                      dockerServer: ${{ parameters.dockerRegistryACR }}
+                      dockerEmail: ${{ parameters.dockerRegistryEmail }}
+                    namespace: ${{ parameters.k8sNamespace[parameters.environment] }}
+
+              # Substituir tag de imagem nos manifestos
+              - ${{ if eq(parameters.enableImageTagReplacement, true) }}:
+                - task: K8sUtilsFromVivo@3
+                  displayName: 'Substituir tag de imagem'
+                  inputs:
+                    command: 'update-manifest-image'
+                    manifestPath: $(Build.SourcesDirectory)/${{ parameters.manifestsPath[parameters.environment] }}
+                    newTag: $(VersionManagerVivo.DEPLOY_VERSION)
+                    oldTag: ${{ parameters.imageTagToken }}
+                    updateAll: true
+
+              # Preparar e aplicar manifesto de Secret com substituição de tokens (opcional)
+              # A substituição é feita em arquivo temporário por segurança
+              # (evita exposição de valores sensíveis no repositório)
+              - ${{ if eq(parameters.usePlaceholdersSecretManifest, true) }}:
+                - task: Bash@3
+                  displayName: 'Preparar manifests temporários'
+                  inputs:
+                    targetType: 'inline'
+                    script: |
+                      set -euo pipefail
+
+                      TEMP_MANIFESTS="${AGENT_TEMPDIRECTORY}/manifests"
+                      SRC_MANIFESTS="${BUILD_SOURCESDIRECTORY}/${{ parameters.manifestsPath[parameters.environment] }}"
+                      SECRET_SOURCE="${BUILD_SOURCESDIRECTORY}/${{ parameters.placeholdersSecretManifestFile[parameters.environment] }}"
+
+                      echo "Preparando manifests temporários"
+
+                      rm -rf "$TEMP_MANIFESTS"
+                      mkdir -p "$TEMP_MANIFESTS"
+
+                      if [ ! -d "$SRC_MANIFESTS" ]; then
+                        echo "ERROR: Pasta de manifests não encontrada: $SRC_MANIFESTS"
+                        exit 1
+                      fi
+
+                      if [ ! -f "$SECRET_SOURCE" ]; then
+                        echo "ERROR: Manifesto de Secret não encontrado: $SECRET_SOURCE"
+                        exit 1
+                      fi
+
+                      cp -R "$SRC_MANIFESTS"/. "$TEMP_MANIFESTS"
+
+                      cp "$SECRET_SOURCE" \
+                        "${AGENT_TEMPDIRECTORY}/replaced_secret_manifest.yaml"
+
+                - task: replacetokens@6
+                  displayName: 'Substituir tokens no manifesto de Secret'
+                  inputs:
+                    targetFiles: '$(Agent.TempDirectory)/replaced_secret_manifest.yaml'
+                    tokenPattern: 'custom'
+                    tokenPrefix: '${{ parameters.placeholderPrefix }}'
+                    tokenSuffix: '${{ parameters.placeholderSuffix }}'
+                    verbosity: detailed
+                    actionOnNoFiles: warn
+
+                - task: Bash@3
+                  displayName: 'Substituir Secret na pasta temporária'
+                  inputs:
+                    targetType: 'inline'
+                    script: |
+                      set -euo pipefail
+                      SECRET_SOURCE="${BUILD_SOURCESDIRECTORY}/${{ parameters.placeholdersSecretManifestFile[parameters.environment] }}"
+                      SECRET_FILENAME=$(basename "$SECRET_SOURCE")
+                      TARGET_SECRET="${AGENT_TEMPDIRECTORY}/manifests/${SECRET_FILENAME}"
+                      if [ ! -f "$TARGET_SECRET" ]; then
+                        echo "ERROR: Secret não encontrado na pasta temporária: $TARGET_SECRET"
+                        exit 1
+                      fi
+                      cp \
+                        "${AGENT_TEMPDIRECTORY}/replaced_secret_manifest.yaml" \
+                        "$TARGET_SECRET"
+
+                - task: K8sUtilsFromVivo@3
+                  displayName: 'kubectl apply - ${{ parameters.environment }} $(DRY_RUN_LABEL)'
+                  inputs:
+                    command: 'kubectl-apply'
+                    manifestPath: $(Agent.TempDirectory)/manifests
+                    namespace: ${{ parameters.k8sNamespace[parameters.environment] }}
+                    kubectlApplyWait: true
+                    kubectlApplyWaitTimeout: '300'
+                    kubectlApplyDryRun: ${{ parameters.enableDryRun }}
+
+                - task: Bash@3
+                  displayName: 'Limpar arquivos temporários'
+                  condition: always()
+                  inputs:
+                    targetType: 'inline'
+                    script: |
+                      set -euo pipefail
+
+                      rm -f "${AGENT_TEMPDIRECTORY}/replaced_secret_manifest.yaml"
+                      rm -rf "${AGENT_TEMPDIRECTORY}/manifests"
+
+              - ${{ if ne(parameters.usePlaceholdersSecretManifest, true) }}:
+
+                - task: K8sUtilsFromVivo@3
+                  displayName: 'kubectl apply - ${{ parameters.environment }} $(DRY_RUN_LABEL)'
+                  inputs:
+                    command: 'kubectl-apply'
+                    manifestPath: $(Build.SourcesDirectory)/${{ parameters.manifestsPath[parameters.environment] }}
+                    namespace: ${{ parameters.k8sNamespace[parameters.environment] }}
+                    kubectlApplyWait: true
+                    kubectlApplyWaitTimeout: '300'
+                    kubectlApplyDryRun: ${{ parameters.enableDryRun }}
+
+              # Commit do manifesto atualizado (opcional)
+              - ${{ if and(eq(parameters.enableManifestCommit, true), eq(parameters.enableDryRun, false)) }}:
+                - task: Bash@3
+                  displayName: 'Commit do manifesto atualizado'
+                  inputs:
+                    targetType: 'inline'
+                    script: |
+                      set -euo pipefail
+                      
+                      cd "$(Build.SourcesDirectory)"
+                      
+                      # Configurar git
+                      git config user.email "azure-pipelines@telefonicati.onmicrosoft.com"
+                      git config user.name "Azure Pipelines"
+                      
+                      # Verificar se há mudanças
+                      if git diff --quiet "${MANIFESTS_PATH}"; then
+                        echo "##[section] ℹ️ Nenhuma alteração detectada nos manifestos"
+                        exit 0
+                      fi
+                      
+                      # Commit e push com retry e rebase em caso de non-fast-forward
+                      git add "${MANIFESTS_PATH}"
+                      git commit -m "${COMMIT_MESSAGE} ${VERSION}"
+                      
+                      MAX_RETRIES=3
+                      for i in $(seq 1 $MAX_RETRIES); do
+                        if git push origin "HEAD:${BRANCH_NAME}"; then
+                          echo "##[section] ✅ Manifesto atualizado commitado com sucesso"
+                          exit 0
+                        fi
+                        echo "##[warning] Push rejeitado (tentativa $i/$MAX_RETRIES). Aplicando rebase..."
+                        git pull --rebase origin "${BRANCH_NAME}"
+                      done
+                      
+                      echo "##[error] Falha ao fazer push após ${MAX_RETRIES} tentativas"
+                      exit 1
+                  env:
+                    MANIFESTS_PATH: "$(Build.SourcesDirectory)/${{ parameters.manifestsPath[parameters.environment] }}"
+                    VERSION: "$(VersionManagerVivo.DEPLOY_VERSION)"
+                    COMMIT_MESSAGE: "${{ parameters.manifestCommitMessage }}"
+                    BRANCH_NAME: "$(Build.SourceBranchName)"
+                    SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+
+              - ${{ if eq(parameters.enableDryRun, false) }}:
+                # Registro no Event Hub (obrigatório)
+                - task: VivoEventHubTools@3
+                  displayName: 'Registro de deploy no Event Hub'
+                  condition: always()
+                  continueOnError: true
+                  inputs:
+                    command: 'deploy'
+                    eventHubConnection: 'EVHCodeProd'
+                    componentVersion: '$(VersionManagerVivo.DEPLOY_VERSION)'
+                    deployArtifactName: $(K8S_IMAGES)
+                    deployArtifactType: 'container'
+                    deployEnvironmentType: 'kubernetes'
+                    deployEnvironmentName: '${{ parameters.environment }}'
+                    deployEnvironmentCluster: ${{ parameters.aksClusterName[parameters.environment] }}
+                    deployEnvironmentNamespace: ${{ parameters.k8sNamespace[parameters.environment] }}
+                    deployEnvironmentAccessUrl: '$(K8S_APP_URL_LIST)'
+                    annotations: 'deploy-method=kubectl'
+                    pipelineType: 'framework/deploy-kubectl'
+                  
+          on:
+            failure:
+              steps:
+                - ${{ if eq(parameters.useAKSManagedIdentity, true) }}:
+                  - task: Kubernetes@1
+                    displayName: 'Login no AKS para debug'
+                    inputs:
+                      connectionType: 'Azure Resource Manager'
+                      azureSubscriptionEndpoint: ${{ parameters.aksServiceConnection[parameters.environment] }}
+                      azureResourceGroup: ${{ parameters.aksResourceGroup[parameters.environment] }}
+                      kubernetesCluster: ${{ parameters.aksClusterName[parameters.environment] }}
+                      namespace: ${{ parameters.k8sNamespace[parameters.environment] }}
+                      command: 'login'
+
+                - ${{ if eq(parameters.useKubeconfig, true) }}:
+                  - task: Kubernetes@1
+                    displayName: 'Login no Kubernetes para debug'
+                    inputs:
+                      connectionType: 'Kubernetes Service Connection'
+                      kubernetesServiceEndpoint: ${{ parameters.kubeconfigServiceConnection[parameters.environment] }}
+                      namespace: ${{ parameters.k8sNamespace[parameters.environment] }}
+                      command: 'login'
+
+                # Debug do Kubernetes usando custom task
+                - task: K8sUtilsFromVivo@3
+                  displayName: 'Debug do Kubernetes'
+                  continueOnError: true
+                  inputs:
+                    command: 'debug-kubernetes'
+                    namespace: ${{ parameters.k8sNamespace[parameters.environment] }}
+                    debugKubernetesMaxPodsLogs: '5'
+                    debugKubernetesLogTailLines: '100'

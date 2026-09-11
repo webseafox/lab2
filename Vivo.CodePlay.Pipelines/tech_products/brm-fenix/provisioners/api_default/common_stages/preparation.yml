@@ -1,0 +1,220 @@
+# This YAML file defines the stages and jobs for the "Preparation" stage in a pipeline.
+
+parameters:
+  # The 'config' parameter is an object that holds configuration information for the pipeline.
+  - name: config
+    type: object
+  - name: flow
+    type: object
+
+stages:
+  - stage: stage_prep
+    displayName: "Pipeline Initialization"
+    pool: $(POOL)
+    jobs:
+      - job: image_tag_definition
+        displayName: "Define Image Tag"
+        condition: |
+          and(
+            ne(variables['TECHNOLOGY'], 'onlyHelmUpdate'),
+            ne(variables['APPLICATION_NAME'], 'bi-publisher-reports')
+          )
+        steps:
+          - checkout: none
+          - script: |
+              echo "##[debug] ACR BRM REPOSITORY .......................................: $(ACR_BRM_REPOSITORY)"
+              echo "##[debug] BRM CORE VERSION .........................................: $(BRM_CORE_RELEASE_VERSION)"
+
+              DOCKER_REGISTRY_CUSTOM_IMAGE=$(ACR_BRM_REPOSITORY)brm15/custom/
+
+              DOCKER_IMAGE_TAG="${DOCKER_REGISTRY_CUSTOM_IMAGE}$(CONTAINER_IMAGE_NAME)"
+              DOCKER_REGISTRY_CUSTOM_IMAGE_PATH=$(echo "$DOCKER_IMAGE_TAG" | cut -d'/' -f2-)
+
+              echo "##[debug] DOCKER REGISTRY CUSTOM IMAGE .............................: $DOCKER_REGISTRY_CUSTOM_IMAGE"
+              echo "##[debug] DOCKER IMAGE TAG .........................................: $DOCKER_IMAGE_TAG"
+              echo "##[debug] DOCKER REGISTRY IMAGE PATH ...............................: $DOCKER_REGISTRY_CUSTOM_IMAGE_PATH"
+
+              echo "##vso[task.setvariable variable=DOCKER_REGISTRY_CUSTOM_IMAGE;isOutput=true]$DOCKER_REGISTRY_CUSTOM_IMAGE"
+              echo "##vso[task.setvariable variable=DOCKER_IMAGE_TAG;isOutput=true]$DOCKER_IMAGE_TAG"
+              echo "##vso[task.setvariable variable=DOCKER_REGISTRY_CUSTOM_IMAGE_PATH;isOutput=true]$DOCKER_REGISTRY_CUSTOM_IMAGE_PATH"
+            name: define_image_tag
+            displayName: "Image Tag"
+
+          # Informations absorvido aqui (item 1): elimina job separado e o agente alocado apenas para echo.
+          - ${{ if or(eq(parameters.config.stageSecurityOnly, 'False'), eq(parameters.config.stageSecurityOnly, '')) }}:
+              - task: CmdLine@2
+                name: task_information
+                displayName: "Informations"
+                inputs:
+                  script: |
+                    echo "##[debug] FLOW ...............................................: ${{ parameters.flow.flow }}"
+                    echo "##[debug] APPLICATION NAME ...................................: $(APPLICATION_NAME)"
+                    echo "##[debug] ENVIRONMENT ........................................: $(ENVIRONMENT)"
+                    echo "##[debug] SOURCE BRANCH ......................................: $(Build.SourceBranchName)"
+                    echo "##[debug] BRM CORE VERSION ...................................: $(BRM_CORE_RELEASE_VERSION)"
+                    echo "##[debug] JAVA VERSION .......................................: $(JAVA_VERSION)"
+                    echo "##[debug] AZURE ENVIRONMENT CONTROL ..........................: $(AZURE_ENVIRONMENT)"
+
+                    if [ "${{ parameters.flow.flow }}" == "CI" ]; then
+                      echo "##[debug] DISABLE STAGE CODE SECURITY ANALYSIS ...............: $(DISABLE_STAGE_CODE_SECURITY_ANALYSIS)"
+                      echo "##[debug] DISABLE STAGE STATIC CODE ANALYSIS .................: $(DISABLE_STAGE_STATIC_CODE_ANALYSIS)"
+                      echo "##[debug] DISABLE UNIT TEST ..................................: $(DISABLE_UNIT_TEST)"
+                    else
+                      echo "##[debug] DEPLOY COMMANDS FILE ...............................: $(DEPLOY_COMMANDS_FILE)"
+                      echo "##[debug] DISABLE DEPLOY VALIDATE ............................: $(DISABLE_DEPLOY_VALIDATE)"
+                      echo "##[debug] DISABLE VERIFY ENVIRONMENT VERSION..................: $(DISABLE_VERIFY_ENVIRONMENT_VERSION)"
+                      if [ "${{ parameters.config.applicationParameters.applicationName }}" != "bi-publisher-reports" ] && [ "${{ parameters.config.applicationParameters.applicationName }}" != "oracle-communications-offline-mediation-controller" ]; then
+                        echo "##[debug] OPERATION HOST HELM PATH ...........................: $(OPERATION_HOST_HELM_PATH)"
+                        echo "##[debug] OPERATION HOST COMMANDS PATH .......................: $(OPERATION_HOST_COMMANDS_PATH)"
+                        echo "##[debug] PDC EXPORT TARGET FOLDER ...........................: $(PDC_EXPORT_TARGET_FOLDER)"
+                        echo "##[debug] HELM CHART DEPLOY FILE .............................: $(HELM_CHART_FILE)"
+                        echo "##[debug] APPLICATION VERSION RECEIVED .......................: ${{ parameters.flow.cd_params.appVersion }}"
+                        echo "##[debug] FORCE DEPLOYMENT WITH SAME VERSION .................: ${{ parameters.flow.cd_params.forceDeployment }}"
+                        echo "##[debug] HELM RELEASE NAMES..................................: ${{ parameters.config.applicationParameters.helmReleaseNames }}"
+                        echo "##[debug] APPLICATION POD.....................................: ${{ parameters.config.applicationParameters.container }}"
+                      fi
+                    fi
+
+      - ${{ if ne(parameters.flow.flow, 'CD') }}:
+          - job: app_config_keys
+            displayName: "Get AppSec Config Keys"
+            steps:
+              - checkout: none
+              - ${{ if eq(parameters.config.stageSecurityOnly, 'True') }}:
+                  - template: ../../../tasks/bash/start_time.yml
+              - template: /tasks/bash/welcome.yml@CorePipelines
+              - template: /task_groups/security/get_appconfig_keys.yml@CorePipelines
+
+      - ${{ if eq(parameters.flow.flow, 'CI') }}:
+          # This job uses a template to checkout the source code repository into the "source_code" directory.
+          - job: configure_catalog
+            displayName: "catalog-info"
+            condition: |
+              and(
+                ne(variables['TECHNOLOGY'], 'onlyHelmUpdate'),
+                ne(variables['APPLICATION_NAME'], 'bi-publisher-reports')
+              )
+            steps:
+              - template: ../../../task_groups/checkout/checkout.yml
+                parameters:
+                  repository: self
+                  path: source_code
+              # This job changes the current directory to the "source_code" directory.
+              - script: cd $(Pipeline.Workspace)/source_code
+                displayName: "Change Directory to source_code"
+              # This job uses a template to publish catalog information as artifacts.
+              - template: /tasks/artifacts/publish_catalog_info.yml@CorePipelines
+                parameters:
+                  breakWhenNotFound: true
+
+      # This job uses a template to configure the execution mode
+      - job: execution_mode
+        displayName: "Application Execution Mode to BC, ECE, PDC"
+        condition: |
+          and(
+            ne(variables['TECHNOLOGY'], 'onlyHelmUpdate'),
+            in(variables['APPLICATION_NAME'], 'elastic-charging-engine', 'pricing-design-center', 'bi-publisher-reports')
+          )
+        steps:
+          - checkout: none
+          - template: ../../../tasks/execution_mode/mode.yml
+
+      # Este job define a versao do componente usando o Build.BuildNumber (BRM 15+).
+      - job: version
+        displayName: "Version"
+        dependsOn: image_tag_definition
+        condition: |
+          and(
+            ne(variables['TECHNOLOGY'], 'onlyHelmUpdate'),
+            ne(variables['TECHNOLOGY'], 'helmCharts'),
+            ne(variables['APPLICATION_NAME'], 'bi-publisher-reports')
+          )
+        variables:
+          - name: DOCKER_REGISTRY_CUSTOM_IMAGE_PATH
+            value: $[ dependencies.image_tag_definition.outputs['define_image_tag.DOCKER_REGISTRY_CUSTOM_IMAGE_PATH'] ]
+        steps:
+          - checkout: none
+          - task: CmdLine@2
+            displayName: "Set Version"
+            name: version
+            inputs:
+              script: |
+                VERSION="$(Build.BuildNumber)"
+                echo "##[debug] VERSION..............................: ${VERSION}"
+                echo "##vso[task.setvariable variable=VERSION;isoutput=true]${VERSION}"
+
+      - ${{ if or(eq(parameters.config.stageSecurityOnly, 'False'), eq(parameters.config.stageSecurityOnly, '')) }}:
+        # This job uses a template to send a notification message to Microsoft Teams with the application name and a webhook URL.
+        - job: notification
+          displayName: "Teams Notification"
+          dependsOn:
+            - execution_mode
+            - version
+          condition: eq(variables['DISABLE_TEAMS_NOTIFICATION'], 'false')
+          variables:
+            - name: APP_EXECUTION_MODE
+              value: $[ dependencies.execution_mode.outputs['mode.APP_EXECUTION_MODE'] ]
+            - name: VERSION
+              value: $[ dependencies.version.outputs['version.VERSION'] ]
+          steps:
+            - checkout: none
+            - script: |
+                FACTS="{ \"name\": \"🚀 BRM Version:\", \"value\": \"_$(BRM_CORE_RELEASE_VERSION)_\" },"
+
+                if [ "${{ parameters.flow.flow }}" == "CI" ]; then
+                  FACTS="$FACTS{ \"name\": \"⛓️ Stage Security Only:\", \"value\": \"_${{ parameters.config.stageSecurityOnly }}_\" },{ \"name\": \"⚡Trigger the CD Pipeline:\", \"value\": \"_${{ parameters.flow.triggerCD }}_\" },"
+                else
+                  if [ "${{ parameters.config.applicationParameters.applicationName }}" != "bi-publisher-reports" ] && [ "${{ parameters.config.applicationParameters.applicationName }}" != "oracle-communications-offline-mediation-controller" ]; then
+                    FACTS="$FACTS{ \"name\": \"🔁 Force Deployment with Same Version:\", \"value\": \"_${{ parameters.flow.cd_params.forceDeployment }}_\" },"
+                  fi
+                fi
+
+                if [ -n "$APP_EXECUTION_MODE" ] && [ -n "$VERSION" ]; then
+                    FACTS="$FACTS{ \"name\": \"🆔 Application Execution Mode:\", \"value\": \"_$(APP_EXECUTION_MODE)_\" },{ \"name\": \"🔖 Application Version:\", \"value\": \"_$(VERSION)_\" }"
+                elif [ -n "$APP_EXECUTION_MODE" ]; then
+                  FACTS="$FACTS{ \"name\": \"🆔 Application Execution Mode:\", \"value\": \"_$(APP_EXECUTION_MODE)_\" }"
+                elif [ -n "$VERSION" ]; then
+                  FACTS="$FACTS{ \"name\": \"🔖 Application Version:\", \"value\": \"_$(VERSION)_\" }"
+                fi
+
+                echo "##[debug] APP EXECUTION MODE................: $APP_EXECUTION_MODE"
+                echo "##[debug] VERSION...........................: $VERSION"
+                echo "##[debug] FACTS.............................: $FACTS"
+
+                echo "##vso[task.setvariable variable=FACTS;isoutput=true]$FACTS"
+              name: factsFormatter
+              displayName: "Facts Formatter"
+            - template: ../../../tasks/teams/send_message.yml
+              parameters:
+                flow: ${{ parameters.flow.flow }}
+                title: "Notification from $(APPLICATION_NAME)"
+                webhookUrl: "$(TEAMS_WEBHOOK)"
+                status: Started
+                facts: "$(factsFormatter.FACTS)"
+
+      - ${{ if eq(parameters.config.applicationParameters.applicationName, 'bi-publisher-reports') }}:
+          - job: bip_gate
+            displayName: "BI Publisher Reports Gate"
+            dependsOn: execution_mode
+            condition: succeeded()
+            variables:
+              - name: APP_EXECUTION_MODE
+                value: $[ dependencies.execution_mode.outputs['mode.APP_EXECUTION_MODE'] ]
+            steps:
+              - checkout: none
+              - task: CmdLine@2
+                displayName: "Gate"
+                inputs:
+                  script: |
+                    echo "##[debug] APP_EXECUTION_MODE..........................: $APP_EXECUTION_MODE"
+                    echo "##[debug] ENVIRONMENT.................................: $ENVIRONMENT"
+                    echo "##[debug] IS_BIP_ENVIRONMENTS.........................: $IS_BIP_ENVIRONMENTS"
+
+                    if [[ $IS_BIP_ENVIRONMENTS == "False" ]]; then
+                      echo "##vso[task.logissue type=error;]!!!!!!!!!! [$ENVIRONMENT] environment is not available Environment. !!!!!!!!!!"
+                      echo "##vso[task.complete result=Failed;]"
+
+                      exit 1
+                    fi
+
+                    printf ">>>>> [$APP_EXECUTION_MODE] operation mode and [$ENVIRONMENT] environment are available <<<<<\n\n"

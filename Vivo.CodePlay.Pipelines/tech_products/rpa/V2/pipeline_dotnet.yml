@@ -1,0 +1,504 @@
+#trigger:
+#  - branch: master
+#  - branch: master
+variables:
+  solution: '**/*.sln'
+  BuildPlatform: 'Any CPU'
+  BuildConfiguration: 'Release'
+  JAVA_HOME: 'C:\Program Files\Java\jdk-17'
+  # Variáveis utilizadas por templates de Segurança (Fortify/SCA)
+  CACORP_LOCATION: $(Agent.HomeDirectory)/../../certs/CACORP.pem
+  APP_LANGUAGE: 'dotnet'
+  FORTIFY_APP_DEFAULT_VERSION: DevSecOps
+  AKV_DEVOPS_NAME: 'kv-azdevops-shared'
+  VERSION_FILE_PATH: $(System.DefaultWorkingDirectory)/${{ parameters.versionFile }}
+
+resources:
+  repositories:
+    - repository: RPAScripts
+      name: DevOps/Vivo.CodePlay.Pipelines
+      type: git       
+      ref: master
+      endpoint: CodePlay
+
+parameters:
+- name: PUBLISH_REPOSITORY
+  type: string
+  default: "default-value"
+
+- name: PUBLISH_ARTIFACT_ID
+  type: string
+  default: "default-value"
+
+- name: SONARQUBE_CONNECTION_NAME
+  type: string
+  default: "default-value"
+
+- name: SONARQUBE_PROJECT_NAME
+  type: string
+  default: "default-value"
+
+- name: NUGET_VERSION
+  type: string
+  default: "default-value"
+
+- name: BUILD_VERSION
+  type: string
+  default: "default-value"
+
+- name: URL_NEXUS
+  type: string
+
+- name: agentPool
+  type: string
+  default: "GeneralPurposeLinuxAgentsCI"
+  displayName: 'Agent Pool para execução das análises de segurança'
+
+- name: useNetworkProxy
+  type: boolean
+  default: false
+  displayName: 'Configurar proxy de rede para acesso externo (se necessário)'
+
+- name: enableFortifyExclusions
+  type: boolean
+  default: false
+  displayName: 'Faz checkout do repositório Fortify Exclusions'
+
+- name: allowAutomatedVersionPush
+  type: boolean
+  default: false
+  displayName: 'Permitir commit e push automático do arquivo VERSION'
+
+- name: versionFile
+  type: string
+  default: 'VERSION'
+  displayName: 'Arquivo utilizado pela VersionManagerVivo@8 para leitura/escrita da versão'
+
+- name: branchingStrategy
+  type: string
+  default: 'trunkbased'
+  displayName: 'Estratégia de versionamento semântico aplicada pela VersionManagerVivo@8'
+  values:
+    - 'trunkbased'
+    - 'vivoflow'
+    - 'releaseflow'
+    - 'gitlabflow'
+    - 'gitlabflow-semantic'
+    - 'custom'
+    - 'monorepo'
+
+- name: checkoutSubmodules
+  type: boolean
+  default: false
+  displayName: 'Faz checkout recursivo de submódulos git no build (necessário para repos com dependências via submodule)'
+
+stages:
+  - stage: BuildApplication
+    condition: |
+      or(
+        eq(variables['Build.SourceBranchName'], 'staging'),
+        eq(variables['Build.SourceBranchName'], 'master')
+      )
+    variables:
+      # Só a branch master/main publica/comita versão (stages PublishNexus/VersionCommit).
+      # Em qualquer outra branch (staging, etc.) o cálculo de versão aqui é só
+      # informativo e descartável, então pulamos a validação de branch da
+      # estratégia (branchingStrategy) para não falhar builds em branches que
+      # ela não reconhece (ex.: trunkbased/vivoflow rejeitando 'staging').
+      # main é incluída junto de master porque trunkbased trata as duas como
+      # branch principal válida.
+      - name: SKIP_VERSION_VALIDATION
+        value: $[ and(ne(variables['Build.SourceBranchName'], 'master'), ne(variables['Build.SourceBranchName'], 'main')) ]
+    jobs:
+      - job: Build_Publish
+        pool:
+          name: "RPAAgents"
+          demands: "nice"
+        steps:
+          - checkout: self
+            persistCredentials: true
+            submodules: ${{ parameters.checkoutSubmodules }}
+
+          - task: PowerShell@2
+            displayName: 'Ensure VERSION file'
+            inputs:
+              targetType: 'inline'
+              pwsh: false
+              script: |
+                $versionFile = Join-Path "$(System.DefaultWorkingDirectory)" "VERSION"
+                if (-not (Test-Path $versionFile)) {
+                  Set-Content -Path $versionFile -Value "0.0.0"
+                  Write-Host "[VERSION] VERSION criado em $versionFile com valor 0.0.0"
+                }
+
+          - task: VersionManagerVivo@8
+            displayName: 'Definition Version'
+            name: BuildVersion
+            inputs:
+              command: 'nextVersion'
+              branchingStrategy: ${{ parameters.branchingStrategy }}
+              versionFile: $(VERSION_FILE_PATH)
+              bumpMethod: 'patch'
+              passthroughVersion: $(SKIP_VERSION_VALIDATION)
+
+          - task: NuGetToolInstaller@0
+            displayName: 'Use NuGet'
+            inputs:
+              versionSpec: ${{ parameters.NUGET_VERSION }}
+          
+          - task: DownloadSecureFile@1
+            name: nugetconfig
+            displayName: 'Download nuget.config'
+            inputs:
+              secureFile: 'nugetconfig'
+          
+          - task: NuGetAuthenticate@1
+            inputs:
+              nuGetServiceConnections: RPA_COMPONENTS_RESTORE_NUGET
+              forceReinstallCredentialProvider: true
+
+          - task: NuGetCommand@2
+            inputs:
+              command: 'restore'
+              restoreSolution: '**/*.sln'
+              selectOrConfig: 'config'
+              feedsToUse: 'config'
+              nugetConfigPath: $(nugetconfig.secureFilePath)
+              externalFeedCredentials: RPA_COMPONENTS_RESTORE_NUGET
+              msbuildVersion: '17.0'
+
+          - task: VSBuild@1
+            displayName: 'Build solution **/*.sln'
+            inputs:
+              solution: '$(solution)'
+              platform: '$(BuildPlatform)'
+              configuration: '$(BuildConfiguration)'
+
+          - task: PublishSymbols@2
+            displayName: 'Publish symbols path'
+            inputs:
+              SearchPattern: '**/bin/**/*.pdb'
+              PublishSymbols: false
+            continueOnError: true
+
+          - task: CopyFiles@2
+            displayName: 'Copy Files x86 to: $(build.artifactstagingdirectory)'
+            inputs:
+              SourceFolder: '$(system.defaultworkingdirectory)\${{ parameters.PUBLISH_ARTIFACT_ID }}\bin\${{ parameters.BUILD_VERSION }}'
+              Contents: '**/*'
+              TargetFolder: '$(build.artifactstagingdirectory)\bin\${{ parameters.BUILD_VERSION }}'
+            condition: and(succeededOrFailed(), eq('${{ parameters.BUILD_VERSION }}', 'x86'))
+          
+          - task: CopyFiles@2
+            displayName: 'Copy Files AnyCPU to: $(build.artifactstagingdirectory)'
+            inputs:
+              SourceFolder: '$(system.defaultworkingdirectory)'
+              Contents: '**/bin/$(BuildConfiguration)/**'
+              TargetFolder: '$(build.artifactstagingdirectory)'
+            condition: and(succeededOrFailed(), ne('${{ parameters.BUILD_VERSION }}', 'x86'))
+
+          - task: ArchiveFiles@2
+            displayName: 'Archive build output to ZIP'
+            inputs:
+              rootFolderOrFile: '$(build.artifactstagingdirectory)'
+              includeRootFolder: false
+              archiveType: 'zip'
+              archiveFile: '$(build.artifactstagingdirectory)/${{ parameters.PUBLISH_ARTIFACT_ID }}.zip'
+              replaceExistingArchive: true
+
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish Artifact: drop'
+            inputs:
+              PathtoPublish: '$(build.artifactstagingdirectory)'
+              ArtifactName: 'drop'  # Nome do artefato publicado
+
+          # ==================================================================
+          # [Publicação] Publica artefato compilado para uso no stage de Segurança (SCA Scan)
+          # ==================================================================
+          - task: PublishPipelineArtifact@1
+            displayName: 'Publish Build Artifact for Security Analysis'
+            condition: succeeded()
+            inputs:
+              targetPath: '$(build.artifactstagingdirectory)'
+              artifactName: '${{ parameters.PUBLISH_ARTIFACT_ID }}'
+              publishLocation: 'pipeline'
+
+  # ==================================================================
+  # STAGE: SECURITY ANALYSIS (PARALLEL)
+  # ==================================================================
+  - stage: SecurityAnalysis
+    displayName: 'Security Analysis'
+    dependsOn: BuildApplication
+    condition: |
+      and(
+        succeeded(),
+        or(
+          eq(variables['Build.SourceBranchName'], 'staging'),
+          eq(variables['Build.SourceBranchName'], 'master')
+        )
+      )
+    jobs:
+
+      - job: AppSecConfigKeys
+        displayName: 'Get AppSec Config Keys'
+        pool: ${{ parameters.agentPool }}
+        steps:
+          - template: /security/get_appconfig_keys_framework.yml
+            parameters:
+              azureSubscription: DevOpsSharedResources
+              appConfigurationEndpoint: https://appcs-azdevops-shared.azconfig.io
+              useNetworkProxy: ${{ parameters.useNetworkProxy }}
+
+      # ==================================================================
+      # CAPACIDADE: FORTIFY SCAN (SAST)
+      # ==================================================================
+      - job: FortifyScan
+        displayName: 'Fortify Scan (SAST)'
+        dependsOn:
+        - AppSecConfigKeys
+        variables:
+          USE_FORTIFY: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.USE_FORTIFY'] ]
+          USE_CONVISO: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.USE_CONVISO'] ]
+          SKIP_SECURITY_GATE: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.SKIP_SECURITY_GATE'] ]
+          FORTIFY_LOCAL_SCANCENTRAL_VERSION: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.FORTIFY_LOCAL_SCANCENTRAL_VERSION'] ]
+        condition: and(succeeded(), eq(variables.USE_FORTIFY, true))
+        pool:
+          name: "GeneralPurposeLinuxAgentsCI"
+        steps:
+
+        - template: /security/define_appsec_app_version.yml
+
+        - template: /security/run_fortify_scan.yml
+          parameters:
+            fortifyExclusionRepository: 'FortifyExclusion'
+            enableFortifyExclusions: ${{ parameters.enableFortifyExclusions }}
+            appLanguage: 'dotnet'
+            appVersion: "$(FORTIFY_APP_VERSION)" # OBS: A variável FORTIFY_APP_VERSION é definida no template /security/define_appsec_app_version.yml
+
+      # ==================================================================
+      # CAPACIDADE: SCA SCAN (SCA)
+      # ==================================================================
+      - job: SCAScan
+        displayName: 'SCA Scan'
+        dependsOn:
+        - AppSecConfigKeys
+        variables:
+          USE_DEPENDENCY_TRACK: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.USE_DEPENDENCY_TRACK'] ]
+          USE_DT_DOCKER: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.USE_DT_DOCKER'] ]
+          USE_CONVISO: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.USE_CONVISO'] ]
+          SKIP_SECURITY_GATE_SCA: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.SKIP_SECURITY_GATE_SCA'] ]
+        condition: and(
+                      succeeded(),
+                      eq(variables.USE_DEPENDENCY_TRACK, true)
+                    )
+        pool: ${{ parameters.agentPool }}
+        steps:
+
+        - template: /security/define_appsec_app_version.yml
+
+        - template: /security/run_sca_scan.yml
+          parameters:
+            appVersion: "$(FORTIFY_APP_VERSION)" # OBS: A variável FORTIFY_APP_VERSION é definida no template /security/define_appsec_app_version.yml
+            buildArtifactName: ${{ parameters.PUBLISH_ARTIFACT_ID }}
+
+  - stage: PublishNexus
+    dependsOn:
+      - BuildApplication
+      - SecurityAnalysis
+    condition: and(succeeded(),eq(variables['Build.SourceBranch'], 'refs/heads/master'))
+    jobs:
+      - job: PublishNexus
+        pool:
+          name: "RPAAgents"
+          demands: "nice"
+        steps:
+          - checkout: self
+            persistCredentials: true
+
+          # NOTA: A versao e recalculada aqui (idempotente, sem side-effects) apenas
+          # para referenciar o mesmo valor que sera publicado no Nexus. A gravacao/
+          # commit/tag da versao real so acontece no stage VersionCommit, apos o
+          # sucesso da publicacao.
+          - task: VersionManagerVivo@8
+            name: PublishVersion
+            displayName: 'Next version'
+            inputs:
+              command: 'nextVersion'
+              branchingStrategy: ${{ parameters.branchingStrategy }}
+              versionFile: $(VERSION_FILE_PATH)
+              bumpMethod: 'patch'
+
+          - task: DownloadBuildArtifacts@1
+            displayName: 'Download Build Artifacts'
+            inputs:
+              buildType: 'current'
+              artifactName: 'drop'            # Nome do artefato que quer baixar
+              downloadPath: '$(System.ArtifactsDirectory)'
+
+          - task: NexusArtifactUpload@0
+            inputs:
+              serverEndpoint: "Nexus Asis"
+              repository: "${{ parameters.PUBLISH_REPOSITORY }}"
+              localFileLocation: "$(System.ArtifactsDirectory)/drop/${{ parameters.PUBLISH_ARTIFACT_ID }}.zip"
+              remoteFileLocation: "/br/com/vivo/rpa/controlM/${{ parameters.PUBLISH_ARTIFACT_ID }}/$(PublishVersion.VERSION)/${{ parameters.PUBLISH_ARTIFACT_ID }}.zip"
+            condition: eq(variables['Build.SourceBranch'], 'refs/heads/master')
+
+  # ==================================================================
+  # STAGE: VERSION COMMIT
+  # Grava a nova versao no arquivo, cria commit + tag e faz push, apenas
+  # apos a publicacao no Nexus ter sido concluida com sucesso.
+  # ==================================================================
+  - stage: VersionCommit
+    displayName: 'Commit Version'
+    dependsOn:
+      - PublishNexus
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/master'), eq('${{ parameters.allowAutomatedVersionPush }}', 'true'))
+    jobs:
+      - job: CommitVersion
+        displayName: 'Commit Release Version'
+        pool: ${{ parameters.agentPool }}
+        steps:
+          - checkout: self
+            clean: true
+            persistCredentials: true
+            fetchDepth: 0
+
+          - task: VersionManagerVivo@8
+            displayName: 'Next version'
+            name: VersionManagerVivo
+            inputs:
+              command: 'nextVersion'
+              branchingStrategy: ${{ parameters.branchingStrategy }}
+              versionFile: $(VERSION_FILE_PATH)
+              bumpMethod: 'patch'
+
+          - task: VersionManagerVivo@8
+            displayName: 'Commit and Tag Version'
+            inputs:
+              command: 'commitVersion'
+              version: '$(VersionManagerVivo.VERSION)'
+              versionFile: $(VERSION_FILE_PATH)
+              createTag: true
+              pushChanges: true
+
+  - stage: DownloadNexus
+    condition: eq(variables['Build.SourceBranch'], 'refs/heads/deploy')
+    jobs:
+      - job: DownloadNexus
+        pool: GeneralPurposeLinuxAgentsCD
+        steps:
+        - checkout: self
+        - checkout: RPAScripts
+
+        - task: PowerShell@2
+          inputs:
+            targetType: 'inline'
+            script: |                
+              cd $(Build.Repository.Name)
+              dir
+              $Version=$(cat VERSION)
+              echo "Versão do artefato no Nexus que irá realizar o Deploy "$Version
+              echo "##vso[task.setvariable variable=Version]$Version"
+          displayName: 'Get Version'
+
+        - task: AzureKeyVault@2
+          displayName: 'Getting AKV Credentials'
+          timeoutInMinutes: 1
+          retryCountOnTaskFailure: 5
+          inputs:
+            azureSubscription: 'DevOpsSharedResources'
+            KeyVaultName: 'kv-azdevops-shared'
+            SecretsFilter: 'NEXUS-DEFAULT-USR, NEXUS-DEFAULT-PSW'
+
+        - script: |
+            echo "Nexus credentials loaded"
+          displayName: 'Use Nexus Credentials'
+
+        - task: PowerShell@2
+          displayName: 'Download arquivo ZIP do Nexus'
+          inputs:
+            targetType: 'inline'
+            script: |
+              # Defina a URL do seu repositório Nexus e o caminho de destino
+              $source = "${{ parameters.URL_NEXUS }}${{ parameters.PUBLISH_ARTIFACT_ID }}/$(Version)/${{ parameters.PUBLISH_ARTIFACT_ID }}.zip"
+              $destination = "$(System.DefaultWorkingDirectory)/${{ parameters.PUBLISH_ARTIFACT_ID }}.zip"
+
+              Write-Output "Download URL: $source"
+              Write-Output "Destination Path: $destination"
+
+              # Obtenha as credenciais do Azure DevOps Pipeline
+              $username = "$(NEXUS-DEFAULT-USR)"
+              $password = "$(NEXUS-DEFAULT-PSW)"
+              $securePassword = ConvertTo-SecureString $password -AsPlainText -Force
+              $credentials = New-Object System.Management.Automation.PSCredential($username, $securePassword)
+
+              # Baixar o arquivo
+              Invoke-WebRequest -Uri $source -OutFile $destination -Credential $credentials
+
+              # Verifique se o arquivo foi baixado
+              if (Test-Path $destination) {
+                Write-Output "Arquivo baixado com sucesso!"
+              } else {
+                Write-Output "Falha ao baixar o arquivo."
+              }
+        
+        - task: PowerShell@2
+          displayName: 'Listar arquivos no diretório'
+          inputs:
+            targetType: 'inline'
+            script: |
+              Get-ChildItem -Path "$(System.DefaultWorkingDirectory)"
+
+
+        - task: PublishBuildArtifacts@1
+          displayName: 'Publish Artifacts'
+          condition: succeeded()
+          inputs:
+            ArtifactName: 'bin'
+            pathToPublish: '$(System.DefaultWorkingDirectory)'
+            publishLocation: 'Container'
+
+  - stage: DeployApplication
+    condition: eq(variables['Build.SourceBranch'], 'refs/heads/deploy')
+    variables:
+      - group: RPADEVOPS
+    jobs:
+      - job: Deploy
+        pool: 
+          name: "RPAAgents"
+          demands: "csharp"
+        steps:
+          - checkout: self
+            persistCredentials: true
+          - checkout: RPAScripts
+            persistCredentials: true
+            
+          - task: DownloadPipelineArtifact@2
+            displayName: 'Download Pipeline Artifact'
+            inputs:
+              buildType: current
+              targetPath: $(System.ArtifactsDirectory)
+              itemPattern: '**'
+
+          - task: PowerShell@2
+            inputs:
+              targetType: 'inline'
+              script: |
+                
+                cd $(Build.Repository.Name)
+                cd .azuredevops
+                $Resources=$(cat resources)
+                echo "Maquinas cadastradas no arquivo resources "$Resources
+                echo "##vso[task.setvariable variable=Resources]$Resources"
+            displayName: 'Get Resources' 
+
+          - task: PowerShell@2
+            displayName: "Deploy"
+            inputs:
+              targetType: 'inline'
+              script: |
+                Write-Host "Resultado"
+                Write-Host "Current Directory: $(System.ArtifactsDirectory)"
+                Write-Host "Current Directory: $(System.DefaultWorkingDirectory)"
+                Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force
+                .\Vivo.CodePlay.Pipelines\tech_products\rpa\V2\Deploy_Csharp_v2.ps1 -listDestination $(Resources) -logFile 'logCopyZip.txt' -PathFile '$(System.ArtifactsDirectory)\bin\' -ArquivoProjeto '${{ parameters.PUBLISH_ARTIFACT_ID }}' -usuario '$(User)' -senha '$(PASS)' -AllowPlainPassword

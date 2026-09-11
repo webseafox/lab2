@@ -1,0 +1,70 @@
+parameters:
+- name: serviceConnectionSuffix
+  type: string
+  default: "$(subscriptionEnv)"
+- name: subscriptionId
+  type: string
+- name: resourceGroup
+  type: string
+- name: storageAccountName
+  type: string
+- name: environment
+  type: string
+- name: partitionKey
+  type: string
+  default: "apapi"
+- name: condition
+  type: object
+  default: succeeded()
+
+steps:
+- task: AzureCLI@2
+  displayName: "Upsert Application - ${{ parameters.environment }}"
+  condition: ${{ parameters.condition }}
+  name: upsert_application
+  inputs:
+    azureSubscription: $(serviceConnectionPrefixName)-${{ parameters.serviceConnectionSuffix }}
+    scriptType: bash
+    scriptLocation: inlineScript
+    inlineScript: |
+      set -euo pipefail
+
+      az account set --subscription "${{ parameters.subscriptionId }}"
+
+      CONFIG_FILE="$(Build.SourcesDirectory)/.azuredevops/env/${{ parameters.environment }}/client-config.json"
+      if [ ! -f "$CONFIG_FILE" ]; then
+        echo "##vso[task.logissue type=error] Client config file not found: $CONFIG_FILE"
+        exit 1
+      fi
+
+      # Extract application data from client-config.json
+      APP_ID=$(jq -r '.id' "$CONFIG_FILE" | tr '[:upper:]' '[:lower:]')
+      APP_NAME=$(jq -r '.name' "$CONFIG_FILE")
+      APP_DESC=$(jq -r '.description' "$CONFIG_FILE")
+      APP_EMAIL=$(jq -r '.email' "$CONFIG_FILE")
+      APP_PHONE=$(jq -r '.phone_number' "$CONFIG_FILE")
+
+      echo "##[debug] Upserting application: $APP_NAME ($APP_ID)"
+
+      # Get storage account key
+      ACCOUNT_KEY=$(az storage account keys list \
+        --account-name "${{ parameters.storageAccountName }}" \
+        --resource-group "${{ parameters.resourceGroup }}" \
+        --query '[0].value' -o tsv)
+
+      # Upsert application entity (insert with merge if exists)
+      az storage entity insert \
+        --table-name "applications${{ parameters.environment }}" \
+        --entity \
+          PartitionKey=${{ parameters.partitionKey }} \
+          RowKey="${APP_ID}" \
+          name="${APP_NAME}" \
+          description="${APP_DESC}" \
+          email="${APP_EMAIL}" \
+          phone="${APP_PHONE}" \
+          phone@odata.type=Edm.String \
+        --if-exists merge \
+        --account-name "${{ parameters.storageAccountName }}" \
+        --account-key "$ACCOUNT_KEY"
+
+      echo "✅ Application '${APP_NAME}' upserted successfully!"

@@ -1,0 +1,78 @@
+parameters:
+- name: applicationID
+- name: apiID
+- name: apiName
+- name: method
+- name: type
+- name: value
+- name: every
+- name: period
+
+steps:
+- script: |
+    echo "##[debug] API_MANAGER_BASE_URL........: ${API_MANAGER_BASE_URL}"
+    echo "##[debug] API_ID......................: ${API_ID}"
+    echo "##[debug] API_NAME....................: ${API_NAME}"
+    echo "##[debug] APPLICATION_ID..............: ${APPLICATION_ID}"
+    echo "##[debug] METHOD......................: ${METHOD}"
+    echo "##[debug] TYPE........................: ${TYPE}"
+    echo "##[debug] VALUE.......................: ${VALUE}"
+    echo "##[debug] EVERY.......................: ${EVERY}"
+    echo "##[debug] PERIOD......................: ${PERIOD}"
+
+    jq -n \
+    --arg apiName "${API_NAME}" \
+    --arg apiId "${API_ID}" \
+    --arg method "${METHOD}" \
+    --arg type "${TYPE}" \
+    --arg value "${VALUE}" \
+    --arg every "${EVERY}" \
+    --arg period "${PERIOD}" \
+    '{"type":"APPLICATION", "name": $apiName, "description": "", "restrictions": [{"api":$apiId, "method":$method, "type":$type, "config": {"period":$period, "messages":$value, "mb":$value, "per":$every}}]}' > new_application_quota.json
+
+    echo "##[command] GET /applications/${APPLICATION_ID}/quota"
+    curl -s -k --request GET "${API_MANAGER_BASE_URL}/applications/${APPLICATION_ID}/quota" \
+    --user "${ADMIN_USERNAME}:${ADMIN_PASSWORD}" | jq -r 'select(.restrictions != []) // {}' > current_application_quota.json
+
+    echo "##[debug] current_application_quota.json"
+    jq 'if . == {} then error("Application Quota Not Found") else . end | .' current_application_quota.json
+    retVal=$?
+
+    if [ $retVal -ne 0 ]; then
+      echo "##[command] POST /applications/${APPLICATION_ID}/quota"
+
+      REQUEST_BODY="$(jq -r -c '.' new_application_quota.json)"
+      echo "##[debug] REQUEST_BODY................: ${REQUEST_BODY}"
+
+      curl -s -i -k --fail --request POST "${API_MANAGER_BASE_URL}/applications/${APPLICATION_ID}/quota" \
+      --user "${ADMIN_USERNAME}:${ADMIN_PASSWORD}" \
+      --header "content-type: application/json" \
+      --data-raw "${REQUEST_BODY}"
+    else
+      echo "##[command] PUT /applications/${APPLICATION_ID}/quota"
+
+      echo "##[debug] Preparing restrictions update"
+      jq --arg method "${METHOD}" 'del(.restrictions[] | select(.method == $method))' current_application_quota.json > temp_application_quota.json
+      jq -n '{ restrictions: [ inputs.restrictions ] | add | unique }' temp_application_quota.json new_application_quota.json > new_restrictions_quota.json
+      REQUEST_BODY="$(jq -r -c -s '.[0] * .[1]' current_application_quota.json new_restrictions_quota.json)"
+      echo "##[debug] REQUEST_BODY................: ${REQUEST_BODY}"
+
+      curl -s -i -k --fail --request PUT "${API_MANAGER_BASE_URL}/applications/${APPLICATION_ID}/quota" \
+      --user "${ADMIN_USERNAME}:${ADMIN_PASSWORD}" \
+      --header "content-type: application/json" \
+      --data-raw "${REQUEST_BODY}"
+    fi
+  displayName: Override Application Quota
+  workingDirectory: $(Agent.TempDirectory)
+  env:
+    API_MANAGER_BASE_URL: $(API_MANAGER_BASE_URL)
+    ADMIN_USERNAME: $(ADMIN_USERNAME)
+    ADMIN_PASSWORD: $(ADMIN_PASSWORD)
+    API_ID: ${{ parameters.apiID }}
+    API_NAME: ${{ parameters.apiName }}
+    APPLICATION_ID: ${{ parameters.applicationID }}
+    METHOD: ${{ parameters.method }}
+    TYPE: ${{ parameters.type }}
+    VALUE: ${{ parameters.value }}
+    EVERY: ${{ parameters.every }}
+    PERIOD: ${{ parameters.period }}

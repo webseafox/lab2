@@ -1,0 +1,222 @@
+parameters:
+- name: skipSecurityGate
+  default: false
+- name: convisoCompany
+  default: 430
+- name: appVersion
+  default: "DevSecOps"
+- name: vivoFlow
+  type: string
+  default: "none"
+- name: imageSource
+  default: "${DOCKER_REGISTRY}/${DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_TAG}"
+
+steps:
+  - ${{ if or(eq(parameters.vivoFlow, 'none'),and(ne(parameters.vivoFlow, 'none'),or(eq(variables['Build.SourceBranchName'], 'master'),eq(variables['Build.SourceBranchName'], 'main'),startsWith(variables['Build.SourceBranchName'], 'release/'),contains(parameters.vivoFlow, variables['Build.SourceBranchName']))))}}:
+    
+    - task: Bash@3
+      displayName: 'Set SCA Docker Variables'
+      inputs:
+        targetType: inline
+        script: |
+          echo "##vso[task.setvariable variable=DT_SCA_ENDPOINT]https://sca.redecorp.br/api"
+          echo "##vso[task.setvariable variable=DT_APP_DEFAULT_NAME]$(System.TeamProject)-$(Build.Repository.Name)"
+          echo "##vso[task.setvariable variable=DT_APP_DEFAULT_VERSION]DevSecOps"
+          
+          echo "Security variables for this job have been set."
+
+    ## -> Download Security Tokens
+    - task: AzureKeyVault@2
+      displayName: 'Getting AKV Security Credentials'
+      timeoutInMinutes: 1
+      retryCountOnTaskFailure: 5
+      inputs:
+        azureSubscription: DevOpsSharedResources
+        KeyVaultName: $(AKV_DEVOPS_NAME)
+        SecretsFilter: 'CONVISO-API-KEY, DEPENDENCY-TRACK-TOKEN'
+      condition: and(eq(variables['DEPENDENCY-TRACK-TOKEN'], ''), eq(variables['CONVISO-API-KEY'], ''))
+
+    ## -> Syft Install
+    - task: SyftInstall@1
+      displayName: Install Syft
+      condition: eq(variables.USE_DT_DOCKER, 'true')
+      inputs:
+        mode: custom
+        useCache: true
+        version: 1.19.0
+
+    ## -> Get Service Connection
+    - task: LoadEndpointDockerRegistryFromVivo@4
+      name: docker_endpoint
+      displayName: 'Loading Docker Registry'  
+      condition: eq(variables.USE_DT_DOCKER, 'true')
+      inputs:
+        endpoint: $(DOCKER_DEFAULT_REGISTRY_SERVICE_CONNECTION_NAME)
+        authParamsFilter: 'REGISTRY'
+
+    ## -> Remove HTTPS:// from Docker Registry
+    - task: NunjucksInline@4
+      condition: eq(variables.USE_DT_DOCKER, 'true')
+      displayName: 'Generating Image Source for SCA Scan' 
+      inputs:
+        sourceType: 'text'
+        source: |
+          var DOCKER_REGISTRY = {{"$(docker_endpoint.AUTH_REGISTRY)" | replace(r/https?:\/\//, '')}}
+
+    ## -> Generates SBOM from Docker image    
+    - task: GenerateSbomSyft@1
+      displayName: 'Generating SBOM with Syft'
+      condition: eq(variables.USE_DT_DOCKER, 'true')
+      inputs:
+        useDockerImage: true
+        reportPath: "cyclonedx_report.json"
+        imageSource: ${{ parameters.imageSource }}
+      
+    ## -> Validates whether the image scan occurred normally and the SBOM was generated
+    - task: Bash@3
+      displayName: 'Validating SCAN'
+      condition: eq(variables.USE_DT_DOCKER, 'true')
+      env:
+        DT_APP_DEFAULT_NAME: "$(System.TeamProject)-$(Build.Repository.Name)"
+      inputs:
+        workingDirectory: '$(Build.SourcesDirectory)'
+        targetType: inline
+        script: |
+
+          echo "##[debug] Project name: $(DT_APP_DEFAULT_NAME)"
+          echo "##[debug] Project version: ${{ parameters.appVersion }}"          
+          echo "##[debug] Report Path: cyclonedx_report.json"
+          if [ -e "cyclonedx_report.json" ]; then
+            echo "##[debug] Scan completed."
+          else
+            echo "##[debug] Scan fail."
+            exit 1
+          fi
+
+    ## ->  Uploading SBOM to DT
+    - task: UploadSbomDT@1
+      name: upload_sbom
+      displayName: 'Uploading SBOM to DT'
+      condition: eq(variables.USE_DT_DOCKER, 'true')
+      env:
+        DT_SCA_ENDPOINT: "https://sca.redecorp.br/api"
+        DT_APP_DEFAULT_NAME: "$(System.TeamProject)-$(Build.Repository.Name)"
+      inputs:
+        projectName: '$(DT_APP_DEFAULT_NAME)'
+        projectVersion: '${{ parameters.appVersion }}'
+        cacorpLocation: '$(CACORP_LOCATION)'
+        dtScaEndpoint: '$(DT_SCA_ENDPOINT)'
+        dtScaToken: '$(DEPENDENCY-TRACK-TOKEN)'
+        reportPath: 'cyclonedx_report.json'
+        sbomTokenVariable: 'SBOM_TOKEN'
+
+    ## ->  Monitoring synchronization with DT
+    - task: AnalysisSbomDT@1
+      name: analysis_sbom
+      displayName: 'Analysing SBOM'
+      condition: eq(variables.USE_DT_DOCKER, 'true')
+      inputs:
+        cacorpLocation: '$(CACORP_LOCATION)'
+        dtScaEndpoint: '$(DT_SCA_ENDPOINT)'
+        dtScaToken: '$(DEPENDENCY-TRACK-TOKEN)'
+        sbomToken: $(upload_sbom.SBOM_TOKEN)
+        maxAttempts: 20
+        retryInterval: 15
+
+    ## -> Getting project ID and parameters from Security Gate. 
+    ## -> Critical and/or high new vulnerabilities should be equal to 0
+    - task: GetProjectDT@1
+      name: get_projetct_id
+      displayName: 'Retriving project ID'
+      condition: eq(variables.USE_DT_DOCKER, 'true')
+      env:
+        DT_SCA_ENDPOINT: "https://sca.redecorp.br/api"
+        DT_APP_DEFAULT_NAME: "$(System.TeamProject)-$(Build.Repository.Name)"
+      inputs:
+        projectName: '$(DT_APP_DEFAULT_NAME)'
+        projectVersion: ${{ parameters.appVersion }}
+        cacorpLocation: '$(CACORP_LOCATION)'
+        dtScaEndpoint: '$(DT_SCA_ENDPOINT)'
+        dtScaToken: '$(DEPENDENCY-TRACK-TOKEN)'
+        projectIdVariable: 'PROJECT_ID'
+        gateValidationVariable: 'GATE_VALIDATION'
+
+    ## -> Retriving SBOM Token and Moving SBOM to Artifacts Directory
+    - task: Bash@3
+      displayName: 'Moving SBOM'
+      condition: eq(variables.USE_DT_DOCKER, 'true')
+      inputs:
+        targetType: inline
+        script: |
+          echo "##[debug] SBOM token: $(upload_sbom.SBOM_TOKEN)"
+          mv cyclonedx_report.json $(Build.ArtifactStagingDirectory)/  
+
+    - task: PublishBuildArtifacts@1
+      displayName: "Publishing SBOM"
+      condition: eq(variables.USE_DT_DOCKER, 'true')
+      inputs:
+        pathToPublish: "$(Build.ArtifactStagingDirectory)/cyclonedx_report.json"
+        artifactName: "sbom-docker"
+
+    - task: convisoAzureSyncTask@1
+      displayName: "Conviso Sync"
+      condition: and( eq(variables.USE_CONVISO, 'true'), eq(variables.USE_DT_DOCKER, 'true'))
+      continueOnError: true
+      inputs:
+        API_KEY: "$(CONVISO-API-KEY)"
+        PROJECT_ID: "$(get_projetct_id.PROJECT_ID)"
+        INTEGRATION: "DEPENDENCY_TRACK"
+        COMPANY_ID: ${{ parameters.convisoCompany }}
+
+    - task: Bash@3
+      displayName: "Evaluate Security Gate"
+      condition: and( eq(variables.SKIP_SECURITY_GATE_SCA, 'false'), eq(variables.USE_DT_DOCKER, 'true'))
+      env:
+        SKIP_SECURITY_GATE_SCA: ${{ parameters.skipSecurityGate }} 
+        SG_BLOCK: "$(get_projetct_id.GATE_VALIDATION)"
+      inputs:
+        targetType: 'inline'
+        script: |
+
+          echo "##[debug] SKIP_SECURITY_GATE_SCA: ${SKIP_SECURITY_GATE_SCA}"
+          echo "##[debug] SG_BLOCK: ${SG_BLOCK}"
+
+          if [[ "${SG_BLOCK}" =~ ^(T|t)rue$ ]]; then
+            echo "##[debug] Dependency-Track Project ID: $(get_projetct_id.PROJECT_ID)"
+            echo "##vso[task.logissue type=error;] Security Gate failed because critical and high potential vulnerabilities were found by our security tools in the source code for this project. For more information."
+            echo "##vso[task.logissue type=error;] Check Vivo Appsec team wiki in https://wikicorp.telefonica.com.br/pages/viewpage.action?pageId=524036659 for more details."
+            
+            echo "##[debug] The components listed below contain critical and/or high vulnerabilities and are currently blocking this project's pipeline. Please update them to allow the pipeline to proceed."
+
+            RESPONSE=$(curl -s --cacert ${CACORP_LOCATION} \
+                          -X GET "${DT_SCA_ENDPOINT}/v1/violation/project/$(get_projetct_id.PROJECT_ID)?pageSize=1000" \
+                          -H "X-API-Key: $(DEPENDENCY-TRACK-TOKEN)" \
+                          -H 'Content-Type: application/json')
+
+            echo "$RESPONSE" | jq -r '.[] | select((.analysis.analysisState=="NOT_SET") or (.analysis == null) or (.analysis.analysisState == null)) | "Component: \(.component.name) \nVersion: \(.component.version) \nComponent ID: \(.component.uuid) \nViolation ID: \(.uuid) \n----------------------------------------------"'
+
+            echo "##vso[task.complete result=Failed;]"
+            exit
+          fi
+            
+          echo "##[debug] No critical and high vulnerabilities were found that violate AppSec policies."
+          echo "##[debug] For more information about the process, check Vivo Appsec team wiki in https://wikicorp.telefonica.com.br/pages/viewpage.action?pageId=524036659."
+          
+  - ${{ else }}:
+    - task: Bash@3
+      displayName: 'Security Scan Skipped'
+      inputs:
+        targetType: inline
+        script: |
+          YELLOW='\033[1;33m'
+          BLUE='\033[0;34m'
+          NC='\033[0m' # No Color
+          echo -e "${YELLOW}==================================[ AÇÃO: SCAN IGNORADO (SKIPPED) ]==================================${NC}"
+          echo -e "Modo de Operação Ativo: ${YELLOW}VivoFlow${NC}"
+          echo -e "Branch Atual: ${YELLOW}$(Build.SourceBranchName)${NC}"
+          echo -e "Regras de Validação em Vigor: ${YELLOW}master, main, release/*, ${{ join(', ', parameters.vivoFlow) }}${NC}"
+          echo ""
+          echo -e "${YELLOW}MOTIVO: O scan de segurança foi intencionalmente ignorado pois o branch '$(Build.SourceBranchName)' não corresponde a nenhuma das regras de validação ativas.${NC}"
+          echo ""
+          echo -e "${BLUE}Dica: Se este branch deveria ser validado, acione a Equipe de AppSec appsec_vivo.br@telefonica.com${NC}"
+          echo -e "${YELLOW}====================================================================================================${NC}"

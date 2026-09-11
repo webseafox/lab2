@@ -1,0 +1,213 @@
+parameters:
+  filesPath: ""
+  environmentsObservability: ""
+  cleanEntries: ""
+
+steps:
+  - task: CmdLine@2
+    displayName: "Create History files"
+    inputs:
+      script: |
+        echo "##[debug] FILES PATH ...............................: ${{ parameters.filesPath }}"
+
+        for env in $(echo "${{ parameters.environmentsObservability }}" | tr ',' ' '); do
+          # Convert environment name to uppercase for variable reference
+          env_upper=$(echo "$env" | tr '[:lower:]' '[:upper:]')
+          history_var_name="ERRORS_${env_upper}"
+          history_value=$(eval echo \$${history_var_name})
+          
+          echo ""
+          echo "==================== ${env_upper} ===================="
+
+          # Define history file path for the current environment
+          history_file="${{ parameters.filesPath }}/${env}_history.md"
+
+          # Create history file header if it doesn't exist
+          if [ ! -f "${history_file}" ]; then
+            echo ">> Creating new history file"
+            # Create directory if it doesn't exist
+            mkdir -p "${{ parameters.filesPath }}"
+            {
+            echo "# 📜 Error History - ${env_upper}"
+            echo ""
+            echo "| # | 📅 Data/Hora | 🔢 Build | 🖥️ Nodes | 📦 Pods |"
+            echo "|---|--------------|----------|----------|---------|"
+            } > "${history_file}"
+          fi
+
+          # Limpeza de entradas antigas do histórico SEMPRE
+            if [ -f "${history_file}" ] && [ -n "${{ parameters.cleanEntries }}" ]; then
+              cutoff_date=$(date -d "${{ parameters.cleanEntries }} days ago" '+%d/%m/%Y' 2>/dev/null || date -v-${{ parameters.cleanEntries }}d '+%d/%m/%Y' 2>/dev/null || echo "01/01/2000")
+              cutoff_timestamp=$(date -d "${{ parameters.cleanEntries }} days ago" '+%s' 2>/dev/null || date -v-${{ parameters.cleanEntries }}d '+%s' 2>/dev/null || echo "0")
+              temp_history="/tmp/history_filtered_${env}_$$.md"
+              ENTRIES_BEFORE=$(grep -E '^\|' "${history_file}" | grep -v '^| #' | grep -v '^|---' | wc -l | tr -d ' ')
+              head -n 4 "${history_file}" > "${temp_history}"
+              ENTRIES_REMOVED=0
+              grep -E '^\|' "${history_file}" | grep -v '^| #' | grep -v '^|---' | while IFS= read -r line; do
+                entry_date=$(echo "$line" | cut -d'|' -f3 | cut -d' ' -f2 | tr -d ' ')
+                entry_day=$(echo "$entry_date" | cut -d'/' -f1)
+                entry_month=$(echo "$entry_date" | cut -d'/' -f2)
+                entry_year=$(echo "$entry_date" | cut -d'/' -f3)
+                entry_timestamp=$(date -d "${entry_year}-${entry_month}-${entry_day}" '+%s' 2>/dev/null || echo "$cutoff_timestamp")
+                if [ "$entry_timestamp" -ge "$cutoff_timestamp" ]; then
+                  echo "$line" >> "$temp_history"
+                else
+                  echo ">> Starting old history entries cleanup for ${env_upper} (cutoff: ${{ parameters.cleanEntries }} days)"
+                  echo "    > Removing old history entry: $line"
+                  ENTRIES_REMOVED=$((ENTRIES_REMOVED + 1))
+                fi
+              done
+              mv "$temp_history" "$history_file"
+            fi
+
+          # Validate history_value format and content
+          if [ "${history_value}" = "0,0" ]; then
+            echo "##[section]No errors detected for ${env} - Resetting consecutive failures counter"
+            # Reset consecutive failures counter
+            consecutive_file="${{ parameters.filesPath }}/${env}_consecutive_failures.txt"
+            echo "0|" > "${consecutive_file}"
+            continue
+          fi
+          
+          # Parse nodes and pods from history_value (format: "nodes,pods")
+          node_count=$(echo "${history_value}" | cut -d',' -f1 | tr -d ' ' | grep -E '^[0-9]+$' || echo "0")
+          pod_count=$(echo "${history_value}" | cut -d',' -f2 | tr -d ' ' | grep -E '^[0-9]+$' || echo "0")
+          
+          # Additional safety check - set to 0 if empty or invalid
+          node_count=${node_count:-0}
+          pod_count=${pod_count:-0}
+          
+          # Validate numeric values after parsing
+          if ! [[ "${node_count}" =~ ^[0-9]+$ ]]; then
+            echo "##[warning]Invalid node count after parsing: [${node_count}] - setting to 0"
+            node_count=0
+          fi
+          
+          if ! [[ "${pod_count}" =~ ^[0-9]+$ ]]; then
+            echo "##[warning]Invalid pod count after parsing: [${pod_count}] - setting to 0"
+            pod_count=0
+          fi
+          
+          # Skip if both counts are zero
+          if [ "${node_count}" -eq 0 ] && [ "${pod_count}" -eq 0 ]; then
+            echo "##[section]No errors detected for ${env} (0,0) - Resetting consecutive failures counter"
+            # Reset consecutive failures counter
+            consecutive_file="${{ parameters.filesPath }}/${env}_consecutive_failures.txt"
+            echo "0|" > "${consecutive_file}"
+            continue
+          fi
+
+          echo ">> Updating history file for environment"
+          
+          echo ">> Nodes with issues: ${node_count}"
+          echo ">> Pods with issues: ${pod_count}"
+          
+          # Track consecutive failures (format: count|build1,build2,build3)
+          consecutive_file="${{ parameters.filesPath }}/${env}_consecutive_failures.txt"
+          if [ ! -f "${consecutive_file}" ]; then
+            echo "0|" > "${consecutive_file}"
+          fi
+          
+          # Read current state
+          consecutive_data=$(cat "${consecutive_file}")
+          consecutive_failures=$(echo "$consecutive_data" | cut -d'|' -f1)
+          failed_builds=$(echo "$consecutive_data" | cut -d'|' -f2)
+          
+          consecutive_failures=$((consecutive_failures + 1))
+          current_build="$(Build.BuildNumber)"
+          
+          # Add current build to the list
+          if [ -z "$failed_builds" ]; then
+            failed_builds="$current_build"
+          else
+            failed_builds="${failed_builds} > ${current_build}"
+          fi
+          
+          # Save updated state
+          echo "${consecutive_failures}|${failed_builds}" > "${consecutive_file}"
+          
+          echo ">> Consecutive failures: ${consecutive_failures}/3"
+          echo ">> Failed builds: ${failed_builds}"
+          
+          # Only add to history after 3 consecutive failures
+          if [ "${consecutive_failures}" -lt 3 ]; then
+            echo "##[warning]Issue detected but not adding to history yet (${consecutive_failures}/3 consecutive builds)"
+            continue
+          fi
+          
+          echo "##[section]3 consecutive failures detected - Adding to history"
+          echo ">> Builds with failures: ${failed_builds}"
+          
+          # Reset counter after adding to history
+          echo "0|" > "${consecutive_file}"
+          
+          # Get next order number
+          last_order=$(grep -E '^\|' "${history_file}" | grep -v '^| #' | grep -v '^|---' | tail -n 1 | cut -d'|' -f2 | tr -d ' ' || echo "0")
+          next_order=$((last_order + 1))
+          
+          current_date=$(date '+%d/%m/%Y %H:%M')
+          current_timestamp=$(date '+%s')
+          
+          # Append new entry to existing file (preserving all previous content)
+          echo "| ${next_order} | ${current_date} | $(Build.BuildNumber) | ${node_count} | ${pod_count} |" >> "${history_file}"
+          
+          # Clean up entries older 
+          echo ">> Cleaning up entries older than ${{ parameters.cleanEntries }} days"
+          cutoff_date=$(date -d '${{ parameters.cleanEntries }} days ago' '+%d/%m/%Y' 2>/dev/null || date -v-${{ parameters.cleanEntries }}d '+%d/%m/%Y' 2>/dev/null || echo "01/01/2000")
+          cutoff_timestamp=$(date -d '${{ parameters.cleanEntries }} days ago' '+%s' 2>/dev/null || date -v-${{ parameters.cleanEntries }}d '+%s' 2>/dev/null || echo "0")
+
+          ENTRIES_IN_HISTORY=$(grep -E '^\|' "${history_file}" | grep -v '^| #' | grep -v '^|---' | wc -l | tr -d ' ')
+          ENTRIES_IN_HISTORY=$((ENTRIES_IN_HISTORY - 1))
+          
+          temp_history="/tmp/history_filtered_${env}_$$.md"
+          
+          # Keep header (first 4 lines)
+          head -n 4 "${history_file}" > "${temp_history}"
+          
+          # Filter entries by date
+          grep -E '^\|' "${history_file}" | grep -v '^| #' | grep -v '^|---' | while IFS= read -r line; do
+            entry_date=$(echo "$line" | cut -d'|' -f3 | cut -d' ' -f2 | tr -d ' ')
+
+            if [ "$line" = "| --- | ---------------- | ----------- | -------- | ------- |" ]; then
+              continue
+            fi
+            
+            # Convert entry date to timestamp for comparison
+            entry_day=$(echo "$entry_date" | cut -d'/' -f1)
+            entry_month=$(echo "$entry_date" | cut -d'/' -f2)
+            entry_year=$(echo "$entry_date" | cut -d'/' -f3)
+            
+            # Create timestamp for comparison (handle different date command formats)
+            entry_timestamp=$(date -d "${entry_year}-${entry_month}-${entry_day}" '+%s' 2>/dev/null || \
+                      date -j -f "%Y-%m-%d" "${entry_year}-${entry_month}-${entry_day}" '+%s' 2>/dev/null || \
+                      echo "$cutoff_timestamp")
+
+            if [ "$entry_timestamp" -ge "$cutoff_timestamp" ]; then
+              ENTRIES_IN_HISTORY=$((ENTRIES_IN_HISTORY + 1))
+                      
+              # Recalculate order number for filtered entries
+              new_order=$(grep -E '^\|' "${temp_history}" | grep -v '^| #' | grep -v '^|---' | wc -l | tr -d ' ')
+
+              # Update the order number in the line
+              updated_line=$(echo "$line" | awk -F'|' -v order="$new_order" '{$2=" "order" "; print}' OFS='|')
+
+              echo "$updated_line" >> "${temp_history}"
+            else
+              ENTRIES_CLEANUP=$((ENTRIES_CLEANUP + 1))
+            fi
+          done
+          
+          # Replace history file with filtered version
+          mv "${temp_history}" "${history_file}"
+          
+          # Count total entries in history
+          ENTRIES_IN_NEW_HISTORY=$(grep -E '^\|' "${history_file}" | grep -v '^| #' | grep -v '^|---' | wc -l | tr -d ' ')
+          ENTRIES_IN_NEW_HISTORY=$((ENTRIES_IN_NEW_HISTORY - 1))
+
+          echo "   >> Total entries in history (last ${{ parameters.cleanEntries }} days): ${ENTRIES_IN_NEW_HISTORY}"
+          echo "   >> Total entries removed: $((ENTRIES_IN_HISTORY - ENTRIES_IN_NEW_HISTORY))"
+          
+          echo "##[group]>> History File Content"
+          cat "${history_file}"
+          echo "##[endgroup]"
+        done

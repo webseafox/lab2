@@ -1,0 +1,99 @@
+parameters:
+- name: pythonVersion
+  default: '3.9'
+  values:
+    - "3.7"
+    - "3.9"
+    - "3.10"
+    - "3.11"
+
+- name: updateVersion
+  default: false
+  type: boolean
+
+- name: incrementLevel
+  default: patch
+
+- name: environment
+  type: string
+
+variables:
+- template: /provisioners/app/trunkbased/python/databricks_default/variables/load.yml
+  parameters:
+    updateVersion: ${{ parameters.updateVersion }}
+    pythonVersion: ${{ parameters.pythonVersion }}
+
+resources:
+  repositories:
+    - repository: FortifyExclusion
+      name: DevOps/Vivo.Fortify.Exclusions
+      type: git
+      ref: refs/heads/master
+      endpoint: CorePipelines
+
+stages:
+# CI / CD Flow
+
+## INIT
+- template: /provisioners/app/trunkbased/python/databricks_default/stages/init.yml
+
+- ${{ if or(eq(variables['Build.SourceBranch'], 'refs/heads/main'), eq(variables['Build.SourceBranch'], 'refs/heads/master') ) }}:
+  ## BUMP VERSION
+  - template: /provisioners/app/trunkbased/python/databricks_default/stages/bump_version.yml
+    parameters:
+      incrementLevel: ${{ parameters.incrementLevel }}
+
+  ## BUILD & TEST
+  - template: /provisioners/app/trunkbased/python/databricks_default/stages/build_test.yml
+    parameters:
+      pythonVersion: ${{parameters.pythonVersion}}
+
+  ## GATES
+  - template: /provisioners/app/trunkbased/python/databricks_default/stages/gates.yml
+    parameters:
+      pythonVersion: ${{parameters.pythonVersion}}
+
+  ## SECURITY
+  - template: /provisioners/app/trunkbased/python/databricks_default/stages/security_sast_sca.yml
+    parameters:
+      fortifyExclusionRepository: FortifyExclusion
+
+  ## PACKAGE
+  - template: /provisioners/app/trunkbased/python/databricks_default/stages/package.yml
+    parameters:
+      pythonVersion: ${{parameters.pythonVersion}}
+      incrementLevel: ${{ parameters.incrementLevel }}
+
+  ## VALIDATIONS
+  - template: /provisioners/app/trunkbased/python/databricks_default/stages/validation.yml
+
+  ## DEPLOY
+  - ${{ if or(eq(variables['Build.SourceBranch'], 'refs/heads/main'), eq(variables['Build.SourceBranch'], 'refs/heads/master') ) }}:
+    - template: /provisioners/app/trunkbased/python/databricks_default/stages/deploy.yml
+      parameters:
+        environment: dev
+        gitTag: true
+        pythonVersion: ${{parameters.pythonVersion}}
+        # incrementLevel: ${{ parameters.incrementLevel }}
+
+# Manual Release Flow
+- ${{ if startsWith(variables['Build.SourceBranch'], 'refs/tags/') }}:
+  - template: /provisioners/app/trunkbased/python/databricks_default/stages/release.yml
+    parameters:
+      ${{ if eq(parameters.environment, 'dev') }}:
+        environment: dev
+        pythonVersion: ${{ parameters.pythonVersion }}
+        databricksHost: $(BASE_DATABRICKS_URL_DEV)
+        databricksToken: $(DATABRICKS_TOKEN_DEV)
+
+      ${{ if eq(parameters.environment, 'homologation') }}:
+        environment: homologation
+        pythonVersion: ${{ parameters.pythonVersion }}
+        databricksHost: $(BASE_DATABRICKS_URL_HML)
+        databricksToken: $(DATABRICKS_TOKEN_HML)
+
+      ${{ if eq(parameters.environment, 'production') }}:
+        environment: production
+        pythonVersion: ${{ parameters.pythonVersion }}
+        databricksHost: $(BASE_DATABRICKS_URL_PRD)
+        databricksToken: $(DATABRICKS_TOKEN_PRD)

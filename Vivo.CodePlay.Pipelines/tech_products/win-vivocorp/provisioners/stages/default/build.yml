@@ -1,0 +1,149 @@
+parameters:
+- name: environment
+  type: string
+
+stages:
+- stage: compile
+  displayName: "Compile Siebel"
+  condition: succeeded()
+  dependsOn: ['import_files']
+  pool: $(PollVivoCorpSiebelAgents)
+  jobs:
+  - job: ListSiebdevProcesses
+    displayName: "List Siebdev Processes"
+    condition: eq(stageDependencies.import_files.import_files.outputs['checkSifFiles.sif_found'], 'true')
+    steps:
+    - checkout: none
+    - task: CmdLine@2
+      displayName: "List Siebdev.exe Processes"
+      inputs:
+        script: |
+          echo Listing all siebdev.exe processes...
+          tasklist /fi "imagename eq siebdev.exe"
+
+  - job: GenerateTimestamp
+    displayName: "Generate Timestamp and Start Log"
+    condition: eq(stageDependencies.import_files.import_files.outputs['checkSifFiles.sif_found'], 'true')
+    steps:    
+    - checkout: none
+    - task: CmdLine@2
+      displayName: "Generate Timestamp"
+      inputs:
+        script: |
+          @echo off
+          set datetimei=%date:~-4%_%date:~3,2%_%date:~0,2%_%time:~0,2%_%time:~3,2%_%time:~6,2%
+          set "timestamp=%datetimei: =0%"
+          echo %timestamp% > C:\Siebel_Devops\log\Timestamp_$(environmentNameUpperCase).txt
+          echo Start Compilation > C:\Siebel_Devops\log\Compile_$(environmentNameUpperCase)_%timestamp%.log
+          echo [%timestamp%] Timestamp generated for logging. >> C:\Siebel_Devops\log\Compile_$(environmentNameUpperCase)_%timestamp%.log
+          type  C:\Siebel_Devops\log\Compile_$(environmentNameUpperCase)_%timestamp%.log
+
+  - job: CheckCompilation
+    displayName: "Check if Compilation Should Proceed"
+    condition: eq(stageDependencies.import_files.import_files.outputs['checkSifFiles.sif_found'], 'true')
+    dependsOn: GenerateTimestamp
+    steps:
+    - checkout: none
+    - task: CmdLine@2
+      displayName: "Check nao_compilar.txt"
+      inputs:
+        script: |         
+          for /f %%i in (C:\Siebel_Devops\log\Timestamp_$(environmentNameUpperCase).txt) do set timestamp=%%i
+          set log_path=C:\Siebel_Devops\log\Compile_$(environmentNameUpperCase)_%timestamp%.log
+
+          REM Verificar se o arquivo nao_compilar.txt existe
+          if exist C:\Siebel_Devops\$(environmentNameUpperCase)\temp\nao_compilar.txt (
+              echo [%date% %time%] Não existem objetos para serem compilados. >> %log_path%
+              echo Limpando o diretório temporário... >> %log_path%
+              del "C:\Siebel_Devops\$(environmentNameUpperCase)\temp\*" /f /q
+              del C:\Siebel_Devops\log\Timestamp_$(environmentNameUpperCase).txt
+              type %log_path%
+              exit /b 1
+          ) else (
+              echo [%date% %time%] Existem objetos para serem compilados. >> %log_path%
+              type %log_path%
+          )
+
+  - job: MonitorCompilation
+    displayName: "Run Siebel Compilation and Monitor PID"
+    condition: eq(stageDependencies.import_files.import_files.outputs['checkSifFiles.sif_found'], 'true')
+    # Timeout de 240 minutos (4h) necessário devido à compilação Siebel que pode levar
+    # entre 90-180 minutos em cenários complexos. Baseado em histórico de execuções QA.
+    # Ref: Builds Siebel com múltiplos objetos podem exceder 2h em picos.
+    timeoutInMinutes: 240
+    dependsOn: CheckCompilation
+    steps:
+      - checkout: none
+      - task: PowerShell@2
+        displayName: "Run Siebel Compilation"
+        # Nota: timeout controlado no nível do job (240min)
+        inputs:
+          targetType: inline
+          script: |
+            $log_path = "C:\Siebel_Devops\log\Compile_$(environmentNameUpperCase)_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+
+            # Exibe informações no log do Azure DevOps
+            Write-Host "======================================================================================"
+            Write-Host "=============================== INFORMATIONS ========================================="
+            Write-Host "======================================================================================"
+            Write-Host "=============================== GENERAL INFORMATION ABOUT HOSTS ======================"
+            Write-Host "Siebel Developer Client: $(siebelDeveloperClient)"
+            Write-Host "Configuration file: $(configurationFile)"
+            Write-Host "SRF file path: $(SRFFilePath)"
+            Write-Host "Log path: $log_path"
+            Write-Host "======================================================================================"
+            Write-Host "`n"
+
+            # Log inicio
+            Write-Host "[$(Get-Date)] Starting Siebel process..."
+            Add-Content -Path $log_path -Value "[$(Get-Date)] Starting Siebel process..."
+
+            # Iniciar o processo Siebel usando Start-Process e capturar o PID
+            $process = Start-Process -FilePath $(siebelDeveloperClient) -ArgumentList "/c `"$(configurationFile)`" /s $(environmentNameUpperCase) /u $(siebeluser) /p $(siebelpass) /tl PTB /bc 'Siebel Repository' `"$(SRFFilePath)`"" -PassThru -NoNewWindow
+
+            Start-Sleep -Seconds 2
+
+            if ($process -eq $null) {
+                Write-Host "[$(Get-Date)] Failed to start process."
+                Add-Content -Path $log_path -Value "[$(Get-Date)] Failed to start process."
+                exit 1
+            }
+
+            # Registrar o PID no log
+            $processId = $process.Id
+            Write-Host "[$(Get-Date)] Process started with PID $processId."
+            Add-Content -Path $log_path -Value "[$(Get-Date)] Process started with PID $processId."
+
+            # Monitorar o processo pelo PID
+            Write-Host "[$(Get-Date)] Waiting for process PID $processId to finish..."
+            Add-Content -Path $log_path -Value "[$(Get-Date)] Waiting for process PID $processId to finish..."
+
+            # Monitorar o PID
+            do {
+                $processStatus = Get-Process -Id $processId -ErrorAction SilentlyContinue
+                if ($processStatus) {
+                    Write-Host "[$(Get-Date)] Process is still running... waiting 3 minutes."
+                    Add-Content -Path $log_path -Value "[$(Get-Date)] Process is still running... waiting 3 minutes."
+                    Start-Sleep -Seconds 180
+                } else {
+                    Write-Host "[$(Get-Date)] Process no longer running. Exiting loop."
+                    Add-Content -Path $log_path -Value "[$(Get-Date)] Process no longer running. Exiting loop."
+                    break
+                }
+            } while ($true)
+
+            # Log final
+            Write-Host "[$(Get-Date)] Process PID $processId finished."
+            Add-Content -Path $log_path -Value "[$(Get-Date)] Process PID $processId finished."
+
+  - job: SkipCompilation
+    displayName: "Skip Compilation"
+    condition: ne(stageDependencies.import_files.import_files.outputs['checkSifFiles.sif_found'], 'true')
+    steps:
+    - checkout: none
+    - task: CmdLine@2
+      displayName: "Skip Compilation"
+      inputs:
+        script: |
+          echo No SIF files found. Skipping compilation.
+          echo No SIF files found. Skipping compilation. > C:\Siebel_Devops\log\Compile_$(environmentNameUpperCase)_Skip.log

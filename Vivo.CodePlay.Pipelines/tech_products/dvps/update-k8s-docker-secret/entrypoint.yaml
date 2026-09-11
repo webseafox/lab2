@@ -1,0 +1,145 @@
+parameters:
+  - name: dockerRegistry
+    displayName: 'Docker Registry'
+    type: string
+    default: 'ACR'
+    values:
+      - 'ACR'
+      - 'Nexus'
+  - name: connectionType
+    displayName: "Connection type"
+    type: string
+    default: 'kubeconfig'
+    values:
+      - 'kubeconfig'
+      - 'serviceConnection'
+  - name: kubeconfig
+    displayName: "Kubeconfig"
+    type: string
+  - name: namespace
+    displayName: "Namespace K8s"
+    type: string
+  - name: environment
+    displayName: "Environment"
+    type: string
+    default: dev
+
+variables:
+- template: /global/variables/pipeline.yml@VivoCorePipelines
+  parameters:
+    ACRAsDefaultDockerRegistry: ${{ eq(parameters.dockerRegistry, 'ACR') }}
+- group: "azdo-team-project-variables"
+- ${{ if eq(parameters.environment, 'dev') }}:
+  - name: serviceConnectionDeploySuffix
+    value: dev
+- ${{ elseif in(parameters.environment, 'esteira1', 'esteira2', 'preprod', 'prodlike') }}:
+  - name: serviceConnectionDeploySuffix
+    value: test
+- ${{ elseif eq(parameters.environment, 'producao') }}:
+  - name: serviceConnectionDeploySuffix
+    value: prod
+- ${{ else }}:
+  - name: serviceConnectionDeploySuffix
+    value: dev
+
+resources:
+  repositories:
+    - repository: VivoCorePipelines
+      name: DevOps/Vivo.Core.Pipelines
+      type: git
+      ref: refs/tags/v1
+      endpoint: CorePipelines
+
+jobs:
+- job: updateK8sDockerSecret
+  pool: "GeneralPurposeLinuxAgentsCI"
+  displayName: 'Update K8s Docker Secret'
+  steps:
+  - checkout: none
+
+  - script: |
+      #!/bin/bash
+      set -e
+      echo "Validating connection parameters..."
+      
+      if [ "${{ parameters.connectionType }}" == "kubeconfig" ] && [ "${{ parameters.kubeconfig }}" == "none" ]; then
+        echo "##vso[task.logissue type=error]When connectionType is 'kubeconfig', the kubeconfig parameter must not be 'none'"
+        echo "##vso[task.complete result=Failed;]"
+        exit 1
+      fi
+      
+      if [ "${{ parameters.connectionType }}" == "serviceConnection" ] && { [ -z "$(azureKubernetesClusterPrefix)" ] || [ -z "$(azureResourceGroupPrefix)" ] || [ -z "$(serviceConnectionDeploySuffix)" ] || [ -z "$(azureServiceConnectionPrefix)" ]; }; then
+        echo "##vso[task.logissue type=error]When connectionType is 'serviceConnection', the required Azure connection variables (azureKubernetesClusterPrefix, azureResourceGroupPrefix, serviceConnectionDeploySuffix, azureServiceConnectionPrefix) must be defined"
+        echo "##vso[task.complete result=Failed;]"
+        exit 1
+      fi
+      
+      echo "Connection parameters validation successful"
+    displayName: 'Validate Connection Parameters'
+
+  - template: tasks/azure_key_vault/docker_credentials.yml@VivoCorePipelines
+    parameters:
+      dockerRegistry: '${{ parameters.dockerRegistry }}'
+
+  - script: |
+      #!/bin/bash
+      echo "##[section]Docker Registry Secret Variables"
+      echo "##[command]HELM_IMAGE_PULL_SECRET: $(HELM_IMAGE_PULL_SECRET)"
+      echo "##[command]DOCKER_DEFAULT_REGISTRY: $(DOCKER_DEFAULT_REGISTRY)"
+      echo "##[command]DOCKER_REGISTRY_EMAIL: $(DOCKER_REGISTRY_EMAIL)"
+      
+      echo "##[section]Kubernetes Connection Variables"
+      echo "##[command]Connection Type: ${{ parameters.connectionType }}"
+      if [ "${{ parameters.connectionType }}" == "kubeconfig" ]; then
+        echo "##[command]Using kubeconfig: ${{ parameters.kubeconfig }}"
+      else
+        echo "##[command]Using Service Connection:"
+        echo "##[command]azureServiceConnectionPrefix: $(azureServiceConnectionPrefix)"
+        echo "##[command]serviceConnectionDeploySuffix: $(serviceConnectionDeploySuffix)" 
+        echo "##[command]azureResourceGroupPrefix: $(azureResourceGroupPrefix)"
+        echo "##[command]azureKubernetesClusterPrefix: $(azureKubernetesClusterPrefix)"
+      fi
+      echo "##[command]Namespace: ${{ parameters.namespace }}"
+      echo "##[command]Environment: ${{ parameters.environment }}"
+      echo "##[command]Docker Registry: ${{ parameters.dockerRegistry }}"
+    displayName: 'Display Docker Registry and Kubernetes Variables'
+
+  - ${{ if eq(parameters.connectionType, 'kubeconfig') }}:
+      - template: tasks/artifacts/download_secure_files.yml@VivoCorePipelines
+        parameters:
+          secureFile: '${{parameters.kubeconfig}}'
+
+      - task: CreateDockerRegistryK8sSecret@1
+        displayName: 'Update docker registry secret'
+        inputs:
+          k8sKubeconfig: '$(secureFile.secureFilePath)'
+          k8sNamespace: '${{parameters.namespace}}'
+          k8sSecretName: '$(HELM_IMAGE_PULL_SECRET)'
+          forceDockerK8sSecretCreation: true
+          dockerServer: '$(DOCKER_DEFAULT_REGISTRY)'
+          dockerUsername: '$(DOCKER-REGISTRY-USERNAME)'
+          dockerPassword: '$(DOCKER-REGISTRY-PASSWORD)'
+          dockerEmail: '$(DOCKER_REGISTRY_EMAIL)'
+  - ${{ else }}:
+      - task: Kubernetes@1
+        displayName: 'Delete existing docker secret'
+        inputs:
+          connectionType: 'Azure Resource Manager'
+          azureSubscriptionEndpoint: "$(azureServiceConnectionPrefix)-$(serviceConnectionDeploySuffix)"
+          azureResourceGroup: "$(azureResourceGroupPrefix)-$(serviceConnectionDeploySuffix)"
+          kubernetesCluster: "$(azureKubernetesClusterPrefix)-$(serviceConnectionDeploySuffix)"
+          namespace: '${{ parameters.namespace }}'
+          command: 'delete'
+          arguments: 'secret $(HELM_IMAGE_PULL_SECRET) --ignore-not-found=true'
+
+      - task: Kubernetes@1
+        displayName: 'Create docker secret'
+        inputs:
+          connectionType: 'Azure Resource Manager'
+          azureSubscriptionEndpoint: "$(azureServiceConnectionPrefix)-$(serviceConnectionDeploySuffix)"
+          azureResourceGroup: "$(azureResourceGroupPrefix)-$(serviceConnectionDeploySuffix)"
+          kubernetesCluster: "$(azureKubernetesClusterPrefix)-$(serviceConnectionDeploySuffix)"
+          namespace: '${{ parameters.namespace }}'
+          outputFormat: 'none'
+          command: 'create'
+          arguments: "secret docker-registry $(HELM_IMAGE_PULL_SECRET) --docker-server=$(DOCKER_DEFAULT_REGISTRY) --docker-username=$(DOCKER-REGISTRY-USERNAME) --docker-password=$(DOCKER-REGISTRY-PASSWORD) --docker-email=$(DOCKER_REGISTRY_EMAIL)"

@@ -1,0 +1,1 @@
+FROM vcr-docker.nexus.telefonica.com.br/corp/node/18/builder/corp-node18

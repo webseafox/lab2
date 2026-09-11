@@ -1,0 +1,721 @@
+# ==================================================================
+# Pipeline: CI Build Python Docker - Build, Test & Publish de Imagens Python
+# -----------------------------------------------------
+# Pipeline de CI para bibliotecas Python utilizando Poetry ou UV, Pytest e
+# publicação em Azure Artifacts. Executa instalação de dependências,
+# execução de testes com cobertura, e construção/ publicação de imagem Docker
+# quando aplicável. Mantém versionamento a partir de `pyproject.toml`.
+#
+# NOTAS:
+# - Suporta Poetry (padrão) ou UV como gerenciador de pacotes
+# - A autenticação no Feed é um pouco complexa, olhar pipeline modelo para mais infos.
+# - Poetry: autenticação via variáveis POETRY_HTTP_BASIC_[NOME DO FEED]_PASSWORD
+# - UV: autenticação via UV_INDEX_URL e UV_EXTRA_INDEX_URL
+# - Além disso o pyproject.toml precisa estar configurado corretamente.
+# TODOS:
+# - Inclusão dos estágios de segurança
+# - Inclusão de gates
+# - Mudar versionamento para o Version Manager (commit)
+# ==================================================================
+
+# ==================================================================
+
+parameters:
+  # ==================================================================
+  # Controle de Fluxo e Capacidades
+  # ==================================================================
+  - name: runUnitTest
+    type: boolean
+    default: true
+    displayName: 'Executar testes unitários'
+
+  - name: runQualityGate
+    type: boolean
+    default: true
+    displayName: 'Executar Quality Gate (SonarQube)'
+
+  - name: prValidationOnly
+    type: boolean
+    default: false
+    displayName: 'Executa apenas a validação, não publica nem gera versão'
+  # ==================================================================
+  # Parâmetros de Infraestrutura e Execução
+  # ==================================================================
+  - name: agentPool
+    type: string
+    default: GeneralPurposeLinuxAgentsCI
+    displayName: 'Agent Pool para execução'
+
+  - name: useNetworkProxy
+    type: boolean
+    default: false
+    displayName: 'Configurar proxy de rede para acesso externo (se necessário)'
+
+  # ==================================================================
+  # Configurações de Python / Projeto
+  # ==================================================================
+  - name: packageManager
+    type: string
+    default: 'poetry'
+    displayName: 'Gerenciador de pacotes Python (poetry ou uv)'
+    values:
+      - 'poetry'
+      - 'uv'
+
+  - name: versionFile
+    type: string
+    default: 'pyproject.toml'
+    displayName: 'Arquivo de versionamento (pyproject.toml)'
+
+  - name: branchingStrategy
+    type: string
+    default: 'trunkbased'
+    displayName: 'Estratégia de versionamento'
+    values:
+      - 'trunkbased'
+      - 'vivoflow'
+      - 'releaseflow'
+      - 'gitlabflow'
+      - 'gitlabflow-semantic'
+      - 'custom'
+      - 'monorepo'
+
+  - name: workingDirectory
+    type: string
+    default: $(Build.SourcesDirectory)
+    displayName: 'Diretório do projeto Python'
+
+  - name: coverageSource
+    type: string
+    default: 'src'
+    displayName: 'Diretório fonte para cobertura de código (ex: src)'
+
+  - name: testSetupScript
+    type: string
+    default: ''
+    displayName: 'Caminho opcional para script de setup (ex: src/helper/dev_start.sh) executado antes dos testes'
+
+  - name: publishAllureReport
+    type: boolean
+    default: false
+    displayName: 'Publicar relatório Allure (gerado durante pytest)'
+
+  - name: testAllureResultsDir
+    type: string
+    default: '$(Pipeline.Workspace)/allure-results'
+    displayName: 'Diretório de resultados do Allure (evite Build.SourcesDirectory)'
+
+  # ==================================================================
+  # Configurações de Docker / Imagem
+  # ==================================================================
+  - name: imageName
+    type: string
+    default: '$(SIGLA)/$(Build.Repository.Name)'
+    displayName: 'Nome da imagem Docker'
+
+  - name: dockerfilePath
+    type: string
+    default: 'Dockerfile'
+    displayName: 'Caminho do Dockerfile'
+
+  - name: registryServiceConnection
+    type: string
+    default: 'ACR-DEVOPS'
+    displayName: 'Service Connection do Registry'
+
+# ==================================================================
+# Configurações de Segurança
+# ==================================================================
+  - name: enableFortifyExclusions
+    displayName: 'Faz checkout do repositório Fortify Exclusions'
+    type: boolean
+    default: false
+
+# ==================================================================
+# Configurações do Sonar
+# ==================================================================
+  - name: useSonarConfigFile
+    type: boolean
+    default: true
+    displayName: 'Usar arquivo de configuração do SonarQube?'
+
+  - name: sonarConfigFilePath
+    type: string
+    default: '.azuredevops/sonar-project.properties'
+    displayName: 'Caminho do arquivo de configuração do SonarQube'
+
+  - name: sonarPollingTimeoutSec
+    type: string
+    default: '300'
+    displayName: 'Timeout do Polling SonarQube (s)'
+
+  - name: sonarJavaVersion
+    type: string
+    default: 'openjdk-17.0.2'
+    displayName: 'Versão do Java para análise SonarQube'
+    values:
+      - 'openjdk-21.0.2'
+      - 'openjdk-17.0.2'
+      - 'openjdk-11.0.2'
+
+  # ==================================================================
+  # Service Connection do SonarQube
+  # Hoje ainda permite referenciar manualmente o Sonar VIP ou comum.
+  # Será depreciado em breve (história futura) para aderir à governança da ADR 0006.
+  # ==================================================================
+  - name: sonarServiceConnection
+    type: string
+    default: 'VIVO_SONARQUBE'
+    displayName: '(DEPRECATED) Service Connection do SonarQube'
+
+  - name: sonarQualityGate
+    type: string
+    default: 'AzureDevOps-Default'
+    displayName: 'Quality Gate do SonarQube'
+
+  - name: sonarScannerMode
+    type: string
+    default: 'cli'
+    displayName: 'Modo de execução do scanner SonarQube para análise de código (cli recomendado para Python)'
+    values:
+      - 'cli'
+      - 'dotnet'
+
+  - name: sonarProjectKey
+    type: string
+    default: '$(System.TeamProject)-$(Build.Repository.Name)'
+    displayName: 'Chave única do projeto no SonarQube formada pela combinação do projeto e repositório'
+
+  - name: sonarProjectName
+    type: string
+    default: '$(System.TeamProject)-$(Build.Repository.Name)'
+    displayName: 'Nome descritivo do projeto no SonarQube usado para identificação na interface'
+
+# ==================================================================
+# Configurações de App Configuration
+# ==================================================================
+  - name: useAppConfig
+    type: boolean
+    default: true
+    displayName: 'Usar Azure App Configuration para SonarQube'
+
+# ==================================================================
+# Variáveis Internas do Pipeline
+# ==================================================================
+variables:
+  - name: SIGLA
+    value: $[ lower(split(variables['System.TeamProject'],' ')[0]) ]
+  - name: DEFAULT_FEED_NAME
+    value: $[ upper(variables['SIGLA']) ]
+
+  # Variáveis utilizadas por templates de Segurança (Fortify/SCA)
+  - name: CACORP_LOCATION
+    value: $(Agent.HomeDirectory)/../../certs/CACORP.pem
+  - name: FORTIFY_APP_DEFAULT_VERSION
+    value: DevSecOps
+  - name: APP_LANGUAGE
+    value: 'other'
+
+  # - TMPDIR: impede que Python/Poetry use /tmp do sistema operacional
+  # $(Agent.TempDirectory) → ex: /home/vsts/work/_temp  (limpo entre jobs pelo Azure DevOps)
+  - name: TMPDIR
+    value: $(Agent.TempDirectory)
+
+  # Poetry: redireciona cache para o diretório oficial do agente
+  # - POETRY_CACHE_DIR: cache de pacotes em $(Agent.TempDirectory) (/home/vsts/work/_temp), não em ~/
+  - name: POETRY_CACHE_DIR
+    value: $(Agent.TempDirectory)/poetry
+  
+  # UV: configuração de cache e diretórios
+  # - UV_CACHE_DIR: diretório de cache do UV
+  # - UV_PROJECT_ENVIRONMENT: localização do ambiente virtual
+  - name: UV_CACHE_DIR
+    value: $(Agent.TempDirectory)/uv
+  - name: UV_PROJECT_ENVIRONMENT
+    value: .venv
+
+  - name: DOCKER_SERVICE_CONNECTION
+    value: ${{ parameters.registryServiceConnection }}
+
+  # Configurações de KeyVault para Segurança
+  - name: AKV_DEVOPS_NAME
+    value: 'kv-azdevops-shared'
+
+  # Variables for Proxy
+  - name: PROXY_NSKP_SERVER
+    value: "nskp.redecorp.br:8080"
+  - name: PROXY_SQUID_SERVER
+    value: "10.240.58.39:3128"
+  - name: PROXY_AGENT_HTTP
+    value: "http://$(PROXY_NSKP_SERVER)"
+  - name: PROXY_AGENT_HTTPS
+    value: "http://$(PROXY_NSKP_SERVER)"
+  - name: PROXY_AGENT_NO_PROXY
+    value: "localhost,0.0.0.0,127.0.0.1,10.244.0.0/16,192.168.0.0/16,10.129.178.173,nexus.telefonica.com.br,acrsharedservices01.azurecr.io,appcs-azdevops-shared.azconfig.io,scm.azurewebsites.net"
+
+# ==================================================================
+# Estágios do Pipeline
+# ==================================================================
+stages:
+# ==================================================================
+# Stage 1: PythonBuild - Instalação, Testes e Análise de Qualidade
+# Descrição: Instala dependências com Poetry, executa testes unitários (Pytest),
+#            gera relatório de cobertura (Coverage.py) e executa análise SonarQube
+# ==================================================================
+  - stage: PythonBuild
+    displayName: 'Build e Testes Python'
+    condition: succeeded()
+    jobs:
+      - job: PythonBuild
+        displayName: 'Build e Testes'
+        pool: ${{ parameters.agentPool }}
+        steps:
+          # ------------------------------------------------------------------
+          # Configuração inicial do job
+          # - Checkout do repositório
+          # - Exibição de parâmetros (modo debug)
+          # ------------------------------------------------------------------
+          - checkout: self
+
+          # AVISO TEMPORÁRIO: Este bloco será removido após a remoção definitiva do parâmetro 'sonarServiceConnection'.
+          # Exibe warning para quem ainda sobrescreve manualmente o parâmetro.
+          - ${{ if ne(parameters.sonarServiceConnection, 'VIVO_SONARQUBE') }}:
+            - script: |
+                echo "##vso[task.logissue type=warning]O parâmetro 'sonarServiceConnection' está depreciado e será removido após 30/06/2026. Consulte ADR 0006 e ADR 0008 para detalhes. A escolha da instância Sonar será automática via custom task e vip.json. Atualize seu pipeline!"
+                echo "##vso[task.logissue type=warning]ADR 0006: https://dev.azure.com/telefonica-vivo-brasil/DevOps/_git/Vivo.CodePlay.Pipelines?path=/doc/adr/0006-uso-do-sonar.md"
+                echo "##vso[task.logissue type=warning]ADR 0008: https://dev.azure.com/telefonica-vivo-brasil/DevOps/_git/Vivo.CodePlay.Pipelines?path=/framework/docs/adr/0008-sonar-vip-governance.md"
+                echo "##vso[task.complete result=SucceededWithIssues;]"
+              displayName: '⚠️ AVISO: Depreciação do sonarServiceConnection'
+
+          # ==================================================================
+          # Observabilidade e Diagnóstico
+          # ==================================================================
+          - task: VivoUtilsFromVivo@1
+            displayName: 'Show Pipeline Parameters'
+            condition: eq(variables['System.Debug'], 'true')
+            inputs:
+              command: 'show-pipeline-parameters'
+              parameters: '${{ convertToJson(parameters) }}'
+
+          # ==================================================================
+          # [Compliance] Verifica se o repositório está em conformidade com as políticas de configuração
+          # ==================================================================
+          - task: VivoDevOpsConfigCompliance@1
+            displayName: 'Check DevOps Config Compliance'
+            inputs:
+              workDir: ${{ parameters.workingDirectory }}
+              policySets: |
+                image-definition-files
+
+          # ==================================================================
+          # [Versionamento] Definição da versão (VersionManager)
+          # ==================================================================
+          - task: VersionManagerVivo@8
+            displayName: 'Next version'
+            inputs:
+              command: 'nextVersion'
+              branchingStrategy: ${{ parameters.branchingStrategy }}
+              versionFile: '${{ parameters.workingDirectory }}/${{ parameters.versionFile }}'
+              bumpMethod: 'patch'
+              passthroughVersion: ${{ parameters.prValidationOnly }}
+            name: VersionManagerVivo
+
+          - ${{ if eq(parameters.packageManager, 'poetry') }}:
+            # ------------------------------------------------------------------
+            # Instalação de dependências (ambiente de build e dependências do projeto)
+            # - Atualiza pip e instala Poetry
+            # - Configura variáveis de autenticação para Azure Artifacts
+            # ------------------------------------------------------------------
+            - script: |
+                export PIP_INDEX_URL="https://AzureDevOps:${AZDO_FEED_PASSWORD}@pkgs.dev.azure.com/telefonica-vivo-brasil/_packaging/DevOps/pypi/simple/"
+
+                python -m pip install --upgrade pip
+                pip install poetry
+              displayName: 'Instalar Poetry e dependências (ferramentas)'
+              env:
+                AZDO_FEED_PASSWORD: $(System.AccessToken) # Token do sistema para autenticação no Azure Artifacts
+
+
+            - script: |
+                export POETRY_HTTP_BASIC_$(DEFAULT_FEED_NAME)_USERNAME='AzureDevOps' # Nome de usuário fixo para Azure Artifacts
+                export POETRY_HTTP_BASIC_$(DEFAULT_FEED_NAME)_PASSWORD="${AZDO_FEED_PASSWORD}"
+                # Para libs no feed compartilhado do DevOps
+                export POETRY_HTTP_BASIC_DEVOPS_USERNAME='AzureDevOps' # Nome de usuário fixo para Azure Artifacts
+                export POETRY_HTTP_BASIC_DEVOPS_PASSWORD="${AZDO_FEED_PASSWORD}"
+
+                # Garante configurações globais do Poetry para criar virtualenvs no projeto
+                poetry config virtualenvs.create true
+                poetry config virtualenvs.in-project true
+
+                poetry install
+              displayName: 'Instalar dependências do projeto'
+              workingDirectory: ${{ parameters.workingDirectory }}
+              env:
+                AZDO_FEED_PASSWORD: $(System.AccessToken) # Token do sistema para autenticação no Azure Artifacts
+
+
+          - ${{ if eq(parameters.packageManager, 'uv') }}:       
+            # ------------------------------------------------------------------
+            # Instalação de dependências (ambiente de build e dependências do projeto)
+            # - Atualiza pip e instala Poetry ou UV
+            # - Configura variáveis de autenticação para Azure Artifacts
+            # ------------------------------------------------------------------
+            - script: |
+                export PIP_INDEX_URL="https://AzureDevOps:${AZDO_FEED_PASSWORD}@pkgs.dev.azure.com/telefonica-vivo-brasil/_packaging/DevOps/pypi/simple/"
+
+                python -m pip install --upgrade pip
+                echo "##[section] Instalando UV"
+                pip install uv
+              displayName: 'Instalar gerenciador de pacotes (${{ parameters.packageManager }})'
+              env:
+                AZDO_FEED_PASSWORD: $(System.AccessToken) # Token do sistema para autenticação no Azure Artifacts
+
+            - script: |
+                echo "##[section] Instalando dependências com UV"
+                # Configurar autenticação para UV
+                export UV_INDEX_URL="https://AzureDevOps:${AZDO_FEED_PASSWORD}@pkgs.dev.azure.com/telefonica-vivo-brasil/_packaging/DevOps/pypi/simple/"
+                export UV_EXTRA_INDEX_URL="https://AzureDevOps:${AZDO_FEED_PASSWORD}@pkgs.dev.azure.com/telefonica-vivo-brasil/_packaging/$(DEFAULT_FEED_NAME)/pypi/simple/"
+                uv sync
+              displayName: 'Instalar dependências do projeto'
+              workingDirectory: ${{ parameters.workingDirectory }}
+              env:
+                AZDO_FEED_PASSWORD: $(System.AccessToken) # Token do sistema para autenticação no Azure Artifacts
+
+          # ------------------------------------------------------------------
+          # Testes e cobertura
+          # - Executa pytest com cobertura e gera relatórios JUnit/XML
+          # ------------------------------------------------------------------
+          - ${{ if eq(parameters.runUnitTest, true) }}:
+            - script: |
+                if [ -n "${{ parameters.testSetupScript }}" ] && [ -f "${{ parameters.testSetupScript }}" ]; then
+                  echo "Sourcing test setup script: ${{ parameters.testSetupScript }}"
+                  source ${{ parameters.testSetupScript }}
+                elif [ -n "${{ parameters.testSetupScript }}" ]; then
+                  echo "##[warning]Test setup script not found: ${{ parameters.testSetupScript }}"
+                fi
+                
+                # Habilita a geração de resultados do Allure somente quando o report for publicado.
+                # Requer o plugin 'allure-pytest' declarado nas dependências do projeto (pyproject.toml).
+                ALLURE_ARGS=""
+                if [ "${PUBLISH_ALLURE,,}" = "true" ]; then
+                  echo "##[section] Geração de resultados do Allure habilitada em: ${ALLURE_RESULTS_DIR}"
+                  mkdir -p "${ALLURE_RESULTS_DIR}"
+                  ALLURE_ARGS="--alluredir=${ALLURE_RESULTS_DIR}"
+                fi
+
+                if [[ "${{ parameters.packageManager }}" == "poetry" ]]; then
+                  echo "##[section] Executando testes com Poetry"
+                  poetry run pytest --cov=${COVERAGE_SOURCE} --cov-report=xml:test-results/coverage.xml --cov-report=term-missing --junitxml=test-results/junit.xml ${ALLURE_ARGS}
+                elif [[ "${{ parameters.packageManager }}" == "uv" ]]; then
+                  echo "##[section] Executando testes com UV"
+                  uv run pytest --cov=${COVERAGE_SOURCE} --cov-report=xml:test-results/coverage.xml --cov-report=term-missing --junitxml=test-results/junit.xml ${ALLURE_ARGS}
+                fi
+              workingDirectory: ${{ parameters.workingDirectory }}
+              displayName: 'Executar testes e gerar cobertura'
+              env:
+                COVERAGE_SOURCE: ${{ parameters.coverageSource }}
+                PUBLISH_ALLURE: ${{ parameters.publishAllureReport }}
+                ALLURE_RESULTS_DIR: ${{ parameters.testAllureResultsDir }}
+            
+            - task: PublishTestResults@2
+              inputs:
+                testResultsFiles: '**/junit.xml'
+                testRunTitle: 'Resultados dos testes Python'
+                searchFolder: '${{ parameters.workingDirectory }}/test-results'
+              condition: succeededOrFailed()
+              displayName: 'Publicar resultados dos testes'
+
+            - task: PublishCodeCoverageResults@2
+              inputs:
+                summaryFileLocation: '**/coverage.xml'
+                pathToSources: '${{ parameters.workingDirectory }}'
+              condition: succeededOrFailed()
+              displayName: 'Publicar cobertura de código'
+
+          - ${{ if eq(parameters.publishAllureReport, true) }}:
+            # ==================================================================
+            # CAPACIDADE: ALLURE REPORT (condicional publishAllureReport)
+            # Pré-requisitos:
+            #   - Os resultados do Allure são gerados durante a execução de pytest
+            #   - Dependências: allure-pytest
+            #   - Extensão Allure instalada na Org (task PublishAllureReport@2)
+            # ==================================================================
+            - task: PublishAllureReport@2.1.4
+              displayName: 'Publish Allure Report'
+              condition: succeededOrFailed()
+              inputs:
+                testResultsDir: '${{ parameters.testAllureResultsDir }}'
+
+          #############################################################################
+          # CAPACIDADE: QUALITY GATE (SONARQUBE)
+          #############################################################################
+          # Descrição: Análise estática de código e quality gate
+          # Documentação: https://dvps.redecorp.azr/portal/codeplay/capacidades/catalog/quality-gate
+          # Pré-requisitos:
+          #   - Service Connection 'SonarQube' configurada
+          #   - Projeto configurado no SonarQube
+          #   - Quality Gate definido no SonarQube
+          # Configuração: Parâmetro 'runQualityGate' = true
+          # Observações: Não executa em Pull Requests
+          #############################################################################
+          - ${{ if eq(parameters.runQualityGate, true) }}:
+            # ==================================================================
+            # [SonarQube] Análise Completa de Qualidade de Código
+            # ==================================================================
+            - task: SonarAnalysisFromVivo@4
+              displayName: 'SonarQube Full Analysis'
+              inputs:
+                command: 'analysis'
+                SonarQubeVip: 'VIVO_SONARQUBE_VIP'
+                SonarQube: 'VIVO_SONARQUBE'
+                scannerMode: ${{ parameters.sonarScannerMode }}
+                ${{ if eq(parameters.useSonarConfigFile, true) }}:
+                  configFile: ${{ parameters.sonarConfigFilePath }}
+                cliProjectKey: ${{ parameters.sonarProjectKey }}
+                cliProjectName: ${{ parameters.sonarProjectName }}
+                cliProjectVersion: $(VersionManagerVivo.VERSION)
+                qualityGate: ${{ parameters.sonarQualityGate }}
+                acronym: $(SIGLA)
+                reportPath: '$(Agent.TempDirectory)/sonar/$(Build.BuildId)/report-task.txt'
+                pollingTimeoutSec: ${{ parameters.sonarPollingTimeoutSec }}
+                useOpaRepository: 'true'
+                codePlayServiceConnection: 'CodePlay'
+                opaProject: 'DVPS - DEVOPS'
+                opaRepository: 'Vivo.OpenPolicy.SonarQube'
+                opaBranch: 'master'
+                useAppConfig: ${{ parameters.useAppConfig }}
+                azureSubscription: DevOpsSharedResources
+                appConfigurationEndpoint: https://appcs-azdevops-shared.azconfig.io
+                sonarUrlPemCertificate: $(Agent.HomeDirectory)/../../certs/CACORP.pem
+                extraProperties: |
+                  sonar.python.coverage.reportPaths=${{ parameters.workingDirectory }}/test-results/coverage.xml
+                  sonar.sources=${{ parameters.workingDirectory }}/${{ parameters.coverageSource }}
+                  sonar.python.version=3.x
+                  sonar.scanner.metadataFilePath=$(Agent.TempDirectory)/sonar/$(Build.BuildId)/report-task.txt
+                  sonar.qualitygate.wait=false
+                  sonar.coverage.jacoco.xmlReportPaths=${{ parameters.workingDirectory }}/test-results/junit.xml
+                  sonar.qualitygate.timeout=${{ parameters.sonarPollingTimeoutSec }}
+                  sonar.verbose=${SYSTEM_DEBUG,,}
+              env:
+                ASDF_JAVA_VERSION: ${{ parameters.sonarJavaVersion }}
+
+          # ==================================================================
+          # Publicação de Artefatos da Aplicação
+          # ==================================================================
+          - script: |
+              rsync -av \
+                --exclude='.venv' \
+                ${{ parameters.workingDirectory }}/ \
+                $(Build.ArtifactStagingDirectory)/python-application-context/
+            displayName: 'Prepare Application Files (rsync)'
+            condition: succeeded()
+
+          - task: PublishPipelineArtifact@1
+            displayName: 'Publish Python Application Artifacts'
+            condition: succeeded()
+            inputs:
+              targetPath: '$(Build.ArtifactStagingDirectory)/python-application-context'
+              artifact: 'python-application-artifacts'
+              publishLocation: 'pipeline'
+
+  # ==================================================================
+  # Stage 2: SecurityAnalysis - Análise de Segurança SAST
+  # Descrição: Executa análise de segurança estática (SAST) com Fortify ScanCentral.
+  #            Gates de segurança (bloqueio ou não do pipeline) são realizados pelo
+  #            time de AppSec via chaves de configuração recuperadas do AppConfig corporativo.
+  # ==================================================================
+  - stage: SecurityAnalysis
+    displayName: 'Security Analysis'
+    dependsOn:
+    - PythonBuild
+    condition: succeeded()
+    jobs:
+
+    - job: AppSecConfigKeys
+      displayName: 'Get AppSec Config Keys'
+      pool: ${{ parameters.agentPool }}
+      steps:
+      - template: /security/get_appconfig_keys_framework.yml
+        parameters:
+          azureSubscription: DevOpsSharedResources
+          appConfigurationEndpoint: https://appcs-azdevops-shared.azconfig.io
+          useNetworkProxy: ${{ parameters.useNetworkProxy }}
+
+    # ==================================================================
+    # CAPACIDADE: FORTIFY SCAN (SAST)
+    # ==================================================================
+    # Descrição: Análise estática de código (SAST) usando Fortify ScanCentral e SSC, com integração à Conviso e publicação de artefatos.
+    # Documentação: https://dvps.redecorp.azr/portal/codeplay/capacidades/catalog/sast
+    # Observações: Exporta variáveis e publica artefatos para uso no Security Gate.
+    # ==================================================================
+
+    - job: FortifyScan
+      displayName: 'Fortify Scan'
+      dependsOn: 
+      - AppSecConfigKeys
+      variables:
+        USE_FORTIFY: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.USE_FORTIFY'] ]
+        USE_CONVISO: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.USE_CONVISO'] ]
+        SKIP_SECURITY_GATE: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.SKIP_SECURITY_GATE'] ]
+        FORTIFY_LOCAL_SCANCENTRAL_VERSION: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.FORTIFY_LOCAL_SCANCENTRAL_VERSION'] ]
+      condition: and(succeeded(), eq(variables.USE_FORTIFY, true))
+      pool: ${{ parameters.agentPool }}
+      steps:
+
+      - template: /security/define_appsec_app_version.yml
+
+      - template: /security/run_fortify_scan.yml
+        parameters:
+          fortifyExclusionRepository: 'FortifyExclusion'
+          enableFortifyExclusions:  ${{ parameters.enableFortifyExclusions }}
+          appLanguage: 'other'
+          appVersion: "$(FORTIFY_APP_VERSION)" # OBS: A variável FORTIFY_APP_VERSION é definida no template /security/define_appsec_app_version.yml
+
+  # ==================================================================
+  # Stage 3: DockerBuild - Construção da Imagem Docker
+  # Descrição: Baixa artefatos, constrói imagem Docker com aplicação,
+  #            executa análise SCA (Dependency Track) se habilitado pelo AppSec
+  #            e publica no Azure Container Registry
+  # ==================================================================
+  - stage: DockerBuild
+    displayName: 'Docker Build'
+    dependsOn: 
+    - SecurityAnalysis
+    condition: succeeded()
+    jobs:          
+    # ==================================================================
+    # Job 3.1: DockerBuild - Construção e Publicação da Imagem Docker
+    # Descrição: Baixa artefatos, copia para contexto Docker, constrói e publica imagem
+    # ==================================================================
+    - job: DockerBuild
+      displayName: 'Build Docker Image'
+      pool: ${{ parameters.agentPool }}
+      variables:
+        USE_DT_DOCKER: $[ stageDependencies.SecurityAnalysis.AppSecConfigKeys.outputs['evaluate_flags.USE_DT_DOCKER'] ]
+        USE_CONVISO: $[ stageDependencies.SecurityAnalysis.AppSecConfigKeys.outputs['evaluate_flags.USE_CONVISO'] ]
+        SKIP_SECURITY_GATE_SCA: $[ stageDependencies.SecurityAnalysis.AppSecConfigKeys.outputs['evaluate_flags.SKIP_SECURITY_GATE_SCA'] ]
+      steps:
+      # ==================================================================
+      # [Configuração Inicial] Checkout e Download de Artefatos
+      # ==================================================================
+      - checkout: self
+
+      - task: DownloadPipelineArtifact@2
+        displayName: 'Download Python Application Artifacts'
+        inputs:
+          buildType: 'current'
+          artifactName: 'python-application-artifacts'
+          targetPath: '$(System.ArtifactsDirectory)/python-application-artifacts'
+
+      # ==================================================================
+      # [Versionamento] Definição da versão (VersionManager)
+      # ==================================================================
+      - task: VersionManagerVivo@8
+        displayName: 'Next version'
+        inputs:
+          command: 'nextVersion'
+          branchingStrategy: ${{ parameters.branchingStrategy }}
+          versionFile: '${{ parameters.workingDirectory }}/${{ parameters.versionFile }}'
+          bumpMethod: 'patch'
+          passthroughVersion: ${{ parameters.prValidationOnly }}
+        name: VersionManagerVivo
+
+      # ==================================================================
+      # [Preparação Docker] Cópia dos Artefatos para Contexto de Build
+      # ==================================================================
+      - task: CopyFiles@2
+        displayName: 'Copy Application Files to Build Context'
+        inputs:
+          sourceFolder: '$(System.ArtifactsDirectory)/python-application-artifacts'
+          contents: '**/*'
+          targetFolder: '${{ parameters.workingDirectory }}'
+          flattenFolders: false
+          overWrite: false  # Não vai sobrescrever os arquivos existentes
+          
+      - script: | 
+          echo "##[group] Docker Build Context"
+          ls -la '${{ parameters.workingDirectory }}'
+          echo "##[endgroup]"
+        condition: eq(variables['System.Debug'], 'true')
+        displayName: 'Show Docker Build Context'
+
+      # ==================================================================
+      # [Docker Build & Push] Construção da Imagem com Template Central
+      # ==================================================================
+      - ${{ if eq(parameters.prValidationOnly, false) }}:
+        - template: /framework/templates/docker-build-and-push.yaml
+          parameters:
+            imageName: ${{ parameters.imageName }}
+            imageTag: '$(VersionManagerVivo.VERSION)'
+            registryServiceConnection: '${{ parameters.registryServiceConnection }}'
+            pushImage: true
+            buildArgs:
+              - "APPLICATION_NAME=$(Build.Repository.Name)"
+              - "APP_VERSION=$(VersionManagerVivo.VERSION)"
+              - "AZURE_DEVOPS_PAT=$(System.AccessToken)"
+              - "VERSION=$(VersionManagerVivo.VERSION)"
+            dockerfilePath: ${{ parameters.workingDirectory }}/${{ parameters.dockerfilePath }}
+            buildContext: '${{ parameters.workingDirectory }}'
+            loginRegistryServiceConnections:
+            - ${{ parameters.registryServiceConnection }}
+
+  # ==================================================================
+  # Stage 4: VersionCommit - Commit e Tag da Versão de Release
+  # Descrição: Atualiza versão no pyproject.toml, cria commit e tag Git
+  #            Executa apenas na master, quando não é PR de validação e quando Docker push está habilitado
+  # ==================================================================
+  - ${{ if eq(parameters.prValidationOnly, false) }}:
+    - stage: VersionCommit
+      displayName: 'Commit Version'
+      dependsOn:
+      - DockerBuild
+      condition: succeeded()
+      jobs:
+        - job: CommitVersion
+          displayName: 'Commit Release Version'
+          pool: ${{ parameters.agentPool }}
+          steps:
+            # ==================================================================
+            # Checkout para Commit da Versão
+            # ==================================================================
+            - checkout: self
+              clean: true
+              persistCredentials: true
+              fetchDepth: 0
+
+            # ==================================================================
+            # [Versionamento] Reafirma versão e realiza commit/tag
+            # ==================================================================
+            - task: VersionManagerVivo@8
+              displayName: 'Next version'
+              inputs:
+                command: 'nextVersion'
+                branchingStrategy: ${{ parameters.branchingStrategy }}
+                versionFile: '${{ parameters.workingDirectory }}/${{ parameters.versionFile }}'
+                bumpMethod: 'patch'
+              name: VersionManagerVivo
+
+            - task: VersionManagerVivo@8
+              displayName: 'Commit and Tag Version'
+              inputs:
+                command: 'commitVersion'
+                version: '$(VersionManagerVivo.VERSION)'
+                versionFile: ${{ parameters.workingDirectory }}/${{ parameters.versionFile }}
+                createTag: true
+                pushChanges: true
+            
+            # ==============================================================================
+            # [Versionamento] Publica versão de build no Event Hub para rastreabilidade
+            # ==============================================================================
+            - task: VivoEventHubTools@3
+              continueOnError: true
+              displayName: 'Publish Build Event to Event Hub'
+              inputs:
+                command: build
+                eventHubConnection: EVHCodeProd
+                eventHubName: 'govapp.component.build.event'
+                componentProject: $(System.TeamProject)
+                componentName: $(Build.Repository.Name)
+                componentVersion: $(VersionManagerVivo.VERSION)
+                componentBuildId: $(Build.BuildId)
+                componentPipelineUrl: $(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)&view=results

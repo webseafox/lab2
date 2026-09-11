@@ -1,0 +1,415 @@
+
+parameters:
+- name: environment
+  displayName: 'Escolha o ambiente para publicar'
+  type: string
+  default: dev
+  values:
+  - dev
+  - preprod
+  - prod
+
+- name: vivonow_chg
+  displayName: 'Numero CHG do VivoNow, somente para "prod"'
+  default: CHG0000001
+
+variables:
+- name: System.debug
+  value: "true"
+
+stages:
+
+- stage: stage_vivonow_gate
+  displayName: 'VivoNow Gate'
+  pool: GeneralPurposeLinuxAgentsCD
+  variables:
+  - name: System.debug
+    value: "true"
+  jobs:
+  - job: job_vivonow_chg
+    displayName: 'Check on (VivoNow)'
+    continueOnError: False
+    condition: eq('${{ parameters.environment }}', 'prod')
+    steps:
+
+    - task: AxiosFromVivo@4
+      name: vivoNowCHG
+      displayName: "Fetch CHG"
+      inputs:
+        type: 'text'
+        origin: |
+          var options = {
+            method: 'GET',
+            url: 'http://10.41.252.111:9010/vivonow/viewer/${{ parameters.vivonow_chg }}'
+          };
+        variablePrefix: 'VIVO_NOW_CHG_'
+      env:
+        NODE_EXTRA_CA_CERTS: $(CACORP_LOCATION)
+
+    - task: RegexMatch@4
+      displayName: 'Query CHG'
+      inputs:
+        source: $(VIVO_NOW_CHG_BODY)
+        regex: '/(<title>)(.*)(<\/title>)/ig'
+        outVarPrefix: 'CHG_FOUND_'
+
+    - script: exit 1
+      displayName: 'Check CHG'
+      condition: not(variables['CHG_FOUND_HAS_MATCH'])
+
+- stage: stage_govapp_gate
+  displayName: 'GovApp Gate'
+  pool: GeneralPurposeLinuxAgentsCD
+  jobs:
+  - job:
+    displayName: 'Governance Policies Check'
+    continueOnError: False
+    steps:
+    - checkout: self
+
+    - task: XmlParseFromVivo@4
+      displayName: 'Get pom.xml info'
+      inputs:
+        type: 'file'
+        origin: $(Build.SourcesDirectory)/pom.xml
+        jpaths: |
+          var POM_XML_VERSION = .project.version._text
+
+    - task: LoadFile@4
+      inputs:
+        script: |
+          CATALOG_YAML_CONTENT = $(Build.SourcesDirectory)/catalog-info.yaml
+
+    - task: YamlParseFromVivo@4
+      displayName: 'Get Metadata Info'
+      inputs:
+        type: 'file'
+        origin: $(Build.SourcesDirectory)/catalog-info.yaml
+        jpaths: |
+          var CATALOG_YAML_NAME = .metadata.name
+          var CATALOG_YAML_ACRONYM = .metadata.annotations['techarch.governance-app.acronym']
+          var CATALOG_YAML_K8S_NS = .metadata.annotations['vivo.io/kubernetes-k8s-namespace-${{ parameters.environment }}']
+
+    - task: VivoGovernance@1
+      continueOnError: true
+      displayName: 'Governance Validate'
+      inputs:
+        breakglass: false
+        serverEndpoint: 'governanceapi'
+        operation: 'validate'
+        component: $(CATALOG_YAML_NAME)
+        version: $(POM_XML_VERSION)
+        cluster: aks-$(CATALOG_YAML_ACRONYM)-${{ parameters.environment }}
+        namespace: $(CATALOG_YAML_K8S_NS)
+        deployment: $(CATALOG_YAML_NAME)
+        environment: ${{ parameters.environment }}
+        catalogInfo: $(CATALOG_YAML_CONTENT)
+
+- stage:
+  displayName: 'Push to Repositories'
+  pool: GeneralPurposeLinuxAgentsCD
+  jobs:
+  # - job:
+  #   continueOnError: False
+  #   condition: succeeded()
+  #   displayName: 'Push to Nexus'
+  #   # pool: DefaultDevOpsAgents
+  #   pool: GeneralPurposeLinuxAgentsCD
+  #   steps:
+  #   - task: DownloadBuildArtifacts@1
+  #     displayName: 'Get new pom.xml'
+  #     inputs:
+  #       buildType: "current"
+  #       downloadPath: "$(System.ArtifactsDirectory)"
+
+  #   - task: XmlParseFromVivo@4
+  #     displayName: 'Get Main Info'
+  #     name: pom_info
+  #     inputs:
+  #       type: 'file'
+  #       origin: $(System.ArtifactsDirectory)/bin/pom.xml
+  #       jpaths: |
+  #         var POM_XML_VERSION = .project.version._text
+  #         var POM_XML_ARTIFACT_ID = .project.artifactId._text
+  #         var POM_XML_GROUP_ID = .project.groupId._text
+
+  #   - task: YamlParseFromVivo@4
+  #     displayName: 'Get Metadata Info'
+  #     name: catalog_info
+  #     inputs:
+  #       type: 'file'
+  #       origin: $(System.ArtifactsDirectory)/bin/catalog-info.yaml
+  #       jpaths: |
+  #         var CATALOG_YAML_ACRONYM = .metadata.annotations['techarch.governance-app.acronym']
+
+  #   - task: NexusUploadAllMvnFromVivo@5
+  #     displayName: 'Push to Nexus'
+  #     inputs:
+  #       nexusEndpoint: 'Nexus Asis'
+  #       nexusRepoMaven: "$(CATALOG_YAML_ACRONYM)-mvn"
+
+  - job:
+    continueOnError: False
+    displayName: 'Push to Docker (RELEASE)'
+    condition: eq('${{ parameters.environment }}', 'prod')
+    steps:
+
+    - checkout: self
+      fetchDepth: 1
+
+    - task: XmlParseFromVivo@4
+      displayName: 'Get Main Info'
+      inputs:
+        type: 'file'
+        origin: pom.xml
+        jpaths: |
+          var POM_XML_VERSION = .project.version._text
+
+    - task: YamlParseFromVivo@4
+      displayName: 'Get Metadata Info'
+      inputs:
+        type: 'file'
+        origin: catalog-info.yaml
+        jpaths: |-
+          var CATALOG_YAML_NAME = .metadata.name
+          var CATALOG_YAML_ACRONYM = .metadata.annotations['techarch.governance-app.acronym']
+
+    - task: Docker@2
+      displayName: 'Docker Pull (SNAPSHOT)'
+      inputs:
+        containerRegistry: 'ACR-DEVOPS'
+        command: pull
+        arguments:
+          "\
+          acrsharedservices01.azurecr.io\
+          /$(CATALOG_YAML_ACRONYM)\
+          /$(CATALOG_YAML_NAME)\
+          :$(POM_XML_VERSION)-SNAPSHOT\
+          "
+
+    - task: Docker@2
+      displayName: 'Docker Tag to (RELEASE)'
+      inputs:
+        containerRegistry: 'ACR-DEVOPS'
+        command: tag
+        arguments:
+          "\
+          acrsharedservices01.azurecr.io\
+          /$(CATALOG_YAML_ACRONYM)\
+          /$(CATALOG_YAML_NAME)\
+          :$(POM_XML_VERSION)-SNAPSHOT\
+          \ \
+          acrsharedservices01.azurecr.io\
+          /$(CATALOG_YAML_ACRONYM)\
+          /$(CATALOG_YAML_NAME)\
+          :$(POM_XML_VERSION)-RELEASE\
+          "
+
+    - task: Docker@2
+      displayName: 'Push to Docker (RELEASE)'
+      inputs:
+        containerRegistry: 'ACR-DEVOPS'
+        command: push
+        arguments:
+          "\
+          acrsharedservices01.azurecr.io\
+          /$(CATALOG_YAML_ACRONYM)\
+          /$(CATALOG_YAML_NAME)\
+          :$(POM_XML_VERSION)-RELEASE\
+          "
+
+- stage:
+  displayName: 'Deploy on (${{ parameters.environment }})'
+  pool: GeneralPurposeLinuxAgentsCD
+  variables:
+  - name: DOCKER_TAG_SUFIX
+    ${{ if eq('${{ parameters.environment }}', 'prod') }}:
+      value: 'RELEASE'
+    ${{ else }}:
+      value: 'SNAPSHOT'
+  jobs:
+  - deployment:
+    displayName: 'Deploy on (${{ parameters.environment }})'
+    # creates an environment if it doesn't exist
+    environment:
+      name: 'deploy-${{ parameters.environment }}'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+            fetchDepth: 1
+
+          - task: XmlParseFromVivo@4
+            displayName: 'Get Main Info'
+            inputs:
+              type: 'file'
+              origin: pom.xml
+              jpaths: |
+                var POM_XML_VERSION = .project.version._text
+
+          - task: YamlParseFromVivo@4
+            displayName: 'Get Metadata Info'
+            inputs:
+              type: 'file'
+              origin: catalog-info.yaml
+              jpaths: |-
+                var CATALOG_YAML_NAME = .metadata.name
+                var CATALOG_YAML_ACRONYM = .metadata.annotations['techarch.governance-app.acronym']
+                var CATALOG_YAML_K8S_NS = .metadata.annotations['vivo.io/kubernetes-k8s-namespace-${{ parameters.environment }}']
+
+          - task: NunjucksInline@4
+            displayName: 'Bind Variables'
+            inputs:
+              sourceType: 'text'
+              source: |
+                var HELM_REPO_PREFIX = {{ CATALOG_YAML_ACRONYM or 'devops'}}
+
+          - task: AzureKeyVault@2
+            displayName: 'Getting AKV credentials'
+            timeoutInMinutes: 1
+            retryCountOnTaskFailure: 5
+            inputs:
+              azureSubscription: DevOpsSharedResources
+              KeyVaultName: kv-azdevops-shared
+              SecretsFilter: >-
+                NEXUS-DEPS-USR, NEXUS-DEPS-PSW
+
+          - task: DownloadSecureFile@1
+            # this task must have a name
+            name: kubeconfig
+            displayName: 'Download config from (${{parameters.environment}})'
+            inputs:
+              # secureFile: 'aks-${{parameters.sigla_bu}}-${{parameters.environment}}'
+              secureFile: 'kube-${{parameters.environment}}'
+
+          - task: Bash@3
+            displayName: 'Helm repo add'
+            continueOnError: false
+            inputs:
+              targetType: inline
+              script: >-
+                helm repo add
+                --force-update
+                $(HELM_REPO_PREFIX)-helm
+                https://nexus.telefonica.com.br/repository/devops-helm
+                --insecure-skip-tls-verify
+                --username $(HELM-REGISTRY-NEXUS-USERNAME)
+                --password $(HELM-REGISTRY-NEXUS-PASSWORD)
+                --kubeconfig $(kubeconfig.secureFilePath)
+
+          - task: Bash@3
+            displayName: 'Helm repo update'
+            inputs:
+              targetType: inline
+              script: >-
+                helm repo update --kubeconfig $(kubeconfig.secureFilePath)
+
+          - task: Bash@3
+            displayName: 'Helm login'
+            inputs:
+              targetType: inline
+              script: >-
+                helm registry login
+                acrsharedservices01.azurecr.io
+                --username $(HELM-REGISTRY-ACR-USERNAME)
+                --password "$(HELM-REGISTRY-ACR-PASSWORD)"
+
+          - task: Bash@3
+            displayName: 'Deploy on (${{ parameters.environment }})'
+            inputs:
+              workingDirectory: $(Build.SourcesDirectory)
+              targetType: inline
+              script: >-
+                helm upgrade $(CATALOG_YAML_NAME)
+                oci://acrsharedservices01.azurecr.io/helm/devops/generic-java-microservice
+                --version "1.0.15"
+                -f "./.azuredevops/config/${{ parameters.environment }}/values.yml"
+                -f "./.azuredevops/config/${{ parameters.environment }}/environments_variables.yml"
+                -f "./.azuredevops/config/${{ parameters.environment }}/secrets.yaml"
+                --kubeconfig $(kubeconfig.secureFilePath)
+                --namespace "$(CATALOG_YAML_K8S_NS)"
+                --install
+                --insecure-skip-tls-verify
+                --wait
+                --timeout 300s
+                --set "nameOverride=$(CATALOG_YAML_NAME)"
+                --set "fullnameOverride=$(CATALOG_YAML_NAME)"
+                --set "containerName=$(CATALOG_YAML_NAME)"
+                --set "image.repository=acrsharedservices01.azurecr.io/$(CATALOG_YAML_ACRONYM)/$(CATALOG_YAML_NAME)"
+                --set "image.tag=$(POM_XML_VERSION)-$(DOCKER_TAG_SUFIX)"
+                --set "imagePullSecrets[0].name=acr-$(CATALOG_YAML_ACRONYM)"
+                --output table
+                --history-max 2
+                --atomic
+                --debug
+
+        on:
+          success:
+            steps:
+            - checkout: self
+              fetchDepth: 1
+
+            - task: XmlParseFromVivo@4
+              displayName: 'Get pom.xml info'
+              inputs:
+                type: 'file'
+                origin: $(Build.SourcesDirectory)/pom.xml
+                jpaths: |
+                  var POM_XML_VERSION = .project.version._text
+
+            - task: LoadFile@4
+              displayName: 'Load catalog-info.yaml'
+              inputs:
+                script: |
+                  CATALOG_YAML_CONTENT = $(Build.SourcesDirectory)/catalog-info.yaml
+
+            - task: YamlParseFromVivo@4
+              displayName: 'Get Metadata Info'
+              inputs:
+                type: 'file'
+                origin: $(Build.SourcesDirectory)/catalog-info.yaml
+                jpaths: |
+                  var CATALOG_YAML_NAME = .metadata.name
+                  var CATALOG_YAML_ACRONYM = .metadata.annotations['techarch.governance-app.acronym']
+                  var CATALOG_YAML_K8S_NS = .metadata.annotations['vivo.io/kubernetes-k8s-namespace-${{ parameters.environment }}']
+
+            - task: CatchLogsToLocalDirectoryFromVivo@4
+              displayName: 'Dump logs and metas'
+              inputs:
+                dumpDir: $(Build.ArtifactStagingDirectory)/audit
+
+            - task: PublishBuildArtifacts@1
+              displayName: 'Push Logs to Artifacts'
+              inputs:
+                ArtifactName: audit
+                PathtoPublish: $(Build.ArtifactStagingDirectory)/audit
+
+            - task: VivoGovernance@1
+              continueOnError: true
+              displayName: 'Gov Notify "deploy"'
+              inputs:
+                breakglass: false
+                serverEndpoint: 'governanceapi'
+                operation: 'deploy'
+                component: $(CATALOG_YAML_NAME)
+                version: $(POM_XML_VERSION)
+                cluster: aks-$(CATALOG_YAML_ACRONYM)-${{ parameters.environment }}
+                namespace: $(CATALOG_YAML_K8S_NS)
+                deployment: $(CATALOG_YAML_NAME)
+                environment: ${{ parameters.environment }}
+                catalogInfo: $(CATALOG_YAML_CONTENT)
+
+          failure:
+            steps:
+            - task: CatchLogsToLocalDirectoryFromVivo@4
+              displayName: 'Dump logs and metas'
+              inputs:
+                dumpDir: $(Build.ArtifactStagingDirectory)/audit
+
+            - task: PublishBuildArtifacts@1
+              displayName: 'Push Logs to Artifacts'
+              inputs:
+                ArtifactName: audit
+                PathtoPublish: $(Build.ArtifactStagingDirectory)/audit
+

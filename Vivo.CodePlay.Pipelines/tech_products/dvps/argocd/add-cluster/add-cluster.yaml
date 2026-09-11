@@ -1,0 +1,504 @@
+# Parâmetros
+parameters:
+  - name: environment
+  - name: clusterName
+    default: ''
+  - name: resourceGroup
+    default: ''
+  - name: subscriptionId
+    default: ''
+  - name: action
+  - name: kubeconfigBase64
+    displayName: 'Kubeconfig em Base64 (opcional) - echo "$(cat ~/.kube/config)" | base64 -w 0'
+    type: string
+    default: ''
+    # Quando fornecido, o pipeline usará este kubeconfig ao invés de obter credenciais do AKS.
+    # Use: echo "$(cat ~/.kube/config)" | base64 -w 0
+
+stages:
+  # Stage de pré-validação - valida conectividade e exibe comandos que serão executados
+  - stage: prevalidation_stage
+    displayName: "Pre-Validation"
+    pool:
+      name: $(AGENT_POOL_CI)
+    dependsOn:
+      - default_initializer
+    condition: succeeded()
+
+    jobs:
+      - job: prevalidation_job
+        displayName: "Validate Cluster Connectivity & Preview Commands"
+        steps:
+          # Fazer checkout do código-fonte
+          - checkout: self
+            displayName: Checkout Source Code
+            clean: true
+
+          # Azure Login (apenas quando kubeconfig customizado NÃO é fornecido)
+          - task: Bash@3
+            displayName: 'Azure Login'
+            condition: and(succeeded(), eq('${{ parameters.kubeconfigBase64 }}', ''))
+            inputs:
+              targetType: 'inline'
+              script: |
+                if az login --service-principal -u $(SP_CLIENT_ID) -p $(SP_CLIENT_SECRET) --tenant $(SP_TENANT_ID); then
+                  echo "##[debug] Login successful."
+                else
+                  echo "##[error] Azure login failed - Service Principal $(SP_CLIENT_ID)"
+                  exit 1
+                fi
+
+          # Set Azure Subscription (apenas quando kubeconfig customizado NÃO é fornecido)
+          - task: Bash@3
+            displayName: 'Set Azure Subscription'
+            condition: and(succeeded(), eq('${{ parameters.kubeconfigBase64 }}', ''))
+            inputs:
+              targetType: 'inline'
+              script: |
+                subscriptionId="${{ parameters.subscriptionId }}"
+                echo "##[debug] Setting Azure subscription to $subscriptionId"
+                if az account set --subscription "$subscriptionId"; then
+                  echo "##[debug] Azure subscription set successfully."
+                else
+                  echo "##[error] Failed to set Azure subscription!"
+                  exit 1
+                fi
+
+          # Get AKS Credentials (apenas quando kubeconfig customizado NÃO é fornecido)
+          - task: Bash@3
+            displayName: 'Get AKS Credentials'
+            condition: and(succeeded(), eq('${{ parameters.kubeconfigBase64 }}', ''))
+            inputs:
+              targetType: 'inline'
+              script: |
+                resourceGroup="${{ parameters.resourceGroup }}"
+                clusterName="${{ parameters.clusterName }}"
+                KUBECONFIG_PATH="$(Agent.TempDirectory)/kubeconfig"
+                
+                if az aks get-credentials --resource-group $resourceGroup --name $clusterName --file $KUBECONFIG_PATH; then
+                  echo "##[debug] Successfully retrieved kubeconfig for cluster $clusterName"
+                else
+                  echo "##[error] Service Principal $(SP_CLIENT_ID) does not have the necessary permissions to get kubeconfig!"
+                  exit 1
+                fi
+
+          # Setup Custom Kubeconfig (apenas quando kubeconfig customizado É fornecido)
+          - task: Bash@3
+            displayName: 'Setup Custom Kubeconfig'
+            condition: and(succeeded(), ne('${{ parameters.kubeconfigBase64 }}', ''))
+            inputs:
+              targetType: 'inline'
+              script: |
+                echo "##[debug] Using custom kubeconfig provided by user"
+                KUBECONFIG_PATH="$(Agent.TempDirectory)/kubeconfig"
+                
+                echo "$KUBECONFIG_B64" | base64 -d > "$KUBECONFIG_PATH"
+                chmod 0600 "$KUBECONFIG_PATH"
+                
+                if ! kubectl --kubeconfig="$KUBECONFIG_PATH" config view > /dev/null 2>&1; then
+                  echo "##[error] Invalid kubeconfig provided! Please check the base64 encoding."
+                  exit 1
+                fi
+                
+                echo "##[debug] Custom kubeconfig successfully configured at $KUBECONFIG_PATH"
+            env:
+              KUBECONFIG_B64: ${{ parameters.kubeconfigBase64 }}
+
+          # Validar conectividade com o cluster
+          - task: Bash@3
+            displayName: 'Validate Cluster Connectivity'
+            inputs:
+              targetType: 'inline'
+              script: |
+                export KUBECONFIG="$(Agent.TempDirectory)/kubeconfig"
+                
+                echo "=============================================="
+                echo "       VALIDAÇÃO DE CONECTIVIDADE"
+                echo "=============================================="
+                echo ""
+                
+                # Obter informações do contexto atual
+                context=$(kubectl config current-context 2>/dev/null)
+                if [ -z "$context" ]; then
+                  echo "##[error] Não foi possível obter o contexto atual do kubeconfig!"
+                  exit 1
+                fi
+                echo "✅ Contexto atual: $context"
+                
+                # Obter URL do API Server
+                server=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')
+                if [ -z "$server" ]; then
+                  echo "##[error] Não foi possível obter a URL do API Server!"
+                  exit 1
+                fi
+                echo "✅ API Server URL: $server"
+                
+                # Testar conectividade com o cluster
+                echo ""
+                echo "🔄 Testando conectividade com o cluster..."
+                if kubectl cluster-info > /dev/null 2>&1; then
+                  echo "✅ Cluster acessível!"
+                else
+                  echo "##[error] Não foi possível conectar ao cluster! Verifique:"
+                  echo "   - Se o kubeconfig está correto"
+                  echo "   - Se o cluster está em execução"
+                  echo "   - Se há conectividade de rede com o API Server"
+                  exit 1
+                fi
+                
+                # Exibir informações do cluster
+                echo ""
+                echo "📊 Informações do Cluster:"
+                kubectl cluster-info 2>/dev/null | head -5
+                
+                # Verificar versão do Kubernetes
+                echo ""
+                echo "📦 Versão do Kubernetes:"
+                kubectl version --short 2>/dev/null || kubectl version 2>/dev/null | grep -E "Server|Client" | head -2
+                
+                # Salvar variáveis para próximas etapas
+                echo "##vso[task.setvariable variable=CLUSTER_CONTEXT;isOutput=true]$context"
+                echo "##vso[task.setvariable variable=CLUSTER_SERVER;isOutput=true]$server"
+            name: validate_connectivity
+
+          # Baixar ArgoCD para preview dos comandos
+          - script: |
+              curl -sSL -o ${ARGOCD_PATH} https://github.com/argoproj/argo-cd/releases/download/${ARGOCD_VERSION}/argocd-linux-amd64
+              chmod +x ${ARGOCD_PATH}
+            displayName: 'Download ArgoCD Binary'
+            env:
+              ARGOCD_VERSION: v2.13.3
+              ARGOCD_PATH: $(Agent.TempDirectory)/argocd
+
+          # Recuperar secret do Azure Key Vault para verificar status no ArgoCD
+          - task: AzureKeyVault@2
+            displayName: 'Get AKV Credentials'
+            timeoutInMinutes: 1
+            retryCountOnTaskFailure: 5
+            inputs:
+              azureSubscription: 'DevOpsSharedResources'
+              KeyVaultName: 'kv-azdevops-shared'
+              SecretsFilter: 'ARGOCD-4P-B64-CONFIG-FILE'
+          
+          # Configurar arquivo de credenciais do ArgoCD
+          - script: |
+              echo ${AKV_ARGOCD_4P_B64_CONFIG_FILE} | base64 -d > ${ARGOCD_CONFIG_PATH}
+              chmod 0600 ${ARGOCD_CONFIG_PATH}
+            displayName: 'Setup ArgoCD Config'
+            env:
+              AKV_ARGOCD_4P_B64_CONFIG_FILE: $(ARGOCD-4P-B64-CONFIG-FILE)
+              ARGOCD_CONFIG_PATH: $(Agent.TempDirectory)/argocd-config
+
+          # Preview dos comandos ArgoCD que serão executados
+          - task: Bash@3
+            displayName: 'Preview ArgoCD Commands'
+            inputs:
+              targetType: 'inline'
+              script: |
+                export KUBECONFIG="$(Agent.TempDirectory)/kubeconfig"
+                ARGOCD_PATH="$(Agent.TempDirectory)/argocd"
+                ARGOCD_CONFIG_PATH="$(Agent.TempDirectory)/argocd-config"
+                
+                context=$(kubectl config current-context)
+                server=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')
+                
+                echo ""
+                echo "=============================================="
+                echo "       PREVIEW DOS COMANDOS ARGOCD"
+                echo "=============================================="
+                echo ""
+                
+                # Verificar se o cluster já existe no ArgoCD
+                echo "🔍 Verificando se o cluster já existe no ArgoCD..."
+                existing_clusters=$($ARGOCD_PATH cluster list --config $ARGOCD_CONFIG_PATH -o json 2>/dev/null | jq -r '.[].server' || echo "")
+                
+                cluster_exists="false"
+                for existing_server in $existing_clusters; do
+                  if [[ "$existing_server" == "$server" ]]; then
+                    cluster_exists="true"
+                    break
+                  fi
+                done
+                
+                if [[ "$cluster_exists" == "true" ]]; then
+                  echo "⚠️  Cluster JÁ EXISTE no ArgoCD: $server"
+                else
+                  echo "✅ Cluster NÃO existe no ArgoCD (será adicionado)"
+                fi
+                
+                echo ""
+                echo "=============================================="
+                echo "       COMANDOS QUE SERÃO EXECUTADOS"
+                echo "=============================================="
+                echo ""
+                
+                # Determinar argumentos baseado na ação
+                ARGOCD_ARGS=""
+                if [[ "$ARGOCD_ACTION" == "update" ]]; then
+                  ARGOCD_ARGS="--upsert"
+                  echo "📝 Ação: UPDATE (--upsert)"
+                else
+                  echo "📝 Ação: ADD"
+                fi
+                
+                echo ""
+                echo "📋 Comando que será executado:"
+                echo "   ┌────────────────────────────────────────────────────────────────"
+                echo "   │ argocd cluster add $context \\"
+                echo "   │   --kubeconfig \$KUBECONFIG \\"
+                echo "   │   --config \$ARGOCD_CONFIG_PATH $ARGOCD_ARGS"
+                echo "   └────────────────────────────────────────────────────────────────"
+                echo ""
+                echo "📌 Variáveis:"
+                echo "   • KUBECONFIG: $(Agent.TempDirectory)/kubeconfig"
+                echo "   • ARGOCD_CONFIG_PATH: $(Agent.TempDirectory)/argocd-config"
+                echo "   • Contexto: $context"
+                echo "   • Server: $server"
+                echo ""
+                
+                # Validação final
+                if [[ "$cluster_exists" == "true" && "$ARGOCD_ACTION" != "update" ]]; then
+                  echo "=============================================="
+                  echo "⚠️  AVISO IMPORTANTE"
+                  echo "=============================================="
+                  echo ""
+                  echo "O cluster já existe no ArgoCD e a ação não é 'update'."
+                  echo "O pipeline FALHARÁ no stage de execução!"
+                  echo ""
+                  echo "Para atualizar um cluster existente, use: action=update"
+                  echo ""
+                fi
+                
+                echo "=============================================="
+                echo "       FIM DO PREVIEW"
+                echo "=============================================="
+            env:
+              ARGOCD_ACTION: ${{ parameters.action }}
+
+  - stage: add_cluster_stage
+    displayName: "Add Cluster"
+    pool:
+      name: $(AGENT_POOL_CI)
+    dependsOn:
+      - prevalidation_stage
+    condition: succeeded()
+
+    jobs:
+      - deployment: add_cluster_job
+        environment: 
+          name: ${{ parameters.environment }}
+        displayName: "Add Cluster"
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+              # Fazer checkout do código-fonte e limpar o workspace
+              - checkout: self
+                displayName: Checkout Source Code
+                name: checkout_source_code
+                clean: true
+                path: source_code
+                submodules: recursive
+              
+              # Realizar login no Azure usando Service Principal e validar credenciais
+              # Executado apenas quando kubeconfig customizado NÃO é fornecido
+              - task: Bash@3
+                displayName: 'Azure Login'
+                condition: and(succeeded(), eq('${{ parameters.kubeconfigBase64 }}', ''))
+                inputs:
+                  targetType: 'inline'
+                  script: |
+
+                    # Exibir mensagem de sucesso ou erro ao tentar login com Service Principal
+                    if az login --service-principal -u $(SP_CLIENT_ID) -p $(SP_CLIENT_SECRET) --tenant $(SP_TENANT_ID); then
+                      echo "##[debug] Login successful."
+                    else
+                      echo "##[error] Azure login failed - Service Principal $(SP_CLIENT_ID)"
+                      exit 1
+                    fi
+              
+              # Definir a assinatura da Azure
+              # Executado apenas quando kubeconfig customizado NÃO é fornecido
+              - task: Bash@3
+                displayName: 'Set Azure Subscription'
+                condition: and(succeeded(), eq('${{ parameters.kubeconfigBase64 }}', ''))
+                inputs:
+                  targetType: 'inline'
+                  script: |
+                    subscriptionId="${{ parameters.subscriptionId }}"
+                    echo "##[debug] Setting Azure subscription to $subscriptionId"
+
+                    # Exibir mensagem de sucesso ou erro ao tentar definir uma subscription
+                    if az account set --subscription "$subscriptionId"; then
+                      echo "##[debug] Azure subscription set successfully."
+                    else
+                      echo "##[error] Failed to set Azure subscription!"
+                      exit 1
+                    fi
+
+              # Obter o kubeconfig do cluster AKS
+              # Executado apenas quando kubeconfig customizado NÃO é fornecido
+              - task: Bash@3
+                displayName: 'Get AKS Credentials'
+                name: get_aks_credentials
+                condition: and(succeeded(), eq('${{ parameters.kubeconfigBase64 }}', ''))
+                inputs:
+                  targetType: 'inline'
+                  script: |
+                    resourceGroup="${{ parameters.resourceGroup }}"
+                    clusterName="${{ parameters.clusterName }}"
+                    KUBECONFIG_PATH="$(Agent.TempDirectory)/kubeconfig"
+                    
+                    # Exibir mensagem de sucesso ou erro ao tentar obter o kubeconfig
+                    if az aks get-credentials --resource-group $resourceGroup --name $clusterName --file $KUBECONFIG_PATH; then
+                      echo "##[debug] Successfully retrieved kubeconfig for cluster $clusterName"
+                      echo "##vso[task.setvariable variable=KUBECONFIG_PATH;isOutput=true]$KUBECONFIG_PATH"
+                    else
+                      echo "##[error] Service Principal $(SP_CLIENT_ID) does not have the necessary permissions to get kubeconfig!"
+                      exit 1
+                    fi
+
+              # Configurar kubeconfig customizado quando fornecido pelo usuário
+              - task: Bash@3
+                displayName: 'Setup Custom Kubeconfig'
+                name: setup_custom_kubeconfig
+                condition: and(succeeded(), ne('${{ parameters.kubeconfigBase64 }}', ''))
+                inputs:
+                  targetType: 'inline'
+                  script: |
+                    echo "##[debug] Using custom kubeconfig provided by user"
+                    KUBECONFIG_PATH="$(Agent.TempDirectory)/kubeconfig"
+                    
+                    # Decodificar kubeconfig de base64 e salvar no arquivo
+                    echo "$KUBECONFIG_B64" | base64 -d > "$KUBECONFIG_PATH"
+                    chmod 0600 "$KUBECONFIG_PATH"
+                    
+                    # Validar se o kubeconfig é válido
+                    if ! kubectl --kubeconfig="$KUBECONFIG_PATH" config view > /dev/null 2>&1; then
+                      echo "##[error] Invalid kubeconfig provided! Please check the base64 encoding."
+                      exit 1
+                    fi
+                    
+                    echo "##[debug] Custom kubeconfig successfully configured at $KUBECONFIG_PATH"
+                    echo "##vso[task.setvariable variable=KUBECONFIG_PATH;isOutput=true]$KUBECONFIG_PATH"
+                env:
+                  KUBECONFIG_B64: ${{ parameters.kubeconfigBase64 }}
+
+              # Obter URL da API server (Servidor da API) do cluster AKS a partir do kubeconfig
+              - task: Bash@3
+                displayName: 'Get AKS Cluster API Server URL'
+                name: get_aks_api_url
+                condition: succeeded()
+                inputs:
+                  targetType: 'inline'
+                  script: |
+                    # Usar o caminho fixo do kubeconfig (ambos os steps salvam no mesmo local)
+                    export KUBECONFIG="$(Agent.TempDirectory)/kubeconfig"
+                    
+                    echo "##[debug] Using kubeconfig file: ${KUBECONFIG}"
+
+                    # Obter API server do kubeconfig
+                    server=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')
+
+                    # Exibir erro se a URL da API server não for encontrada
+                    if [ -z "$server" ]; then
+                      echo "##[error] Failed to retrieve AKS API Server URL!"
+                      exit 1
+                    fi
+
+                    echo "##[debug] Retrieved AKS API Server URL: $server"
+                    echo "##vso[task.setvariable variable=AKS_CLUSTER_SERVER]$server"
+
+              # Baixar e tornar executável o binário do ArgoCD
+              - script: |
+                  echo "##[debug] Download argocd binary"
+                  curl -sSL -o ${ARGOCD_PATH} https://github.com/argoproj/argo-cd/releases/download/${ARGOCD_VERSION}/argocd-linux-amd64
+                  chmod +x ${ARGOCD_PATH}
+                  echo "##[debug] ArgoCD binary downloaded to ${ARGOCD_PATH}"
+                  echo "##vso[task.setvariable variable=ARGOCD_PATH]${ARGOCD_PATH}"
+                  ${ARGOCD_PATH} version --client
+                displayName: 'Download ArgoCD Binary'
+                name: download_argocd
+                env:
+                  ARGOCD_VERSION: v2.13.3
+                  ARGOCD_PATH: $(Agent.TempDirectory)/argocd
+
+              # Recuperar secret do Azure Key Vault para autenticação no ArgoCD
+              - task: AzureKeyVault@2
+                displayName: 'Get AKV Credentials'
+                timeoutInMinutes: 1
+                retryCountOnTaskFailure: 5
+                inputs:
+                  azureSubscription: 'DevOpsSharedResources'
+                  KeyVaultName: 'kv-azdevops-shared'
+                  SecretsFilter: 'ARGOCD-4P-B64-CONFIG-FILE'
+              
+              # Criar e configurar o arquivo de credenciais do ArgoCD a partir do secret recuperado
+              - script: |
+                  echo "##[debug] Setting up argocd config file to ${ARGOCD_CONFIG_PATH}"
+                  echo ${AKV_ARGOCD_4P_B64_CONFIG_FILE} | base64 -d > ${ARGOCD_CONFIG_PATH}
+                  chmod 0600 ${ARGOCD_CONFIG_PATH}
+                  echo "##vso[task.setvariable variable=ARGOCD_CONFIG_PATH]${ARGOCD_CONFIG_PATH}"
+                displayName: Set ARGOCD_CONFIG_PATH Var
+                name: set_argocd_config_path
+                env:
+                  AKV_ARGOCD_4P_B64_CONFIG_FILE: $(ARGOCD-4P-B64-CONFIG-FILE)
+                  ARGOCD_CONFIG_PATH: $(Agent.TempDirectory)/argocd-config
+
+              # Validar se o cluster já existe no ArgoCD
+              - task: Bash@3
+                displayName: 'Validate AKS Cluster in ArgoCD'
+                condition: succeeded()
+                inputs:
+                  targetType: 'inline'
+                  script: |
+                    # Obter lista da URL do server dos clusters
+                    servers=$(${ARGOCD_PATH} cluster list --config ${ARGOCD_CONFIG_PATH} -o json | jq -r '.[].server')
+
+                    # Verificar se o cluster já existe no ArgoCD e exibir erro caso exista
+                    for server in $servers; do
+                      if [[ "$server" == "${AKS_CLUSTER_SERVER}" && "$ARGOCD_ACTION" != "update" ]]; then
+                        echo "##[error] Server $server already exists in ArgoCD!"
+                        exit 1
+                      fi
+                    done
+
+                    echo "##[debug] Server ${AKS_CLUSTER_SERVER} does not exist in ArgoCD."
+                env:
+                  ARGOCD_CONFIG_PATH: $(ARGOCD_CONFIG_PATH)
+                  ARGOCD_PATH: $(download_argocd.ARGOCD_PATH)
+                  AKS_CLUSTER_SERVER: $(get_aks_api_url.AKS_CLUSTER_SERVER)
+                  ARGOCD_ACTION: ${{ parameters.action }}
+
+              # Adicionar cluster no ArgoCD                   
+              - task: Bash@3
+                displayName: 'Add Cluster'
+                condition: succeeded()
+                inputs:
+                  targetType: 'inline'
+                  script: |
+                    ARGOCD_ARGS=""
+                    if [[ "$ARGOCD_ACTION" == "update" ]]; then
+                      ARGOCD_ARGS="--upsert"
+                    fi
+                    
+                    # Usar o caminho fixo do kubeconfig (ambos os steps salvam no mesmo local)
+                    export KUBECONFIG="$(Agent.TempDirectory)/kubeconfig"
+                    
+                    # Obter contexto atual do kubeconfig
+                    context=$(kubectl config current-context)
+                    echo "##[debug] Current Kubernetes context: $context"
+
+                    # Exibe mensagem de sucesso ou erro ao tentar adicionar o cluster
+                    if ${ARGOCD_PATH} cluster add $context --kubeconfig ${KUBECONFIG} --config ${ARGOCD_CONFIG_PATH} ${ARGOCD_ARGS}; then
+                      echo "##[debug] Cluster $context successfully added to ArgoCD."
+                    else
+                      echo "##[error] Failed to add cluster to ArgoCD!"
+                      exit 1
+                    fi
+                env:
+                  ARGOCD_CONFIG_PATH: $(ARGOCD_CONFIG_PATH)
+                  ARGOCD_PATH: $(download_argocd.ARGOCD_PATH)
+                  AKS_CLUSTER_SERVER: $(get_aks_api_url.AKS_CLUSTER_SERVER)
+                  ARGOCD_ACTION: ${{ parameters.action }}
+                   

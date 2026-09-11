@@ -1,0 +1,194 @@
+################################################################
+# ESSE TEMPLATE É TEMPORARIO E DEVE SE TORNAR UMA CUSTOMTASK #
+###############################################################
+
+# Template para commit e tag de versão
+# Parâmetros de entrada:
+# - version: Versão a ser criada (ex: 1.0.0) - Obrigatório
+# - versionFile: Arquivo onde será salva a versão (padrão: version.txt)
+# - targetBranch: Branch de destino para push (padrão: branch atual)
+# - gitUserEmail: Email do usuário Git (padrão: devops@vivo.com.br)
+# - gitUserName: Nome do usuário Git (padrão: Azure DevOps)
+# - commitMessage: Mensagem do commit (padrão: "chore: bump version to {version} [skip ci]")
+#
+# Features:
+# - 🔍 Verificação de tag duplicada com sugestões
+# - 🏷️ Uso de variáveis de ambiente para facilitar manutenção
+# - 📊 Sistema completo de logs Azure DevOps (##[debug], ##[error], ##[warning])
+# - 🎯 Mensagens de erro detalhadas com dicas de resolução
+# - 📋 Outputs estruturados: CreatedTag e CreatedVersion
+# - 🔧 Tratamento robusto de erros com códigos de saída apropriados
+#
+# Pré-requisitos:
+# - persistCredentials: true no checkout
+# - fetchDepth: 0 para histórico completo
+# - Permissões de push para o branch e criação de tags no repositório remoto
+
+parameters:
+- name: version
+  type: string
+  displayName: 'Versão da aplicação'
+- name: versionFile
+  type: string
+  displayName: 'Arquivo de versão'
+  default: 'version.txt'
+- name: targetBranch
+  type: string
+  displayName: 'Branch de destino'
+  default: $(Build.SourceBranchName)
+- name: gitUserEmail
+  type: string
+  displayName: 'Email do usuário Git'
+  default: 'devops@vivo.com.br'
+- name: gitUserName
+  type: string
+  displayName: 'Nome do usuário Git'
+  default: 'Azure DevOps'
+- name: commitMessage
+  type: string
+  displayName: 'Mensagem do commit'
+  default: 'chore: bump version [skip ci]'
+
+steps:
+- script: |
+    set -e
+    
+    echo "##[section]Iniciando processo de versionamento e criação de tag"
+    echo "##[debug]Versão solicitada: $VERSION"
+    echo "##[debug]Arquivo de versão: $VERSION_FILE"
+    echo "##[debug]Branch de destino: $TARGET_BRANCH"
+    
+    # Configurar usuário Git usando variáveis de ambiente
+    echo "##[group]Configuração do Git"
+    echo "##[debug]Configurando usuário Git: $GIT_USER_NAME <$GIT_USER_EMAIL>"
+    git config user.email "$GIT_USER_EMAIL"
+    git config user.name "$GIT_USER_NAME"
+    echo "##[command]git config user.email '$GIT_USER_EMAIL'"
+    echo "##[command]git config user.name '$GIT_USER_NAME'"
+    echo "##[endgroup]"
+    
+    # Validar se a versão foi fornecida
+    echo "##[group]Validações de entrada"
+    if [ -z "$VERSION" ]; then
+      echo "##vso[task.logissue type=error]❌ ERRO CRÍTICO: Parâmetro 'version' é obrigatório mas não foi fornecido"
+      echo "##[error]A versão deve ser informada (ex: 1.0.0, v2.1.3, release-1.5)"
+      exit 1
+    fi
+    echo "##[debug]✅ Parâmetro version validado: $VERSION"
+
+    
+    # Verificar se a tag já existe
+    echo "##[debug]Verificando se tag '$VERSION' já existe no repositório..."
+    if git tag -l | grep -q "^$VERSION$"; then
+      echo "##vso[task.logissue type=error]❌ ERRO: Tag '$VERSION' já existe no repositório"
+      echo "##[error]Para criar uma nova versão, utilize um número de versão diferente"
+      echo "##[error]Tags existentes similares:"
+      git tag -l | grep -E "^[0-9]+\.[0-9]+\.[0-9]+" | sort -V | tail -5
+      exit 1
+    fi
+    echo "##[debug]✅ Tag '$VERSION' não existe, prosseguindo com criação"
+    echo "##[endgroup]"
+    
+    # Atualizar arquivo de versão se especificado
+    if [ -n "$VERSION_FILE" ] && [ "$VERSION_FILE" != "" ]; then
+      echo "##[group]Atualização do arquivo de versão"
+
+      # Verificar se houve mudanças no arquivo
+      echo "##[debug]Verificando se há mudanças no arquivo de versão..."
+      if git diff --quiet "$VERSION_FILE"; then
+        echo "##[warning]⚠️ Arquivo de versão não foi alterado"
+      else
+        echo "##[debug]Arquivo modificado, adicionando ao commit..."
+        git add "$VERSION_FILE"
+        echo "##[command]git add '$VERSION_FILE'"
+        
+        if git commit -m "$COMMIT_MESSAGE"; then
+          echo "##[command]git commit -m '$COMMIT_MESSAGE'"
+          echo "##[debug]✅ Arquivo de versão commitado com sucesso"
+        else
+          echo "##vso[task.logissue type=error]❌ ERRO: Falha ao fazer commit do arquivo de versão"
+          echo "##[error]Mensagem do commit: $COMMIT_MESSAGE"
+          exit 1
+        fi
+      fi
+      echo "##[endgroup]"
+    else
+      echo "##[debug]Arquivo de versão não especificado, pulando atualização"
+    fi
+  
+    # Criar tag da versão
+    echo "##[group]Criação da tag de versão"
+    TAG_NAME="$VERSION"
+    echo "##[section]Criando tag: $TAG_NAME"
+    echo "##[debug]Mensagem da tag: Release version $TAG_NAME - Build $BUILD_ID"
+    
+    if git tag -a "$TAG_NAME" -m "Release version $TAG_NAME - Build $BUILD_ID"; then
+      echo "##[command]git tag -a '$TAG_NAME' -m 'Release version $TAG_NAME - Build $BUILD_ID'"
+      echo "##[debug]✅ Tag '$TAG_NAME' criada com sucesso localmente"
+    else
+      echo "##vso[task.logissue type=error]❌ ERRO: Falha ao criar tag '$TAG_NAME'"
+      echo "##[error]Verifique se há conflitos ou problemas com o repositório Git"
+      exit 1
+    fi
+    echo "##[endgroup]"
+    
+    
+    # Push das alterações e tag
+    echo "##[group]Push para repositório remoto"
+    echo "##[section]Fazendo push das alterações para branch: $TARGET_BRANCH"
+    echo "##[debug]Comando: git push origin HEAD:$TARGET_BRANCH"
+    
+    if git push origin HEAD:"$TARGET_BRANCH"; then
+      echo "##[command]git push origin HEAD:'$TARGET_BRANCH'"
+      echo "##[debug]✅ Push para branch '$TARGET_BRANCH' realizado com sucesso"
+    else
+      echo "##vso[task.logissue type=error]❌ ERRO: Falha ao fazer push para branch '$TARGET_BRANCH'"
+      echo "##[error]Verifique se:"
+      echo "##[error]  1. O branch '$TARGET_BRANCH' existe no repositório remoto"
+      echo "##[error]  2. Você tem permissão de push para este branch"
+      echo "##[error]  3. Não há conflitos de merge pendentes"
+      exit 1
+    fi
+    
+    echo "##[section]Fazendo push da tag: $TAG_NAME"
+    echo "##[debug]Comando: git push origin $TAG_NAME"
+    
+    if git push origin "$TAG_NAME"; then
+      echo "##[command]git push origin '$TAG_NAME'"
+      echo "##[debug]✅ Push da tag '$TAG_NAME' realizado com sucesso"
+    else
+      echo "##vso[task.logissue type=error]❌ ERRO: Falha ao fazer push da tag '$TAG_NAME'"
+      echo "##[error]A tag foi criada localmente mas não foi enviada para o repositório remoto"
+      echo "##[error]Verifique permissões de push de tags"
+      exit 1
+    fi
+    echo "##[endgroup]"
+    
+    # Definir variáveis de saída
+    echo "##[group]Definindo variáveis de saída"
+    echo "##[debug]Configurando variáveis de saída do pipeline..."
+    echo "##vso[task.setvariable variable=CreatedTag;isOutput=true]$TAG_NAME"
+    echo "##vso[task.setvariable variable=CreatedVersion;isOutput=true]$VERSION"
+    echo "##[debug]✅ Variáveis de saída configuradas:"
+    echo "##[debug]  - CreatedTag: $TAG_NAME"
+    echo "##[debug]  - CreatedVersion: $VERSION"
+    echo "##[endgroup]"
+    
+    echo "##[section]🎉 Processo de versionamento concluído com sucesso!"
+    echo "##[debug]📋 Resumo da operação:"
+    echo "##[debug]  📌 Tag criada: $TAG_NAME"
+    echo "##[debug]  📁 Arquivo de versão: ${VERSION_FILE:-"(não especificado)"}"
+    echo "##[debug]  🌿 Branch de destino: $TARGET_BRANCH"
+    echo "##[debug]  🔢 Build ID: $BUILD_ID"
+    
+  displayName: 'Commit and Tag Version'
+  name: 'commitVersion'
+  env:
+    SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+    VERSION: ${{ parameters.version }}
+    VERSION_FILE: ${{ parameters.versionFile }}
+    TARGET_BRANCH: ${{ parameters.targetBranch }}
+    GIT_USER_EMAIL: ${{ parameters.gitUserEmail }}
+    GIT_USER_NAME: ${{ parameters.gitUserName }}
+    COMMIT_MESSAGE: ${{ parameters.commitMessage }}
+    BUILD_ID: $(Build.BuildId)

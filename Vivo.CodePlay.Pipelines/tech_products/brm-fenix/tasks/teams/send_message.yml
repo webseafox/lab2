@@ -1,0 +1,151 @@
+# This YAML file defines a pipeline task that sends a message to a Microsoft Teams channel using a webhook URL.
+
+parameters:
+  - name: flow
+    default: "-"
+  - name: CDPipelineTriggeredURL # The URL of the triggered CD pipeline.
+    default: ""
+  - name: title # The title of the message.
+  - name: webhookUrl # The webhook URL of the Microsoft Teams channel.
+  - name: status # The status of the pipeline. Possible values are "Started" or "Finish".
+  - name: pipelineStartTime # The start time of the pipeline in seconds since the epoch.
+    default: ""
+  - name: pipelineEndTime # The end time of the pipeline in seconds since the epoch.
+    default: ""
+  - name: facts # Additional facts to include in the message.
+    default: ""
+  - name: facts2 # Additional facts to include in the message.
+    default: ""
+  - name: facts3 # Additional facts to include in the message.
+    default: ""
+
+steps:
+  - task: CmdLine@2
+    displayName: "Send Message"
+    retryCountOnTaskFailure: "3"
+    continueOnError: true
+    inputs:
+      script: |
+        secs=$(( ${{ parameters.pipelineEndTime }}-${{ parameters.pipelineStartTime }} ))
+        TIME_ELAPSED=$(printf '%02d:%02d:%02d\n' $((secs/3600)) $((secs%3600/60)) $((secs%60)))
+
+        # Print debug information
+        echo "##[debug] WEB_HOOK_URL ......................................: ${{ parameters.webhookUrl }}"
+        echo "##[debug] FLOW ..............................................: ${{ parameters.flow }}"
+        echo "##[debug] TITLE .............................................: ${{ parameters.title }}"
+        echo "##[debug] STATUS ............................................: ${{ parameters.status }}"
+        echo "##[debug] PIPELINE_START_TIME ...............................: ${{ parameters.pipelineStartTime }}"
+        echo "##[debug] PIPELINE_END_TIME .................................: ${{ parameters.pipelineEndTime }}"
+        echo "##[debug] TIME_ELAPSED ......................................: $TIME_ELAPSED"
+        echo "##[debug] FACTS .............................................: ${{ parameters.facts }}"
+        echo "##[debug] FACTS 2 ...........................................: ${{ parameters.facts2 }}"
+        echo "##[debug] FACTS 3 ...........................................: ${{ parameters.facts3 }}"
+        if [[ "${{ parameters.flow }}" == "CI" ]]; then
+          echo "##[debug] CD_PIPELINE_TIGGERED_URL ..........................: ${{ parameters.CDPipelineTriggeredURL }}"
+        fi
+
+        case "${{ parameters.status }}" in
+          "Started") THEME_COLOR='#0000FF' ;;
+          "Finish")
+            THEME_COLOR='#7FFF00'
+            FACTS='{
+                "name": "⏱️ Pipeline Duration:",
+                "value": "'$TIME_ELAPSED'"
+              }'
+            if [[ "${{ parameters.flow }}" == "CI" ]]; then
+              ACTIONS='{
+                  "@type": "OpenUri",
+                  "name": "View Static Analysis",
+                  "targets": [{
+                      "os": "default",
+                      "uri": "http://sonar.devops.redecorp.br/dashboard?id=fenix-$(Build.Repository.Name)&branch=$(Build.SourceBranchName)"
+                  }]
+                },
+                {
+                  "@type": "OpenUri",
+                  "name": "View CD Pipeline",
+                  "targets": [{
+                      "os": "default",
+                      "uri": "${{ parameters.CDPipelineTriggeredURL }}"
+                  }]
+                }'
+            fi
+          ;;
+          "Failed") 
+            THEME_COLOR='#FF0000'
+            FACTS='{
+                "name": "⏱️ Pipeline Duration:",
+                "value": "'$TIME_ELAPSED'"
+              }'
+          ;;
+          "Finish [Only Security Analysis]") 
+            THEME_COLOR='#7FFF00'
+            FACTS='{
+                "name": "⏱️ Pipeline Duration:",
+                "value": "'$TIME_ELAPSED'"
+              }'
+          ;;
+          *) THEME_COLOR='#B0E0E6' ;;
+        esac
+
+        # Start the "Send Message" group
+        echo "##[group]Send Message"
+        shopt -s nocasematch
+
+        # Define the JSON message to be sent
+        JSON_MESSAGE='{
+            "@type": "MessageCard",
+            "@context": "http://schema.org/extensions",
+            "themeColor": "'"${THEME_COLOR}"'",
+            "summary": "-",
+            "sections": [{
+              "activityTitle": "**${{ parameters.title }}**",
+              "activitySubtitle": "_Build $(Build.BuildNumber)_",
+              "activityImage": "https://cdn-icons-png.freepik.com/256/16466/16466981.png",
+              "facts": [
+              {
+                "name": "📄 Status:",
+                "value": "_${{ parameters.status }}_"
+              },
+              {
+                "name": "🔀 Flow:",
+                "value": "_${{ parameters.flow }}_"
+              },
+              {
+                "name": "🌱 Environment:",
+                "value": "_$(ENVIRONMENT)_"
+              },
+              {
+                "name": "👤 Started By:",
+                "value": "_$(Build.RequestedFor)_"
+              }],
+              "markdown": true
+            }, {
+              "facts": [ '${FACTS}' ]
+            }, {
+              "facts": [ ${{ parameters.facts }} ]
+            }, {
+              "facts": [ ${{ parameters.facts2 }} ]
+            }, {
+              "facts": [ ${{ parameters.facts3 }} ]
+            }],
+            "potentialAction": [
+            {
+              "@type": "OpenUri",
+              "name": "View Pipeline",
+              "targets": [{
+                  "os": "default",
+                  "uri": "$(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)"
+              }]
+            },
+            '${ACTIONS}'
+            ]
+        }'
+
+        # Send the message via curl
+        curl -v -X POST ${{ parameters.webhookUrl }} \
+          -H 'Content-Type: application/json; charset=utf-8' \
+          --data-binary @- << EOF
+          $JSON_MESSAGE
+        EOF
+        echo "##[endgroup]"

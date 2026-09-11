@@ -1,0 +1,70 @@
+jobs:
+- job: build
+  pool: GeneralPurposeLinuxAgentsCI
+  condition: true
+  steps:
+  - template: /tech_products/azr4/templates/steps/version_update.yaml
+  - script: mkdir temp_result
+    displayName: 'Create temp_result dir'
+  - template: /tech_products/azr4/templates/steps/execute_in_docker.yaml
+    parameters:
+      image: 'registry.telefonicabigdata.com/jenkins-slaves/ml-python:1.0.9'
+      command: |
+        echo ${DEPRECIATION_MESSAGE}
+        pip3 install -r requirements.txt &&\
+        pyinstaller ${PYINSTALLER_ARGS} --onefile ${MAIN_FILE_PATH} &&\
+        mkdir evaluation && cp -r dist/ temp_result/source  && cp -r models/ evaluation/ config/ temp_result/
+      envs:
+      - key: 'MAIN_FILE_PATH'
+        value: $(MAIN_FILE_PATH)
+      - key: 'PYINSTALLER_ARGS'
+        value: $(PYINSTALLER_ARGS)
+  - script: |
+      echo ${DEPRECIATION_MESSAGE}
+      echo '##[debug] Init execution'
+      echo ${SSH_CRED_FILE_B64_CONTENT} | base64 -d > "${SSH_KEY}"
+      chmod 600 "${SSH_KEY}"
+      echo "##[debug] Creating folder ${SSH_PATH}/${PROJECT_NAME}/build in ${SSH_SERVER}"
+      ssh -i ${SSH_KEY} ${SSH_USER}@${SSH_SERVER} \
+          "rm -rf ${SSH_PATH}/${PROJECT_NAME}/.backup-build || true &&\
+          mv ${SSH_PATH}/${PROJECT_NAME}/build ${SSH_PATH}/${PROJECT_NAME}/.backup-build || true &&\
+          mkdir -p ${SSH_PATH}/${PROJECT_NAME}/build"
+      echo "##[debug]  Copying files to ${SSH_USER}"
+      scp -O -i ${SSH_KEY} -r temp_result/* ${SSH_USER}@${SSH_SERVER}:${SSH_PATH}/${PROJECT_NAME}/build/
+      echo "##[debug] Creating folder ${SSH_PATH}/${PROJECT_NAME}/build in ${SSH_SERVER}"
+      ssh -i ${SSH_KEY} ${SSH_USER}@${SSH_SERVER} \
+          "cd ${SSH_PATH}/${PROJECT_NAME}/build/ &&\
+          export PATH_KEYTAB=${PATH_KEYTAB} &&\
+          ./source/execute_file train"
+      echo "##[debug] Copying files from ${SSH_USER}"
+      scp -O -i ${SSH_KEY} -r ${SSH_USER}@${SSH_SERVER}:${SSH_PATH}/${PROJECT_NAME}/build/* temp/
+    displayName: 'Execute Train'
+    condition: and(succeeded(), eq(variables.EXECUTE_TRAIN, 'true'))
+    env:
+      SSH_CRED_FILE_B64_CONTENT: $(SSH_CRED_FILE_B64_CONTENT)
+      SSH_USER: $(SSH_USER)
+      SSH_SERVER: $(SSH_SERVER)
+      SSH_PATH: $(SSH_PATH)
+      PROJECT_NAME: $(PROJECT_NAME)
+      PATH_KEYTAB: $(PATH_KEYTAB)
+      SSH_KEY: $(Agent.TempDirectory)/id_rsa
+  - task: Bash@3
+    inputs:
+      targetType: 'inline'
+      script: |
+        echo ${DEPRECIATION_MESSAGE}
+        cp -rf temp/* temp_result/
+      displayName: 'Copy Files to temp_result'
+      condition: and(succeeded(), eq(variables.EXECUTE_TRAIN, 'true'))
+  - script: |
+        echo ${DEPRECIATION_MESSAGE}
+        tar -zcvf ${TAR_FILE_PATH} ./temp_result/*
+        ls -la
+    displayName: 'Generate .tar'
+    env:
+      TAR_FILE_PATH: $(PROJECT_NAME)-$(set_version.VERSION).tar.gz
+  - task: PublishPipelineArtifact@1
+    inputs:
+      targetPath: $(PROJECT_NAME)-$(set_version.VERSION).tar.gz
+      artifact: 'ml_model'
+      publishLocation: 'pipeline'

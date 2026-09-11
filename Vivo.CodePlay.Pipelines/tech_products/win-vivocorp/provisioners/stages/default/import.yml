@@ -1,0 +1,168 @@
+parameters:
+- name: environment
+  type: string
+
+stages:
+- stage: import_files
+  displayName: "Import files"
+  dependsOn: prepare
+  pool: $(PollVivoCorpSiebelAgents)
+  jobs:
+  - job: import_files
+    displayName: "Import files"
+    timeoutInMinutes: 120
+    steps:
+      - checkout: self
+        fetchDepth: 0
+        fetchTags: false
+
+      - task: DownloadPipelineArtifact@2
+        displayName: 'Download new_sifs.log pipeline artifact'
+        inputs:
+          artifact: 'new_sifs'
+          path: 'C:/Siebel_Devops/$(environmentNameUpperCase)/ambientes'
+
+      - task: CmdLine@2
+        displayName: 'Show new_sifs.log'
+        inputs:
+          script: |
+            @echo off
+            type C:\Siebel_Devops\$(environmentNameUpperCase)\ambientes\new_sifs.log
+
+      - task: PowerShell@2
+        displayName: 'Run PowerShell script for replace'
+        inputs:
+          targetType: 'inline'
+          script: |
+            $logFile = "C:\Siebel_Devops\$(environmentNameUpperCase)\ambientes\new_sifs.log"
+            (Get-Content -Path $logFile) -replace '/', '\' | Out-File -Encoding ASCII -FilePath $logFile
+
+
+      - task: CmdLine@2
+        displayName: 'Copy files listed in new_sifs.log to target directory'
+        inputs:
+          script: |
+            @echo off
+            set LOG_FILE=C:\Siebel_Devops\$(environmentNameUpperCase)\ambientes\new_sifs.log
+            set TARGET_DIR=C:\Siebel_Devops\$(environmentNameUpperCase)\temp
+
+            echo LOG_FILE is set to: %LOG_FILE%
+            echo TARGET_DIR is set to: %TARGET_DIR%
+
+            if not exist "%LOG_FILE%" (
+              echo "Error: %LOG_FILE% not found!"
+              exit 0
+            )
+
+            for /f %%i in ('findstr /r /v "^$" "%LOG_FILE%"') do set NON_EMPTY=1
+            if not defined NON_EMPTY (
+              echo "Error: %LOG_FILE% is empty!"
+              exit 0
+            )
+            for /f "tokens=*" %%a in (%LOG_FILE%) do (
+              echo Processing file: %%a
+              echo F|xcopy "$(Build.SourcesDirectory)\%%a" "%TARGET_DIR%\%%a" /Y
+            )
+      - task: CmdLine@2
+        displayName: 'Check for ONR Files'
+        name: checkOnrFiles
+        inputs:
+          script: |
+            @echo off
+            set LOG_FILE=C:\Siebel_Devops\$(environmentNameUpperCase)\ambientes\new_sifs.log
+            
+            if not exist "%LOG_FILE%" (
+              echo new_sifs.log not found, setting onr_found=false
+              echo ##vso[task.setvariable variable=onr_found;isOutput=true]false
+              exit 0
+            )
+            
+            findstr /i "\.xml" "%LOG_FILE%" >nul
+            if %errorlevel%==0 (
+              echo XML files found in new_sifs.log
+              echo ##vso[task.setvariable variable=onr_found;isOutput=true]true
+            ) else (
+              echo No XML files found in new_sifs.log
+              echo ##vso[task.setvariable variable=onr_found;isOutput=true]false
+              exit 0
+            )
+
+      - task: CmdLine@2
+        displayName: 'Check for SIF Files'
+        name: checkSifFiles
+        inputs:
+          script: |
+            @echo off
+            if exist C:\Siebel_Devops\$(environmentNameUpperCase)\temp\*.sif (
+              echo SIF files found.
+              echo ##vso[task.setvariable variable=sif_found;isOutput=true]true
+              set "sif_found=true"
+              exit 0
+            ) else (
+              echo No SIF files found.
+              echo "file sifs doesn't exist" > C:\Siebel_Devops\$(environmentNameUpperCase)\temp\nao_compilar.txt
+              echo ##vso[task.setvariable variable=sif_found;isOutput=true]false
+              set "sif_found=false"
+              exit 0
+            )
+      
+      - task: CmdLine@2
+        displayName: 'Check for Workflow Files'
+        name: checkWorkflowFiles
+        inputs:
+          script: |
+            @echo off
+            if exist C:\Siebel_Devops\$(environmentNameUpperCase)\temp\Workflow_Process-*.sif (
+              echo Workflow files found.
+              echo ##vso[task.setvariable variable=wfo_found;isOutput=true]true
+              set "wfo_found=true"
+              exit 0
+            ) else (
+              echo No Workflow files found.
+              echo ##vso[task.setvariable variable=wfo_found;isOutput=true]false
+              set "wfo_found=false"
+              exit 0
+            )
+
+      - task: CmdLine@2
+        displayName: 'Check for Non-Workflow SIF Files'
+        name: checkNonWorkflowSif
+        inputs:
+          script: |
+            @echo off
+            setlocal enabledelayedexpansion
+            set "non_workflow_sif_found=false"
+
+            if not exist C:\Siebel_Devops\$(environmentNameUpperCase)\temp\*.sif (
+              echo No SIF files found.
+              echo ##vso[task.setvariable variable=non_workflow_sif_found;isOutput=true]false
+              exit 0
+            )
+
+            for /f "delims=" %%a in ('dir /b C:\Siebel_Devops\$(environmentNameUpperCase)\temp\*.sif') do (
+              echo %%a | findstr /i /b /c:"Workflow_Process-" >nul
+              if errorlevel 1 (
+                echo Non-workflow SIF found: %%a
+                set "non_workflow_sif_found=true"
+              )
+            )
+
+            echo ##vso[task.setvariable variable=non_workflow_sif_found;isOutput=true]!non_workflow_sif_found!
+            exit 0
+
+      - task: CmdLine@2
+        displayName: 'Execute Siebel Batch Import'
+        condition: and(succeeded(), eq(variables['checkSifFiles.sif_found'], 'true'))
+        inputs:
+          workingDirectory: 'C:\Siebel\8.1\Tools_1\BIN'
+          script: |
+            @echo off
+            set datetime=%date:~-4%_%date:~3,2%_%date:~0,2%_%time:~0,2%_%time:~3,2%_%time:~6,2%
+            set "timestamp=%datetime: =0%"
+            echo %timestamp%
+
+            siebdev.exe /c "C:\Siebel\8.1\Tools_1\BIN\ENU\$(environmentNameUpperCase).cfg" /s $(environmentNameUpperCase) /u $(siebeluser) /p $(siebelpass) /batchimport "Siebel Repository" overwrite "C:\Siebel_Devops\$(environmentNameUpperCase)\temp" C:\Siebel_Devops\log\Import_$(environmentNameUpperCase)_%timestamp%.log
+
+            del "C:\Siebel_Devops\$(environmentNameUpperCase)\temp\*" /f /q
+
+            type C:\Siebel_Devops\log\Import_$(environmentNameUpperCase)_%timestamp%.log

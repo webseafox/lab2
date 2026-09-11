@@ -1,0 +1,259 @@
+parameters:
+  - name: environment
+    type: string
+    default: dev
+  - name: tag_version
+    type: string
+    default: ''
+
+stages:
+  - stage: Deploy
+    displayName: 'Deploy to Storage Account'
+    jobs:
+      - deployment: DeployMFE
+        displayName: 'Deploy to Storage Account'
+        pool:
+          name: $(PRIVATE_AGENT_SHARED)
+        environment: ${{ parameters.environment }}
+        variables:
+          - group: mfe-storageaccount
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                # Checkout para pegar as variáveis de ambiente
+                - checkout: self
+                  clean: true
+                  fetchDepth: 1
+                  path: source
+                  persistCredentials: true
+                  
+                # Verificar conteúdo do diretório source
+                - script: |
+                    echo "Verificando conteúdo do diretório source:"
+                    ls -la "$(Pipeline.Workspace)/source"
+                    
+                    if [ -f "$(Pipeline.Workspace)/source/catalog-info.yaml" ]; then
+                      echo "catalog-info.yaml encontrado!"
+                      echo "Conteúdo do catalog-info.yaml:"
+                      cat "$(Pipeline.Workspace)/source/catalog-info.yaml"
+                    else
+                      echo "##[warning]catalog-info.yaml não encontrado no diretório source"
+                      echo "Verificando em outros diretórios..."
+                      find "$(Pipeline.Workspace)" -name "catalog-info.yaml" -type f
+                    fi
+                  displayName: 'Verificar diretório source'
+
+                # Criar diretório para artefatos e configurar .npmrc
+                - script: |
+                    mkdir -p "$(Pipeline.Workspace)/artifact"
+                    echo "registry=https://pkgs.dev.azure.com/telefonica-vivo-brasil/_packaging/DevOps/npm/registry/" > "$(Pipeline.Workspace)/artifact/.npmrc"
+                    echo "always-auth=true" >> "$(Pipeline.Workspace)/artifact/.npmrc"
+                  displayName: 'Create Artifact Directory and Setup npmrc'
+
+                # Autenticar com Azure Artifacts
+                - task: npmAuthenticate@0
+                  inputs:
+                    workingFile: "$(Pipeline.Workspace)/artifact/.npmrc"
+                    
+                # Extrair ACRONYM do catalog-info.yaml
+                - script: |
+                    CATALOG_INFO_PATH="$(Pipeline.Workspace)/source/catalog-info.yaml"
+                    
+                    if [ ! -f "$CATALOG_INFO_PATH" ]; then
+                      echo "##[error]catalog-info.yaml não encontrado em: $CATALOG_INFO_PATH"
+                      exit 1
+                    fi
+                    
+                    ACRONYM=$(yq -r '.metadata.annotations."techarch.governance-app.acronym"' "$CATALOG_INFO_PATH")
+                    
+                    if [ -z "$ACRONYM" ]; then
+                      echo "##[error]GOV_APP_ACRONYM não encontrado no catalog-info.yaml"
+                      echo "Conteúdo do catalog-info.yaml:"
+                      cat "$CATALOG_INFO_PATH"
+                      exit 1
+                    fi
+                    
+                    # Exportar como variável de ambiente para uso posterior
+                    echo "##vso[task.setvariable variable=GOV_APP_ACRONYM]$ACRONYM"
+                    echo "GOV_APP_ACRONYM=$ACRONYM"
+                  displayName: 'Extrair GOV_APP_ACRONYM do catalog-info.yaml'
+
+                # Download e preparação do pacote NPM
+                - script: |
+                    cd "$(Pipeline.Workspace)/artifact"
+                    export NPM_CONFIG_USERCONFIG="$(Pipeline.Workspace)/artifact/.npmrc"
+                    
+                    echo "Installing NPM package..."
+                    npm install @$(GOV_APP_ACRONYM)/$(Build.Repository.Name)@${{ parameters.tag_version }}
+                    
+                    echo "Checking package structure..."
+                    PACKAGE_DIR="node_modules/@$(GOV_APP_ACRONYM)/$(Build.Repository.Name)"
+                    ls -la "$PACKAGE_DIR"
+                    
+                    echo "Creating dist directory..."
+                    rm -rf dist
+                    mkdir -p dist
+                    
+                    echo "Copying package files..."
+                    if [ -d "$PACKAGE_DIR/dist" ]; then
+                      echo "Found dist directory, copying contents..."
+                      cp -r "$PACKAGE_DIR/dist/"* dist/
+                    else
+                      echo "No dist directory found, copying all files..."
+                      cp -r "$PACKAGE_DIR/"* dist/
+                    fi
+                    
+                    echo "Listing final dist contents..."
+                    ls -la dist/
+                  displayName: 'Download NPM Package'
+                  env:
+                    NPM_CONFIG_USERCONFIG: "$(Pipeline.Workspace)/artifact/.npmrc"
+
+                # Deploy para Storage Account
+                - task: AzureCLI@2
+                  displayName: 'Replace Variables and Deploy to Storage'
+                  inputs:
+                    azureSubscription: 'DevOpsSharedResources'
+                    scriptType: 'bash'
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      # Diretório do artefato baixado
+                      ARTIFACT_DIR="$(Pipeline.Workspace)/artifact"
+                      CONFIG_DIR="$(Pipeline.Workspace)/source/.azuredevops/config/${{ parameters.environment }}"
+                      
+                      # Criar script Python temporário
+                      cat > process_vars.py << 'EOF'
+                      import yaml
+                      import json
+                      import os
+                      import sys
+
+                      # Ler variáveis do arquivo YAML
+                      with open(sys.argv[1], 'r') as f:
+                          config = yaml.safe_load(f)
+                      
+                      # Criar dicionário de variáveis
+                      env_vars = {}
+                      for var in config.get('env', []):
+                          env_vars[var['name']] = var['value']
+                      
+                      # Salvar como JSON
+                      print(json.dumps(env_vars))
+                      EOF
+                      
+                      # Validar se o diretório dist existe e não está vazio
+                      DIST_DIR="$(Pipeline.Workspace)/artifact/dist"
+                      if [ ! -d "$DIST_DIR" ]; then
+                        echo "##vso[task.logissue type=error]O diretório dist não foi encontrado em: $DIST_DIR"
+                        echo "##[error]O diretório dist não foi encontrado!"
+                        exit 1
+                      fi
+
+                      # Verificar se o diretório está vazio
+                      if [ -z "$(ls -A "$DIST_DIR")" ]; then
+                        echo "##vso[task.logissue type=error]O diretório dist está vazio: $DIST_DIR"
+                        echo "##[error]O diretório dist está vazio!"
+                        exit 1
+                      fi
+
+                      # Executar script Python e capturar saída
+                      ENV_VARS=$(python3 process_vars.py "$CONFIG_DIR/environments_variables.yml")
+                      
+                      # Extract values from catalog-info.yaml
+                      CATALOG_INFO_PATH="$(Pipeline.Workspace)/source/catalog-info.yaml"
+                      
+                      if [ ! -f "$CATALOG_INFO_PATH" ]; then
+                        echo "##[error]catalog-info.yaml não encontrado em: $CATALOG_INFO_PATH"
+                        exit 1
+                      fi
+                      
+                      ACRONYM=$(yq -r '.metadata.annotations."techarch.governance-app.acronym"' "$CATALOG_INFO_PATH")
+                      REPO_NAME=$(yq -r '.metadata.annotations."dev.azure.com/repo"' "$CATALOG_INFO_PATH")
+                      
+                      if [ -z "$ACRONYM" ]; then
+                        echo "##[error]GOV_APP_ACRONYM não encontrado no catalog-info.yaml"
+                        echo "Conteúdo do catalog-info.yaml:"
+                        cat "$CATALOG_INFO_PATH"
+                        exit 1
+                      fi
+                      
+                      APP_NAME="${ACRONYM}-${REPO_NAME}"
+                      
+                      echo "##[debug]Acronym: $ACRONYM"
+                      echo "##[debug]Repo Name: $REPO_NAME"
+                      echo "##[debug]App Name: $APP_NAME"
+                      
+                      # Encontrar o arquivo bundle JS
+                      BUNDLE_FILE=$(find "$DIST_DIR" -type f -name "${APP_NAME}*.js")
+                      
+                      if [ -n "$BUNDLE_FILE" ]; then
+                        echo "Found bundle file: $BUNDLE_FILE"
+                        
+                        # Criar a string JavaScript com o conteúdo JSON
+                        ENV_VARS_TO_APPEND="window.Σ_environment={...(window.Σ_environment||{}), ['${APP_NAME}']: $ENV_VARS};"
+                        
+                        # Adicionar as variáveis no início do arquivo bundle
+                        echo "$ENV_VARS_TO_APPEND" > "$BUNDLE_FILE.tmp"
+                        cat "$BUNDLE_FILE" >> "$BUNDLE_FILE.tmp"
+                        mv "$BUNDLE_FILE.tmp" "$BUNDLE_FILE"
+                        
+                        echo "Environment variables injected into bundle file"
+                      else
+                        echo "Warning: Bundle file not found"
+                      fi
+
+                      # Upload para o Storage Account usando variáveis da Library
+                      echo "Uploading to Storage Account..."
+                      
+                      # Extract major.minor version from tag_version
+                      MAJOR_MINOR=$(echo "${{ parameters.tag_version }}" | cut -d'.' -f1,2)
+                      
+                      # Create destination path with correct structure
+                      DEST_PATH="\$web/mfe/$(Build.Repository.Name)/$MAJOR_MINOR"
+                      
+                      # Compress files with gzip
+                      echo "##[debug]Compressing files with gzip..."
+                      cd "$ARTIFACT_DIR/dist" && \
+                      gzip -r -6 * && \
+                      find . -type f -name "*.gz" | while read file; do mv "$file" "${file%.gz}"; done
+                      
+                      echo "##[debug]Uploading files with gzip content-encoding..."
+                      
+                      # Definir variáveis com base no ambiente
+                      ENV="${{ parameters.environment }}"
+                      ENV_UPPER=$(echo "$ENV" | tr '[:lower:]' '[:upper:]')
+                      echo "Ambiente: $ENV (Uppercase: $ENV_UPPER)"
+                      
+                      # Obter a string de conexão baseada no ambiente
+                      CONNECTION_VAR="STORAGE_CONNECTION_${ENV_UPPER}"
+                      STORAGE_NAME_VAR="STORAGE_NAME_${ENV_UPPER}"
+                      STORAGE_KEY_VAR="STORAGE_KEY_${ENV_UPPER}"
+                      
+                      echo "##[debug]Variável de conexão: $CONNECTION_VAR"
+                      echo "##[debug]Variável de nome: $STORAGE_NAME_VAR"
+                      echo "##[debug]Variável de chave: $STORAGE_KEY_VAR"
+                      
+                      # Verificar se as variáveis existem
+                      if [ -z "${!STORAGE_NAME_VAR}" ]; then
+                        echo "##[error]Variável $STORAGE_NAME_VAR não encontrada"
+                        exit 1
+                      fi
+                      
+                      if [ -z "${!STORAGE_KEY_VAR}" ]; then
+                        echo "##[error]Variável $STORAGE_KEY_VAR não encontrada"
+                        exit 1
+                      fi
+                      
+                      echo "##[debug]Uploading files with gzip content-encoding..."
+                      echo "##[debug]Storage Account: ${!STORAGE_NAME_VAR}"
+                      echo "##[debug]Destination: $DEST_PATH"
+                      
+                      az storage blob upload-batch \
+                        --account-name "${!STORAGE_NAME_VAR}" \
+                        --auth-mode key \
+                        --account-key "${!STORAGE_KEY_VAR}" \
+                        --destination "$DEST_PATH" \
+                        --source "$ARTIFACT_DIR/dist" \
+                        --content-encoding "gzip" \
+                        --overwrite

@@ -1,0 +1,275 @@
+﻿parameters:
+- name: enablePublish
+  displayName: 'Habilitar publicação no Artifacts'
+  type: boolean
+  default: false
+
+stages:
+# Estágio de Build
+- stage: Build
+  displayName: '🏗️ Build ${{ variables[''Build.SourceBranchName''] }}'
+  jobs:
+  - job: Build
+    displayName: '🏗️ Build'
+    pool: GeneralPurposeLinuxAgentsCI
+    steps:
+      - task: DownloadSecureFile@1
+        name: SettingsNexus
+        displayName: '🔐 Download secure file (settings.xml)'
+        inputs:
+          secureFile: 'settings_pipelines.xml'
+
+      - task: AzureKeyVault@2
+        name: CofreUsuario
+        displayName: '🔑 Inicializa Key Vault'
+        inputs:
+          azureSubscription: 'DevOpsSharedResources'
+          KeyVaultName: 'kv-azdevops-shared'
+          SecretsFilter: 'NEXUS-DEPS-USR, NEXUS-DEPS-PSW'
+          RunAsPreJob: true
+
+      - checkout: self
+        displayName: '🔄 Checkout code'
+        fetchDepth: 0
+        persistCredentials: true
+        clean: true
+
+      # ==================================================================
+      # [Compliance] Verifica se o repositório está em conformidade com as políticas de configuração
+      # ==================================================================
+      - task: VivoDevOpsConfigCompliance@1
+        displayName: 'Check DevOps Config Compliance'
+        inputs:
+          policySets: |
+            image-definition-files
+
+      - task: Bash@3
+        displayName: '🏗️ Build Composer package (Docker/Ant)'
+        inputs:
+          targetType: inline
+          script: |
+            BUILDER_IMAGE_NAME="builder/$(Build.BuildId)"
+            docker build --no-cache -t $BUILDER_IMAGE_NAME -f .azuredevops/builder.Dockerfile .
+            docker run --rm \
+              -v $(Build.Repository.LocalPath):/app \
+              -w /app \
+              $BUILDER_IMAGE_NAME ant ExportWar
+            echo "Conteúdo do LocalPath após build:"
+            ls -l $(Build.Repository.LocalPath)
+
+      - task: PublishPipelineArtifact@1
+        displayName: '📤 Publish WAR artifact'
+        inputs:
+          targetPath: '$(Build.Repository.LocalPath)/$(APP).war'
+          artifact: 'war_artifact'
+          publishLocation: 'pipeline'
+
+- stage: Publish
+  pool: GeneralPurposeLinuxAgentsCI
+  displayName: '📦 Publish to Azure Artifacts'
+  condition: and(succeeded(), eq('${{ parameters.enablePublish }}', 'true'))
+  jobs:
+    - job: Publish
+      displayName: '📦 Publish Universal Package'
+      steps:
+        - checkout: self
+          displayName: '🔄 Checkout code'
+          fetchDepth: 0
+          persistCredentials: true
+          clean: true
+
+        # Baixa o artefato gerado no build
+        - task: DownloadPipelineArtifact@2
+          displayName: '⬇️ Download WAR artifact'
+          inputs:
+            buildType: 'current'
+            artifactName: 'war_artifact'
+            targetPath: '$(Build.SourcesDirectory)'
+
+        # Recupera versão do VERSION.md
+        - task: PowerShell@2
+          name: GetVersionMd
+          displayName: '🏷️ Recupera versão do VERSION.md'
+          inputs:
+            targetType: 'inline'
+            script: |
+              $versionPath = "VERSION.md"
+              if (!(Test-Path $versionPath)) { Write-Error "Arquivo VERSION.md não encontrado!"; exit 1 }
+              $versionLines = Get-Content $versionPath
+              $maxV = -1
+              foreach ($line in $versionLines) {
+                if ($line -match "^\|\s*0\.0\.([0-9]+)\s*\|") {
+                  $v = [int]$matches[1]
+                  if ($v -gt $maxV) { $maxV = $v }
+                }
+              }
+              if ($maxV -eq -1) {
+                Write-Error "[ERRO] Nenhuma versão encontrada no padrão 0.0.v em VERSION.md."
+                exit 1
+              }
+              $versionMd = "0.0.$maxV"
+              Write-Host "[LOG] Maior versão encontrada no VERSION.md: $versionMd"
+              Write-Host "##vso[task.setvariable variable=versionMd]$versionMd"
+
+        # Recupera versão do build.xml
+        - task: PowerShell@2
+          name: GetBuildXmlVersion
+          displayName: '🏷️ Recupera versão do build.xml'
+          inputs:
+            targetType: 'inline'
+            script: |
+              [xml]$xml = Get-Content "build.xml"
+              $versionAttr = ($xml.project.property | Where-Object { $_.name -eq "version" }).value
+              Write-Host "[LOG] Valor recuperado do build.xml: $versionAttr"
+              Write-Host "##vso[task.setvariable variable=versionBuildXml]$versionAttr"
+        # Valida versões
+        - task: PowerShell@2
+          displayName: '✅ Valida versões'
+          inputs:
+            targetType: 'inline'
+            script: |
+              $versionMd = "$(versionMd)"
+              $versionBuildXml = "$(versionBuildXml)"
+              Write-Host "[LOG] Versão do VERSION.md: $versionMd"
+              Write-Host "[LOG] Versão do build.xml: $versionBuildXml"
+              # Função para comparar versões
+              function Compare-Version($v1, $v2) {
+                $a = $v1.Trim().Split('.') | ForEach-Object { [int]$_ }
+                $b = $v2.Trim().Split('.') | ForEach-Object { [int]$_ }
+                for ($i=0; $i -lt [Math]::Max($a.Count, $b.Count); $i++) {
+                  $ai = if ($i -lt $a.Count) { $a[$i] } else { 0 }
+                  $bi = if ($i -lt $b.Count) { $b[$i] } else { 0 }
+                  if ($ai -gt $bi) { return 1 }
+                  if ($ai -lt $bi) { return -1 }
+                }
+                return 0
+              }
+
+              $cmp = Compare-Version $versionBuildXml $versionMd
+              Write-Host "[LOG] Resultado da comparação: $cmp (0 = igual, 1 = build.xml maior, -1 = build.xml menor)"
+              if ($cmp -gt 0) {
+                Write-Error "Não é permitido alterações manuais de versão no build.xml"
+                exit 1
+              }
+
+        # Atualiza VERSION.md
+        - task: PowerShell@2
+          displayName: '🏷️ Atualiza VERSION.md'
+          inputs:
+            targetType: 'inline'
+            script: |
+              $ErrorActionPreference = 'Stop'
+              $versionPath = "VERSION.md"
+              if (!(Test-Path $versionPath)) { Write-Error "Arquivo VERSION.md não encontrado!"; exit 1 }
+              $versionLines = Get-Content $versionPath
+              $maxV = -1
+              foreach ($line in $versionLines) {
+                if ($line -match "^\|\s*0\.0\.([0-9]+)\s*\|") {
+                  $v = [int]$matches[1]
+                  if ($v -gt $maxV) { $maxV = $v }
+                }
+              }
+              $newVersion = "0.0.$([int]$maxV+1)"
+              Write-Host "##vso[task.setvariable variable=newVersion]$newVersion"
+              # Encontra o índice da primeira linha de separador da tabela principal
+              $insertIndex = 0
+              for ($i = 0; $i -lt $versionLines.Length; $i++) {
+                if ($versionLines[$i] -match "^\|[-\|]+\|$") {
+                  $insertIndex = $i + 1
+                  break
+                }
+              }
+              $branch = $env:BUILD_SOURCEBRANCHNAME
+              $publishDate = (Get-Date).ToString('dd/MM/yyyy')
+              $newEntry = "|  $newVersion  | $branch |  $publishDate  |              |                          |"
+              $newLines = $versionLines[0..($insertIndex-1)] + $newEntry + $versionLines[$insertIndex..($versionLines.Length-1)]
+              $lastUpdated = Get-Date -Format "dd/MM/yyyy"
+              $newContent = ($newLines -join "`n") -replace '\*Last updated: [^*]+\*', ''
+              $newContent = $newContent.TrimEnd() + "`n*Last updated: $lastUpdated*"
+              Set-Content $versionPath -Value $newContent -Encoding UTF8
+              Write-Host "[ALTERAÇÃO] Linha adicionada ao VERSION.md: $newEntry"
+
+        # Atualiza build.xml com a versão publicada
+        - task: PowerShell@2
+          displayName: '🏷️ Atualiza build.xml com versão publicada'
+          inputs:
+            targetType: 'inline'
+            script: |
+              $ErrorActionPreference = 'Stop'
+              $buildXmlPath = "build.xml"
+              $publishedVersion = "$(newVersion)"
+              if (!(Test-Path $buildXmlPath)) { Write-Error "Arquivo build.xml não encontrado!"; exit 1 }
+              $buildXmlLines = Get-Content $buildXmlPath
+              $pattern = '<property name="version" value="[^"]*" />'
+              $changed = $false
+              for ($i = 0; $i -lt $buildXmlLines.Length; $i++) {
+                if ($buildXmlLines[$i] -match $pattern) {
+                  $indent = ($buildXmlLines[$i] -replace '^(\s*).*$', '$1')
+                  $newLine = $indent + '<property name="version" value="' + $publishedVersion + '" />'
+                  Write-Host "[ALTERAÇÃO] Linha original do build.xml: $($buildXmlLines[$i])"
+                  $buildXmlLines[$i] = $newLine
+                  Write-Host "[ALTERAÇÃO] Linha modificada do build.xml: $newLine"
+                  $changed = $true
+                }
+              }
+              if (-not $changed) {
+                Write-Host "[AVISO] Nenhuma linha de versão encontrada para substituir no build.xml."
+              }
+              Set-Content $buildXmlPath -Value $buildXmlLines -Encoding UTF8
+
+        # Publica pacote
+        - task: UniversalPackages@0
+          displayName: '📦 Publish Azure Artifacts'
+          inputs:
+            command: 'publish'
+            publishDirectory: '$(Build.SourcesDirectory)/$(APP).war'
+            feedsToUsePublish: 'internal'
+            vstsFeedPublish: '3d53bc62-8749-4931-ae46-a443b73bc87a'
+            vstsFeedPackagePublish: '$(FEED_PACKAGE)'
+            versionOption: 'custom'
+            versionPublish: '$(newVersion)'
+
+        # Valida build.xml antes do commit
+        - task: PowerShell@2
+          displayName: '✅ Valida build.xml antes do commit'
+          inputs:
+            targetType: 'inline'
+            script: |
+              Write-Host 'Conteúdo do build.xml antes do commit:'
+              Get-Content build.xml
+
+        # Commit e push das alterações
+        - task: CmdLine@2
+          displayName: '📝 Commit alterações'
+          inputs:
+            script: |
+              git config user.email "azure-pipelines@telefonicati.onmicrosoft.com"
+              git config user.name "Azure Pipelines"
+              git add VERSION.md build.xml
+              git commit -m "chore: atualiza versão $newVersion" || echo "Nada a commitar, forçando push."
+              BRANCH_NAME=$(echo $(Build.SourceBranch) | sed 's#refs/heads/##')
+              git push origin HEAD:$BRANCH_NAME
+
+        # Sincroniza VERSION.md em todas as branches
+        - task: CmdLine@2
+          displayName: '🔃 Sync VERSION.md em todas as branches'
+          inputs:
+            script: |
+              BRANCH_NAME=$(echo $(Build.SourceBranch) | sed 's#refs/heads/##')
+              # Garante que a branch principal existe localmente antes de copiar o VERSION.md
+              if ! git show-ref --verify --quiet refs/heads/$BRANCH_NAME; then
+                git fetch origin $BRANCH_NAME
+                git checkout $BRANCH_NAME
+              fi
+              for BRANCH in $(git branch -r | grep -v "$BRANCH_NAME" | grep -v '\->' | sed 's#origin/##'); do
+                echo "Sincronizando VERSION.md para $BRANCH"
+                git fetch origin $BRANCH || continue
+                git checkout $BRANCH
+                git pull origin $BRANCH
+                git checkout $BRANCH_NAME -- VERSION.md
+                git add VERSION.md
+                git commit -m "chore: sincroniza VERSION.md da branch $BRANCH_NAME" || echo "Nada a commitar em $BRANCH, forçando push."
+                git status
+                git push --force origin $BRANCH
+              done
+              git checkout $BRANCH_NAME

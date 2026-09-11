@@ -1,0 +1,133 @@
+parameters:
+- name: fortifyExclusionRepository
+- name: dependsOn
+  type: object
+- name: branchName
+  type: string
+
+stages:
+- stage: security_backend
+  displayName: "Security Backend"
+  dependsOn: "${{ parameters.dependsOn }}"
+  condition: not(or(failed(), canceled()))
+  isSkippable: false
+  pool: $(PRIVATE_AGENT_DEFAULT)
+  jobs:
+  - job: app_config_keys
+    workspace:
+      clean: all
+    displayName: "Get AppSec Config Keys"
+    condition: and(
+                  succeeded(),
+                  not(
+                    or(
+                      ${{ in(parameters.branchName, 'refs/heads/master', 'master') }},
+                      ${{ startsWith(parameters.branchName, 'project/') }},
+                      ${{ startsWith(parameters.branchName, 'stage/') }}
+                    )
+                  )
+                )
+    steps:
+    - template: /tasks/bash/welcome.yml@CorePipelines
+    - template: /security/get_appconfig_keys.yml
+      parameters:
+        repositoryName: "src-sap-commerce-core-customize-java"
+        repositoryId: "c8c3900d-d41f-46bb-a7de-aea0be3e3ad0"
+
+  - job: sast_scan
+    workspace:
+      clean: all
+    dependsOn: app_config_keys
+    variables:
+      USE_FORTIFY: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_FORTIFY'] ]
+      USE_CONVISO: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_CONVISO'] ]
+      SKIP_SECURITY_GATE: $[ dependencies.app_config_keys.outputs['evaluate_flags.SKIP_SECURITY_GATE'] ]
+    condition: and(
+                  succeeded(),
+                  and(
+                    eq(variables.USE_FORTIFY, 'true'),
+                    eq(variables.flowIsToReview, true),
+                    not(startsWith(variables['Build.SourceBranch'], 'refs/tags/'))
+                  ),
+                  not(
+                    or(
+                      ${{ in(parameters.branchName, 'refs/heads/master', 'master') }},
+                      ${{ startsWith(parameters.branchName, 'project/') }},
+                      ${{ startsWith(parameters.branchName, 'stage/') }}
+                    )
+                  )
+                )
+    displayName: "SAST Scan"
+    steps:
+    - template: /security/run_fortify_scan.yml
+      parameters:
+        fortifyExclusionRepository: ${{ parameters.fortifyExclusionRepository }}
+        fortifyArtifactName: "fortify-log-backend-$(System.JobAttempt)"
+        fortifyArtifactNameToPublish: "fortify-vulnerabilities-report-corecustomize-$(System.JobAttempt)"
+        appVersion: "DevSecOps-development"
+        repositoryAlias: "CoreCustomize"
+        repositoryName: "src-sap-commerce-core-customize-java"
+        branchName: ${{ parameters.branchName }}
+
+    - template: /tasks/telemetry/telemetry.yml@CorePipelines
+
+  - job: sca_scan
+    dependsOn: app_config_keys
+    displayName: "SCA Scan"
+    workspace:
+      clean: all
+    variables:
+      USE_DEPENDENCY_TRACK: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_DEPENDENCY_TRACK'] ]
+      USE_DT_DOCKER: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_DT_DOCKER'] ]
+      USE_CONVISO: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_CONVISO'] ]
+      SKIP_SECURITY_GATE_SCA: $[ dependencies.app_config_keys.outputs['evaluate_flags.SKIP_SECURITY_GATE_SCA'] ]
+    condition: and(
+                  succeeded(),
+                  eq(variables.USE_DEPENDENCY_TRACK, true),
+                  eq(variables.USE_DT_DOCKER, false),
+                  not(
+                    or(
+                      ${{ in(parameters.branchName, 'refs/heads/master', 'master') }},
+                      ${{ startsWith(parameters.branchName, 'project/') }},
+                      ${{ startsWith(parameters.branchName, 'stage/') }}
+                    )
+                  )
+                )
+    steps:
+      - checkout: CoreCustomize
+        clean: true
+        fetchDepth: 1
+        fetchTags: false
+        persistCredentials: true
+
+      - bash: |
+          echo "##[section]Stage para preparação do build e testes do Core Customize"
+          git fetch --no-tags origin "$BRANCH_NAME:$BRANCH_NAME" -f --depth 1
+          git checkout "$BRANCH_NAME"
+          git log
+        displayName: "Reset branch Core Customize ${{parameters.branchName }}"
+        env:
+          BRANCH_NAME: ${{parameters.branchName}}
+
+      - template: /security/run_sca_scan.yml
+        parameters:
+          appVersion: "DevSecOps-development"
+          repositoryName: "src-sap-commerce-core-customize-java"
+          buildArtifactName: "app-backend"
+
+  - job:
+    displayName: "About Security Backend"
+    condition: and(
+                succeeded(),
+                or(
+                  ${{ in(parameters.branchName, 'refs/heads/master', 'master') }},
+                  ${{ startsWith(parameters.branchName, 'project/') }},
+                  ${{ startsWith(parameters.branchName, 'stage/') }}
+                )
+              )
+    steps:
+    - checkout: none
+    - bash: |
+        echo "##[section]Não será executado o stage Security devido a branch '${{ parameters.branchName }}' (master, stage/* ou project/*) já estar coberta por segurança."
+      displayName: "Skip Security Backend"
+

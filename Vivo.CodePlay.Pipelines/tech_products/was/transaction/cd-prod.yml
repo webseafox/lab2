@@ -1,0 +1,99 @@
+﻿parameters:
+  - name: packageVersion
+    displayName: 'Versão do pacote para deploy'
+    type: string
+  - name: environment
+    displayName: 'Ambiente de destino'
+    default: producao
+    values:
+    - producao 
+
+stages:
+- stage: Deploy
+  displayName: '🚀 Deploy ${{ split(variables[''Build.SourceBranchName''],''_'')[0] }}'
+  jobs:
+    - deployment: Deploy
+      environment: 'deploy-${{ parameters.environment }}'
+      displayName: '🚀 Deploy'
+      pool: GeneralPurposeLinuxAgentsCD
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+            - task: UniversalPackages@0
+              displayName: '⬇️ Baixando arquivo de Azure Artifacts'
+              inputs:
+                command: 'download'
+                downloadDirectory: '$(Pipeline.Workspace)/transaction-config'
+                feedsToUse: 'internal'
+                vstsFeed: '3d53bc62-8749-4931-ae46-a443b73bc87a'
+                vstsFeedPackage: '$(FEED_PACKAGE)'
+                vstsPackageVersion: ${{ parameters.packageVersion }}
+
+            - script: ls -R $(Pipeline.Workspace)
+              displayName: '📋 Lista Pipeline Workspace (debug)'
+            - script: ls -R $(Build.ArtifactStagingDirectory)
+              displayName: '📋 Lista ArtifactStagingDirectory (debug)'
+            
+            # Copia o arquivo para o servidor SYNC de Produção
+            - task: CopyFilesOverSSH@0
+              displayName: '📤 Transferindo arquivo para servidor SYNC 1154CO'
+              inputs:
+                sshEndpoint: 'SSH_SYNCPROD'
+                sourceFolder: '$(Pipeline.Workspace)/transaction-config'
+                contents: '$(ARQUIVO)'
+                targetFolder: '$(TRANSACTION_FILE_DIR)'
+                readyTimeout: '20000' # string. Required. SSH handshake timeout. Default: 20000.
+
+
+            # Atualiza o status de deployment no VERSION.md
+            - checkout: self
+              displayName: '🔄 Checkout code'
+              persistCredentials: true
+            
+            - task: PowerShell@2
+              displayName: '🏷️ Atualizando STATUS no VERSION.md'
+              inputs:
+                targetType: 'inline'
+                script: |
+                    $version = "${{ parameters.packageVersion }}"
+                    $deployDate = Get-Date -Format "dd/MM/yyyy"
+                    if (Test-Path "VERSION.md") {
+                      $content = Get-Content "VERSION.md" -Raw
+                      $lines = $content -split "`r?`n"
+                      $versionUpdated = $false
+                      for ($i = 0; $i -lt $lines.Length; $i++) {
+                        # Procura pela linha da versão com "-" na coluna de Deploy Date
+                        if ($lines[$i] -match "^\|\s*$version\s*\|.*\|\s*-\s*\|") {
+                          # Substitui "-" pela data atual de deploy
+                          $lines[$i] = $lines[$i] -replace "-", $deployDate
+                          Write-Host "Versão $version marcada como deployada em $deployDate"
+                          $versionUpdated = $true
+                          break
+                        }
+                      }
+                      if (-not $versionUpdated) {
+                        Write-Warning "Versão $version não encontrada ou já deployada"
+                      }
+                      $newContent = $lines -join "`n"
+                      $lastUpdated = Get-Date -Format "yyyy.MM.dd"
+                      $newContent = $newContent -replace '\*Last updated: [^*]+\*', "*Last updated: $lastUpdated*"
+                      Set-Content "VERSION.md" -Value $newContent -Encoding UTF8
+                      Write-Host "VERSION.md atualizado - versão $version deployada"
+                    } else {
+                      Write-Error "VERSION.md não encontrado!"
+                      exit 1
+                    }
+                workingDirectory: '$(Build.SourcesDirectory)'
+            
+            - task: CmdLine@2
+              displayName: '📝 Commitando status de deploy no VERSION.md na master'
+              inputs:
+                script: |
+                  git config user.email "azure-pipelines@telefonicati.onmicrosoft.com"
+                  git config user.name "Azure Pipelines"
+                  git checkout master || git checkout -b master
+                  git add VERSION.md
+                  git commit -m "chore: marca versão ${{ parameters.packageVersion }} como deployada em produção"
+                  git push origin master
+                workingDirectory: '$(Build.SourcesDirectory)'

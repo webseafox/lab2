@@ -1,0 +1,312 @@
+## ============================================================================
+## Template: Validate and Prepare Kubernetes Secrets (Stage 1)
+## ============================================================================
+
+parameters:
+  - name: targetEnvironment
+    type: string
+  - name: gitRepoName
+    type: string
+  - name: secretName
+    type: string
+  - name: secrets
+    type: string
+    default: "{}"
+  - name: overrideExistingKeys
+    type: boolean
+    default: false
+  - name: dryRun
+    type: boolean
+    default: false
+
+stages:
+  - stage: cd_validate_and_prepare
+    displayName: "Validate & Prepare"
+    pool:
+      name: GeneralPurposeLinuxAgentsCI
+    dependsOn:
+      - naming_and_tagging
+    condition: succeeded()
+
+    jobs:
+      - deployment: validate_parameters
+        displayName: "Validate Parameters"
+        condition: succeeded()
+        ${{ if or(eq(parameters.targetEnvironment, 'prod'), eq(parameters.targetEnvironment, 'prod-front'), eq(parameters.targetEnvironment, 'prod-bff'), eq(parameters.targetEnvironment, 'prod-ms')) }}:
+          environment: $(DEPLOY_ENVIRONMENT_PROD)
+        ${{ else }}:
+          environment: $(DEPLOY_ENVIRONMENT_LIB)
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: Bash@3
+                  displayName: "Validate Parameters"
+                  name: validate
+                  inputs:
+                    targetType: inline
+                    script: |
+                      set -e
+
+                      TARGET_ENV="${{ parameters.targetEnvironment }}"
+                      GIT_REPO_NAME_RAW="${{ parameters.gitRepoName }}"
+                      SECRET_NAME="${{ parameters.secretName }}"
+                      SECRETS_JSON='${{ parameters.secrets }}'
+                      OVERRIDE_EXISTING_KEYS=$(echo "${{ parameters.overrideExistingKeys }}" | tr '[:upper:]' '[:lower:]')
+
+                      GIT_REPO_NAME="${GIT_REPO_NAME_RAW//[[:space:]]/}"
+                      APP_NAME="${APPLICATION_NAME:-}"
+
+                      IS_GENERAL_SECRET="false"
+                      if [ -z "$GIT_REPO_NAME" ]; then
+                        IS_GENERAL_SECRET="true"
+                        echo "Mode: General secrets"
+                      else
+                        echo "Mode: App-specific secrets"
+                      fi
+
+                      if [ -z "$TARGET_ENV" ]; then
+                        echo "##[error]Parameter 'targetEnvironment' is required."
+                        exit 1
+                      fi
+
+                      if [ "$IS_GENERAL_SECRET" = "false" ] && [ -z "$APP_NAME" ]; then
+                        echo "##[error]Variable 'APPLICATION_NAME' not found in variable group '$GIT_REPO_NAME'."
+                        exit 1
+                      fi
+
+                      if [ -z "$SECRET_NAME" ]; then
+                        echo "##[error]Parameter 'secretName' is required."
+                        exit 1
+                      fi
+
+                      if ! echo "$SECRETS_JSON" | jq empty 2>/dev/null; then
+                        echo "##[error]Invalid JSON format for 'secrets' parameter. Expected: {\"KEY\":\"value\", ...}"
+                        exit 1
+                      fi
+
+                      SECRET_COUNT=$(echo "$SECRETS_JSON" | jq 'keys | length')
+                      if [ "$SECRET_COUNT" -eq 0 ]; then
+                        echo "##[error]No secrets provided. Please specify at least one key-value pair."
+                        exit 1
+                      fi
+
+                      NAMESPACE="$TARGET_ENV"
+                      if [[ "$NAMESPACE" =~ ^esteira0([1-9])-(.+)$ ]]; then
+                        NAMESPACE="esteira${BASH_REMATCH[1]}-${BASH_REMATCH[2]}"
+                      fi
+
+                      if [ -n "$APP_NAME" ]; then
+                        APP_NAME_NORMALIZED=$(echo "$APP_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9.-]/-/g' | sed 's/--*/-/g' | sed 's/^-\|-$//g')
+                      else
+                        APP_NAME_NORMALIZED=""
+                      fi
+
+                      FULL_SECRET_NAME=$(echo "$SECRET_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9.-]/-/g' | sed 's/--*/-/g' | sed 's/^-\|-$//g')
+
+                      echo "Secret type: $([ "$IS_GENERAL_SECRET" = "true" ] && echo "General" || echo "App-specific")"
+                      echo "Repository: ${GIT_REPO_NAME:-N/A}"
+                      echo "Application: ${APP_NAME_NORMALIZED:-N/A}"
+                      echo "Namespace: $NAMESPACE"
+                      echo "Secret name: $FULL_SECRET_NAME"
+                      echo "Input key count: $SECRET_COUNT"
+                      echo "Override keys: ${{ parameters.overrideExistingKeys }}"
+                      echo "Dry run: ${{ parameters.dryRun }}"
+
+                      echo "##vso[task.setvariable variable=APP_NAME;isOutput=true]$APP_NAME_NORMALIZED"
+                      echo "##vso[task.setvariable variable=NAMESPACE;isOutput=true]$NAMESPACE"
+                      echo "##vso[task.setvariable variable=FULL_SECRET_NAME;isOutput=true]$FULL_SECRET_NAME"
+                      echo "##vso[task.setvariable variable=IS_GENERAL_SECRET;isOutput=true]$IS_GENERAL_SECRET"
+
+      - job: prepare_secret
+        displayName: "Prepare Secret Manifest"
+        dependsOn: validate_parameters
+        variables:
+          APP_NAME: $[ dependencies.validate_parameters.outputs['validate_parameters.validate.APP_NAME'] ]
+          NAMESPACE: $[ dependencies.validate_parameters.outputs['validate_parameters.validate.NAMESPACE'] ]
+          FULL_SECRET_NAME: $[ dependencies.validate_parameters.outputs['validate_parameters.validate.FULL_SECRET_NAME'] ]
+          IS_GENERAL_SECRET: $[ dependencies.validate_parameters.outputs['validate_parameters.validate.IS_GENERAL_SECRET'] ]
+
+        steps:
+          - checkout: git://FRBR - FRAMEWORK BRASIL/infra.infra-devops-aks-preprod@refs/heads/master
+            clean: true
+            path: gitops-preprod
+            persistCredentials: "true"
+            displayName: "Checkout GitOps (Pre-Production)"
+            condition: and(succeeded(), not(or(startsWith('${{ parameters.targetEnvironment }}', 'darklaunch-'), startsWith('${{ parameters.targetEnvironment }}', 'prod-'))))
+
+          - checkout: git://FRBR - FRAMEWORK BRASIL/infra.infra-devops-aks-prod@refs/heads/master
+            clean: true
+            path: gitops-prod
+            persistCredentials: "true"
+            displayName: "Checkout GitOps (Production)"
+            condition: and(succeeded(), or(startsWith('${{ parameters.targetEnvironment }}', 'darklaunch-'), startsWith('${{ parameters.targetEnvironment }}', 'prod-')))
+
+          - task: Bash@3
+            displayName: "Check Existing SealedSecret in GitOps"
+            name: check_existing
+            inputs:
+              targetType: inline
+              script: |
+                set -e
+
+                NAMESPACE="$(NAMESPACE)"
+                SECRET_NAME="$(FULL_SECRET_NAME)"
+                APP_NAME="$(APP_NAME)"
+                IS_GENERAL_SECRET="$(IS_GENERAL_SECRET)"
+                ENVIRONMENT="${{ parameters.targetEnvironment }}"
+
+                if [[ "$ENVIRONMENT" =~ ^(darklaunch-.*|prod-.*)$ ]]; then
+                  GITOPS_BASE="$(Pipeline.Workspace)/gitops-prod"
+                else
+                  GITOPS_BASE="$(Pipeline.Workspace)/gitops-preprod"
+                fi
+
+                if [ "$IS_GENERAL_SECRET" = "true" ]; then
+                  SEALED_SECRET_PATH="$GITOPS_BASE/src/$ENVIRONMENT/secrets/${SECRET_NAME}-sealed.yml"
+                else
+                  SEALED_SECRET_PATH="$GITOPS_BASE/src/$ENVIRONMENT/apps/$APP_NAME/secrets/${SECRET_NAME}-sealed.yml"
+                fi
+
+                echo "Looking for existing SealedSecret at: $SEALED_SECRET_PATH"
+
+                EXISTING_JSON="{}"
+                SECRET_MODE="CREATE"
+
+                if [ -f "$SEALED_SECRET_PATH" ]; then
+                  echo "Existing SealedSecret found - will merge keys."
+                  SECRET_MODE="MERGE"
+
+                  EXISTING_KEYS=$(yq -r '.spec.encryptedData | keys | .[]' "$SEALED_SECRET_PATH" 2>/dev/null || echo "")
+                  
+                  if [ -n "$EXISTING_KEYS" ]; then
+                    echo "Existing keys:"
+                    for KEY in $EXISTING_KEYS; do
+                      echo "  - $KEY"
+                      EXISTING_JSON=$(echo "$EXISTING_JSON" | jq --arg k "$KEY" '. + {($k): "***EXISTING***"}')
+                    done
+                  fi
+                else
+                  echo "No existing SealedSecret found - will create new."
+                fi
+
+                echo "##vso[task.setvariable variable=SECRET_MODE;isOutput=true]$SECRET_MODE"
+                echo "##vso[task.setvariable variable=GITOPS_BASE;isOutput=true]$GITOPS_BASE"
+
+                echo "$EXISTING_JSON" > $(Pipeline.Workspace)/existing-keys.json
+                echo "##vso[task.setvariable variable=EXISTING_KEYS_FILE;isOutput=true]$(Pipeline.Workspace)/existing-keys.json"
+
+          - task: Bash@3
+            displayName: "Merge Analysis"
+            name: merge_analysis
+            inputs:
+              targetType: inline
+              script: |
+                set -e
+
+                SECRET_MODE="$(check_existing.SECRET_MODE)"
+                EXISTING_KEYS_FILE="$(check_existing.EXISTING_KEYS_FILE)"
+                INPUT_JSON='${{ parameters.secrets }}'
+                OVERRIDE_EXISTING=$(echo "${{ parameters.overrideExistingKeys }}" | tr '[:upper:]' '[:lower:]')
+
+                echo "Mode: $SECRET_MODE"
+                echo "Override existing keys: $OVERRIDE_EXISTING"
+
+                EXISTING_JSON=$(cat "$EXISTING_KEYS_FILE")
+
+                ADD_COUNT=0
+                OVERRIDE_COUNT=0
+                SKIP_COUNT=0
+                KEYS_TO_PROCESS=""
+
+                for KEY in $(echo "$INPUT_JSON" | jq -r 'keys[]'); do
+                  KEY_EXISTS=$(echo "$EXISTING_JSON" | jq --arg k "$KEY" 'has($k)')
+                  
+                  if [ "$KEY_EXISTS" = "true" ]; then
+                    if [ "$OVERRIDE_EXISTING" = "true" ]; then
+                      echo "  $KEY: EXISTS -> OVERRIDE"
+                      KEYS_TO_PROCESS="$KEYS_TO_PROCESS $KEY"
+                      ((OVERRIDE_COUNT++)) || true
+                    else
+                      echo "##[warning]  $KEY: EXISTS -> SKIP (use overrideExistingKeys=true to overwrite)"
+                      ((SKIP_COUNT++)) || true
+                    fi
+                  else
+                    echo "  $KEY: NEW -> ADD"
+                    KEYS_TO_PROCESS="$KEYS_TO_PROCESS $KEY"
+                    ((ADD_COUNT++)) || true
+                  fi
+                done
+
+                TOTAL_CHANGES=$((ADD_COUNT + OVERRIDE_COUNT))
+
+                echo "Keys to add: $ADD_COUNT"
+                echo "Keys to override: $OVERRIDE_COUNT"
+                echo "Keys skipped: $SKIP_COUNT"
+                echo "Total changes: $TOTAL_CHANGES"
+
+                if [ "$TOTAL_CHANGES" -eq 0 ]; then
+                  echo "##[warning]No changes to apply - all input keys already exist and override is disabled."
+                  echo "##vso[task.setvariable variable=HAS_CHANGES;isOutput=true]false"
+                else
+                  echo "##vso[task.setvariable variable=HAS_CHANGES;isOutput=true]true"
+                fi
+
+                echo "##vso[task.setvariable variable=KEYS_TO_PROCESS;isOutput=true]$KEYS_TO_PROCESS"
+
+          - task: Bash@3
+            displayName: "Build Secret Manifest"
+            name: build_manifest
+            condition: and(succeeded(), eq(variables['merge_analysis.HAS_CHANGES'], 'true'))
+            inputs:
+              targetType: inline
+              script: |
+                set -e
+
+                NAMESPACE="$(NAMESPACE)"
+                SECRET_NAME="$(FULL_SECRET_NAME)"
+                INPUT_JSON='${{ parameters.secrets }}'
+                KEYS_TO_PROCESS="$(merge_analysis.KEYS_TO_PROCESS)"
+                DRY_RUN=$(echo "${{ parameters.dryRun }}" | tr '[:upper:]' '[:lower:]')
+
+                echo "Building secret manifest for $SECRET_NAME in $NAMESPACE"
+
+                DATA_SECTION=""
+                for KEY in $KEYS_TO_PROCESS; do
+                  VALUE=$(echo "$INPUT_JSON" | jq -r --arg k "$KEY" '.[$k]')
+                  ENCODED_VALUE=$(echo -n "$VALUE" | base64 -w 0)
+                  DATA_SECTION="${DATA_SECTION}  ${KEY}: ${ENCODED_VALUE}\n"
+                  echo "  Added key: $KEY"
+                done
+
+                MANIFEST_FILE="$(Pipeline.Workspace)/secret-manifest.yaml"
+
+                cat > "$MANIFEST_FILE" << EOF
+                apiVersion: v1
+                kind: Secret
+                metadata:
+                  name: ${SECRET_NAME}
+                  namespace: ${NAMESPACE}
+                  annotations:
+                    sealedsecrets.bitnami.com/managed: "true"
+                    sealedsecrets.bitnami.com/patch: "true"
+                type: Opaque
+                data:
+                $(echo -e "$DATA_SECTION")
+                EOF
+
+                sed -i 's/^                //' "$MANIFEST_FILE"
+
+                if [ "$DRY_RUN" = "true" ]; then
+                  echo "##[warning]DRY-RUN MODE - Manifest created but will not be sealed or committed."
+                fi
+
+                echo "##vso[task.setvariable variable=MANIFEST_FILE;isOutput=true]$MANIFEST_FILE"
+
+          - task: PublishPipelineArtifact@1
+            displayName: "Publish Secret Manifest"
+            condition: and(succeeded(), eq(variables['merge_analysis.HAS_CHANGES'], 'true'))
+            inputs:
+              targetPath: "$(Pipeline.Workspace)/secret-manifest.yaml"
+              artifact: "secret-manifest-${{ parameters.secretName }}"
+              publishLocation: "pipeline"

@@ -1,0 +1,201 @@
+﻿## -> Parameters:
+parameters:
+- name: bump_version
+- name: bump_message
+
+## -> Initialize global variables   
+variables:
+
+- template: /tech_products/adcp/initialize/variables_global.yml
+- template: /tech_products/adcp/initialize/variables_flutter_lib.yml
+
+## -> Override global variables, with variables set in Library/Variable Groups (Pipelines)
+## -> Use this to change the variables on runtime
+- group: "${{ variables['Build.DefinitionName'] }}"
+
+stages:
+
+## -> TAG for CI - Flutter
+
+- stage: tag
+  displayName: "Version & TAG"
+  pool: $(PRIVATE_AGENT_SHARED)
+  jobs:
+
+  - job: Tag
+    displayName: "Version & TAG"
+    condition: |
+               and(
+                  succeeded(),
+                  in(variables['Build.SourceBranch'], 'refs/heads/master')
+                )    
+    steps:
+    - checkout: self
+      persistCredentials: true
+      fetchDepth: 0
+      fetchTags: true   
+      clean: true
+
+    # Set Git Config     
+    - task: Bash@3
+      displayName: 'Set Git Config'
+      name: git_config
+      inputs:
+        targetType: inline
+        script: |
+          git config http.extraHeader "Authorization: Basic $(ACCESS_TOKEN)"
+          git config --global user.email "azuredevops@telefonicati.onmicrosoft.com"
+          git config --global user.name "Azure DevOps"
+          git config --global url."https://$GIT_ACCESS_TOKEN@dev.azure.com/telefonica-vivo-brasil/ECVV%20-%20ECOSISTEMA%20VIVO".insteadOf "https://telefonica-vivo-brasil@dev.azure.com/telefonica-vivo-brasil/ECVV%20-%20ECOSISTEMA%20VIVO"
+          git config --global url."https://$GIT_ACCESS_TOKEN@dev.azure.com/telefonica-vivo-brasil/ADCP%20-%20FLUTTER".insteadOf "https://telefonica-vivo-brasil@dev.azure.com/telefonica-vivo-brasil/ADCP%20-%20FLUTTER"
+      env:      
+        GIT_ACCESS_TOKEN: '$(GIT_ACCESS_TOKEN)'
+
+    # Get Pull Request Number
+    - task: Bash@3
+      displayName: 'Pull Request Number'
+      name: pull_request_numnber
+      inputs:
+        targetType: inline
+        script: |
+
+          source_version_message=$BUILD_SOURCEVERSIONMESSAGE
+          echo "##[debug]BUILD_SOURCEVERSIONMESSAGE: $source_version_message"
+
+          #PR title: 'Merged PR 21515: fix: patch validation'
+          #PR number is 21515
+          # Expressão regular para capturar o valor após "INCREMENTO e CHANGE"
+          pattern_pr="Merged\ PR\ ([0-9]+):"
+
+          if [[ $source_version_message =~ $pattern_pr ]]; then
+              pr_number=${BASH_REMATCH[1]}
+              echo "##[debug]PULL REQUEST NUMBER: $pr_number"
+              echo "##vso[task.setvariable variable=PULL_REQUEST_NUMBER;]$pr_number"
+              echo "##vso[task.setvariable variable=HAS_PULL_REQUEST;]true"
+          else
+              echo "##vso[task.setvariable variable=HAS_PULL_REQUEST;]false"
+          fi
+
+    # Get Pull Request Info if exists
+    - task: PullRequestGetInfo@1
+      displayName: 'Get Pull Request Info'
+      condition: eq(variables.HAS_PULL_REQUEST, true)
+      inputs:
+        pullRequestNumber: $(PULL_REQUEST_NUMBER)
+        pullRequestTitleVariable: 'PULL_REQUEST_TITLE'
+        pullRequestDescriptionVariable: 'PULL_REQUEST_DESCRIPTION'
+
+    # Tag
+    # Use standard-version to bump version and create tag
+    - task: Bash@3
+      displayName: 'Updating Version & Tag'
+      name: tag
+      inputs:
+        targetType: inline
+        script: |
+
+          build_reason="$BUILD_REASON"
+          echo "##[debug]Build reason is: $build_reason"         
+
+          if [[ "$build_reason" == "Manual" ]]; then
+
+            bump_version="${{ parameters.bump_version }}"
+            bump_message="${{ parameters.bump_message }}"
+
+            # Manual
+            echo "##[debug]Bump version: $bump_version"
+            echo "##[debug]Bump message: $bump_message"
+
+            if [[ $bump_message =~ (feat!:|chore!:|fix!:|feat:|fix:) ]]; then
+              npx standard-version --release-as "$bump_version" --releaseCommitMessageFormat "$bump_message [skip ci]" 
+              git push --follow-tags origin HEAD:$(Build.SourceBranchName)
+            else
+              echo "##[error]Message type error"
+              echo "##[debug]Esta pipeline espera um tipo no parâmetro de mensagem. [feat/fix]"
+              echo "##vso[task.complete result=Failed;]"            
+              exit 1
+            fi
+
+          else
+
+            # Pull Request
+            commit_description=$BUILD_SOURCEVERSIONMESSAGE
+            echo "##[debug]Commit description is: $commit_description"
+
+            if [[ $(HAS_PULL_REQUEST) == true ]]; then
+              echo "##[debug]Pull request"
+            
+              pr_description="$(PULL_REQUEST_DESCRIPTION)"            
+              if [[ -n "$pr_description" ]]; then
+                echo "##[debug]Pull request description OK"
+              else
+                echo "##[error]Pull request description is empty"
+                echo "##vso[task.complete result=Failed;]"
+                exit 1
+              fi              
+
+              #Conventional commits
+              #PR title: 'Merged PR 21515: fix: patch validation'
+              #Excluir caracteres antes de 'fix:'
+              #Commit message: fix: patch validation
+
+              if [[ $commit_description =~ (BREAKING CHANGE|feat!:|chore!:|fix!:) ]]; then
+                echo "##[debug]Bump major version"
+                # Extrai a palavra-chave (feat!: ou chore!: ou fix!:)
+                keyword=$(echo "$commit_description" | grep -oE 'feat!:|chore!:|fix!:')          
+                # Remove tudo antes da palavra-chave
+                description_after_keyword="${description_pull_request#*$keyword}"
+                commit_message=$keyword$description_after_keyword             
+                npx standard-version --release-as major --releaseCommitMessageFormat "$commit_message [skip ci]"            
+
+              elif [[ $commit_description =~ (feat:) ]]; then
+                echo "##[debug]Feat"
+                # Extrai a palavra-chave (feat:)
+                keyword=$(echo "$commit_description" | grep -oE 'feat:')          
+                # Remove tudo antes da palavra-chave
+                description_after_keyword="${description_pull_request#*$keyword}"
+                commit_message=$keyword$description_after_keyword            
+                npx standard-version --release-as minor --releaseCommitMessageFormat "$commit_message [skip ci]"            
+
+              elif [[ $commit_description =~ (fix:) ]]; then
+                echo "##[debug]Patch"
+                # Extrai a palavra-chave (fix:)
+                keyword=$(echo "$commit_description" | grep -oE 'fix:')          
+                # Remove tudo antes da palavra-chave
+                description_after_keyword="${description_pull_request#*$keyword}"
+                commit_message=$keyword$description_after_keyword            
+                npx standard-version --release-as patch --releaseCommitMessageFormat "$commit_message [skip ci]"            
+
+              else
+      
+                echo "##[error]Commit type error"
+                echo "##[debug]Esta pipeline espera um tipo na descrição do commit ou titulo do PR. [feat/fix]"
+                echo "##vso[task.complete result=Failed;]"            
+                exit 1
+              fi
+
+              git push --follow-tags origin HEAD:$(Build.SourceBranchName) 
+              #git push --follow-tags origin $(Build.SourceBranchName)
+            
+            else
+
+              echo "##[debug]Pull request does not exist"
+              echo "##[debug]Skipping TAG."
+
+            fi
+          fi
+
+    # Clear Git Config
+    - task: Bash@3
+      displayName: 'Clear Git Config'
+      name: clear_git_config
+      condition: always()
+      continueOnError: true
+      inputs:
+        targetType: inline
+        script: |
+          git config --unset-all http.extraHeader
+          git config --global --unset-all url."https://$GIT_ACCESS_TOKEN@dev.azure.com/telefonica-vivo-brasil/ECVV%20-%20ECOSISTEMA%20VIVO".insteadOf "https://telefonica-vivo-brasil@dev.azure.com/telefonica-vivo-brasil/ECVV%20-%20ECOSISTEMA%20VIVO"
+          git config --global --unset-all url."https://$GIT_ACCESS_TOKEN@dev.azure.com/telefonica-vivo-brasil/ADCP%20-%20FLUTTER".insteadOf "https://telefonica-vivo-brasil@dev.azure.com/telefonica-vivo-brasil/ADCP%20-%20FLUTTER"
+      env:
+        GIT_ACCESS_TOKEN: $(GIT_ACCESS_TOKEN)     

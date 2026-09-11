@@ -1,0 +1,154 @@
+steps:
+  - task: Docker@2
+    name: DockerLogin
+    displayName: 'Login on Azure Container Registry'
+    inputs:
+      containerRegistry: 'ACR-DEVOPS'
+      command: 'login'
+
+  - task: Bash@3
+    displayName: 'Defining BPEL/MDS Package Name'
+    condition: and(succeeded(), in(variables['EXECUTION_TYPE'], 'DEPLOY'))
+    inputs:
+      targetType: 'inline'
+      script: |
+        if [[ `echo $PARTITION | grep resources` && `echo $PROJECT | grep oramds` ]]
+        then
+          SOA_PACKAGE_NAME=soaconfig.jar
+          echo "##vso[task.setvariable variable=SOA_PACKAGE_NAME]$SOA_PACKAGE_NAME"
+          mv $(Build.SourcesDirectory)/oramds-$(PACKAGE_NUMBER).jar $(Build.SourcesDirectory)/soaconfig.jar
+        else
+          SOA_PACKAGE_NAME=sca_"$PROJECT"_rev"$COMPOSITE_VERSION".jar
+          echo "##vso[task.setvariable variable=SOA_PACKAGE_NAME]$SOA_PACKAGE_NAME"
+          mv $(Build.SourcesDirectory)/soaconfig-$(PACKAGE_NUMBER).jar $(Build.SourcesDirectory)/$SOA_PACKAGE_NAME
+        fi
+  
+  - task: Bash@3
+    displayName: "Deploying MDS Package"
+    condition: and(succeeded(), contains(variables['Build.SourceBranch'], 'MDS'))
+    inputs:
+      targetType: 'inline'
+      script: |
+        SERVER_HOST="$(QA_${{ upper(parameters.qa_environment) }}_DEPLOY_HOST)"
+        echo "##vso[task.setvariable variable=SERVER_HOST]$SERVER_HOST"
+        SERVER_IP="$(QA_${{ upper(parameters.qa_environment) }}_DEPLOY_HOST_IP)"
+        echo "##vso[task.setvariable variable=SERVER_IP]$SERVER_IP"
+        SERVER_LISTENER_NAME="$(QA_${{ upper(parameters.qa_environment) }}_DEPLOY_HOST_LISTENER_NAME)"
+        echo "##vso[task.setvariable variable=SERVER_LISTENER_NAME]$SERVER_LISTENER_NAME"
+        SERVER_PORT="$(QA_${{ upper(parameters.qa_environment) }}_DEPLOY_PORT)"
+        echo "##vso[task.setvariable variable=SERVER_PORT]$SERVER_PORT"
+        IFS=';'
+        read -ra HOSTS <<< "$SERVER_HOST"
+        read -ra IPS <<< "$SERVER_IP"
+        read -ra LISTENERS <<< "$SERVER_LISTENER_NAME"
+        read -ra PORTS <<< "$SERVER_PORT"
+        for (( i = 0; i < ${#HOSTS[@]}; i++ ))
+        do
+          echo "${HOSTS[i]}":"${PORTS[i]}"
+          SERVER="${HOSTS[i]}":"${PORTS[i]}"
+          echo "${LISTENERS[i]}":"${IPS[i]}"
+          SERVER_HOST="${LISTENERS[i]}":"${IPS[i]}"
+          docker run --rm --entrypoint bash \
+            -v $(Build.SourcesDirectory):/builds \
+            -w /builds \
+            --hostname azdevops-daet \
+            --dns=$(PRIMARY_DNS) \
+            --dns=$(SECONDARY_DNS) \
+            --dns-search=redecorp.br \
+            --add-host $SERVER_HOST \
+            -e PIPELINE_DEPLOYER_USER=$(PIPELINE_DEPLOYER_USER) \
+            -e PIPELINE_DEPLOYER_PASS=$(PIPELINE_DEPLOYER_PASS) \
+            -e ENVIRONMENT=$SERVER \
+            -e SOA_PACKAGE_NAME=$(SOA_PACKAGE_NAME) \
+            -e PARTITION=$(PARTITION) \
+            -e PROJECT=$(PROJECT) \
+            $(DOCKER_IMAGE) \
+            -c "cd /;
+                chmod +x /deploy-mds.sh;
+                ./deploy-mds.sh"
+          if ! grep -q 'code=200' $(Build.SourcesDirectory)/deploy.log
+          then
+            echo "##vso[task.complete result=Failed;]"
+            break
+          fi
+        done
+
+  - task: Bash@3
+    displayName: 'Verifying ConfigPlan'
+    condition: and(succeeded(), contains(variables['Build.SourceBranch'], 'SOA'))
+    inputs:
+      targetType: 'inline'
+      script: |
+        if [ "${{ upper(parameters.qa_environment) }}" = "ESTEIRA1" ]; then
+          CFGPLAN=cfgplan.esteira-1.xml
+          echo "##vso[task.setvariable variable=CFGPLAN]$CFGPLAN"
+        elif [ "${{ upper(parameters.qa_environment) }}" = "ESTEIRA2" ]; then
+          CFGPLAN=cfgplan.esteira-2.xml
+          echo "##vso[task.setvariable variable=CFGPLAN]$CFGPLAN"
+        elif [ "${{ upper(parameters.qa_environment) }}" = "PREPROD" ]; then
+          CFGPLAN=cfgplan.pre-prod.xml
+          echo "##vso[task.setvariable variable=CFGPLAN]$CFGPLAN"
+        fi
+
+        if test -f $(Build.SourcesDirectory)/$PARTITION/$PROJECT/$CFGPLAN; then
+          echo "Deploy será realizado com ConfigPlan na ${{ upper(parameters.qa_environment) }}"
+        else
+          echo "Deploy será realizado sem ConfigPlan na ${{ upper(parameters.qa_environment) }}"
+        fi
+
+  - task: Bash@3
+    displayName: "Deploying BPEL Package"
+    condition: and(succeeded(), contains(variables['Build.SourceBranch'], 'SOA'))
+    inputs:
+      targetType: 'inline'
+      script: |
+        SERVER_HOST="$(QA_${{ upper(parameters.qa_environment) }}_DEPLOY_HOST)"
+        echo "##vso[task.setvariable variable=SERVER_HOST]$SERVER_HOST"
+        SERVER_IP="$(QA_${{ upper(parameters.qa_environment) }}_DEPLOY_HOST_IP)"
+        echo "##vso[task.setvariable variable=SERVER_IP]$SERVER_IP"
+        SERVER_LISTENER_NAME="$(QA_${{ upper(parameters.qa_environment) }}_DEPLOY_HOST_LISTENER_NAME)"
+        echo "##vso[task.setvariable variable=SERVER_LISTENER_NAME]$SERVER_LISTENER_NAME"
+        SERVER_PORT="$(QA_${{ upper(parameters.qa_environment) }}_DEPLOY_PORT)"
+        echo "##vso[task.setvariable variable=SERVER_PORT]$SERVER_PORT"
+        IFS=';'
+        read -ra HOSTS <<< "$SERVER_HOST"
+        read -ra IPS <<< "$SERVER_IP"
+        read -ra LISTENERS <<< "$SERVER_LISTENER_NAME"
+        read -ra PORTS <<< "$SERVER_PORT"
+        for (( i = 0; i < ${#HOSTS[@]}; i++ ))
+        do
+          echo "${HOSTS[i]}":"${PORTS[i]}"
+          SERVER="${HOSTS[i]}":"${PORTS[i]}"
+          echo "${LISTENERS[i]}":"${IPS[i]}"
+          SERVER_HOST="${LISTENERS[i]}":"${IPS[i]}"
+          docker run --rm --entrypoint bash \
+            -v $(Build.SourcesDirectory):/builds \
+            -w /builds \
+            --hostname azdevops-daet \
+            --dns=$(PRIMARY_DNS) \
+            --dns=$(SECONDARY_DNS) \
+            --dns-search=redecorp.br \
+            --add-host $SERVER_HOST \
+            -e PIPELINE_DEPLOYER_USER=$(PIPELINE_DEPLOYER_USER) \
+            -e PIPELINE_DEPLOYER_PASS=$(PIPELINE_DEPLOYER_PASS) \
+            -e ENVIRONMENT=$SERVER \
+            -e SOA_PACKAGE_NAME=$(SOA_PACKAGE_NAME) \
+            -e PARTITION=$(PARTITION) \
+            -e PROJECT=$(PROJECT) \
+            -e CFGPLAN=$(CFGPLAN) \
+            $(DOCKER_IMAGE) \
+            -c "cd /;
+                chmod +x /deploy-composite.sh;
+                ./deploy-composite.sh"
+          if [[ $(grep -ic "already exists" $(Build.SourcesDirectory)/partition.log) -eq 0 && $(grep -ic "Partition was successfully created" $(Build.SourcesDirectory)/partition.log) -eq 0 ]]
+          then
+            echo "##vso[task.logissue type=error]Ocorreu um problema durante a criação da partição."
+            echo "##vso[task.complete result=Failed;]"
+            break
+          elif ! grep -q 'code=200' $(Build.SourcesDirectory)/deploy.log
+          then
+            echo "##vso[task.logissue type=error]Ocorreu um problema durante o deploy do composto."
+            echo "##vso[task.complete result=Failed;]"
+            break
+          fi
+        done

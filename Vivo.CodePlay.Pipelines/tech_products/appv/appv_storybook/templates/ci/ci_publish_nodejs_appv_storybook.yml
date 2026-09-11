@@ -1,0 +1,165 @@
+stages:
+- stage: ci_publish
+  displayName: "CI - Publish"
+  pool:
+    name: GeneralPurposeLinuxAgentsCI
+  dependsOn:
+  - environment_init
+  - ci_build
+  condition: succeeded()
+
+  ## -> Loads variables from other stages.
+  variables:  
+  - name: NEXUS_DEPS_USR
+    value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEPS_USR'] ]    
+  - name: NEXUS_DEPS_PSW
+    value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEPS_PSW'] ] 
+  - name: NEXUS_DEFAULT_USR
+    value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEFAULT_USR'] ]    
+  - name: NEXUS_DEFAULT_PSW
+    value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEFAULT_PSW'] ] 
+  - name: NEW_VERSION
+    value: $[ stageDependencies.ci_build.build.outputs['new_version.NEW_VERSION'] ]
+  - name: ARTIFACT_NAME
+    value: $[ stageDependencies.ci_build.build.outputs['artifact_name.ARTIFACT_NAME'] ]
+ 
+  jobs:
+
+  ## -> Using a job of type deployment for publish.
+  - deployment: publish
+    displayName: Publish Library    
+    workspace:
+      clean: all
+    environment:
+      name: $(DEPLOY_ENVIRONMENT_LIB)
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+
+          ## -> Downlood and uncompress the downloaded artifact.
+          ## -> 30f35852-3f7e-4c0c-9a88-e127b4f97211 is the decorator for download artifact.
+          - task: DownloadBuildArtifacts@1
+            displayName: 'Download Build Artifacts'
+            inputs:
+              artifactName: $(ARTIFACT_NAME)
+              cleanDestinationFolder: false
+              extractTars: true
+              parallelizationLimit: 8
+              downloadPath: $(System.ArtifactsDirectory)
+
+          ## -> Set artifact information to variables.
+          - task: Bash@3
+            displayName: Artifacts Info
+            inputs:
+              targetType: inline
+              script: |
+                echo "##[debug] Artifact name: '$(ARTIFACT_NAME)'"
+
+                echo "##[debug] Target directory location: '$(pwd "$(DEFAULT_WORKDIR_ARTIFACTS)/$(ARTIFACT_NAME)")'"
+                echo "##[debug] Target directory path: '$(DEFAULT_WORKDIR_ARTIFACTS)/$(ARTIFACT_NAME)'"
+                echo "##[debug] Target directory content:'"
+                echo "$(ls -lh '$(DEFAULT_WORKDIR_ARTIFACTS)/$(ARTIFACT_NAME)')"
+                echo "##[debug] NEW_VERSION: $(NEW_VERSION)"
+
+          ## -> Publish Artifact to NEXUS.
+          ## -> Only allowed for the specified branches below. Other branches must skip this task.
+          ## -> Using npm to push to nexus.
+
+          - task: Bash@3
+            displayName: 'Copiando Storybook e Playroom para o blob storage'
+            # env:
+            #   HTTPS_PROXY: $(PROXY_AGENT_HTTPS)
+            #   HTTP_PROXY: $(PROXY_AGENT_HTTP)
+            #   NO_PROXY: $(PROXY_AGENT_NO_PROXY)
+            inputs:
+              targetType: inline
+              script: |
+                echo "##[debug] Target directory storybook path: '$(DEFAULT_WORKDIR_ARTIFACTS)/$(ARTIFACT_NAME)/storybook-static'"
+                echo "##[debug] Target directory playroom path: '$(DEFAULT_WORKDIR_ARTIFACTS)/$(ARTIFACT_NAME)/dist/playroom'"
+                # Instala o Azure CLI extension para o Azure DevOps
+                #az extension add --name storage-preview
+
+                # Definindo o delimitador como hífen
+                IFS='-'
+
+                # Lendo os campos separados
+                read -ra parts <<< "$(Build.Repository.Name)"
+
+                # Acessando as partes separadas
+                src=${parts[0]}
+                project=${parts[1]}
+
+                # Exibindo as partes
+                echo "Parte 1: $src"
+                echo "Parte 2: $project"
+      
+                # Copia a pasta e seu conteúdo do Storybook para o Blob Storage
+                az storage blob upload-batch \
+                --verbose \
+                --account-name $(AZURE_STORAGE_ACCOUNT_NAME) \
+                --account-key $(AZURE_STORAGE_ACCOUNT_KEY) \
+                --overwrite \
+                -d fb-core/storybooks/$project \
+                -s '$(DEFAULT_WORKDIR_ARTIFACTS)/$(ARTIFACT_NAME)/storybook-static'
+
+                # Copia a pasta e seu conteúdo do Playroom para o Blob Storage
+                az storage blob upload-batch \
+                --verbose \
+                --account-name $(AZURE_STORAGE_ACCOUNT_NAME) \
+                --account-key $(AZURE_STORAGE_ACCOUNT_KEY) \
+                --overwrite \
+                -d fb-core/storybooks/$project/playroom \
+                -s '$(DEFAULT_WORKDIR_ARTIFACTS)/$(ARTIFACT_NAME)/dist/playroom'
+            
+        on:
+          success:
+            steps:
+            - task: Bash@3
+              displayName: Storybook e Playroom deployado no Blobstorage com sucesso
+              name: t_success_message
+              inputs:
+                targetType: inline
+                script: |
+                  # Definindo o delimitador como hífen
+                  IFS='-'
+
+                  # Lendo os campos separados
+                  read -ra parts <<< "$(Build.Repository.Name)"
+
+                  # Acessando as partes separadas
+                  src=${parts[0]}
+                  project=${parts[1]}
+
+                  # Exibindo as partes
+                  echo "Parte 1: $src"
+                  echo "Parte 2: $project"
+
+                  echo "##======================================================== Storybook atualizado ============================================================"
+                  echo "## Para acessar, basta clicar no link abaixo :"
+                  echo "##=== https://preframeworkbrasilsa.telefonicabigdata.com/fb-core/storybooks/$project/index.html ======================="
+
+                  echo "##======================================================== Playroom atualizado ============================================================"
+                  echo "## Para acessar, basta clicar no link abaixo :"
+                  echo "##=== https://preframeworkbrasilsa.telefonicabigdata.com/fb-core/storybooks/$project/playroom/index.html ======================="
+              
+          failure:
+            steps:
+            - task: Bash@3
+              displayName: Lib Publish Failure
+              name: t_failure_message
+              inputs:
+                targetType: inline
+                script: |
+                  echo "##[error] ================================================================================================================================="
+                  echo "##[error]                                                  FAILURE LIB PUBLISH"
+                  echo "##[error] ================================================================================================================================="
+                  echo "##[error] Se está vendo essa mensagem é porque aconteceu algo erro durante a publicação da sua biblioteca."
+                  echo "##[error] "
+                  echo "##[error] Segue abaixo umas dicas para o Troubleshooting:"
+                  echo "##[error] $(ALERT_MESSAGE_ARROW) Consulte o log do estágio de publicação do artefato."
+                  echo "##[error] $(ALERT_MESSAGE_ARROW) Verifique se a versão corrente da biblioteca já existe no repositório (sobrescrita não é permitido)."
+                  echo "##[error] $(ALERT_MESSAGE_ARROW) Confira se as informações do repositório e credenciais de acesso estão corretas."
+                  echo "##[error] "
+                  echo "##[error] Caso tenha dúvidas sobre essa fase do pipeline acesse a nossa documentação: $(CORPORATE_WIKI_DOC_URL)"
+                  echo "##[error] ================================================================================================================================="

@@ -1,0 +1,116 @@
+
+## -> CI
+trigger:
+  branches:
+    include:
+      - 'master'
+      - 'main'
+      - 'codeplay'
+  paths:
+    exclude:
+      - .azuredevops/*cd.*
+      - .azuredevops/*pr.*
+
+variables:
+- group: "azdo-team-project-variables"
+- group: "${{ variables['Build.Repository.Name'] }}"
+
+stages:
+- stage: Build_and_Push
+  jobs:
+  - job: Helm
+    condition: eq(variables['HELM_REGISTRY_PUSH_ENABLED'], 'true')
+    pool:
+      name: GeneralPurposeLinuxAgentsCI
+    steps:
+    
+    - checkout: self
+      fetchDepth: 1
+      persistCredentials: true
+    
+    - task: Bash@3
+      displayName: 'Get Version'
+      inputs:
+        targetType: 'inline'
+        script: |
+          INCREMENT_VERSION=$(cat VERSION)
+          echo "##vso[task.setvariable variable=INCREMENT_VERSION]$INCREMENT_VERSION"
+    
+    - task: semver-bump@1
+      inputs:
+        VersionVariable: 'INCREMENT_VERSION'
+        IncrementLevel: 'patch'
+    
+    ## -> Set the new version to a variable.
+    - task: Bash@3
+      displayName: 'Set New Version'
+      name: new_version
+      inputs:
+        targetType: inline
+        script: |
+          echo "##[debug] Source NEW_VERSION: '$(INCREMENT_VERSION)'"
+          echo "##vso[task.setvariable variable=NEW_VERSION;isOutput=true]$INCREMENT_VERSION"
+    
+    - task: HelmDeploy@0
+      displayName: "[ACR] Helm package"
+      inputs:
+        command: package
+        chartPath: '$(Build.SourcesDirectory)/helm'
+        destination: $(Build.ArtifactStagingDirectory)
+        chartVersion: $(INCREMENT_VERSION)
+
+    - task: AzureKeyVault@2  
+      displayName: '[Helm ACR] Getting AKV credentials'
+      timeoutInMinutes: 1
+      retryCountOnTaskFailure: 3
+      inputs:
+        azureSubscription: DevOpsSharedResources
+        KeyVaultName: $(AKV_DEVOPS_NAME)
+        SecretsFilter: 'HELM-REGISTRY-ACR-PUBLISH-USERNAME, HELM-REGISTRY-ACR-PUBLISH-PASSWORD'
+    
+    - task: CmdLine@2
+      displayName: "[ACR] Helm registry push"
+      env:
+        HOST: $(HELM_REGISTRY_ACR_NAME)
+        USERNAME: $(HELM-REGISTRY-ACR-PUBLISH-USERNAME)
+        PASSWORD: $(HELM-REGISTRY-ACR-PUBLISH-PASSWORD)
+      inputs:
+        script: |
+          CHART_ARCHIVE=`ls  $(Build.ArtifactStagingDirectory)/$(HELM_CHART_NAME)*.tgz`
+          ACR_REPOSITORY="oci://${HOST}/helm/devops"
+
+          helm registry login ${HOST} \
+            --username ${USERNAME} \
+            --password "${PASSWORD}"
+          
+          helm push ${CHART_ARCHIVE} ${ACR_REPOSITORY}
+    
+    - task: Bash@3
+      displayName: 'Commit Updated Version'
+      inputs:
+        targetType: inline
+        script: |
+          export TAG="$(new_version.NEW_VERSION)"
+
+          ## -> Add changes
+          echo ${TAG} > VERSION
+
+          git stash save VERSION
+          git clean -fdX
+
+          echo "##[command] git checkout ${BUILD_SOURCEBRANCHNAME} --"
+          git fetch
+          git checkout ${BUILD_SOURCEBRANCHNAME} --
+          git pull --rebase origin ${BUILD_SOURCEBRANCHNAME}
+          git stash pop
+
+          echo "##[command] git commit"
+          git add VERSION
+
+          git commit -am "[CI SKIP] Project version has been updated. Released version '$(NEW_VERSION)'" --author="$(Build.RequestedFor) <$(Build.RequestedForEmail)>"
+
+          echo "##[command]git tag ${TAG}"
+          git tag ${TAG} -m "Version has been updated to ${TAG}"
+
+          echo "##[command] git push origin ${BUILD_SOURCEBRANCHNAME}"
+          git push origin --tags ${BUILD_SOURCEBRANCHNAME}

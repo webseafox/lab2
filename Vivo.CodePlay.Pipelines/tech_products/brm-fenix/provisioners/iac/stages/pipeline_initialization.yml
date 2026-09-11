@@ -1,0 +1,220 @@
+parameters:
+  - name: iacParameters
+    type: object
+
+stages:
+  - stage: stage_prep
+    displayName: "Pipeline Initialization"
+    pool: $(POOL)
+    jobs:
+      - job: validations
+        displayName: "Validations"
+        steps:
+          - checkout: none
+
+          - script: |
+              if [ "${{ parameters.iacParameters.isTriggered }}" == "true" ] || [ "${{ parameters.iacParameters.isTriggered }}" == "True" ]; then
+                echo "##vso[build.addbuildtag]Triggered"
+              else
+                echo "##vso[build.addbuildtag]Manual"
+              fi
+            displayName: 'Adding the TAG to the build'
+          
+          - template: ../../../tasks/bash/start_time.yml
+          
+          - task: CmdLine@2
+            name: validation
+            displayName: "Validation Choices"
+            inputs:
+              script: |
+                echo "##[debug] TARGET ..................................................: $(IAC_TARGET)"
+                echo "##[debug] ACTION ..................................................: $(ACTION)"
+                echo "##[debug] ENVIRONMENT .............................................: $(ENVIRONMENT)"
+                echo "##[debug] NUMBER AFFECTED NODES ...................................: ${{ parameters.iacParameters.numberAffectedNodes }}"
+                echo ""
+
+                ERRORS=()
+
+                [ "$(ACTION)" == "-" ] && ERRORS+=("Action")
+                [ "$(ENVIRONMENT)" == "-" ] && ERRORS+=("Environment")
+
+                if [ "${{ parameters.iacParameters.numberAffectedNodes }}" != "ALL" ]; then
+                  if ! [[ "${{ parameters.iacParameters.numberAffectedNodes }}" =~ ^[0-9]+$ ]] || [ "${{ parameters.iacParameters.numberAffectedNodes }}" -le 0 ]; then
+                    ERRORS+=("Number of Affected Nodes must be 'ALL' or a positive integer")
+                  fi
+                fi
+
+                if [ ${#ERRORS[@]} -gt 0 ]; then
+                  ERR_MSG=$(IFS=", "; echo "${ERRORS[*]}")
+                  echo "##vso[task.logissue type=error;]Validation failed for: $ERR_MSG"
+                  exit 1
+                fi
+
+                echo "✅ All validated."
+          
+          - ${{ if eq(parameters.iacParameters.target, 'environment') }}:
+            - template: ../../../task_groups/oci/collect_data_cluster.yml
+              parameters:
+                action: ${{ parameters.iacParameters.action }}
+                environment: $(OPERATION_HOST_ENVIRONMENT)
+                compartmentId: $(IAC_OCI_COMPARTMENT_ID)
+                ociCliFolder: $(OCI_CLI_FOLDER)
+                ociCliFolderPath: $(OCI_CLI_FOLDER_PATH)
+                ociCliKeyFile: $(OCI_CLI_KEY_FILE)
+                ociCliConfigFile: $(OCI_CLI_CONFIG_FILE)
+                ociCliConfigFileName: $(OCI_CLI_CONFIG_FILE_NAME)
+                ociCliKeyFileName: $(OCI_CLI_KEY_FILE_NAME)
+          - ${{ if eq(parameters.iacParameters.target, 'database') }}:
+            - template: ../../../task_groups/oci/collect_data_database.yml
+              parameters:
+                action: ${{ parameters.iacParameters.action }}
+                environment: $(OPERATION_HOST_ENVIRONMENT)
+                dbSystemDisplayName: $(IAC_DB_SYSTEM_DISPLAY_NAME)
+                compartmentId: $(IAC_OCI_COMPARTMENT_ID)
+                ociCliFolder: $(OCI_CLI_FOLDER)
+                ociCliFolderPath: $(OCI_CLI_FOLDER_PATH)
+                ociCliKeyFile: $(OCI_CLI_KEY_FILE)
+                ociCliConfigFile: $(OCI_CLI_CONFIG_FILE)
+                ociCliConfigFileName: $(OCI_CLI_CONFIG_FILE_NAME)
+                ociCliKeyFileName: $(OCI_CLI_KEY_FILE_NAME)
+          
+          - task: CmdLine@2
+            name: validate_nodes_availability
+            displayName: "Validate Nodes Availability"
+            inputs:
+              script: |
+                set -euo pipefail
+
+                action="$(ACTION)"
+                requested_nodes="${{ parameters.iacParameters.numberAffectedNodes }}"
+                nodes_data="$(get_nodes.NODES)"
+
+                echo "##[debug] TARGET ...................................................: $(IAC_TARGET)"
+                echo "##[debug] ACTION ...................................................: $action"
+                echo "##[debug] REQUESTED NODES ..........................................: $requested_nodes"
+                echo "##[debug] NODES DATA ...............................................: $nodes_data"
+                echo ""
+
+                # Validate nodes_data is not empty
+                if [ -z "$nodes_data" ] || [ "$nodes_data" == "" ]; then
+                  echo "##vso[task.logissue type=error;]No nodes data available"
+                  exit 1
+                fi
+
+                # Count nodes by state (4th field in semicolon-separated format)
+                stopped_count=0
+                running_count=0
+
+                IFS=';' read -ra NODES <<< "$nodes_data"
+                for node in "${NODES[@]}"; do
+                  if [ -n "$node" ]; then
+                    state=$(echo "$node" | cut -d',' -f4)
+                    if [ "$state" == "STOPPED" ]; then
+                      stopped_count=$(( stopped_count + 1 ))
+                    elif [ "$state" == "RUNNING" ] || [ "$state" == "AVAILABLE" ]; then
+                      running_count=$(( running_count + 1 ))
+                    fi
+                  fi
+                done
+
+                echo "##[debug] STOPPED NODES COUNT ......................................: $stopped_count"
+                echo "##[debug] RUNNING NODES COUNT ......................................: $running_count"
+                echo ""
+
+                # Validate based on action
+                if [ "$action" == "START" ]; then
+                  if [ "$requested_nodes" == "ALL" ]; then
+                  if [ "$stopped_count" -eq 0 ]; then
+                    echo "##vso[task.logissue type=error;]Cannot START: No STOPPED nodes available"
+                    exit 1
+                  fi
+                  echo "✅ All $stopped_count STOPPED nodes will be started"
+                  else
+                  if [ "$stopped_count" -lt "$requested_nodes" ]; then
+                    echo "##vso[task.logissue type=error;]Cannot START $requested_nodes nodes: Only $stopped_count STOPPED nodes available"
+                    exit 1
+                  fi
+                  echo "✅ $requested_nodes of $stopped_count STOPPED nodes will be started"
+                  fi
+                  
+                elif [ "$action" == "STOP" ]; then
+                  if [ "$requested_nodes" == "ALL" ]; then
+                  if [ "$running_count" -eq 0 ]; then
+                    echo "##vso[task.logissue type=error;]Cannot STOP: No RUNNING nodes available"
+                    exit 1
+                  fi
+                  echo "✅ All $running_count RUNNING nodes will be stopped"
+                  else
+                  if [ "$running_count" -lt "$requested_nodes" ]; then
+                    echo "##vso[task.logissue type=error;]Cannot STOP $requested_nodes nodes: Only $running_count RUNNING nodes available"
+                    exit 1
+                  fi
+                  echo "✅ $requested_nodes of $running_count RUNNING nodes will be stopped"
+                  fi
+                fi
+
+                echo ""
+                echo "✅ Nodes availability validated successfully"
+
+      - job: informations
+        displayName: "Informations"
+        dependsOn: validations
+        variables:
+          - name: START_TIME
+            value: $[ dependencies.validations.outputs['setStartTime.START_TIME_FORMATTED'] ]
+          - name: BRM_PREVIOUS_STATE
+            ${{ if eq(parameters.iacParameters.target, 'environment') }}:
+              value: $[ dependencies.validations.outputs['get_cluster.CLUSTER_STATE'] ]
+            ${{ if eq(parameters.iacParameters.target, 'database') }}:
+              value: $[ dependencies.validations.outputs['get_db_system.DB_SYSTEM_STATE'] ]
+        steps:
+          - checkout: none
+
+          - task: CmdLine@2
+            name: task_information
+            displayName: "Information"
+            inputs:
+              script: |
+                echo "##[debug] TARGET ..................................................: $(IAC_TARGET)"
+                echo "##[debug] ACTION ..................................................: $(ACTION)"
+                echo "##[debug] ENVIRONMENT .............................................: $(ENVIRONMENT)"
+                echo "##[debug] PREVIOUS STATE ..........................................: $(BRM_PREVIOUS_STATE)"
+                echo "##[debug] START TIME ..............................................: $(START_TIME)"
+                echo "##[debug] NUMBER AFFECTED NODES ...................................: ${{ parameters.iacParameters.numberAffectedNodes }}"
+                echo "##[debug] COMMANDS FILES ROOT PATH ................................: $(COMMANDS_FILES_ROOT_PATH)"
+
+      - job: notification
+        displayName: "Teams Notification"
+        dependsOn: validations
+        condition: |
+          and(
+            always(),
+            eq(variables['DISABLE_TEAMS_NOTIFICATION'], 'false')
+          )
+        variables:
+          - name: START_TIME
+            value: $[ dependencies.validations.outputs['setStartTime.START_TIME_FORMATTED'] ]
+          - name: BRM_PREVIOUS_STATE
+            ${{ if eq(parameters.iacParameters.target, 'environment') }}:
+              value: $[ dependencies.validations.outputs['get_cluster.CLUSTER_STATE'] ]
+            ${{ if eq(parameters.iacParameters.target, 'database') }}:
+              value: $[ dependencies.validations.outputs['get_db_system.DB_SYSTEM_STATE'] ]
+        steps:
+          - checkout: none
+
+          - script: |
+              FACTS="{ \"name\": \"⏱️ Start Time:\", \"value\": \"_$(START_TIME)_\" },{ \"name\": \"⬅️ BRM Previous State:\", \"value\": \"_$(BRM_PREVIOUS_STATE)_\" }"
+
+              echo "##[debug] FACTS.............................: $FACTS"
+
+              echo "##vso[task.setvariable variable=FACTS;isoutput=true]$FACTS"
+            name: factsFormatter
+            displayName: "Facts Formatter"
+
+          - template: ../../../tasks/teams/send_message.yml
+            parameters:
+              flow: "$(ACTION) BRM"
+              title: "Notification from Turn Off BRM"
+              webhookUrl: "$(TEAMS_WEBHOOK_IAC)"
+              status: Started
+              facts: "$(factsFormatter.FACTS)"

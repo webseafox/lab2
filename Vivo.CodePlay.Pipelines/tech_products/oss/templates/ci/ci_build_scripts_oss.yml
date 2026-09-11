@@ -1,0 +1,184 @@
+stages:
+- stage: ci_build
+  displayName: "CI - Build"
+  pool:
+    name: $(AGENT_POOL_CI)
+
+  jobs:
+  - job: build
+    displayName: Build
+    timeoutInMinutes: $[ variables['BUILD_JOB_TIMEOUT'] ]
+    steps:
+
+        ## -> Checkout the code
+        - checkout: self
+          displayName: Checkout Code
+          name: checkout_code
+          submodules: true
+          persistCredentials: true
+
+        ## -> Checkout the Last commit
+        - task: Bash@3
+          displayName: Checkout Last Commit
+          name: checkout_last_commit
+          condition: succeeded()
+          continueOnError: false
+          inputs:
+            targetType: inline
+            script: |
+              echo "##[debug] Checkout last commit from '$(Build.SourceBranchName)'"
+
+              git config pull.rebase true
+              git fetch -f --depth 50 origin $(Build.SourceBranchName):$(Build.SourceBranchName)
+              git checkout -f $(Build.SourceBranchName)
+
+              ## -> Ignore commits that only change .azuredevops/ content
+              lastCommit=$(git log --format=%H -- . ':!'".azuredevops/" | head -n 1)
+              lastCommitHash=$(git rev-parse --short=6 $lastCommit)
+
+              echo "##[debug] Last commit short hash '$lastCommitHash'"
+              echo "##vso[task.setvariable variable=SHORT_HASH]$lastCommitHash"
+
+        ## -> Get current version of the artifact
+        - task: CmdLine@2
+          displayName: Get Current Version
+          name: current_version
+          continueOnError: false
+          inputs:
+            targetType: inline
+            script: |
+              if [ ! -f pom.xml ]; then
+                echo "##vso[task.logissue type=warning]The file 'pom.xml' does not exist in the repository."
+              fi
+
+              currentVersion=$(DOCKER_CMD_EXTRACT_POM_XML_VERSION)
+              echo "##[debug] Source CURRENT_VERSION: '$currentVersion' "
+              echo "##vso[task.setvariable variable=CURRENT_VERSION;]$currentVersion"
+
+              incrementVersion=$(echo $currentVersion | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+              if [[ -n $incrementVersion ]]; then
+                echo "##vso[task.setvariable variable=INCREMENT_VERSION;]$incrementVersion"
+              else
+                echo "##[error] Version in the pom.xml is not following semantic versioning."
+                echo "##[error] Verify if the version contains the pattern: <major>.<minor>.<patch>; e.g: 0.0.1, 1.0.0-branch, 1.1.0-branch+hash, 0.0.1-SNAPSHOT; "
+                exit 1
+              fi
+
+        ## -> Bump/Increment version and update increment variable.
+        ## -> Only allows this for master branch and in CI steps. Do not allow manual pushes.
+        ## -> To disable set BUMP_VERSION_ENABLED in pipeline's library.
+        - task: semver-bump@1
+          displayName: Bump Version Master
+          name: bump_version
+          condition: and(
+            succeeded(),
+            and(eq(variables.BUMP_VERSION_ENABLED, 'true'), ne(variables['Build.Reason'], 'Manual')))
+          continueOnError: false
+          inputs:
+            VersionVariable: 'INCREMENT_VERSION'
+            IncrementLevel: 'patch'
+            targetType: inline
+
+        ## -> Set the new version to a variable. This allows it to be used in other stages, jobs or tasks.
+        - task: Bash@3
+          displayName: 'Set New Version'
+          name: new_version
+          continueOnError: false
+          inputs:
+            targetType: inline
+            script: |
+              echo "##[debug] Source CURRENT_VERSION: '$(CURRENT_VERSION)'"
+              if [ '$(Build.SourceBranchName)' == 'master' ]; then
+                echo "##[debug] Source NEW_VERSION: '$(INCREMENT_VERSION)'"
+                echo "##vso[task.setvariable variable=NEW_VERSION;isOutput=true]$(INCREMENT_VERSION)"
+              else
+                newVersion=$(INCREMENT_VERSION)-$(Build.SourceBranchName).$(SHORT_HASH)
+                echo "##[debug] Source NEW_VERSION: $newVersion"
+                echo "##vso[task.setvariable variable=NEW_VERSION;isOutput=true]$newVersion"
+              fi
+
+        ## -> Set artifact information to variables. This allows it to be used in other stages, jobs or tasks.
+        - task: CmdLine@2
+          name: artifact_name
+          displayName: 'Get Artifact Name'
+          inputs:
+            targetType: inline
+            script: |
+
+              artifactId=$(DOCKER_CMD_EXTRACT_ARTIFACT_ID)
+              echo "##[debug] Source ARTIFACT_ID: $artifactId"
+              echo "##vso[task.setvariable variable=ARTIFACT_ID;isOutput=true]$artifactId"
+
+              groupId=$(DOCKER_CMD_EXTRACT_GROUP_ID)
+              echo "##[debug] Source GROUP_ID: $groupId"
+              echo "##vso[task.setvariable variable=GROUP_ID;isOutput=true]$groupId"
+
+              artifactName=${artifactId}-$(new_version.NEW_VERSION)
+              echo "##[debug] Artifact Name: ${artifactName}"
+              echo "##vso[task.setvariable variable=ARTIFACT_NAME;isOutput=true]$artifactName"
+
+              artifactVersion=$(new_version.NEW_VERSION)
+              echo "##[debug] Artifact Version: ${artifactVersion}"
+
+              ## -> Set directory where the scripts should be copied to
+              echo "##vso[task.setvariable variable=DIR_SCRIPTS;]$(Build.ArtifactStagingDirectory)"
+
+        ## -> Copy scripts to staging directory
+        - task: CopyFiles@2
+          displayName: 'Copy Scripts to Staging Directory'
+          inputs:
+            TargetFolder: '$(DIR_SCRIPTS)'
+            OverWrite: true
+            CleanTargetFolder: true
+            Contents: >
+                **/*
+
+                !.git/**/*
+
+                !.*/**/*
+
+                !pom.xml
+
+                !*.md
+
+        ## -> Build the tar file with the scripts
+        - task: Bash@3
+          displayName: Build Version
+          name: build_version
+          continueOnError: false
+          inputs:
+            targetType: inline
+            script: |
+
+              artifactId=$(artifact_name.ARTIFACT_ID)
+              echo "##[debug] Source ARTIFACT_ID: $artifactId"
+
+              groupId=$(artifact_name.GROUP_ID)
+              echo "##[debug] Source GROUP_ID: $groupId"
+
+              artifactName=$(artifact_name.ARTIFACT_NAME)
+              echo "##[debug] Artifact Name: ${artifactName}"
+
+              artifactVersion=$(new_version.NEW_VERSION)
+              echo "##[debug] Artifact Version: ${artifactVersion}"
+
+              dirScripts=$(DIR_SCRIPTS)
+
+              ## -> Check if the scripts directory it not empty, if it is log error, otherwise tar scripts
+              if [ -z "$(ls -A $dirScripts)" ]; then
+                echo "##vso[task.logissue type=error]It was not possible to find the scripts to publish."
+                exit 1
+              else
+                ## -> Package to tar
+                echo "##[group]Package the scripts"
+                cd $dirScripts
+                tar -cvf ${artifactName}.tar .
+                echo "##[endgroup]"
+              fi
+
+        ## -> Publish tar scripts
+        - task: PublishBuildArtifacts@1
+          displayName: 'Publish Scripts to Pipeline'
+          inputs:
+              PathtoPublish: '$(DIR_SCRIPTS)/$(artifact_name.ARTIFACT_NAME).tar'
+              ArtifactName: '$(artifact_name.ARTIFACT_NAME)'

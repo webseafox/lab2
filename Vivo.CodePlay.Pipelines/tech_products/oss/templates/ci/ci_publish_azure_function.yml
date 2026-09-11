@@ -1,0 +1,516 @@
+parameters:
+- name: infrastructureType
+
+stages:
+- stage: ci_publish
+  displayName: "CI - Publish"
+  pool:
+    name: $(AGENT_POOL_CI)
+  dependsOn:
+  - environment_init
+  - ci_build
+  - ci_security
+  condition: and(
+    succeeded(),
+    or(
+      eq(variables['Build.SourceBranchName'],'master'),
+      eq(variables['Build.SourceBranchName'],'main'),
+      eq(variables['Build.SourceBranchName'],'dev'),      
+      startsWith(variables['Build.SourceBranchName'],'hotfix'),
+      and(
+        or(
+          eq('${{ parameters.infrastructureType }}', 'weblogic'),
+          eq(dependencies.environment_init.outputs['environment.multibranch_exclusions.ALLOW_MULTIBRANCH'], 'true')
+        ),
+        or(
+          eq(variables['Build.SourceBranchName'],'prodlike'),
+          eq(variables['Build.SourceBranchName'],'preprod'),
+          eq(variables['Build.SourceBranchName'],'esteira1'),
+          eq(variables['Build.SourceBranchName'],'esteira2')
+        )
+      )
+    ))
+
+  ## -> Loads variables from other stages.
+  variables:
+  - name: NEXUS_DEPS_USR
+    value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEPS_USR'] ]
+  - name: NEXUS_DEPS_PSW
+    value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEPS_PSW'] ]
+  - name: NEXUS_DEFAULT_USR
+    value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEFAULT_USR'] ]
+  - name: NEXUS_DEFAULT_PSW
+    value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEFAULT_PSW'] ]
+  - name: APP_COMPONENT_TYPE
+    value: $[ stageDependencies.environment_init.environment.outputs['catalog_info.APP_COMPONENT_TYPE'] ]
+  - name: SAST_STATUS
+    value: $[ stageDependencies.ci_security.sast_scan.outputs['job_status.SAST_STATUS'] ]
+  - name: SCA_STATUS
+    value: $[ stageDependencies.ci_security.sca_scan.outputs['job_status.SCA_STATUS'] ]
+  - name: SONARQUBE_STATUS
+    value: $[ stageDependencies.ci_quality_gate.sonarqube.outputs['job_status.SONARQUBE_STATUS'] ]
+  - name: GOVERNANCE_STATUS
+    value: $[ stageDependencies.ci_quality_gate.governance.outputs['job_status.GOVERNANCE_STATUS'] ]
+
+  - template: /tech_products/oss/initialize/variables_source_data.yml
+
+  jobs:
+
+  - job: publish
+    displayName: "Publish"
+    steps:
+
+    ## -> Download Artifacts
+    - download: none
+
+    ## -> Check if previous Gates stages were not failed as there is bug in AzDo that bypasses the condition
+    ## -> and the pipeline continues to the next stage.
+    ## -> This is a workaround to avoid the pipeline to continue if the gates failed.
+    - task: Bash@3
+      displayName: Gates Verification
+      condition: and(succeeded(),
+        or(
+          eq(variables.SAST_STATUS, 'Failed'),
+          eq(variables.SCA_STATUS, 'Failed'),
+          eq(variables.SONARQUBE_STATUS, 'Failed'),
+          eq(variables.GOVERNANCE_STATUS, 'Failed')))
+      inputs:
+        targetType: inline
+        script: |
+
+          echo "##[debug] SAST_STATUS       : ${SAST_STATUS:-Skipped}"
+          echo "##[debug] SCA_STATUS        : ${SCA_STATUS:-Skipped}"
+          echo "##[debug] SONARQUBE_STATUS  : ${SONARQUBE_STATUS:-Skipped}"
+          echo "##[debug] GOVERNANCE_STATUS : ${GOVERNANCE_STATUS:-Skipped}"
+
+          echo "##[error] Security or quality gate check(s) failed."
+          echo "##[error] Publication cannot proceed until all gates checks pass. Please address the issues reported in the respective scan results."
+          exit 1
+
+    ## -> Download and uncompress the downloaded artifact.
+    ## -> 30f35852-3f7e-4c0c-9a88-e127b4f97211 is the decorator for download artifact.
+    - task: DownloadBuildArtifacts@1
+      displayName: 'Download Build Artifacts'
+      inputs:
+        artifactName: $(ARTIFACT_NAME)
+        cleanDestinationFolder: false
+        extractTars: true
+        parallelizationLimit: 8
+        downloadPath: $(System.ArtifactsDirectory)
+
+    ## -> Set artifact information to variables.
+    - task: Bash@3
+      displayName: Publish to Nexus
+      condition: succeeded()
+      inputs:
+        workingDirectory: $(DEFAULT_WORKDIR_ARTIFACTS)
+        targetType: inline
+        script: |
+
+          echo "##[debug] Extracted tar path: $(pwd)"
+
+          ## -> Function to publish artifact to nexus
+          run_curl_publish() {
+            argArtId=$1
+            argArtExt=$2
+            argArtFile=$3
+            argPubType=$4
+            generatePom=${5:-true}  # Default to true if not provided
+
+            output=$(curl -v -u "$(NEXUS_DEFAULT_USR):$(NEXUS_DEFAULT_PSW)" \
+              "$(NEXUS_ENDPOINT_API_REPOSITORY)/components?repository=$(NEXUS_REPO_LIB_MVN)" \
+              -H "accept: application/json"  \
+              -H "Content-Type: multipart/form-data" \
+              -F "maven2.groupId=$(GROUP_ID)" \
+              -F "maven2.artifactId=$argArtId" \
+              -F "maven2.version=$(NEW_VERSION)" \
+              -F "maven2.generate-pom=$generatePom" \
+              -F "maven2.asset1.extension=$argArtExt" \
+              -F "maven2.asset1=@$argArtFile" 2>&1)
+
+            if [[ $? -ne 0 ]] ; then
+              echo "##[error] Error while executing curl command to push artifact to nexus."
+              echo "##[debug] $output"
+              exit 1
+            fi
+
+            echo "##[group] $1 Publish Output"
+            echo "$output"
+            echo "##[endgroup]"
+
+            ## -> check if artifact and version is already published by error *"does not allow updating"*
+            if [[ "$output" == *"does not allow updating"*  ]]; then
+              echo '##[error] Artifact version already exists on nexus!'
+              echo '##vso[task.logissue type=error] The version of the artifact you are trying to publish has already been published and cannot be updated.'
+              echo '##[error] If you want to publish a new version of the artifact, please update the package version and try again.'
+              exit 1
+            fi
+
+            ## -> check for general errors while publishing
+            if [[ "$output" == *"HTTP error before end of send"*  ]]; then
+              echo '##vso[task.logissue type=error] A problem has occured while trying to publish to nexus.'
+              echo '##[error] Please verify the curl output for more information. Search for the error in the final lines.'
+              exit 1
+            fi
+
+            ## -> Log the artifact URL
+            NexusArtPath="${GROUP_ID//./%2F}"
+            artifactUrl="https://nexus.telefonica.com.br/#browse/browse:$(NEXUS_REPO_LIB_MVN):${NexusArtPath}%2F$argArtId%2F$(NEW_VERSION)"
+
+            echo "##[debug] See Artifact on Nexus: $artifactUrl"
+            echo "##[section]Successfully published $argArtId"
+            echo ""
+          }
+
+          if command -v tree >/dev/null 2>&1; then
+            echo "##[group] Path tree"
+            echo "$(tree)"
+            echo "##[endgroup]"
+          fi
+
+          targetDirectory="$(DEFAULT_WORKDIR_ARTIFACTS)/$(ARTIFACT_NAME)/$(ARTIFACT_PATH)"
+
+          artifactFilePath=$(echo $targetDirectory/$(ls -1 "$targetDirectory" | grep -E "\.zip$" | sort | head -n 1))
+          artifactFile=$(basename $artifactFilePath)
+          artifactExtension="zip"
+
+          echo "##vso[task.setvariable variable=ARTIFACT_EXTENSION]$artifactExtension"
+
+          echo "##[section]Publishing $(ARTIFACT_ID) version $(NEW_VERSION) as $artifactExtension package..."
+
+          echo "##[debug] ArtifactId        : $(ARTIFACT_ID)"
+          echo "##[debug] Artifact name     : $(ARTIFACT_NAME)"
+          echo "##[debug] Artifact file     : $artifactFile"
+          echo "##[debug] Artifact path     : $(ARTIFACT_PATH)"
+          echo "##[debug] Artifact extension: $artifactExtension"
+
+          echo "##[group] Extracted tar path and content"
+          echo "##[debug] $(pwd)"
+          echo "$(ls -lh)"
+          echo "##[endgroup]"
+
+          echo "##[group] Target directory path and content"
+          echo "##[debug] $targetDirectory"
+          echo "$(ls -lh $targetDirectory)"
+          echo "##[endgroup]"
+
+          echo "##vso[task.setvariable variable=TARGET_DIRECTORY]$targetDirectory"
+
+          ## -> Publish the artifact
+          run_curl_publish "$(ARTIFACT_ID)" "$artifactExtension" "$artifactFilePath" "application/zip" "false"
+
+    ## -> Upload Publish Summary
+    - task: Bash@3
+      displayName: Upload Publish Summary
+      continueOnError: true
+      inputs:
+        targetType: inline
+        script: |
+
+          upload_publish_summary() {
+            NexusArtPath="${GROUP_ID//./%2F}"
+            art="$1"
+            artFile="$2"
+            artExtension="$3"
+            ver="$NEW_VERSION"
+
+            artifactUrl="https://nexus.telefonica.com.br/#browse/browse:$(NEXUS_REPO_LIB_MVN):${NexusArtPath}%2F$art%2F$(NEW_VERSION)"
+
+            ## -> Write the publish summary to a file
+            echo "**Published Artifact $art info:**" >> $(Build.SourcesDirectory)/publishInfo.md
+            echo "Version: $ver" >> $(Build.SourcesDirectory)/publishInfo.md
+            echo "Packaging: $artExtension" >> $(Build.SourcesDirectory)/publishInfo.md
+            echo "File: $artFile" >> $(Build.SourcesDirectory)/publishInfo.md
+            echo "Repository: $NEXUS_REPO_LIB_MVN" >> $(Build.SourcesDirectory)/publishInfo.md
+            echo "Path: ${GROUP_ID//./\/}" >> $(Build.SourcesDirectory)/publishInfo.md
+            echo "[See Published Artifact on Nexus]($artifactUrl)" >> $(Build.SourcesDirectory)/publishInfo.md
+            echo "" >> $(Build.SourcesDirectory)/publishInfo.md
+          }
+
+          modulesArray=($(ARTIFACT_MODULES))
+
+          if { [ ! -z "$ARTIFACT_MODULES" ] && [ "$APP_COMPONENT_TYPE" == "lib" ]; } || [ "$(PUBLISH_MULTIMODULES)" == "true" ]; then
+
+            ## -> Generate the publish pom parant summary
+            upload_publish_summary "$(POM_PARENT_ARTIFACTID)" "pom.xml" "pom"
+
+            for module in "${modulesArray[@]}"; do
+
+              ## -> Construct the variable name
+              ## -> Upper case the module name and change "-" to "_" to get the variable name
+              ## -> Variables exported in the step Artifacts Info
+              varModule=$(echo $module | tr '[:lower:]' '[:upper:]' | tr '-' '_')
+              varArtifactid="${varModule}_ARTIFACT_ID"
+              varArtifactExtension="${varModule}_ARTIFACT_EXTENSION"
+              varArtifactFile="${varModule}_ARTIFACT_FILE"
+
+              ## -> Use indirect reference to get the value of the constructed variable name
+              moduleArtifactid="${!varArtifactid}"
+              moduleArtifactExtension="${!varArtifactExtension}"
+              moduleArtifactFile="${!varArtifactFile}"
+
+              ## -> Generate the publish summary
+              upload_publish_summary "$moduleArtifactid" "$(basename "$moduleArtifactFile")" "$moduleArtifactExtension"
+
+            done
+          else
+            ## -> Generate the publish summary
+            upload_publish_summary "$(ARTIFACT_ID)" "$(ARTIFACT_FILE)" "$(ARTIFACT_EXTENSION)"
+          fi
+
+          ## -> Upload the sumary to the pipeline dashboard
+          echo "##vso[task.addattachment type=Distributedtask.Core.Summary;name="Nexus Publish Summary";]$(Build.SourcesDirectory)/publishInfo.md"
+
+  - job: commit_version_bump
+    displayName: "Commit Version Bump"
+    dependsOn: publish
+    steps:
+
+    ## -> Download a Secure File in the 'Azure Agent' as a copy. This allows it to used for the pipeline.
+    ## -> This step will download a different settings.xml, a custom one.
+    ## -> Set MAVEN_CUSTOM_SETTINGS_SECURE_FILE in pipeline's library.
+    - task: DownloadSecureFile@1
+      displayName: 'Download custom settings.xml from secure file'
+      name: settings
+      condition: and(succeeded(), ne(variables['MAVEN_CUSTOM_SETTINGS_SECURE_FILE'], ''))
+      continueOnError: false
+      inputs:
+        actionOnNoFiles: 'warn'
+        secureFile: '$(MAVEN_CUSTOM_SETTINGS_SECURE_FILE)'
+
+    ## -> Set MAVEN information to variables. This allows it to used in other stages, jobs or tasks.
+    ## -> If MAVEN_CUSTOM_SETTINGS_SECURE_FILE is not used. Use default MAVEN settings.
+    - task: Bash@3
+      displayName: 'Defining Maven Settings Variables'
+      name: settings_variables
+      condition: succeeded()
+      continueOnError: false
+      inputs:
+        targetType: 'inline'
+        script: |
+          if [[ -f $(settings.secureFilePath) ]]; then
+            echo "##vso[task.setvariable variable=MAVEN_SETTINGS_LOCATION;isOutput=true]$(settings.secureFilePath)"
+            echo "##[debug] Pipeline will use custom settings.xml file."
+            echo "##[debug] Pipeline will use the MAVEN_SETTINGS_LOCATION = $(settings.secureFilePath) ."
+          else
+            echo "##vso[task.setvariable variable=MAVEN_SETTINGS_LOCATION;isOutput=true]$(DEFAULT_MAVEN_SETTINGS)"
+            echo "##[debug] Pipeline will use the default settings.xml file."
+            echo "##[debug] Pipeline will use the MAVEN_SETTINGS_LOCATION = $(DEFAULT_MAVEN_SETTINGS) ."
+          fi
+
+    ## -> Replace variables in the downloaded settings.xml to the correct values.
+    - task: qetza.replacetokens.replacetokens-task.replacetokens@5
+      displayName: 'Configuring custom settings.xml'
+      condition: and(succeeded(), ne(variables['MAVEN_CUSTOM_SETTINGS_SECURE_FILE'], ''))
+      continueOnError: false
+      inputs:
+        targetFiles: $(settings_variables.MAVEN_SETTINGS_LOCATION)
+        tokenPattern: 'azpipelines'
+        enableTelemetry: false
+      env:
+        NEXUS_DEPS_USR: $(NEXUS_DEPS_USR)
+        NEXUS_DEPS_PSW: $(NEXUS_DEPS_PSW)
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+
+    # -> Clean the pipeline workspace and checkout the code.
+    # -> 6d15af64-176c-496d-b583-fd2ae21d4df4 is the decorator for checkout.
+    - task: 6d15af64-176c-496d-b583-fd2ae21d4df4@1
+      condition: and(
+        succeeded(),
+        eq(variables.BUMP_VERSION_ENABLED, 'true'))
+      inputs:
+        repository: self
+        persistCredentials: "true"
+        clean: true
+
+    ## -> Checkout the last commit that was pushed to the repository.
+    - task: Bash@3
+      displayName: Checkout Last Commit
+      name: checkout_last_commit
+      condition: and(
+        succeeded(),
+        eq(variables.BUMP_VERSION_ENABLED, 'true'))
+      inputs:
+        targetType: inline
+        script: |
+          echo "##[debug] Checkout last commit from '$(Build.SourceBranchName)'"
+
+          git config pull.rebase true
+          git fetch -f --depth 1 origin $(Build.SourceBranchName):$(Build.SourceBranchName)
+          git checkout -f $(Build.SourceBranchName)
+
+    ## -> Bump version for Java <= 7
+    - task: Bash@3
+      displayName: Bump Version on Legacy Mode (Java <= 7)
+      name: bump_java_7_or_less
+      condition: and(
+        succeeded(),
+        eq(variables.LEGACY_MODE, 'true'),
+        eq(variables.BUMP_VERSION_ENABLED, 'true'))
+      continueOnError: false
+      inputs:
+        targetType: inline
+        script: |
+
+          echo "##[debug] Bumping version on legacy mode..."
+
+          run_docker() {
+            docker run --rm \
+              --log-driver none \
+              --entrypoint xq \
+              -v $(pwd)/"$1":$(pwd)/"$1" \
+              -w $(pwd) vcr-group.nexus.telefonica.com.br/linuxserver/yq \
+              -x "$2" \
+              "$1" > pom_temp.xml
+          }
+
+          echo "##[debug] Build with version: $(NEW_VERSION)"
+
+          ## -> Try to collect an array of modules
+          modules=$(DOCKER_CMD_EXTRACT_POM_XML_MODULE)
+
+          if [ $? -gt 0 ]; then
+            echo "##[warning] No modules found or is not an array, switching to string..."
+            modules=$(DOCKER_CMD_EXTRACT_POM_XML_MODULES)
+            if [ $? -gt 0 ]; then
+              echo "##[warning] No modules found, proceeding to pom parent..."
+            fi
+            dependenciesExpression=".project.dependencies.dependency"
+          else
+            dependenciesExpression=".project.dependencies.dependency[]"
+          fi;
+
+          for module in $modules; do
+            echo "##[debug] Bumping version for module: $module"
+            if [ -f "$module/pom.xml" ]; then
+
+              for dependency in $modules; do
+                run_docker "$module/pom.xml" "(try "$dependenciesExpression" | select(.artifactId==\""$dependency"\")).version=\""$(NEW_VERSION)"\""
+                if [ -f "pom_temp.xml" ]; then
+                  mv pom_temp.xml $(pwd)/"$module/pom.xml"
+                fi
+              done
+
+              run_docker "$module/pom.xml" "(try .project.parent | select(.artifactId==\""$(ARTIFACT_ID)"\")).version=\""$(NEW_VERSION)"\""
+              mv pom_temp.xml $(pwd)/"$module/pom.xml"
+
+              run_docker "$module/pom.xml" ".project.version=\""$(NEW_VERSION)"\""
+              mv pom_temp.xml $(pwd)/"$module/pom.xml"
+
+              echo "##[group] /$module/pom.xml"
+              cat $(pwd)/$module/pom.xml
+              echo "##[endgroup]"
+
+            else
+              echo "##[warning] No pom.xml file found for module: $module"
+            fi
+
+          done
+
+          echo "##[debug] Bumping version for pom parent"
+
+          run_docker "pom.xml" ".project.version=\""$(NEW_VERSION)"\""
+          mv pom_temp.xml $(pwd)/pom.xml
+
+          echo "##[group] pom.xml"
+          cat $(pwd)/pom.xml
+          echo "##[endgroup]"
+
+    ## -> Bump version in code
+    - task: Bash@3
+      displayName: Update Source Version
+      condition: and(
+        succeeded(),
+        eq(variables.LEGACY_MODE, 'false'),
+        eq(variables.BUMP_VERSION_ENABLED, 'true'))
+      inputs:
+        targetType: inline
+        script: |
+
+          echo $(settings_variables.MAVEN_SETTINGS_LOCATION)
+
+          BUILDER_IMAGE_NAME="builder/java"
+
+          docker build --no-cache --build-arg USER_ID=$(DOCKER_CMD_USERNAME) --build-arg GROUP_ID=$(DOCKER_CMD_GROUP) -t $BUILDER_IMAGE_NAME -f .azuredevops/builder.Dockerfile .
+
+          run_docker() {
+            docker run --rm \
+              --user=$(DOCKER_CMD_USERNAME):$(DOCKER_CMD_GROUP) \
+              --network host \
+              --log-driver none \
+              -e JAVA_OPTS_MEMORY_MAX=$(DEFAULT_MAX_MEMORY_BUILD) \
+              -e TZ="America/Sao_Paulo" \
+              -e SYSTEM_ACCESSTOKEN=$(System.AccessToken) \
+              -e NEXUS_DEPS_USR=$(NEXUS_DEPS_USR) \
+              -e NEXUS_DEPS_PSW=$(NEXUS_DEPS_PSW) \
+              -v $(pwd):/app \
+              -v $HOME/.m2:/.m2 \
+              -v $(settings_variables.MAVEN_SETTINGS_LOCATION):/.m2/settings.xml \
+              -w $(DOCKER_WORKDIR) \
+              "$BUILDER_IMAGE_NAME" sh -c "$1"
+          }
+
+          echo "##[debug] Pushing NEW_VERSION: $(NEW_VERSION)"
+
+          run_docker "mvn -e -X $MAVEN_OPTS versions:set -DnewVersion=$(NEW_VERSION) -s /.m2/settings.xml -Dmaven.repo.local=/.m2/repository"
+
+    ## -> Push new version to git
+    - task: Bash@3
+      displayName: 'Commit Updated Version'
+      condition: and(
+        succeeded(),
+        eq(variables.BUMP_VERSION_ENABLED, 'true'))
+      inputs:
+        targetType: inline
+        script: |
+
+          ## -> Define variables
+          branchName=$(Build.SourceBranchName)
+          tagRepo=true
+
+          ## -> Set tagPushParam if tagRepo is true
+          tagPushParam=""
+          echo "##[debug] tagRepo.....: $tagRepo"
+
+          ## -> Add changes and commit
+          git add .
+          git commit -am "[CI SKIP] Project version has been updated. Released version '$(NEW_VERSION)'" --author="$BUILD_REQUESTEDFOR <$BUILD_REQUESTEDFOREMAIL>"
+
+          ## -> Tag the commit if tagRepo is true
+          if [[ "$tagRepo" == "true" ]]; then
+
+            if git rev-parse "$(NEW_VERSION)" >/dev/null 2>&1; then
+              echo "##vso[task.logissue type=warning;]Tag $(NEW_VERSION) already exists. Skipping tag creation and commit."
+            else
+              if [[ "$tagRepo" == "true" ]]; then
+                tagPushParam="--tags"
+                git tag $(NEW_VERSION)
+              fi
+            fi
+
+          fi
+
+          ## -> Show git status for debug purposes
+          git status
+
+          ## -> Attempt to push changes and tags
+          echo "##[command] git push origin $tagPushParam $branchName"
+          git push origin $tagPushParam $branchName
+
+          ## -> Check if git push succeeded
+          if [ $? -ne 0 ]; then
+            echo "##vso[task.logissue type=error;] Git push failed. Permission denied."
+            echo "##vso[task.complete result=Failed;]"
+            exit 1
+          fi
+
+          echo "##[debug] Version updated to $(NEW_VERSION)"
+
+    - task: Bash@3
+      displayName: 'Tag Pipeline with Package Version'
+      condition: succeeded()
+      inputs:
+        targetType: inline
+        script: |
+          echo "##[debug] Adding pipeline tag with new version: $(NEW_VERSION)"
+          echo "##vso[build.addbuildtag]version=$(NEW_VERSION)"

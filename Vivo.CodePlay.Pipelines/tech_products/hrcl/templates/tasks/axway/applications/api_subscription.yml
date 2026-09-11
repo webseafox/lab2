@@ -1,0 +1,84 @@
+parameters:
+- name: apiID
+- name: apiName
+- name: apiOrganizationName
+- name: apiSharedOrganizationsName
+
+steps:
+- script: |
+    set -e
+
+    echo "##[debug] API_MANAGER_BASE_URL........: ${API_MANAGER_BASE_URL}"
+    echo "##[debug] CATALOG_FILE................: ${CATALOG_FILE}"
+    echo "##[debug] API_ORGANIZATION_NAME.......: ${API_ORGANIZATION_NAME}"
+    echo "##[debug] SHARED_ORGANIZATIONS........: ${SHARED_ORGANIZATIONS}"
+    echo "##[debug] API_NAME....................: ${API_NAME}"
+    echo "##[debug] API_ID......................: ${API_ID}"
+
+    if [ ! -f "${CATALOG_FILE}" ]; then
+      echo "##vso[task.logissue type=error] Catalog file not found."
+      exit 1
+    fi
+
+    if [ -z "${API_ID}" ]; then
+      echo "##vso[task.logissue type=error] Invalid API ID to perform Subscription."
+      exit 1
+    fi
+
+    IFS=',' read -r -a sharedOrganizations <<< "${SHARED_ORGANIZATIONS}"
+    sharedOrganizations+=("${API_ORGANIZATION_NAME}")
+
+    for orgName in "${sharedOrganizations[@]}"; do
+
+        jq -rc --arg apiName "${API_NAME}" --arg organizationName "${orgName}" '.topology.workflow.organizations | map(select(.name == $organizationName).applications[]) | map(select(.apis[] == $apiName) | .name)[] // empty' "${CATALOG_FILE}" | while read appName; do
+            echo "##[group] API Subscription for Application '${appName}'"
+            echo "##[debug] APPLICATION_NAME............: ${appName}"
+
+            APPLICATION_ID="$(curl -s -k --get \
+            --data-urlencode "field=name" \
+            --data-urlencode "op=eq" \
+            --data-urlencode "value=${appName}" \
+            --user "${ADMIN_USERNAME}:${ADMIN_PASSWORD}" \
+            "${API_MANAGER_BASE_URL}/applications" | jq -r '.[0].id // empty')"
+
+            echo "##[debug] APPLICATION_ID..............: ${APPLICATION_ID}"
+            if [ -z "${APPLICATION_ID}" ]; then
+                echo "##vso[task.logissue type=warning] Application '${appName}' not found in API Manager."
+                echo "##vso[task.complete result=SucceededWithIssues;]"
+                continue
+            fi
+
+            echo "##[command] POST /applications/${APPLICATION_ID}/apis"
+            REQUEST_BODY='{ "apiId": "'${API_ID}'", "enabled": true }'
+
+            echo "##[debug] REQUEST_BODY................: ${REQUEST_BODY}"
+            RESPONSE_STATUS_CODE=$(curl -i -k -s -o /dev/null -w "%{http_code}" -X POST "${API_MANAGER_BASE_URL}/applications/${APPLICATION_ID}/apis" \
+            --header "content-type: application/json" \
+            --user "${ADMIN_USERNAME}:${ADMIN_PASSWORD}" \
+            --data-raw "${REQUEST_BODY}")
+
+            if [[ "${RESPONSE_STATUS_CODE}" = "200" || "${RESPONSE_STATUS_CODE}" = "201" ]]; then
+              echo "##vso[task.complete result=Succeeded;]"
+            elif [[ "${RESPONSE_STATUS_CODE}" == "409" ]]; then
+              echo "##[warning] Conflict when performing API Subscription for '${appName}'"
+              echo "##vso[task.complete result=Succeeded;]"
+            else
+              echo "##vso[task.logissue type=error;] API Subscription response '${RESPONSE_STATUS_CODE}'."
+              echo "##vso[task.complete result=Failed;]"
+            fi
+
+            echo "##[endgroup]"
+        done    
+    done
+  displayName: Applications API Subscription
+  workingDirectory: $(CATALOG_FILES_PATH)
+  continueOnError: true
+  env:
+    API_MANAGER_BASE_URL: $(API_MANAGER_BASE_URL)
+    ADMIN_USERNAME: $(ADMIN_USERNAME)
+    ADMIN_PASSWORD: $(ADMIN_PASSWORD)
+    API_ORGANIZATION_NAME: ${{ parameters.apiOrganizationName }}
+    SHARED_ORGANIZATIONS: ${{ parameters.apiSharedOrganizationsName }}
+    API_NAME: ${{ parameters.apiName }}
+    API_ID: ${{ parameters.apiID }}
+    CATALOG_FILE: $(CATALOG_FILE_NAME)

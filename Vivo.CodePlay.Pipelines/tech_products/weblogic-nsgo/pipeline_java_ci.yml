@@ -1,0 +1,557 @@
+## -> Parameters:
+parameters:
+- name: qa_environment
+  type: string
+- name: skip_deploy
+  type: boolean
+  default: false
+- name: useMavenCache
+  displayName: Usar cache do maven
+  type: boolean
+  default: True
+- name: secureFile
+  default: settings-sgoe-svn.xml
+- name: fortifyExclusionRepository
+  type: string
+  default: 'FortifyExclusion'
+
+## -> Resources:
+resources:
+  repositories:
+  - repository: FortifyExclusion
+    name: DevOps/Vivo.Fortify.Exclusions
+    type: git
+    ref: refs/heads/master
+    endpoint: CorePipelines
+  - repository: CorePipelines
+    name: DevOps/Vivo.Core.Pipelines
+    type: git
+    ref: refs/tags/latest
+    endpoint: CorePipelines
+
+## -> Initialize global variables   
+variables:
+
+- template: /global/variables/pipeline.yml@CorePipelines
+
+- name: DEFAULT_WORKDIR_ARTIFACTS
+  value: "$(System.ArtifactsDirectory)/extracted_tars/app"
+- name: MAVEN_CACHE_FOLDER
+  value: $HOME/.m2/repository
+- name: MAVEN_OPTS
+  value: '-Dmaven.repo.local=$(MAVEN_CACHE_FOLDER)' 
+
+## -> Override global variables, with variables set in Library/Variable Groups (Pipelines)
+## -> Use this to change the variables on runtime
+- group: "${{ variables['Build.DefinitionName'] }}"
+
+stages:
+
+## -> Initialize pipeline
+- stage: pipeline_init
+  displayName: "Pipeline initialization"
+  pool: $(PRIVATE_AGENT_DEFAULT)
+  jobs:
+  - job: prepare_pipeline
+    displayName: "Prepare"
+    steps:
+        
+    - script: |
+        echo "##[debug] BREAK_WHEN_NOT_FOUND.....: ${BREAK_WHEN_NOT_FOUND}"
+        if [ ! -f "catalog-info.yaml" ]; then
+          if [ "$BREAK_WHEN_NOT_FOUND" = 'True' ]; then
+            echo "##vso[task.logissue type=error] Unable to find catalog-info.yaml file (path=$(pwd))."
+            exit 1
+          fi
+        fi
+      displayName: "Check for catalog-info.yml"
+      env:
+        BREAK_WHEN_NOT_FOUND: true
+
+    - task: CopyFiles@2
+      displayName: "Copy catalog-info.yaml to Staging Directory"
+      inputs:
+        TargetFolder: "$(Build.ArtifactStagingDirectory)"
+        OverWrite: true
+        CleanTargetFolder: true
+        Contents: |
+          catalog-info.yaml
+          
+    - task: PublishPipelineArtifact@1
+      displayName: "Publish catalog-info.yaml"
+      inputs:
+        artifactName: "catalog-info"
+        targetPath: "$(Build.ArtifactStagingDirectory)"
+
+## -> Build for CI - Weblogic
+- stage: build
+  displayName: Build
+  jobs:
+  - job: package
+    displayName: Build, Test and Pack (Back)
+    variables:
+    - name: ASDF_JDK_11
+      value: "openjdk-11.0.2"
+    - name: SONARQUBE_PROJECT_NAME
+      value: "$(System.TeamProject)-$(Build.Repository.Name)"
+    pool: GeneralPurposeLinuxAgentsCI
+    steps:
+    - checkout: self
+      fetchDepth: 1
+      persistCredentials: true
+
+    - script: asdf shim-versions java
+      displayName: 'Getting versões Java (ASDF)'
+
+    - task: AzureKeyVault@2  
+      displayName: 'Getting AKV credentials'
+      inputs:    
+        azureSubscription: DevOpsSharedResources
+        KeyVaultName: kv-azdevops-shared
+        SecretsFilter: 'NEXUS-DEFAULT-USR, NEXUS-DEFAULT-PSW, SONARQUBE-TOKEN'
+
+    - task: YamlParseFromVivo@4
+      displayName: 'Get Metadata Info'
+      inputs:
+        type: 'file'
+        origin: $(Build.SourcesDirectory)/catalog-info.yaml
+        jpaths: |
+          var CATALOG_YAML_ACRONYM = .metadata.annotations['techarch.governance-app.acronym']
+          var CATALOG_YAML_MODULE = .metadata.annotations['techarch.governance-app.module']
+          var CATALOG_YAML_SONAR_PROJECT_KEY = .metadata.annotations['sonarqube.org/project-key']
+          var CATALOG_YAML_JAVA_LANGUAGE_VERSION = .metadata.annotations['arqtech.telefonica.com.br/language-version']
+
+    - task: DownloadSecureFile@1
+      displayName: 'Getting settings file [${{ parameters.secureFile }}]'
+      name: secureFileSgoe
+      inputs:
+        secureFile: ${{ parameters.secureFile }}
+
+    - task: DownloadPackage@1
+      inputs:
+        packageType: 'upack'
+        feed: '/3d53bc62-8749-4931-ae46-a443b73bc87a'
+        view: 'da88d2ff-67d7-44d6-a91b-cc4bffa5fa70'
+        definition: 'af3db6b0-1f07-4b22-8b07-b02c554aa55d'
+        version: '3.8.5'
+        downloadPath: '$(System.ArtifactsDirectory)'
+      env:
+        HTTPS_PROXY: "http://10.240.58.39:3128"
+
+    - task: ExtractFiles@1
+      displayName: 'Extract Apache Maven'
+      inputs:
+        archiveFilePatterns: '$(System.ArtifactsDirectory)/apache-maven-3.8.5-bin.tar.gz'
+        destinationFolder: '$(System.ArtifactsDirectory)/maven'
+        cleanDestinationFolder: false
+
+    - task: DownloadPackage@1
+      inputs:
+        packageType: 'upack'
+        feed: '/3d53bc62-8749-4931-ae46-a443b73bc87a'
+        view: 'da88d2ff-67d7-44d6-a91b-cc4bffa5fa70'
+        definition: '86aac6fe-1f88-48a6-bfa4-ac10c6a70a01'
+        version: '6.0.0'
+        downloadPath: '$(System.ArtifactsDirectory)/java'
+  
+    - task: Bash@3
+      displayName: 'Install and Package Java 6'
+      continueOnError: true
+      inputs:
+        workingDirectory: '$(Build.SourcesDirectory)'
+        targetType: inline
+        script: | 
+          cd $(System.ArtifactsDirectory)/java
+          chmod a+x ./jdk-6u45-linux-x64.bin
+          ./jdk-6u45-linux-x64.bin   
+          tar -czvf jdk-6u45-linux-x64.bin.tar.gz jdk1.6.0_45
+
+    - task: JavaToolInstaller@0
+      displayName: 'Use Java 6'
+      inputs:
+        versionSpec: 6
+        jdkArchitectureOption: x64
+        jdkSourceOption: LocalDirectory
+        jdkFile: '$(System.ArtifactsDirectory)/java/jdk-6u45-linux-x64.bin.tar.gz'
+        jdkDestinationDirectory: '$(System.ArtifactsDirectory)/JDK6'
+        createExtractDirectory: false
+
+    - task: DownloadPackage@1
+      inputs:
+        packageType: 'upack'
+        feed: '/3d53bc62-8749-4931-ae46-a443b73bc87a'
+        view: 'da88d2ff-67d7-44d6-a91b-cc4bffa5fa70'
+        definition: 'edb360b4-572b-4518-9847-2981ddcffac6'
+        version: '8.0.0'
+        downloadPath: '$(System.ArtifactsDirectory)/java'
+  
+    - task: JavaToolInstaller@0
+      displayName: 'Use Java 8'
+      inputs:
+        versionSpec: 8
+        jdkArchitectureOption: x64
+        jdkSourceOption: LocalDirectory
+        jdkFile: '$(System.ArtifactsDirectory)/java/jdk-8u381-linux-x64.tar.gz'
+        jdkDestinationDirectory: '$(System.ArtifactsDirectory)/JDK8'
+        createExtractDirectory: false
+
+    - task: Bash@3
+      displayName: Mudando Versão
+      name: create_new_version
+      continueOnError: false
+      inputs:
+        targetType: inline
+        script: |-
+              echo "Extraindo a versão atual do pom.xml"
+              
+              CURRENT_VERSION=$(grep -oP '(?<=<version>1\.7\.)[0-9]+(?=</version>)' pom.xml | head -n 1)
+
+              if [ -z "$CURRENT_VERSION" ]; then
+                echo "Versão atual não encontrada; definindo patch inicial como 0"
+                CURRENT_VERSION=0
+              fi
+
+              NEW_PATCH=$((CURRENT_VERSION + 1))
+              NEW_VERSION="1.7.$NEW_PATCH"
+              
+              echo "Nova versão calculada: $NEW_VERSION"
+              
+              find . -name 'pom.xml' -exec sed -i 's/<version>1\.7\.'$CURRENT_VERSION'<\/version>/<version>'$NEW_VERSION'<\/version>/g' {} +
+
+              echo "Confirmando as alterações realizadas nos POM.xml:"
+              git diff
+
+              echo "Confirmando a alteração realizada no POM principal:"
+              git diff pom.xml
+
+    - task: Bash@3
+      displayName: Comitando e Enviando Alteração do POM.xml
+      name: commit_and_push_pom_version
+      continueOnError: false
+      inputs:
+        targetType: inline
+        script: |-
+                  TARGET_BRANCH=$(Build.SourceBranchName)
+
+                  echo "Adicionando o pom.xml ao commit"
+                  git add *
+
+                  echo "Comitando a alteração do POM principal"
+                  git commit -m "[skip ci] Atualização do POM principal para nova versão $NEW_VERSION" || echo "Nada para comitar."
+
+                  echo "Fazendo push da alteração para a branch $TARGET_BRANCH"
+                  git push origin HEAD:$TARGET_BRANCH || echo "Falha no push para a branch $TARGET_BRANCH."
+
+    - task: XmlParseFromVivo@4
+      displayName: 'Get New pom.xml info'
+      inputs:
+        type: 'file'
+        origin: $(Build.SourcesDirectory)/pom.xml
+        jpaths: |
+          var POM_XML_VERSION = .project.version._text
+
+    - task: Maven@3
+      displayName: "Maven versions:set"
+      env:
+        HTTPS_PROXY: $(PROXY_AGENT_HTTPS)
+        HTTP_PROXY: $(PROXY_AGENT_HTTP)
+        NO_PROXY: $(PROXY_AGENT_NO_PROXY)
+        PUB_CREDENTIAL_USR: $(NEXUS-DEFAULT-USR)
+        PUB_CREDENTIAL_PSW: $(NEXUS-DEFAULT-PSW)
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+        ARTIFACTS_DIRECTORY: $(System.ArtifactsDirectory)
+      inputs:
+        options: >
+          -s $(secureFileSgoe.secureFilePath)
+          -Dmaven.test.skip=true
+          -DnewVersion=$(POM_XML_VERSION)
+          -DprocessAllModules
+          -DgenerateBackupPoms=false
+          -N versions:update-child-modules
+        mavenPomFile: '$(Build.SourcesDirectory)/sgoe-dev-ear/pom.xml'
+        mavenOptions: '-Xmx2050m'
+        javaHomeOption: 'Path'
+        mavenVersionOption: 'Path'
+        mavenDirectory: '$(System.ArtifactsDirectory)/maven/apache-maven-3.8.5'
+        jdkDirectory: '$(System.ArtifactsDirectory)/JDK8/jdk1.8.0_381'
+        jdkArchitectureOption: 'x64'
+        mavenAuthenticateFeed: false
+        goals: "versions:set"
+
+    - task: Maven@3
+      displayName: "Maven versions:commit"
+      env:
+        HTTPS_PROXY: $(PROXY_AGENT_HTTPS)
+        HTTP_PROXY: $(PROXY_AGENT_HTTP)
+        NO_PROXY: $(PROXY_AGENT_NO_PROXY)
+        PUB_CREDENTIAL_USR: $(NEXUS-DEFAULT-USR)
+        PUB_CREDENTIAL_PSW: $(NEXUS-DEFAULT-PSW)
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+        ARTIFACTS_DIRECTORY: $(System.ArtifactsDirectory)
+      inputs:
+        options: >
+          -s $(secureFileSgoe.secureFilePath)
+          -Dmaven.test.skip=true
+          -DnewVersion=$(POM_XML_VERSION)
+          -DprocessAllModules
+          -DgenerateBackupPoms=false
+          -N versions:update-child-modules
+        mavenPomFile: '$(Build.SourcesDirectory)/sgoe-dev-ear/pom.xml'
+        mavenOptions: '-Xmx2072m'
+        javaHomeOption: 'Path'
+        mavenVersionOption: 'Path'
+        mavenDirectory: '$(System.ArtifactsDirectory)/maven/apache-maven-3.8.5'
+        jdkDirectory: '$(System.ArtifactsDirectory)/JDK8/jdk1.8.0_381'
+        jdkArchitectureOption: 'x64'
+        mavenAuthenticateFeed: false
+        goals: "versions:commit"
+
+    - task: Maven@4
+      displayName: 'Maven Build with Custom JDK 8 and Maven 3.8.5'
+      name: build_ear
+      inputs:
+        mavenPomFile: '$(Build.SourcesDirectory)/sgoe-dev-ear/pom.xml'
+        options: '-DskipTests -Phml -s $(secureFileSgoe.secureFilePath)'
+        mavenOptions: '-Xmx3072m'
+        javaHomeOption: 'Path'
+        mavenVersionOption: 'Path'
+        mavenDirectory: '$(System.ArtifactsDirectory)/maven/apache-maven-3.8.5'
+        jdkDirectory: '$(System.ArtifactsDirectory)/JDK8/jdk1.8.0_381'
+        jdkArchitectureOption: 'x64'
+        mavenAuthenticateFeed: false
+        goals: 'clean install'
+      env:
+        HTTPS_PROXY: $(PROXY_AGENT_HTTPS)
+        HTTP_PROXY: $(PROXY_AGENT_HTTP)
+        NO_PROXY: $(PROXY_AGENT_NO_PROXY)
+        PUB_CREDENTIAL_USR: $(NEXUS-DEFAULT-USR)
+        PUB_CREDENTIAL_PSW: $(NEXUS-DEFAULT-PSW)
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+        ARTIFACTS_DIRECTORY: $(System.ArtifactsDirectory)
+
+    - task: CopyFiles@2
+      displayName: 'Staging Artifacts'
+      inputs:
+        SourceFolder: "$(build.sourcesdirectory)"
+        TargetFolder: "$(Build.ArtifactStagingDirectory)"
+        Contents: |
+          **/target/classes/**
+          **/target/*.*ar
+          **/target/*.ejb
+          **/surefire-reports/TEST-*.xml
+          **/pom.xml
+          .azuredevops/**/*
+          .azuredevops/*
+          catalog-info.y*ml
+          pom.xml
+        CleanTargetFolder: true
+        OverWrite: true
+        flattenFolders: false
+ 
+    - task: PublishBuildArtifacts@1
+      displayName: Publish App Artifacts
+      inputs:
+        ArtifactName: app
+
+# -> Gates for CI - Weblogic
+- stage: gates
+  displayName: "Quality Gates"
+  dependsOn: 
+  - build
+  pool: $(PRIVATE_AGENT_DEFAULT)
+  jobs:
+
+  - job: governance
+    displayName: Governance Policies Check
+    steps:
+
+    - script: |
+        if [ ! -f "catalog-info.yaml" ]; then
+          echo "##vso[task.logissue type=error] Unable to find catalog-info.yaml file (path=$(pwd))."
+        fi
+
+        COMPONENT_NAME="$(yq -r 'select(documentIndex == 0) | .metadata.name | select (.!=null)' catalog-info.yaml)"
+        echo "##vso[task.setvariable variable=COMPONENT_NAME]${COMPONENT_NAME}"
+        echo "##vso[task.setvariable variable=CATALOG_INFO_FILE_CONTENT]$(cat catalog-info.yaml)"
+      name: export_catalog_info
+      displayName: Reading Catalog Info File
+
+    - bash: |
+        version=$(grep version pom.xml | grep -v '<?xml' | grep '<version>'|head -n 1|awk '{print $1}'| cut -d'>' -f 2 | cut -d'<' -f 1)
+        echo "##vso[task.setvariable variable=APP_VERSION]$version"
+        echo "##[debug] Exporting variable 'APP_VERSION': $version"
+      name: export_current_version
+      displayName: Extract App Version 
+
+    - task: VivoGovernance@1
+      inputs:
+        breakglass: $(GOVAPP_BREAK_GLASS)
+        cluster: "$(GOVAPP_CLUSTER)"
+        component: "$(COMPONENT_NAME)"
+        deployment: "$(COMPONENT_NAME)"
+        environment: "${{ parameters.qa_environment }}" 
+        namespace: "$(GOVAPP_NAMESPACE)"
+        operation: "validate"
+        serverEndpoint: $(GOVAPP_SERVICE_CONNECTION_NAME)
+        version: "$(APP_VERSION)"
+        catalogInfo: $(CATALOG_INFO_FILE_CONTENT)
+      continueOnError: true
+      condition: eq(lower(variables.GOVAPP_INTEGRATION_ENABLED), 'true')
+
+  - job: sonarqube
+    displayName: Code Analysis OK OK
+    variables:
+    - name: APP_VERSION
+      value: $[ stageDependencies.build_test.bump_version.outputs['component_bump_version.APP_NEW_VERSION'] ]
+    steps:
+    # Run SonarQube scan for Java or C code
+    - template: /task_groups/gates/run_sonarqube_scan.yml@CorePipelines
+      parameters:
+        stack: "JAVA"
+        projectKey: $(Build.Repository.Name)
+        configFile: '$(Build.SourcesDirectory)/.azuredevops/sonar-project.properties'
+        version: $(APP_VERSION)
+        artifactType: pipeline
+        artifactName: app
+        workdirArtifacts: $(Agent.BuildDirectory)/app
+        continuePipelineOnQualityGateError: true # FALSE PARA ATIVAR O QUALITY GATE
+
+
+## -> Security for CI - Weblogic
+- stage: security
+  displayName: "Security"
+  dependsOn: 
+    - pipeline_init
+    - build
+  pool:
+    name: $(PRIVATE_AGENT_DEFAULT)
+  jobs:
+  - job: app_config_keys
+    displayName: "Get AppSec Config Keys"
+    steps:
+    - template: /task_groups/security/get_appconfig_keys.yml@CorePipelines
+
+  - job: fortify_scan
+    dependsOn: app_config_keys
+    variables:
+      USE_FORTIFY: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_FORTIFY'] ]
+      USE_CONVISO: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_CONVISO'] ]
+      SKIP_SECURITY_GATE: $[ dependencies.app_config_keys.outputs['evaluate_flags.SKIP_SECURITY_GATE'] ]
+    condition: and(
+                    succeeded(),
+                    and(
+                      eq(variables.USE_FORTIFY, 'true'),
+                      eq(variables.flowIsToReview, true),
+                      not(startsWith(variables['Build.SourceBranch'], 'refs/tags/'))
+                    )
+                  )
+    displayName: "Fortify Scan"
+    steps:
+    - template: /task_groups/security/run_fortify_scan.yml@CorePipelines
+      parameters:
+        isGitFlow: true
+        gateCondition: and(
+                        succeeded(),
+                        ne(variables.skip_fortify_gate, true),
+                        ne(variables.USE_CONVISO, 'true')
+                      )
+        fortifyExclusionRepository: ${{ parameters.fortifyExclusionRepository }}
+        skipSecurityGate: $(SKIP_SECURITY_GATE)
+    - template: /tasks/telemetry/telemetry.yml@CorePipelines
+
+  - job: sca_scan
+    dependsOn: app_config_keys
+    displayName: "SCA Scan"
+    variables: 
+      USE_DEPENDENCY_TRACK: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_DEPENDENCY_TRACK'] ]
+      USE_DT_DOCKER: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_DT_DOCKER'] ]
+      USE_CONVISO: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_CONVISO'] ]
+      SKIP_SECURITY_GATE_SCA: $[ dependencies.app_config_keys.outputs['evaluate_flags.SKIP_SECURITY_GATE_SCA'] ]
+    condition: and(
+                  succeeded(),
+                  eq(variables.USE_DEPENDENCY_TRACK, true),
+                  eq(variables.USE_DT_DOCKER, false)
+                )
+    steps:
+      #- template: /security/define_appsec_app_version.yml
+      - template: /security/run_sca_scan.yml
+        parameters:
+          buildArtifactName: app
+          #appVersion: "$(FORTIFY_APP_VERSION)"
+          #vivoFlow: "develop,preprod,esteira1,esteira2"
+
+## Publish - Weblogic
+- stage: state_push_nexus
+  displayName: Push to Nexus
+  dependsOn: ['gates', 'security']
+  condition: and(succeeded('gates'), succeeded('security'))
+  jobs:
+  - job: job_push_nexus
+    displayName: Push to Nexus
+    pool: GeneralPurposeLinuxAgentsCI
+
+    steps:
+    - checkout: self
+
+    - task: DownloadBuildArtifacts@1
+      displayName: Download artifacts
+      inputs:
+        buildType: 'current'
+        downloadType: 'specific'
+        downloadPath: '$(System.ArtifactsDirectory)'
+        cleanDestinationFolder: true
+
+    - task: AzureKeyVault@2
+      displayName: 'Getting AKV Credentials'
+      timeoutInMinutes: 1
+      retryCountOnTaskFailure: 5
+      inputs:
+        azureSubscription: 'DevOpsSharedResources'
+        KeyVaultName: 'kv-azdevops-shared'
+        SecretsFilter: 'NEXUS-DEPS-USR, NEXUS-DEPS-PSW, NEXUS-DEFAULT-USR, NEXUS-DEFAULT-PSW'
+
+    - task: XmlParseFromVivo@4
+      displayName: Get Main Info
+      condition: eq(variables['check_artifact.SKIP_PIPELINE'], 'false')
+      name: pom_info
+      inputs:
+        type: 'file'
+        origin: '$(System.ArtifactsDirectory)/app/pom.xml'
+        jpaths: |
+          var POM_XML_VERSION = .project.version._text
+          var POM_XML_ARTIFACT_ID = .project.artifactId._text
+          var POM_XML_GROUP_ID = .project.groupId._text
+        
+    - task: Bash@3
+      displayName: 'Check POM Files'
+      continueOnError: true
+      inputs:
+        targetType: inline
+        script: | 
+          cd   $(System.ArtifactsDirectory)/app/
+          ls  $(System.ArtifactsDirectory)/app/*/target/
+
+    - task: NexusUploadAllMvnFromVivo@5
+      displayName: 'Push to Nexus SGOE'
+      inputs:
+        nexusEndpoint: 'Nexus Asis'
+        nexusRepoMaven: 'sgoe-mvn'
+        publishInfoFile: 'publishInfo.md'
+        mainPomDirectory: '$(System.ArtifactsDirectory)/app'
+        verbose: true
+
+    - task: NexusUploadMvnFromVivo@5
+      continueOnError: true
+      displayName: Upload COF
+#      condition: eq(variables['check_artifact.SKIP_PIPELINE'], 'false')
+      inputs:
+        nexusEndpoint: "Nexus Asis"
+        nexusRepoMaven: "sgoe-mvn"
+        groupId: $(POM_XML_GROUP_ID)
+        generatePom: false
+        artifactId: $(POM_XML_ARTIFACT_ID)
+        artifactVersion: $(POM_XML_VERSION)
+        artifactFile1:  $(System.ArtifactsDirectory)/app/sgoe-dev-ear/sgoe-dev-ear/target/sgoe.ear
+        artifactExtension1: ear
+        artifactFile2: $(System.ArtifactsDirectory)/app/sgoe-dev-ear/pom.xml
+        artifactExtension2: pom

@@ -1,0 +1,82 @@
+parameters:
+- name: displayName
+  default: Running bash on docker
+- name: pythonVersion
+  type: string
+- name: scriptNameOrCmd
+  type: string
+- name: artifactFeeds
+  default: $(AZURE_ARTIFACTS_FEED)
+
+steps:
+
+- bash: |
+    REPO_NAME=$(Build.Repository.Name)
+    if [[ "$REPO_NAME" == nt-telecom-* ]]; then
+        echo "##vso[task.setvariable variable=projectType]databricks"
+        echo "Projeto telecom, pulando passos referentes à lib-telecom-negocio..."
+    elif [[ "$REPO_NAME" == *"nt-mercadoria-orquestrador"* || "$REPO_NAME" == *"lib-telecom-negocio"* || "$REPO_NAME" == *"nt-exemplo-databricks"* || "$REPO_NAME" == *"lib-servico-negocio"* || "$REPO_NAME" == *"nt-james-webb"* ]]; then
+        echo "##vso[task.setvariable variable=projectType]mercadoria"
+        echo "Projeto mercadoria, pulando passos referentes à lib-telecom-negocio..."
+    elif [[ "$REPO_NAME" == *"nt-lakehouse"* ]]; then
+        echo "##vso[task.setvariable variable=projectType]lakehouse"
+        echo "Projeto lakehouse, pulando passos referentes à lib-telecom-negocio..."
+    elif [[ "$REPO_NAME" == nt-servico-* ]]; then
+        echo "##vso[task.setvariable variable=projectType]databricks"
+        echo "Projeto nota de serviço, pulando passos referentes à lib-telecom-negocio..."
+    else
+        echo "Unknown project type"
+        exit 1
+    fi
+  displayName: 'Set project type based on repository name'
+  
+- task: PipAuthenticate@1
+  displayName: 'Pip Authenticate'
+  condition: eq(variables['projectType'], 'telecom')
+  inputs:
+    artifactFeeds: ${{ parameters.artifactFeeds }}
+  env:
+    http_proxy: $(PROXY_AGENT_HTTP)
+    https_proxy: $(PROXY_AGENT_HTTPS)
+    no_proxy: $(PROXY_AGENT_NO_PROXY)
+
+- bash: |
+    cat << EOF > cmd-pip-auth.sh
+    #!/bin/bash
+
+    echo "##[debug]Setup pipy feed ${PIP_INDEX_URL}..."
+    pip config --user set global.index-url ${PIP_INDEX_URL}
+
+    echo "##[debug]Executing Script or Command"
+    ${SCRIPT_OR_CMD}
+    EOF
+  displayName: Create PIP Auth Script
+  condition: eq(variables['projectType'], 'telecom')
+  env:
+    PIP_INDEX_URL: "$(PIP_INDEX_URL)"
+    SCRIPT_OR_CMD: "${{ parameters.scriptNameOrCmd }}"
+
+- bash: |
+    echo "##[debug] HTTPS_PROXY.......: ${HTTPS_PROXY}"
+    echo "##[debug] HTTP_PROXY........: ${HTTP_PROXY}"
+    echo "##[debug] NO_PROXY..........: ${NO_PROXY}"
+
+    docker run --rm \
+      --user="$(DOCKER_CMD_USERNAME):$(DOCKER_CMD_GROUP)" \
+      --network host \
+      --log-driver none \
+      -e HTTPS_PROXY="$HTTPS_PROXY" \
+      -e HTTP_PROXY="$HTTP_PROXY" \
+      -e NO_PROXY="$NO_PROXY" \
+      -v $(pwd):/app \
+      vcr-group.nexus.telefonica.com.br/corp/python/${PYTHON_VERSION}/builder/corp-py${PYTHON_VERSION} \
+      bash /app/cmd-pip-auth.sh; [ $? -ne 0 ] && echo "##[debug]Ocorreu um erro ao executar o script/comando no container." && exit -1
+
+    rm -f cmd-pip-auth.sh
+  displayName: ${{ parameters.displayName }}
+  condition: eq(variables['projectType'], 'telecom')
+  env:
+    PYTHON_VERSION: "${{ parameters.pythonVersion }}"
+    HTTPS_PROXY: $(PROXY_AGENT_HTTPS)
+    HTTP_PROXY: $(PROXY_AGENT_HTTP)
+    NO_PROXY: "$(PROXY_AGENT_NO_PROXY),$(PROXY_ADDL_NO_PROXY)"

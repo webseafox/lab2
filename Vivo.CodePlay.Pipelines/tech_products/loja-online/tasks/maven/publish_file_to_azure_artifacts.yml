@@ -1,0 +1,139 @@
+parameters:
+  - name: artifactDir
+    type: string
+    default: "$(DEFAULT_WORKDIR_ARTIFACTS)"
+  - name: artifactName
+    type: string
+  - name: targetDir
+    type: string
+  - name: mavenSettingsLocation
+    type: string
+    default: "$(DEFAULT_MAVEN_SETTINGS)"
+  - name: azureArtifactsFeed
+    type: string
+    default: "$(AZURE_ARTIFACTS_FEED)"
+  - name: azureArtifactsOrganization
+    type: string
+    default: "$(AZURE_ARTIFACTS_ORGANIZATION)"
+  - name: azureArtifactsMavenFeedURL
+    type: string
+    default: "$(AZURE_ARTIFACTS_MAVEN_FEED_URL)"
+  - name: cmdExtractVersion
+    type: string
+    default: $(DOCKER_CMD_EXTRACT_POM_XML_VERSION)
+  - name: cmdExtractGroupId
+    type: string
+    default: $(DOCKER_CMD_EXTRACT_APP_GROUP)
+  - name: cmdExtractPackaging
+    type: string
+    default: $(DOCKER_CMD_EXTRACT_APP_PACKAGING)
+  - name: fileExtensions
+    type: string
+    default: "jar,zip,xml"
+
+steps:
+- template:/tech_products/loja-online/global/general/set-output-variable.yml
+  parameters:
+    variable: VERSION
+    command: ${{ parameters.cmdExtractVersion }}
+    workDir: ${{ parameters.artifactDir }}
+
+- template:/tech_products/loja-online/global/general/set-output-variable.yml
+  parameters:
+    variable: ARTIFACT_ID
+    command: $(DOCKER_CMD_EXTRACT_APP_NAME)
+    workDir: ${{ parameters.artifactDir }}
+
+- template:/tech_products/loja-online/global/general/set-output-variable.yml
+  parameters:
+    variable: GROUP_ID
+    command: ${{ parameters.cmdExtractGroupId }}
+    workDir: ${{ parameters.artifactDir }}
+
+- template:/tech_products/loja-online/global/general/set-output-variable.yml
+  parameters:
+    variable: PACKAGING
+    command: ${{ parameters.cmdExtractPackaging }}
+    workDir: ${{ parameters.artifactDir }}
+
+- script: |
+    FILE_EXTENSION=""
+
+    TARGET_DIR="${{ parameters.artifactDir }}/${{ parameters.targetDir }}"
+    if [[ -z ${{ parameters.targetDir }} ]]; then
+      TARGET_DIR=${{ parameters.artifactDir }}
+    fi
+
+    FILENAME=${{ parameters.artifactName }}
+    if [[ -z ${{ parameters.artifactName }}  ]]; then
+      FILENAME=${ARTIFACT_ID}-${VERSION}
+    fi
+
+    # Converte a string de extensões em um array usando o IFS (Internal Field Separator) padrão para ',' 
+    IFS=',' read -r -a extensions_array <<< "${{ parameters.fileExtensions }}"
+
+    # Percorre cada extensão e verifica se o arquivo existe
+    for extension in "${extensions_array[@]}"; do
+        if [[ -f "$TARGET_DIR/$FILENAME.$extension" ]]; then
+            FILE_EXTENSION="$extension"
+            break
+        fi
+    done
+
+    # Verifique se uma extensão foi encontrada
+    if [[ -z "$FILE_EXTENSION" ]]; then
+        echo "Erro: Não foi possível determinar o tipo de empacotamento para $ARTIFACT_ID-$VERSION"
+        exit 1
+    fi
+
+    if [[ -z "$PACKAGING" ]]; then
+      PACKAGING=$FILE_EXTENSION
+      echo "##vso[task.setvariable variable=PACKAGING;]$PACKAGING"
+    fi
+
+    ARTIFACT_FILE="${FILENAME}.${FILE_EXTENSION}"
+    echo "##vso[task.setvariable variable=ARTIFACT_FILE;]$ARTIFACT_FILE"
+    echo "##vso[task.setvariable variable=MAVEN_TARGET_DIR;]$TARGET_DIR"
+  displayName: "Setting artifact filename and target dir"
+  workingDirectory: "${{ parameters.artifactDir }}"
+
+- script: |
+    echo "##[debug]Publishing to Azure Artifacts' feed: ${AZURE_ARTIFACTS_FEED}"
+    echo "##[debug]groupId......${GROUP_ID}"
+    echo "##[debug]artifactId......${ARTIFACT_ID}"
+    echo "##[debug]version......${VERSION}"
+    echo "##[debug]packaging......${PACKAGING}"
+    echo "##[debug]artifactFile......${ARTIFACT_FILE}"
+    echo "##[debug]mavenTargetDir/artifactFile......${MAVEN_TARGET_DIR}/${ARTIFACT_FILE}"
+
+    if [[ -z "$ARTIFACT_FILE" ]]; then
+      echo "Erro: Não foi possível determinar o nome do artefato"
+      exit 1
+    fi
+
+    if [[ ! -f ${MAVEN_TARGET_DIR}/${ARTIFACT_FILE} ]]; then
+      echo "Erro: Não foi possível encontrar o artefato ${MAVEN_TARGET_DIR}/${ARTIFACT_FILE}"
+      exit 1
+    fi
+
+    if [[ -z "$GROUP_ID" || -z "$ARTIFACT_ID" || -z "$VERSION" || -z "$PACKAGING" ]]; then
+      echo "Erro: Todos os atributos groupId, artifactId, version e packaging precisam ser fornecidos."
+      exit 1    
+    fi
+
+    mvn deploy:deploy-file -Durl=${AZURE_ARTIFACTS_MAVEN_FEED_URL} \
+                          -DrepositoryId=${AZURE_ARTIFACTS_ORGANIZATION} \
+                          -Dfile=${MAVEN_TARGET_DIR}/${ARTIFACT_FILE} \
+                          -DgroupId=${GROUP_ID} \
+                          -DartifactId=${ARTIFACT_ID} \
+                          -Dversion=${VERSION} \
+                          -Dpackaging=${PACKAGING} \
+                          -s ${{ parameters.mavenSettingsLocation }} \
+                          -Dmaven.repo.local="${MAVEN_CACHE_FOLDER}"
+  displayName: "Publish to Azure Artifacts"
+  workingDirectory: "${{ parameters.artifactDir }}"
+  env:
+    SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+    AZURE_ARTIFACTS_FEED: ${{ parameters.azureArtifactsFeed }}
+    AZURE_ARTIFACTS_ORGANIZATION: ${{ parameters.azureArtifactsOrganization }}
+    AZURE_ARTIFACTS_MAVEN_FEED_URL: ${{ parameters.azureArtifactsMavenFeedURL }}

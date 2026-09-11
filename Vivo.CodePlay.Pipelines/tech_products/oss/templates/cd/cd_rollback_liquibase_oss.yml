@@ -1,0 +1,301 @@
+stages:
+- stage: rollback_validation
+  displayName: "CD - Rollback Validation ${{parameters.environment}}"
+  condition: ne(dependencies.deploy.result, 'Skipped')
+  dependsOn:
+    - ci_build
+    - deploy
+  pool: $(AGENT_POOL_CD)
+
+  ## -> Loads variables from other stages.
+  variables:
+    - name: ARTIFACT_NAME
+      value: $[ stageDependencies.ci_build.build.outputs['artifact_name.ARTIFACT_NAME'] ]
+    - name: WORK_DIR
+      value: '$(System.ArtifactsDirectory)/extracted_tars/$(ARTIFACT_NAME)'
+
+  jobs:
+    - deployment: rollback_validation
+      displayName: Rollback_Validation
+      workspace:
+        clean: all
+      environment: "rollback-db-${{parameters.environment}}"
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+              ## -> Skip Download
+              - download: none
+
+              ## -> Download DB Arifact
+              - task: DownloadBuildArtifacts@1
+                displayName: 'Download Build Artifacts'
+                inputs:
+                  artifactName: $(ARTIFACT_NAME)
+                  parallelizationLimit: 20
+                  extractTars: true
+
+              ## -> Login to docker registry
+              - task: Docker@2
+                displayName: "Docker login VCR"
+                inputs:
+                  containerRegistry: "VCR-DOCKER"
+                  command: login
+
+              ## -> Build Liquibase docker image
+              - task: Bash@3
+                displayName: 'Build Liquibase Image'
+                inputs:
+                  workingDirectory: $(WORK_DIR)
+                  targetType: inline
+                  script: |
+                    echo "##[group] Show Dockerfile"
+                    cat .azuredevops/builder.Dockerfile
+                    echo "##[endgroup]"
+                    echo "##[debug] Building the docker image from .azuredevops/builder.Dockerfile"
+                    docker build -t "builder/java" -f .azuredevops/builder.Dockerfile .
+
+              ## -> Get the deployment history to check if there are any rollback tags
+              - task: LiquibaseMvnVivoLiquibase@4
+                displayName: 'Get Deployment History'
+                inputs:
+                  cwd: $(WORK_DIR)
+                  goal: 'history'
+                  stdoutFile: '$(WORK_DIR)/deploy-history.txt'
+
+              ## -> Generate raw SQL file for rollback to inspect the raw SQL before deploy.
+              - task: LiquibaseMvnVivoLiquibase@4
+                displayName: 'Generate Rollback SQL Script'
+                inputs:
+                  goal: 'rollbackSQL'
+                  cwd: $(WORK_DIR)
+                  extraAttributes: >-
+                    -Dliquibase.rollbackTag=pre-$(Build.BuildNumber)
+                    -Dliquibase.migrationSqlOutputFile=rollback-$(ARTIFACT_NAME)-$(ENVIRONMENT).sql
+
+              ## -> Publish raw SQL file for changes
+              - task: PublishBuildArtifacts@1
+                displayName: 'Publish Rollback SQL Script File'
+                inputs:
+                  PathtoPublish: $(WORK_DIR)/rollback-$(ARTIFACT_NAME)-$(ENVIRONMENT).sql
+                  ArtifactName: 'rollback_sql_scripts'
+
+              - task: Bash@3
+                displayName: 'Check Rollback Removel Builds'
+                continueOnError: 'true'
+                inputs:
+                  targetType: inline
+                  workingDirectory: $(WORK_DIR)
+                  script: |
+                    rollbackTag="pre-$(Build.BuildNumber)"
+
+                    historyFile=$(cat deploy-history.txt)
+
+                    ## -> Extract all tags matching the pattern pre-NNNNNNNN.N
+                    tags=($(echo "$historyFile" | grep -o 'pre-[0-9]\{8\}\.[0-9]\+'))
+
+                    if [ ${#tags[@]} -gt 0 ]; then
+                        # Find rollback tag index
+                        rollbackIndex=-1
+
+                        for i in "${!tags[@]}"; do
+                            if [ "${tags[$i]}" = "$rollbackTag" ]; then
+                                rollbackIndex=$i
+                                break
+                            fi
+                        done
+
+                        if [ $rollbackIndex -eq -1 ]; then
+                            echo "##[error] Rollback tag not found!"
+                            exit 1
+                        elif [ $rollbackIndex -lt $((${#tags[@]} - 1)) ]; then
+                            echo "##vso[task.logissue type=warning] ATTENTION: Multiple deployments detected after the rollback point. Rolling back will undo ALL subsequent deployments!"
+                            echo "##[warning] The following deployments will be undone:"
+
+                            for ((i=$rollbackIndex + 1; i<${#tags[@]}; i++)); do
+                                echo "${tags[$i]#pre-}"
+                            done
+
+                            echo "##[warning] They will be included in the rollback process if performed now."
+                            echo "##[warning] You can check the changelog of each deployment in the 'Get Deployment History' task."
+                            echo "##vso[task.complete result=SucceededWithIssues;]warning"
+                        elif [ $rollbackIndex -eq $((${#tags[@]} - 1)) ]; then
+                            echo "##[debug] Rollback will undo only this deployment, tag ${rollbackTag}"
+                        fi
+                    fi
+
+          on:
+            success:
+              steps:
+                - task: Bash@3
+                  displayName: Publish Success
+                  inputs:
+                    targetType: inline
+                    script: |
+                        echo "##[section] ================================================================================================================================="
+                        echo "##[section]                                   CHECKLIST TO APPROVE THE ROLLBACK ! "
+                        echo "##[section] ================================================================================================================================="
+                        echo "##[section] Perform the checklist before approving the rollback."
+                        echo "##[section] $(ALERT_MESSAGE_ARROW) Check if the generated rollback script added to the pipeline artifacts is correct."
+                        echo "##[section] $(ALERT_MESSAGE_ARROW) Ensure that the rollback script will not impact future deployments if not desired."
+                        echo "##[section] $(ALERT_MESSAGE_ARROW) Be aware that any new deployments made after this rollback may also be undone."
+                        echo "##[section] $(ALERT_MESSAGE_ARROW) Check which builds will be removed by the task 'Check Rollback Removel Builds'."
+                        echo "##[section] $(ALERT_MESSAGE_ARROW) In case of doubts, consult the technical responsible."
+                        echo "##[section] "
+                        echo "##[section] If you have any questions about this phase of the pipeline, access our documentation: $(CORPORATE_WIKI_DOC_URL)"
+                        echo "##[section]================================================================================================================================="
+
+            failure:
+              steps:
+                - task: Bash@3
+                  displayName: Publish Failure
+                  inputs:
+                    targetType: inline
+                    script: |
+                        echo "##[error] ========================================================================================================================================"
+                        echo "##[error]                                     PRE ROLLBACK WAS NOT SUCCESSFUL! "
+                        echo "##[error] ========================================================================================================================================"
+                        echo "##[error] "
+                        echo "##[error] Below are some troubleshooting tips:"
+                        echo "##[error] $(ALERT_MESSAGE_ARROW) If the task 'Generate SQL File for Rollback' fails with the error 'Could not find tag 'pre-$(Build.BuildNumber)', it means that there is nothing to rollback."
+                        echo "##[error] $(ALERT_MESSAGE_ARROW) Check with the technical responsible on how to proceed in case of an environment failure."
+                        echo "##[error] "
+                        echo "##[error] If you have any questions about this phase of the pipeline, access our documentation: $(CORPORATE_WIKI_DOC_URL)"
+                        echo "##[error] ========================================================================================================================================"
+
+                        ## -> Set Pipeline Tag on failure
+                        echo "##vso[build.addbuildtag]rollback-${{ parameters.environment }}=failed"
+
+- stage: rollback
+  displayName: "CD - Rollback ${{parameters.environment}}"
+  dependsOn:
+    - ci_build
+    - deploy
+    - rollback_validation
+  pool: $(AGENT_POOL_CD)
+
+  ## -> Loads variables from other stages.
+  variables:
+    - name: ARTIFACT_NAME
+      value: $[ stageDependencies.ci_build.build.outputs['artifact_name.ARTIFACT_NAME'] ]
+    - name: WORK_DIR
+      value: '$(System.ArtifactsDirectory)/extracted_tars/$(ARTIFACT_NAME)'
+
+  jobs:
+    - deployment: 'rollback'
+      workspace:
+        clean: all
+      displayName: Rollback
+      environment: "rollback-db-${{parameters.environment}}"
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+              ## -> Skip Download
+              - download: none
+
+              ## -> Download DB Arifact
+              - task: DownloadBuildArtifacts@1
+                displayName: 'Download Build Artifacts'
+                inputs:
+                  artifactName: $(ARTIFACT_NAME)
+                  parallelizationLimit: 20
+                  extractTars: true
+
+              ## -> Login to docker registry
+              - task: Docker@2
+                displayName: "Docker login VCR"
+                inputs:
+                  containerRegistry: "VCR-DOCKER"
+                  command: login
+
+              ## -> Build Liquibase docker image
+              - task: Bash@3
+                displayName: 'Build Liquibase Image'
+                inputs:
+                  workingDirectory: $(WORK_DIR)
+                  targetType: inline
+                  script: |
+                    echo "##[group] Show Dockerfile"
+                    cat .azuredevops/builder.Dockerfile
+                    echo "##[endgroup]"
+                    echo "##[debug] Building the docker image from .azuredevops/builder.Dockerfile"
+                    docker build -t "builder/java" -f .azuredevops/builder.Dockerfile .
+
+              ## -> List changesets that ware not deployed, wether there is any
+              - task: LiquibaseMvnVivoLiquibase@4
+                displayName: 'List Undeployed Changesets Before Rollback'
+                condition: succeededOrFailed()
+                continueOnError: 'true'
+                inputs:
+                  goal: 'status'
+                  cwd: $(WORK_DIR)
+                  extraAttributes: '-Dliquibase.logLevel=WARNING'
+
+              ## -> Rollback the changes deploid in the Deploy stage
+              - task: LiquibaseMvnVivoLiquibase@4
+                displayName: 'Rollback Database Changes'
+                inputs:
+                  goal: 'rollback'
+                  cwd: $(WORK_DIR)
+                  extraAttributes: '-Dliquibase.rollbackTag=pre-$(Build.BuildNumber)'
+
+              ## -> List changesets that ware not deployed, wether there is any
+              - task: LiquibaseMvnVivoLiquibase@4
+                displayName: 'List Undeployed Changesets After Rollback'
+                condition: succeededOrFailed()
+                continueOnError: 'true'
+                inputs:
+                  goal: 'listRollbackChangesets'
+                  cwd: $(WORK_DIR)
+                  extraAttributes: '-Dliquibase.logLevel=WARNING'
+
+              ## -> Diff the data base with the snapshot previously taken
+              - task: LiquibaseMvnVivoLiquibase@4
+                displayName: 'Diff Database Changes'
+                condition: and(succeededOrFailed(), eq(variables.ENABLE_SNAPSHOT_COMPARE, true) )
+                continueOnError: 'true'
+                inputs:
+                  goal: 'diff'
+                  cwd: $(WORK_DIR)
+                  extraAttributes: >-
+                    -Dliquibase.referenceUrl=offline:$(DB_TYPE)?snapshot=snapshot_db_$(environment).json
+          on:
+            success:
+              steps:
+                - task: Bash@3
+                  displayName: Publish Success
+                  inputs:
+                    targetType: inline
+                    script: |
+                        echo "##[section] ================================================================================================================================="
+                        echo "##[section]                                                      ROLLBACK WAS SUCCESSFUL! "
+                        echo "##[section] ================================================================================================================================="
+                        echo "##[section] Your script has been successfully removed from the database."
+                        echo "##[section] If you have any questions about this phase of the pipeline, access our documentation: $(CORPORATE_WIKI_DOC_URL)"
+                        echo "##[section]================================================================================================================================="
+
+                        ## -> Set Pipeline Tag on success
+                        echo "##vso[build.addbuildtag]rollback-${{ parameters.environment }}=succeeded"
+
+            failure:
+              steps:
+                - task: Bash@3
+                  displayName: Publish Failure
+                  inputs:
+                    targetType: inline
+                    script: |
+                        echo "##[error] ================================================================================================================================="
+                        echo "##[error]                                                    ROLLBACK WAS NOT SUCCESSFUL! "
+                        echo "##[error] ================================================================================================================================="
+                        echo "##[error] If you are seeing this message, it means that an error occurred during the rollback of your scripts."
+                        echo "##[error] "
+                        echo "##[error] Here are some troubleshooting tips:"
+                        echo "##[error] $(ALERT_MESSAGE_ARROW) Check the rollback stage log."
+                        echo "##[error] $(ALERT_MESSAGE_ARROW) Consult with the technical responsible on how to proceed in case of an environment failure."
+                        echo "##[error] "
+                        echo "##[error] If you have any questions about this phase of the pipeline, access our documentation: $(CORPORATE_WIKI_DOC_URL)"
+                        echo "##[error] ================================================================================================================================="
+
+                        ## -> Set Pipeline Tag on failure
+                        echo "##vso[build.addbuildtag]rollback-${{ parameters.environment }}=failed"

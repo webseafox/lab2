@@ -1,0 +1,104 @@
+parameters:
+- name: publish_to_nexus
+  type: boolean
+  default: True
+- name: run_integration_tests
+  type: boolean
+  default: False
+- name: run_mutation_tests
+  type: boolean
+  default: False
+- name: generate_documentation
+  type: boolean
+  default: True
+- name: enableDevflowValidations
+  type: boolean
+  default: False
+- name: runSecurityStage
+  type: boolean
+  default: True
+- name: autoIncrementVersion
+  type: boolean
+  default: True
+
+resources:
+  repositories:
+    - repository: FortifyExclusion
+      name: DevOps/Vivo.Fortify.Exclusions
+      type: git
+      ref: refs/heads/master
+      endpoint: CorePipelines
+    - repository: CorePipelines
+      name: DevOps/Vivo.Core.Pipelines
+      type: git
+      ref: refs/tags/v1
+      endpoint: CorePipelines
+    - repository: CorePipelinesScripts
+      name: DevOps/Vivo.Core.Pipelines.Scripts
+      type: git
+      ref: refs/heads/master
+      endpoint: CorePipelines
+
+variables:
+- template: /tech_products/ecmc/core-pipelines/provisioners/app/trunkbased/java/lib_default/variables/load.yml
+  parameters:
+    ACRAsDefaultDockerRegistry: False
+    environment: 'dev'
+    forceDockerK8sSecretCreation: False
+
+stages:
+# CI / CD Flow for Libraries
+
+## INIT
+- template: /tech_products/ecmc/core-pipelines/provisioners/app/trunkbased/java/lib_default/stages/init.yml
+
+- ${{ if or( and(ne(variables['Build.Reason'], 'PullRequest'), in(variables['Build.SourceBranch'], 'refs/heads/main', 'refs/heads/master')), and(startsWith(variables['Build.SourceBranch'], 'refs/heads/'), ne(variables['Build.SourceBranch'], 'refs/heads/main'), ne(variables['Build.SourceBranch'], 'refs/heads/master')) ) }}:
+  ## VALIDATE PREDEFINED STANDARDS (COMMIT MESSAGES, BRANCH NAME ETC)
+  - ${{ if eq(parameters.enableDevflowValidations, True) }}:
+    - template: /tech_products/ecmc/core-pipelines/provisioners/app/trunkbased/java/lib_default/stages/validate_standards_dev_flow.yml
+
+  ## VERSION MANAGEMENT
+  - ${{ if eq(parameters.autoIncrementVersion, True) }}:
+    - template: /tech_products/ecmc/core-pipelines/provisioners/app/trunkbased/java/lib_default/stages/version_management.yml
+
+  ## BUILD & TEST
+  - template: /tech_products/ecmc/core-pipelines/provisioners/app/trunkbased/java/lib_default/stages/build_test.yml
+    parameters:
+      enableDevflowValidations: ${{ parameters.enableDevflowValidations }}
+      run_integration_tests: ${{ parameters.run_integration_tests }}
+      run_mutation_tests: ${{ parameters.run_mutation_tests }}
+
+  ## GATES
+  - template: /tech_products/ecmc/core-pipelines/provisioners/app/trunkbased/java/lib_default/stages/gates.yml
+
+  ## SECURITY
+  - ${{ if eq(parameters.runSecurityStage, True) }}:
+    - template: /tech_products/ecmc/core-pipelines/provisioners/app/trunkbased/java/lib_default/stages/security_sast_sca.yml
+      parameters:
+        fortifyExclusionRepository: FortifyExclusion
+
+  ## PACKAGE
+  - template: /tech_products/ecmc/core-pipelines/provisioners/app/trunkbased/java/lib_default/stages/package.yml
+    parameters:
+      generate_documentation: ${{ parameters.generate_documentation }}
+      ${{ if eq(parameters.runSecurityStage, True) }}:
+        dependsOnSecurityStage: True
+
+  ## PUBLISH
+  - template: /tech_products/ecmc/core-pipelines/provisioners/app/trunkbased/java/lib_default/stages/publish.yml
+    parameters:
+      publish_to_nexus: ${{ parameters.publish_to_nexus }}
+      generate_documentation: ${{ parameters.generate_documentation }}
+
+  - ${{ if eq(parameters.enableDevflowValidations, True) }}:
+  ## FINALIZE PRE VALIDATIONS
+    - template: /tech_products/ecmc/core-pipelines/provisioners/app/trunkbased/java/lib_default/stages/pos_validate_standards_dev_flow.yml
+      parameters:
+        stage_depends_on: publish
+
+# Manual Release Flow
+- ${{ if startsWith(variables['Build.SourceBranch'], 'refs/tags/') }}:
+  - template: /tech_products/ecmc/core-pipelines/provisioners/app/trunkbased/java/lib_default/stages/release.yml
+    parameters:
+      publish_to_nexus: ${{ parameters.publish_to_nexus }}
+      generate_documentation: ${{ parameters.generate_documentation }}

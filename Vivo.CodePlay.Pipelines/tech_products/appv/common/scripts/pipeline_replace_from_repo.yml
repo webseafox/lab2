@@ -1,0 +1,671 @@
+## ========================================================================
+## Pipeline for Mass String Replacement in Repository Files
+## ========================================================================
+## This pipeline allows find-and-replace operations in files across multiple
+## repositories that start with "src" in a specific project.
+##
+## Equivalent functionality to script: replace-from-repo.js
+##
+## Multiline Support:
+##   - Use \n in searchString and replaceString for line breaks
+##   - Example: "line1\nline2" will match/insert actual line breaks
+##
+## Parameters:
+##   - dryRun: Simulate without applying changes
+##   - projectName: Azure DevOps project name
+##   - filePath: File path to modify in each repository
+##   - searchString: String to find (supports \n for newlines)
+##   - replaceString: Replacement string (supports \n for newlines)
+##   - startsWith: Repository name prefix filter
+##   - endsWith: Repository name suffix filter
+##   - branch: Target branch (default: master)
+##   - commitMessage: Commit message (optional)
+##   - skipCi: Add [CI SKIP] to commit
+##   - specificRepository: Process only this repository
+##
+## Execution Identifier:
+##   - A unique ID is automatically generated for each execution
+##   - Format: [MASS-XXXXXX] where XXXXXX is a unique identifier
+##   - Use this ID in the revert pipeline to undo changes
+##
+## Queue Time Variables:
+##   - AZURE_DEVOPS_PAT: Personal PAT of the executor (insert as secret)
+##
+## Prerequisites:
+##   1. Executor must have a valid PAT with permissions: Code (Read & Write)
+##   2. When running the pipeline, enter PAT in AZURE_DEVOPS_PAT variable
+##      and check "Keep this value secret"
+##
+## Usage Examples:
+##
+##   Example 1 - Simple replace:
+##     searchString: refs/heads/master
+##     replaceString: refs/heads/main
+##
+##   Example 2 - Add item to list (include original in replacement):
+##     searchString: - "esteira01-bff"
+##     replaceString: - "esteira01-bff"\n      - "prodlike-bff"
+##
+##   Example 3 - Add parameter block (include original in replacement):
+##     searchString: - name: forceUpgrade\n    displayName: Force Upgrade\n    type: boolean\n    default: False\n    values:\n      - true\n      - false
+##     replaceString: - name: forceUpgrade\n    displayName: Force Upgrade\n    type: boolean\n    default: False\n    values:\n      - true\n      - false\n\n  - name: forceSync\n    displayName: Force Sync\n    type: boolean\n    default: False\n    values:\n      - true\n      - false
+##
+## ========================================================================
+
+parameters:
+  - name: dryRun
+    displayName: "Dry Run (não aplicar alterações)"
+    type: boolean
+    default: true
+
+  - name: projectName
+    displayName: "Nome do Projeto"
+    type: string
+    default: ""
+    values:
+      - FRBR - FRAMEWORK BRASIL
+      - APPV - APP VIVO
+      - APPV - Microservicosmeuvivo
+      - APPV - Microservicos4p
+
+  - name: filePath
+    displayName: "Caminho do Arquivo (ex: /azure-pipelines.yml)"
+    type: string
+    default: ""
+
+  - name: searchString
+    displayName: "String a Encontrar"
+    type: string
+    default: ""
+
+  - name: replaceString
+    displayName: "String de Substituição"
+    type: string
+    default: ""
+
+  - name: startsWith
+    displayName: "Repositório começa com (use * para todos)"
+    type: string
+    default: "src"
+
+  - name: endsWith
+    displayName: "Repositório termina com (use * para todos)"
+    type: string
+    default: "*"
+
+  - name: specificRepositories
+    displayName: "Repositórios Específicos (1 por linha, deixe vazio para todos)"
+    type: object
+    default: []
+
+  - name: branch
+    displayName: "Branch Alvo"
+    type: string
+    default: "master"
+
+  - name: commitMessage
+    displayName: "Mensagem do Commit (opcional)"
+    type: string
+    default: " "
+
+  - name: skipCi
+    displayName: "Adicionar [CI SKIP] ao commit (evita trigger de pipelines)"
+    type: boolean
+    default: true
+
+trigger: none
+pr: none
+
+name: "MASS-REPLACE-$(Date:yyyyMMdd)-$(Rev:r)"
+
+pool:
+  name: GeneralPurposeLinuxAgentsCD
+
+variables:
+  - name: AZURE_DEVOPS_ORG
+    value: "https://dev.azure.com/telefonica-vivo-brasil"
+
+jobs:
+  - job: replace_in_repos
+    displayName: "Replace string in repositories"
+    steps:
+      # ================================================================
+      # Task 1: Validar parâmetros de entrada
+      # ================================================================
+      - task: Bash@3
+        name: validar
+        displayName: "1. Validate parameters"
+        inputs:
+          targetType: inline
+          script: |
+            set -e
+            echo "##[section]============================================================"
+            echo "##[section]PARAMETER VALIDATION"
+            echo "##[section]============================================================"
+
+            PROJECT_NAME='${{ parameters.projectName }}'
+            FILE_PATH='${{ parameters.filePath }}'
+            SEARCH_STRING='${{ parameters.searchString }}'
+            REPLACE_STRING='${{ parameters.replaceString }}'
+            STARTS_WITH='${{ parameters.startsWith }}'
+            ENDS_WITH='${{ parameters.endsWith }}'
+            BRANCH='${{ parameters.branch }}'
+            DRY_RUN='${{ parameters.dryRun }}'
+            SKIP_CI='${{ parameters.skipCi }}'
+            SPECIFIC_REPOS='${{ convertToJson(parameters.specificRepositories) }}'
+            COMMIT_MESSAGE='${{ parameters.commitMessage }}'
+
+            # Normalizar parâmetros opcionais (tratar espaços em branco como vazio)
+            STARTS_WITH=$(echo "$STARTS_WITH" | xargs)
+            ENDS_WITH=$(echo "$ENDS_WITH" | xargs)
+            COMMIT_MESSAGE=$(echo "$COMMIT_MESSAGE" | xargs)
+
+            # Processar lista de repositórios específicos
+            SPECIFIC_REPOS_LIST=$(echo "$SPECIFIC_REPOS" | jq -r '.[]? // empty' 2>/dev/null | xargs)
+            SPECIFIC_REPOS_COUNT=$(echo "$SPECIFIC_REPOS" | jq -r 'length // 0' 2>/dev/null)
+
+            # Tratar '*' como sem filtro
+            [ "$STARTS_WITH" == "*" ] && STARTS_WITH=""
+            [ "$ENDS_WITH" == "*" ] && ENDS_WITH=""
+
+            # Validações obrigatórias
+            [ -z "$PROJECT_NAME" ] && echo "##[error] Parameter 'projectName' is required." && exit 1
+            [ -z "$FILE_PATH" ] && echo "##[error] Parameter 'filePath' is required." && exit 1
+            [ -z "$SEARCH_STRING" ] && echo "##[error] Parameter 'searchString' is required." && exit 1
+            [ -z "$BRANCH" ] && BRANCH="master"
+
+            # Normalizar booleanos
+            DRY_RUN=$(echo "$DRY_RUN" | tr '[:upper:]' '[:lower:]')
+            [[ "$DRY_RUN" =~ ^(true|1|yes|y)$ ]] && DRY_RUN="true" || DRY_RUN="false"
+
+            SKIP_CI=$(echo "$SKIP_CI" | tr '[:upper:]' '[:lower:]')
+            [[ "$SKIP_CI" =~ ^(true|1|yes|y)$ ]] && SKIP_CI="true" || SKIP_CI="false"
+
+            # Gerar identificador único para esta execução
+            EXECUTION_ID="MASS-$(date +%s | sha256sum | head -c 6 | tr '[:lower:]' '[:upper:]')"
+            echo ""
+            echo "##[section]============================================================"
+            echo "##[section]EXECUTION IDENTIFIER: $EXECUTION_ID"
+            echo "##[section]============================================================"
+            echo "##[warning]Save this identifier to revert changes later!"
+            echo "##[command]Use it in pipeline 'pipeline_revert_from_repo.yml'"
+            echo "##[section]============================================================"
+            echo ""
+
+            # Definir mensagem de commit padrão se não fornecida
+            [ -z "$COMMIT_MESSAGE" ] && COMMIT_MESSAGE="build: mass edit files"
+
+            # Construir mensagem de commit com prefixos
+            [ "$SKIP_CI" == "true" ] && COMMIT_MESSAGE="[CI SKIP][$EXECUTION_ID] $COMMIT_MESSAGE" || COMMIT_MESSAGE="[$EXECUTION_ID] $COMMIT_MESSAGE"
+
+            # Atualizar nome do build
+            echo "##vso[build.updatebuildnumber]$COMMIT_MESSAGE"
+
+            echo "##[group]Execution Parameters"
+            echo "##[command]Project: $PROJECT_NAME"
+            echo "##[command]File: $FILE_PATH"
+            echo "##[command]Search: $SEARCH_STRING"
+            echo "##[command]Replace with: $REPLACE_STRING"
+            echo "##[command]Repo prefix: ${STARTS_WITH:-'(no filter)'}"
+            echo "##[command]Repo suffix: ${ENDS_WITH:-'(no filter)'}"
+            echo "##[command]Branch: $BRANCH"
+            echo "##[command]Dry-run: $DRY_RUN"
+            echo "##[command]Skip CI: $SKIP_CI"
+            if [ "$SPECIFIC_REPOS_COUNT" -gt 0 ]; then
+              echo "##[command]Specific repositories ($SPECIFIC_REPOS_COUNT):"
+              echo "$SPECIFIC_REPOS" | jq -r '.[]? // empty' 2>/dev/null | while read -r repo; do
+                echo "##[command]  - $repo"
+              done
+            else
+              echo "##[command]Specific repositories: (all)"
+            fi
+            echo "##[command]Commit message: $COMMIT_MESSAGE"
+            echo "##[endgroup]"
+
+            # Exportar variáveis para próximas tasks
+            echo "##vso[task.setvariable variable=EXECUTION_ID]$EXECUTION_ID"
+            echo "##vso[task.setvariable variable=PROJECT_NAME]$PROJECT_NAME"
+            echo "##vso[task.setvariable variable=FILE_PATH]$FILE_PATH"
+            echo "##vso[task.setvariable variable=SEARCH_STRING]$SEARCH_STRING"
+            echo "##vso[task.setvariable variable=REPLACE_STRING]$REPLACE_STRING"
+            echo "##vso[task.setvariable variable=STARTS_WITH]$STARTS_WITH"
+            echo "##vso[task.setvariable variable=ENDS_WITH]$ENDS_WITH"
+            echo "##vso[task.setvariable variable=BRANCH]$BRANCH"
+            echo "##vso[task.setvariable variable=DRY_RUN]$DRY_RUN"
+            # Encode SPECIFIC_REPOS as base64 to preserve JSON structure through pipeline variables
+            SPECIFIC_REPOS_BASE64=$(echo "$SPECIFIC_REPOS" | base64 -w 0)
+            echo "##vso[task.setvariable variable=SPECIFIC_REPOS_BASE64]$SPECIFIC_REPOS_BASE64"
+            echo "##vso[task.setvariable variable=SPECIFIC_REPOS_COUNT]$SPECIFIC_REPOS_COUNT"
+            echo "##vso[task.setvariable variable=COMMIT_MESSAGE]$COMMIT_MESSAGE"
+
+      # ================================================================
+      # Task 2: Verificar dependências e autenticação
+      # ================================================================
+      - task: Bash@3
+        name: setup
+        displayName: "2. Check dependencies"
+        env:
+          AZURE_DEVOPS_PAT: $(AZURE_DEVOPS_PAT)
+        inputs:
+          targetType: inline
+          script: |
+            set -e
+            echo "##[section]============================================================"
+            echo "##[section]DEPENDENCY CHECK"
+            echo "##[section]============================================================"
+
+            # Check jq
+            if ! command -v jq &> /dev/null; then
+              echo "Installing jq..."
+              sudo apt-get update && sudo apt-get install -y jq
+            fi
+            echo "##[command]jq: OK"
+
+            # Check perl (required for multiline operations)
+            if ! command -v perl &> /dev/null; then
+              echo "Installing perl..."
+              sudo apt-get update && sudo apt-get install -y perl
+            fi
+            echo "##[command]perl: OK"
+
+            # Check PAT
+            if [ -z "$AZURE_DEVOPS_PAT" ]; then
+              echo "##[error] Variable AZURE_DEVOPS_PAT was not provided."
+              echo "##[error] When running the pipeline, enter your personal PAT in the AZURE_DEVOPS_PAT variable."
+              echo "##[error] Check 'Keep this value secret' to protect your token."
+              exit 1
+            fi
+            echo "##[command]PAT: OK"
+
+      # ================================================================
+      # Task 3: Listar e filtrar repositórios
+      # ================================================================
+      - task: Bash@3
+        name: listar
+        displayName: "3. List repositories"
+        env:
+          AZURE_DEVOPS_PAT: $(AZURE_DEVOPS_PAT)
+        inputs:
+          targetType: inline
+          script: |
+            set -e
+            echo "##[section]============================================================"
+            echo "##[section]LISTING REPOSITORIES"
+            echo "##[section]============================================================"
+
+            PROJECT_NAME="$(PROJECT_NAME)"
+            STARTS_WITH="$(STARTS_WITH)"
+            ENDS_WITH="$(ENDS_WITH)"
+            # Decode SPECIFIC_REPOS from base64
+            SPECIFIC_REPOS=$(echo "$(SPECIFIC_REPOS_BASE64)" | base64 -d)
+            SPECIFIC_REPOS_COUNT="$(SPECIFIC_REPOS_COUNT)"
+            ORG_URL="$(AZURE_DEVOPS_ORG)"
+
+            echo "##[debug]SPECIFIC_REPOS JSON: $SPECIFIC_REPOS"
+
+            AUTH_HEADER=$(printf ":%s" "$AZURE_DEVOPS_PAT" | base64 -w 0)
+            PROJECT_ENCODED=$(echo "$PROJECT_NAME" | sed 's/ /%20/g')
+
+            echo "##[command]Project: $PROJECT_NAME"
+            echo "##[command]Filter startsWith: ${STARTS_WITH:-'(no filter)'}"
+            echo "##[command]Filter endsWith: ${ENDS_WITH:-'(no filter)'}"
+            if [ "$SPECIFIC_REPOS_COUNT" -gt 0 ]; then
+              echo "##[command]Specific repositories: $SPECIFIC_REPOS_COUNT repo(s)"
+            else
+              echo "##[command]Specific repositories: (all)"
+            fi
+            echo ""
+
+            # Listar todos os repositórios do projeto
+            HTTP_RESPONSE=$(curl -s -w "\n%{http_code}" -X GET \
+              -H "Authorization: Basic $AUTH_HEADER" \
+              -H "Content-Type: application/json" \
+              "$ORG_URL/$PROJECT_ENCODED/_apis/git/repositories?api-version=7.0")
+
+            HTTP_CODE=$(echo "$HTTP_RESPONSE" | tail -n1)
+            REPOS_JSON=$(echo "$HTTP_RESPONSE" | sed '$d')
+
+            if [ "$HTTP_CODE" != "200" ]; then
+              echo "##[error] Failed to list repositories. HTTP Status: $HTTP_CODE"
+              echo "##[error] Response: $REPOS_JSON"
+              exit 1
+            fi
+
+            # Check for error in response
+            API_ERROR=$(echo "$REPOS_JSON" | jq -r '.message // empty' 2>/dev/null)
+            [ -n "$API_ERROR" ] && echo "##[error] API Error: $API_ERROR" && exit 1
+
+            # Extract repositories
+            REPOS=$(echo "$REPOS_JSON" | jq -r '.value[]? | "\(.id)|\(.name)"' 2>/dev/null)
+            [ -z "$REPOS" ] && echo "##[error] No repositories found in project." && exit 1
+
+            TOTAL_FOUND=$(echo "$REPOS" | wc -l)
+            echo "##[command]Total repositories in project: $TOTAL_FOUND"
+
+            # Preparar lista de repositórios específicos para filtro
+            SPECIFIC_REPOS_FILE=$(mktemp)
+            if [ "$SPECIFIC_REPOS_COUNT" -gt 0 ]; then
+              echo "$SPECIFIC_REPOS" | jq -r '.[]? // empty' 2>/dev/null > "$SPECIFIC_REPOS_FILE"
+              echo "##[debug]Specific repos file content:"
+              cat "$SPECIFIC_REPOS_FILE" || true
+            fi
+
+            # Função para verificar se repo está na lista
+            is_in_specific_list() {
+              local repo_name="$1"
+              local found=1
+              while IFS= read -r specific_repo || [ -n "$specific_repo" ]; do
+                [ -z "$specific_repo" ] && continue
+                if [ "$repo_name" = "$specific_repo" ]; then
+                  found=0
+                  break
+                fi
+              done < "$SPECIFIC_REPOS_FILE"
+              return $found
+            }
+
+            # Filtrar repositórios
+            FILTERED_REPOS_FILE=$(mktemp)
+            while IFS='|' read -r REPO_ID REPO_NAME; do
+              # Filtrar por prefixo
+              [ -n "$STARTS_WITH" ] && [[ ! "$REPO_NAME" =~ ^$STARTS_WITH ]] && continue
+              # Filtrar por sufixo
+              [ -n "$ENDS_WITH" ] && [[ ! "$REPO_NAME" =~ $ENDS_WITH$ ]] && continue
+              # Filtrar por lista de repositórios específicos
+              if [ "$SPECIFIC_REPOS_COUNT" -gt 0 ]; then
+                is_in_specific_list "$REPO_NAME" || continue
+              fi
+              echo "$REPO_ID|$REPO_NAME" >> "$FILTERED_REPOS_FILE"
+            done < <(echo "$REPOS")
+            rm -f "$SPECIFIC_REPOS_FILE"
+
+            FILTERED_COUNT=$(wc -l < "$FILTERED_REPOS_FILE" 2>/dev/null || echo "0")
+            echo ""
+            echo "##[section]Repositories after filter: $FILTERED_COUNT"
+
+            if [ "$FILTERED_COUNT" -eq 0 ]; then
+              echo "##[warning]No repositories match the filters."
+              echo "##vso[task.setvariable variable=FILTERED_REPOS]"
+              echo "##vso[task.setvariable variable=FILTERED_COUNT]0"
+              rm -f "$FILTERED_REPOS_FILE"
+              exit 0
+            fi
+
+            echo ""
+            echo "##[group]Repositories to be processed"
+            while IFS='|' read -r REPO_ID REPO_NAME; do
+              echo "  - $REPO_NAME"
+            done < "$FILTERED_REPOS_FILE"
+            echo "##[endgroup]"
+
+            # Exportar lista de repositórios (base64 para preservar caracteres especiais)
+            FILTERED_REPOS_BASE64=$(cat "$FILTERED_REPOS_FILE" | base64 -w 0)
+            echo "##vso[task.setvariable variable=FILTERED_REPOS]$FILTERED_REPOS_BASE64"
+            echo "##vso[task.setvariable variable=FILTERED_COUNT]$FILTERED_COUNT"
+            rm -f "$FILTERED_REPOS_FILE"
+
+      # ================================================================
+      # Task 4: Processar substituições
+      # ================================================================
+      - task: Bash@3
+        name: replace
+        displayName: "4. Process replacements"
+        condition: and(succeeded(), gt(variables['FILTERED_COUNT'], 0))
+        env:
+          AZURE_DEVOPS_PAT: $(AZURE_DEVOPS_PAT)
+          PARAM_SEARCH_STRING: ${{ parameters.searchString }}
+          PARAM_REPLACE_STRING: ${{ parameters.replaceString }}
+        inputs:
+          targetType: inline
+          script: |
+            set -e
+            echo "##[section]============================================================"
+            echo "##[section]PROCESSING REPLACEMENTS"
+            echo "##[section]============================================================"
+
+            # Recuperar variáveis
+            FILE_PATH="$(FILE_PATH)"
+            BRANCH="$(BRANCH)"
+            DRY_RUN="$(DRY_RUN)"
+            COMMIT_MESSAGE="$(COMMIT_MESSAGE)"
+            ORG_URL="$(AZURE_DEVOPS_ORG)"
+            PROJECT_NAME="$(PROJECT_NAME)"
+            FILTERED_REPOS_BASE64="$(FILTERED_REPOS)"
+            FILTERED_COUNT="$(FILTERED_COUNT)"
+
+            # Get search/replace strings directly from parameters via env vars
+            # This preserves quotes that would be stripped by $(VARIABLE) syntax
+            SEARCH_STRING="$PARAM_SEARCH_STRING"
+            REPLACE_STRING="$PARAM_REPLACE_STRING"
+
+            # Convert \n to actual newlines for multiline support
+            SEARCH_STRING=$(printf '%b' "$SEARCH_STRING")
+            REPLACE_STRING=$(printf '%b' "$REPLACE_STRING")
+
+            # Debug: show what we're searching for
+            echo "##[debug]Search string (escaped): $(echo "$SEARCH_STRING" | cat -A)"
+            echo "##[debug]Search string length: ${#SEARCH_STRING}"
+
+            AUTH_HEADER=$(printf ":%s" "$AZURE_DEVOPS_PAT" | base64 -w 0)
+            PROJECT_ENCODED=$(echo "$PROJECT_NAME" | sed 's/ /%20/g')
+
+            # Decodificar lista de repositórios
+            FILTERED_REPOS=$(echo "$FILTERED_REPOS_BASE64" | base64 -d)
+
+            # Contadores
+            COUNTER_FILE=$(mktemp)
+            echo "0 0 0 0" > "$COUNTER_FILE"
+
+            echo "##[command]Processing $FILTERED_COUNT repositories..."
+            echo ""
+
+            while IFS='|' read -r REPO_ID REPO_NAME; do
+              read TOTAL_REPOS TOTAL_MODIFIED TOTAL_SKIPPED TOTAL_ERRORS < "$COUNTER_FILE"
+              TOTAL_REPOS=$((TOTAL_REPOS + 1))
+              echo "$TOTAL_REPOS $TOTAL_MODIFIED $TOTAL_SKIPPED $TOTAL_ERRORS" > "$COUNTER_FILE"
+
+              echo ""
+              echo "##[group]$REPO_NAME ($TOTAL_REPOS/$FILTERED_COUNT)"
+
+              # Obter referência da branch
+              REFS_JSON=$(curl -s -X GET \
+                -H "Authorization: Basic $AUTH_HEADER" \
+                -H "Content-Type: application/json" \
+                "$ORG_URL/$PROJECT_ENCODED/_apis/git/repositories/$REPO_ID/refs?filter=heads/$BRANCH&api-version=7.0")
+
+              BRANCH_OBJECT_ID=$(echo "$REFS_JSON" | jq -r '.value[0].objectId // empty')
+
+              if [ -z "$BRANCH_OBJECT_ID" ]; then
+                echo "##[warning]Branch '$BRANCH' not found. Skipping..."
+                read TOTAL_REPOS TOTAL_MODIFIED TOTAL_SKIPPED TOTAL_ERRORS < "$COUNTER_FILE"
+                TOTAL_SKIPPED=$((TOTAL_SKIPPED + 1))
+                echo "$TOTAL_REPOS $TOTAL_MODIFIED $TOTAL_SKIPPED $TOTAL_ERRORS" > "$COUNTER_FILE"
+                echo "##[endgroup]"
+                continue
+              fi
+
+              # Obter conteúdo do arquivo
+              FILE_CONTENT=$(curl -s -X GET \
+                -H "Authorization: Basic $AUTH_HEADER" \
+                "$ORG_URL/$PROJECT_ENCODED/_apis/git/repositories/$REPO_ID/items?path=$FILE_PATH&versionDescriptor.version=$BRANCH&api-version=7.0")
+
+              # Verificar se o arquivo existe
+              if [ -z "$FILE_CONTENT" ] || echo "$FILE_CONTENT" | jq -e '.message' > /dev/null 2>&1; then
+                echo "##[warning]File not found: $FILE_PATH. Skipping..."
+                read TOTAL_REPOS TOTAL_MODIFIED TOTAL_SKIPPED TOTAL_ERRORS < "$COUNTER_FILE"
+                TOTAL_SKIPPED=$((TOTAL_SKIPPED + 1))
+                echo "$TOTAL_REPOS $TOTAL_MODIFIED $TOTAL_SKIPPED $TOTAL_ERRORS" > "$COUNTER_FILE"
+                echo "##[endgroup]"
+                continue
+              fi
+
+              # Check if search string exists (multiline support with perl)
+              export SEARCH_STRING
+              if ! perl -0777 -ne 'exit(index($_, $ENV{SEARCH_STRING}) >= 0 ? 0 : 1)' <<< "$FILE_CONTENT"; then
+                echo "##[warning]Search string not found. Skipping..."
+                read TOTAL_REPOS TOTAL_MODIFIED TOTAL_SKIPPED TOTAL_ERRORS < "$COUNTER_FILE"
+                TOTAL_SKIPPED=$((TOTAL_SKIPPED + 1))
+                echo "$TOTAL_REPOS $TOTAL_MODIFIED $TOTAL_SKIPPED $TOTAL_ERRORS" > "$COUNTER_FILE"
+                echo "##[endgroup]"
+                continue
+              fi
+
+              echo "##[section]String found! Performing replacement..."
+
+              # Perform replacement (multiline support with perl)
+              export SEARCH_STRING
+              export REPLACE_STRING
+              NEW_CONTENT=$(perl -0777 -pe 's/\Q$ENV{SEARCH_STRING}\E/$ENV{REPLACE_STRING}/g' <<< "$FILE_CONTENT")
+
+              # Verificar se houve mudança
+              if [ "$FILE_CONTENT" == "$NEW_CONTENT" ]; then
+                echo "##[warning]No changes detected. Skipping..."
+                read TOTAL_REPOS TOTAL_MODIFIED TOTAL_SKIPPED TOTAL_ERRORS < "$COUNTER_FILE"
+                TOTAL_SKIPPED=$((TOTAL_SKIPPED + 1))
+                echo "$TOTAL_REPOS $TOTAL_MODIFIED $TOTAL_SKIPPED $TOTAL_ERRORS" > "$COUNTER_FILE"
+                echo "##[endgroup]"
+                continue
+              fi
+
+              # Mostrar diff
+              echo ""
+              echo "##[section]Changes DIFF:"
+              echo "------------------------------------------------------------"
+              TEMP_ORIGINAL=$(mktemp)
+              TEMP_MODIFIED=$(mktemp)
+              echo "$FILE_CONTENT" > "$TEMP_ORIGINAL"
+              echo "$NEW_CONTENT" > "$TEMP_MODIFIED"
+              diff -u --label "a/$FILE_PATH (original)" --label "b/$FILE_PATH (modificado)" "$TEMP_ORIGINAL" "$TEMP_MODIFIED" || true
+              echo "------------------------------------------------------------"
+              rm -f "$TEMP_ORIGINAL" "$TEMP_MODIFIED"
+
+              # Codificar novo conteúdo em Base64
+              NEW_CONTENT_BASE64=$(echo "$NEW_CONTENT" | base64 -w 0)
+
+              if [ "$DRY_RUN" == "true" ]; then
+                echo ""
+                echo "##[warning][DRY-RUN] Changes that would be made:"
+                echo "##[command]  - Repository: $REPO_NAME"
+                echo "##[command]  - File: $FILE_PATH"
+                echo "##[command]  - Branch: $BRANCH"
+                echo "##[warning][DRY-RUN] Commit will NOT be created."
+                read TOTAL_REPOS TOTAL_MODIFIED TOTAL_SKIPPED TOTAL_ERRORS < "$COUNTER_FILE"
+                TOTAL_MODIFIED=$((TOTAL_MODIFIED + 1))
+                echo "$TOTAL_REPOS $TOTAL_MODIFIED $TOTAL_SKIPPED $TOTAL_ERRORS" > "$COUNTER_FILE"
+                # Grupo permanece aberto para destacar modificações
+                continue
+              fi
+
+              # Criar o push/commit
+              echo "##[command]Creating commit..."
+              PUSH_PAYLOAD=$(cat <<EOF
+            {
+              "refUpdates": [{"name": "refs/heads/$BRANCH", "oldObjectId": "$BRANCH_OBJECT_ID"}],
+              "commits": [{
+                "comment": "$COMMIT_MESSAGE",
+                "changes": [{
+                  "changeType": "edit",
+                  "item": {"path": "$FILE_PATH"},
+                  "newContent": {"content": "$NEW_CONTENT_BASE64", "contentType": "base64encoded"}
+                }]
+              }]
+            }
+            EOF
+            )
+
+              PUSH_RESPONSE=$(curl -s -X POST \
+                -H "Authorization: Basic $AUTH_HEADER" \
+                -H "Content-Type: application/json" \
+                -d "$PUSH_PAYLOAD" \
+                "$ORG_URL/$PROJECT_ENCODED/_apis/git/repositories/$REPO_ID/pushes?api-version=7.0")
+
+              PUSH_ID=$(echo "$PUSH_RESPONSE" | jq -r '.pushId // empty')
+              COMMIT_ID=$(echo "$PUSH_RESPONSE" | jq -r '.commits[0].commitId // empty')
+
+              read TOTAL_REPOS TOTAL_MODIFIED TOTAL_SKIPPED TOTAL_ERRORS < "$COUNTER_FILE"
+              if [ -n "$PUSH_ID" ] && [ "$PUSH_ID" != "null" ]; then
+                echo "##[section]Commit created successfully! Push ID: $PUSH_ID"
+                if [ -n "$COMMIT_ID" ] && [ "$COMMIT_ID" != "null" ]; then
+                  COMMIT_URL="$ORG_URL/$PROJECT_ENCODED/_git/$REPO_NAME/commit/$COMMIT_ID"
+                  echo "##[section]Commit URL: $COMMIT_URL"
+                fi
+                TOTAL_MODIFIED=$((TOTAL_MODIFIED + 1))
+              else
+                ERROR_MSG=$(echo "$PUSH_RESPONSE" | jq -r '.message // "Unknown error"')
+                echo "##[error]Failed to create commit: $ERROR_MSG"
+                TOTAL_ERRORS=$((TOTAL_ERRORS + 1))
+              fi
+              echo "$TOTAL_REPOS $TOTAL_MODIFIED $TOTAL_SKIPPED $TOTAL_ERRORS" > "$COUNTER_FILE"
+
+              # Grupo permanece aberto para destacar modificações
+              sleep 1
+            done < <(echo "$FILTERED_REPOS")
+
+            # Ler contadores finais
+            read TOTAL_REPOS TOTAL_MODIFIED TOTAL_SKIPPED TOTAL_ERRORS < "$COUNTER_FILE"
+            rm -f "$COUNTER_FILE"
+
+            echo ""
+            echo "##[section]============================================================"
+            echo "##[section]PROCESSING COMPLETED"
+            echo "##[section]============================================================"
+            echo "##[command]Total repositories processed: $TOTAL_REPOS"
+            echo "##[section]Modified: $TOTAL_MODIFIED"
+            echo "##[warning]Skipped: $TOTAL_SKIPPED"
+            [ "$TOTAL_ERRORS" -gt 0 ] && echo "##[error]Errors: $TOTAL_ERRORS" || echo "##[command]Errors: $TOTAL_ERRORS"
+
+            # Exportar para resumo
+            echo "##vso[task.setvariable variable=TOTAL_REPOS]$TOTAL_REPOS"
+            echo "##vso[task.setvariable variable=TOTAL_MODIFIED]$TOTAL_MODIFIED"
+            echo "##vso[task.setvariable variable=TOTAL_SKIPPED]$TOTAL_SKIPPED"
+            echo "##vso[task.setvariable variable=TOTAL_ERRORS]$TOTAL_ERRORS"
+
+      # ================================================================
+      # Task 5: Exibir resumo final
+      # ================================================================
+      - task: Bash@3
+        name: resumo
+        displayName: "5. Display summary"
+        condition: always()
+        inputs:
+          targetType: inline
+          script: |
+            echo "##[section]============================================================"
+            echo "##[section]EXECUTION SUMMARY"
+            echo "##[section]============================================================"
+            echo ""
+            echo "##[section]EXECUTION IDENTIFIER: $(EXECUTION_ID)"
+            echo ""
+            echo "##[command]------------------------------------------------------------"
+            echo "##[command]Project: $(PROJECT_NAME)"
+            echo "##[command]File: $(FILE_PATH)"
+            echo "##[command]Branch: $(BRANCH)"
+            echo "##[command]Dry-run: $(DRY_RUN)"
+            echo "##[command]------------------------------------------------------------"
+
+            TOTAL_REPOS="${TOTAL_REPOS:-0}"
+            TOTAL_MODIFIED="${TOTAL_MODIFIED:-0}"
+            TOTAL_SKIPPED="${TOTAL_SKIPPED:-0}"
+            TOTAL_ERRORS="${TOTAL_ERRORS:-0}"
+
+            echo "##[command]Repositories processed: $TOTAL_REPOS"
+            echo "##[section]Successfully modified: $TOTAL_MODIFIED"
+            echo "##[warning]Skipped (no changes): $TOTAL_SKIPPED"
+            [ "$TOTAL_ERRORS" -gt 0 ] && echo "##[error]Errors: $TOTAL_ERRORS" || echo "##[command]Errors: $TOTAL_ERRORS"
+            echo "##[section]============================================================"
+
+            if [ "$(DRY_RUN)" == "true" ]; then
+              echo ""
+              echo "##[warning]DRY-RUN MODE: No changes were applied."
+              echo "##[command]Run again with 'Dry Run = false' to apply changes."
+            else
+              echo ""
+              echo "##[command]To REVERT these changes, use:"
+              echo "##[command]  Pipeline: pipeline_revert_from_repo.yml"
+              echo "##[command]  Identifier: $(EXECUTION_ID)"
+            fi
+
+            if [ "$TOTAL_ERRORS" -gt 0 ]; then
+              echo ""
+              echo "##[warning]There were $TOTAL_ERRORS error(s) during execution."
+            fi

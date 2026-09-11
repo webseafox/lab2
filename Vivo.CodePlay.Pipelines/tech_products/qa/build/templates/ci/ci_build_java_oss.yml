@@ -1,0 +1,229 @@
+stages:
+  - stage: ci_build
+    displayName: "CI - Build"
+    pool:
+      name: $(PRIVATE_AGENT_QA)
+      demands: BuildAgent
+    dependsOn:
+      - environment_init
+
+    # Loads variables from other stages.
+    variables:
+      - name: MAVEN_SETTINGS_LOCATION
+        value: $[ stageDependencies.environment_init.environment.outputs['settings_variables.MAVEN_SETTINGS_LOCATION'] ]
+      - name: MAVEN_CUSTOM_SETTINGS_CONTENT
+        value: $[ stageDependencies.environment_init.environment.outputs['custom_settings.MAVEN_CUSTOM_SETTINGS_CONTENT'] ]
+      - name: NEXUS_DEPS_USR
+        value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEPS_USR'] ]
+      - name: NEXUS_DEPS_PSW
+        value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEPS_PSW'] ]
+
+    jobs:
+      - job: build
+        displayName: Build
+        timeoutInMinutes: 120
+        steps:
+
+            # Download the checkout_env artifact to get the context.
+          - download: current
+            artifact: 'checkout_env'
+            displayName: Download checkout_env Artifact
+          
+          # Checkout the code
+          - checkout: self
+            displayName: Checkout Code
+            name: checkout_code
+            submodules: true
+            persistCredentials: true
+
+          - task: Docker@2
+            displayName: 'Auth for Azure Container Registry'
+            inputs:
+              command: 'login'
+              containerRegistry: ACR-DEVOPS
+              timeoutInMinutes: 90
+              
+            ## Make scripts executable
+          - task: Bash@3
+            displayName: "Set execute permissions for scripts"
+            inputs:
+              targetType: 'inline'
+              script: |
+                pwd
+                ls -lha
+                ls -lha $(Agent.BuildDirectory)
+                chmod +x $(SCRIPTS_FOLDER_JAVA_BUILD)/*.sh
+          
+            # Get the last commit short hash
+          - task: Bash@3
+            displayName: Last Commit short hash
+            name: last_commit_short_hash
+            condition: succeeded()
+            continueOnError: false
+            inputs:
+              targetType: 'tagetPath'
+              script: $(SCRIPTS_FOLDER_JAVA_BUILD)/get_short_hash_commit.sh
+
+          # Get source code data
+          - task: Bash@3
+            displayName: Get Source Data
+            name: source_data
+            condition: succeeded()
+            continueOnError: false
+            inputs:
+              targetType: 'targetPath'
+              script: $(SCRIPTS_FOLDER_JAVA_BUILD)/get_source_data.sh
+
+          # Get current version and set to variables.
+          # For master, set a variable to increment version further on.
+          - task: Bash@3
+            displayName: Get Current Version
+            name: current_version
+            condition: succeeded()
+            continueOnError: false
+            inputs:
+              targetType: 'tagetPath'
+              script: $(SCRIPTS_FOLDER_JAVA_BUILD)/get_current_version.sh
+
+          # Bump/Increment version and update increment variable.
+          # Only allows this for master branch and in CI steps. Do not allow manual pushes.
+          # To disable set BUMP_VERSION_ENABLED in pipeline's library.
+          - task: semver-bump@1
+            displayName: Bump Version Master
+            name: bump_version
+            condition: and(
+              succeeded(),
+              or(
+                and(eq(variables.BUMP_VERSION_ENABLED, 'true'), eq(variables['Build.Reason'], 'IndividualCI')),
+                and(eq(variables.BUMP_VERSION_ENABLED, 'true'), eq(variables['Build.Reason'], 'BatchedCI')),
+                and(eq(False, true), eq(variables['Build.Reason'], 'Manual'))
+              ))
+            continueOnError: false
+            inputs:
+              VersionVariable: 'INCREMENT_VERSION'
+              IncrementLevel: 'patch'
+
+          # Set the new version to a variable. This allows it to be used in other stages, jobs or tasks.
+          - task: Bash@3
+            displayName: 'Set New Version'
+            name: new_version
+            condition: succeeded()
+            continueOnError: false
+            inputs:
+              targetType: 'targetPath'
+              script: $(SCRIPTS_FOLDER_JAVA_BUILD)/set_new_version.sh
+
+          # Load Custom Settings
+          - task: Bash@3
+            displayName: 'Load Custom Settings'
+            name: load_custom_settings
+            condition: and(succeeded(), ne(variables['MAVEN_CUSTOM_SETTINGS_CONTENT'], ''))
+            continueOnError: true
+            inputs:
+              targetType: 'tagetPath'
+              script: $(SCRIPTS_FOLDER_JAVA_BUILD)/load_custom_settings.sh
+
+          # Check Java Version
+          - task: Bash@3
+            displayName: Check for Legacy Java Version
+            name: java_version
+            condition: and(succeeded(), eq(variables.new_version.NEW_VERSION, ''))
+            continueOnError: false
+            inputs:
+              targetType: 'targetPath'
+              script: $(SCRIPTS_FOLDER_JAVA_BUILD)/check_legacy_java_version.sh
+
+
+          # Bump version for Java <= 7
+          - task: Bash@3
+            displayName: Bump Version on Legacy Mode (Java <= 7)
+            name: bump_java_7_or_less
+            condition: and(succeeded(), eq(variables.LEGACY_MODE, 'true'), eq(variables.BUMP_VERSION_ENABLED, 'true'))
+            continueOnError: false
+            inputs:
+              targetType: 'tagetPath'
+              script: $(SCRIPTS_FOLDER_JAVA_BUILD)/bump_version_legacy_mode.sh
+            env:
+              ARTIFACT_ID : $(source_data.ARTIFACT_ID)
+              NEW_VERSION : $(new_version.NEW_VERSION)
+ 
+          # Bump version (Java > 7) in code and build code.
+          - task: Bash@3
+            displayName: Build Version
+            name: build_version
+            condition: succeeded()
+            continueOnError: false
+            inputs:
+              targetType: 'targetPath'
+              script: $(SCRIPTS_FOLDER_JAVA_BUILD)/build_version.sh
+            env:
+              SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+              NEXUS_DEPS_USR: $(NEXUS_DEPS_USR)
+              NEXUS_DEPS_PSW: $(NEXUS_DEPS_PSW)
+              LEGACY_MODE: $(java_version.LEGACY_MODE)
+              MAVEN_SETTINGS_LOCATION: $(MAVEN_SETTINGS_LOCATION)
+              NEW_VERSION: $(new_version.NEW_VERSION)
+          
+          # checko files
+
+          - task: Bash@3
+            displayName: 'Copy Files to Artifact Staging Directory'
+            name: copy_files
+            inputs:
+              targetType: 'targetPath'
+              script: |
+                pwd
+                ls -lha
+                cp -R ./* $(Build.ArtifactStagingDirectory)
+                cp -R ./.azuredevops $(Build.ArtifactStagingDirectory)
+
+          # Set artifact information to variables. This allows it to be used in other stages, jobs or tasks.
+          - task: CmdLine@2
+            name: artifact_name
+            displayName: 'Get Artifact Name'
+            condition: succeeded()
+            continueOnError: false
+            inputs:
+              targetType: 'targetPath'
+              script: $(SCRIPTS_FOLDER_JAVA_BUILD)/get_artifact_name.sh
+
+          # Compress artifacts into tar. This allows to use less space and to be used in other stages, jobs or tasks.
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish Artifact'
+            condition: succeeded()
+            continueOnError: false
+            inputs:
+              ArtifactName: $(artifact_name.ARTIFACT_NAME)
+              StoreAsTar: true
+
+          # Publish results for JUnit tests
+          - task: PublishTestResults@2
+            name: t_publish_test_result
+            displayName: Publish Test Results
+            inputs:
+              mergeTestResults: true
+              searchFolder: $(Build.ArtifactStagingDirectory)
+              testResultsFiles: '**/TEST-*.xml'
+              testResultsFormat: JUnit
+              testRunTitle: Test Results
+              failTaskOnFailedTests: true
+              publishRunAttachments: false
+            continueOnError: true
+
+          # Publish results for Code Coverage
+          - task: PublishCodeCoverageResults@1
+            name: t_publish_code_coverage_result
+            displayName: 'Publish Code Coverage Result'
+            inputs:
+              codeCoverageTool: JaCoCo
+              summaryFileLocation: $(Build.SourcesDirectory)/$(COVERAGE_REPORT_SUMMARY_FILE_LOCATION)
+              pathToSources: $(Build.SourcesDirectory)/$(COVERAGE_REPORT_PATH_TO_SOURCE)
+              reportDirectory: $(Build.SourcesDirectory)/$(COVERAGE_REPORT_REPORT_DIRECTORY)
+              additionalCodeCoverageFiles: $(Build.SourcesDirectory)/$(COVERAGE_REPORT_ADDITIONAL_FILE)
+            continueOnError: true
+          
+          - publish: $(Build.ArtifactStagingDirectory)
+            artifact: checkout_artifacts
+            displayName: 'Publish Checkout Environment'
+            condition: succeeded()
+            continueOnError: false

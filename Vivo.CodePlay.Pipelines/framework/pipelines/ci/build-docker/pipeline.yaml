@@ -1,0 +1,360 @@
+parameters:
+#############################################################################
+# INFRAESTRUTURA E AMBIENTE
+#############################################################################
+- name: agentPool
+  type: string
+  default: GeneralPurposeLinuxAgentsCI
+  displayName: 'Agent Pool para execução'
+
+- name: useNetworkProxy
+  type: boolean
+  default: false
+  displayName: 'Configurar proxy de rede para acesso externo (se necessário)'
+
+- name: workingDirectory
+  type: string
+  default: '$(Build.SourcesDirectory)'
+  displayName: 'Diretório de trabalho'
+
+#############################################################################
+# CONFIGURAÇÕES DE DOCKER
+#############################################################################
+- name: imageName
+  type: string
+  default: '$(SIGLA)/$(Build.Repository.Name)'
+  displayName: 'Nome da imagem Docker'
+
+- name: dockerfilePath
+  type: string
+  default: 'Dockerfile'
+  displayName: 'Caminho do Dockerfile'
+
+- name: registryServiceConnection
+  type: string
+  default: 'ACR-DEVOPS'
+  displayName: 'Service Connection do Registry (padrão: ACR-DEVOPS)'
+
+# Permite logar em múltiplos registries (lista de service connections)
+- name: loginRegistryServiceConnections
+  type: object
+  default:
+    - 'ACR-DEVOPS'
+  displayName: 'Lista de Service Connections para login em registries (lista) [Uso especial; manter ACR-DEVOPS como padrão conforme política de proveniência]'
+
+#############################################################################
+# CONFIGURAÇÕES DE SEGURANÇA
+#############################################################################
+
+# - name: fortifyScanDirectory
+#   type: string
+#   default: $(Build.SourcesDirectory)
+#   displayName: 'Diretório scan Fortify'
+- name: enableFortifyExclusions
+  displayName: 'Faz checkout do repositório Fortify Exclusions'
+  type: boolean
+  default: false
+# Se enableFortifyExclusions, mude fortifyScanDirectory para $(Build.SourcesDirectory)/$(Build.Repository.Name)
+- name: convisoCompany
+  type: string
+  default: '430'
+  displayName: 'Conviso Company ID'
+#############################################################################
+# CONFIGURAÇÕES DE VALIDAÇÃO DE WORKING ITEM (JIRA)
+#############################################################################
+- name: enableWorkingItemValidation
+  type: boolean
+  default: false
+  displayName: 'Habilitar validação de Working Item'
+
+- name: jiraAllowedProjects
+  type: string
+  default: ''
+  displayName: 'Projetos Jira permitidos (csv)'
+
+- name: jiraAllowedIssueTypes
+  type: string
+  default: ''
+  displayName: 'Tipos de issue permitidos (csv)'
+
+- name: jiraAllowedStatuses
+  type: string
+  default: ''
+  displayName: 'Status permitidos (csv)'
+
+- name: jiraOnValidationFailure
+  type: string
+  default: 'fail'
+  displayName: 'Ação quando validação falhar'
+  values:
+    - 'fail'
+    - 'warn'
+
+- name: jiraCheckMode
+  type: string
+  default: 'all'
+  displayName: 'Onde validar a issue key (commit, branch, PR ou combinações)'
+  values:
+    - 'all'           # commit + branch + PR
+    - 'commit'        # apenas mensagem de commit
+    - 'branch'        # apenas nome da branch
+    - 'pr'            # apenas título/descrição do PR
+    - 'commit+branch' # commit e branch (sem PR)
+    - 'commit+pr'     # commit e PR (sem branch)
+    - 'branch+pr'     # branch e PR (sem commit)
+
+
+
+#############################################################################
+# CONFIGURAÇÕES DE VERSIONAMENTO E CONTROLE DE FLUXO
+#############################################################################
+- name: versionFile
+  type: string
+  default: 'version.txt'
+  displayName: 'Arquivo onde será salva a versão'
+
+- name: branchingStrategy
+  type: string
+  default: 'trunkbased'
+  displayName: 'Estratégia de versionamento'
+  values:
+    - 'trunkbased'
+    - 'vivoflow'
+    - 'releaseflow'
+    - 'gitlabflow'
+    - 'gitlabflow-semantic'
+    - 'custom'
+    - 'monorepo'
+
+- name: prValidationOnly
+  type: boolean
+  default: false
+  displayName: 'Executa apenas a validação, não publica nem gera versão'
+
+variables:
+  SIGLA: $[ lower(split(variables['System.TeamProject'],' ')[0]) ]
+  # Configurações de segurança
+  DOCKER_BUILDKIT: 1
+  BUILDKIT_PROGRESS: plain
+
+  # Variáveis utilizadas por templates de Segurança (Fortify/SCA)
+  CACORP_LOCATION: $(Agent.HomeDirectory)/../../certs/CACORP.pem
+  FORTIFY_APP_DEFAULT_VERSION: DevSecOps
+  APP_LANGUAGE: 'other'
+  DOCKER_SERVICE_CONNECTION: ${{ parameters.registryServiceConnection }}
+
+  # Configurações de KeyVault para Segurança
+  AKV_DEVOPS_NAME: 'kv-azdevops-shared'
+
+  # Variables for Proxy
+  PROXY_NSKP_SERVER: "nskp.redecorp.br:8080"
+  PROXY_SQUID_SERVER: "10.240.58.39:3128"
+  PROXY_AGENT_HTTP: "http://$(PROXY_NSKP_SERVER)"
+  PROXY_AGENT_HTTPS: "http://$(PROXY_NSKP_SERVER)"
+  PROXY_AGENT_NO_PROXY: "localhost,0.0.0.0,127.0.0.1,10.244.0.0/16,192.168.0.0/16,10.129.178.173,nexus.telefonica.com.br,acrsharedservices01.azurecr.io,appcs-azdevops-shared.azconfig.io,scm.azurewebsites.net"
+
+stages:
+
+# ==================================================================
+# Stage 0: WorkItemValidation - Validação de vínculo com Working Item
+# Descrição: Executa validação de commit/branch/PR com issue Jira antes
+#            das demais etapas para falhar rapidamente em caso inválido.
+# ==================================================================
+- ${{ if eq(parameters.enableWorkingItemValidation, true) }}:
+  - stage: WorkItemValidation
+    displayName: 'Working Item Validation'
+    condition: succeeded()
+    jobs:
+    - job: JiraValidation
+      displayName: 'Validate Jira Working Item'
+      pool: ${{ parameters.agentPool }}
+      steps:
+      - checkout: self
+
+      - task: JiraValidation@1
+        displayName: 'Validate Jira association'
+        inputs:
+          jiraServiceConnection: 'jiraServiceConnection'
+          checkCommit: ${{ or(eq(parameters.jiraCheckMode, 'all'), contains(parameters.jiraCheckMode, 'commit')) }}
+          checkBranch: ${{ or(eq(parameters.jiraCheckMode, 'all'), contains(parameters.jiraCheckMode, 'branch')) }}
+          checkPR: ${{ or(eq(parameters.jiraCheckMode, 'all'), contains(parameters.jiraCheckMode, 'pr')) }}
+          allowedProjects: '${{ parameters.jiraAllowedProjects }}'
+          allowedIssueTypes: '${{ parameters.jiraAllowedIssueTypes }}'
+          allowedStatuses: '${{ parameters.jiraAllowedStatuses }}'
+          onValidationFailure: '${{ parameters.jiraOnValidationFailure }}'
+
+# ==================================================================
+# Stage 1: SecurityAnalysis - Análise de Segurança SAST
+# Descrição: Executa análise de segurança estática (SAST) com Fortify ScanCentral.
+#            Gates de segurança (bloqueio ou não do pipeline) são realizados pelo
+#            time de AppSec via chaves de configuração recuperadas do AppConfig corporativo.
+# ==================================================================
+- stage: SecurityAnalysis
+  displayName: 'Security Analysis'
+  condition: succeeded()
+  jobs:
+
+  - job: AppSecConfigKeys
+    displayName: 'Get AppSec Config Keys'
+    pool: ${{ parameters.agentPool }}
+    steps:
+    - template: /security/get_appconfig_keys_framework.yml
+      parameters:
+        azureSubscription: DevOpsSharedResources
+        appConfigurationEndpoint: https://appcs-azdevops-shared.azconfig.io
+        useNetworkProxy: ${{ parameters.useNetworkProxy }}
+
+# ==================================================================
+# CAPACIDADE: FORTIFY SCAN (SAST)
+# ==================================================================
+# Descrição: Análise estática de código (SAST) usando Fortify ScanCentral e SSC, com integração à Conviso e publicação de artefatos.
+# Documentação: https://dvps.redecorp.azr/portal/codeplay/capacidades/catalog/sast
+# Observações: Exporta variáveis e publica artefatos para uso no Security Gate.
+# ==================================================================
+
+  - job: FortifyScan
+    displayName: 'Fortify Scan'
+    dependsOn: 
+    - AppSecConfigKeys
+    variables:
+      USE_FORTIFY: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.USE_FORTIFY'] ]
+      USE_CONVISO: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.USE_CONVISO'] ]
+      SKIP_SECURITY_GATE: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.SKIP_SECURITY_GATE'] ]
+      FORTIFY_LOCAL_SCANCENTRAL_VERSION: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.FORTIFY_LOCAL_SCANCENTRAL_VERSION'] ]
+    condition: and(succeeded(), eq(variables.USE_FORTIFY, true))
+    pool: ${{ parameters.agentPool }}
+    steps:
+
+    - template: /security/define_appsec_app_version.yml
+
+    - template: /security/run_fortify_scan.yml
+      parameters:
+        fortifyExclusionRepository: 'FortifyExclusion'
+        enableFortifyExclusions:  ${{ parameters.enableFortifyExclusions }}
+        appLanguage: 'other'
+        appVersion: "$(FORTIFY_APP_VERSION)" # OBS: A variável FORTIFY_APP_VERSION é definida no template /security/define_appsec_app_version.yml
+        convisoCompany: ${{ parameters.convisoCompany }}
+
+# ==================================================================
+# Stage 2: DockerBuild - Construção da Imagem Docker
+# Descrição: Constrói imagem Docker, executa análise SCA (Dependency Track) 
+#            se habilitado pelo AppSec
+#            e publica no Azure Container Registry
+# ==================================================================
+- stage: DockerBuild
+  displayName: 'Docker Build'
+  dependsOn: 
+  - SecurityAnalysis
+  condition: succeeded()
+  jobs:
+  # ==================================================================
+  # Job 2.1: DockerBuild - Construção e Publicação da Imagem Docker
+  # Descrição: Constrói e publica imagem
+  # ==================================================================
+  - job: DockerBuild
+    displayName: 'Build Docker Image'
+    pool: ${{ parameters.agentPool }}
+    variables:
+      USE_DT_DOCKER: $[ stageDependencies.SecurityAnalysis.AppSecConfigKeys.outputs['evaluate_flags.USE_DT_DOCKER'] ]
+      USE_CONVISO: $[ stageDependencies.SecurityAnalysis.AppSecConfigKeys.outputs['evaluate_flags.USE_CONVISO'] ]
+      SKIP_SECURITY_GATE_SCA: $[ stageDependencies.SecurityAnalysis.AppSecConfigKeys.outputs['evaluate_flags.SKIP_SECURITY_GATE_SCA'] ]
+    steps:
+    # ==================================================================
+    # [Configuração Inicial] Checkout do código
+    # ==================================================================
+    - checkout: self
+
+    # ==================================================================
+    # [Observabilidade] Exibe parâmetros quando em modo debug
+    # ==================================================================
+    - task: VivoUtilsFromVivo@1
+      displayName: 'Show Pipeline Parameters'
+      condition: eq(variables['System.Debug'], 'true')
+      inputs:
+        command: 'show-pipeline-parameters'
+        parameters: '${{ convertToJson(parameters) }}'
+
+    # ==================================================================
+    # [Compliance] Verifica se o repositório está em conformidade com as políticas de configuração
+    # ==================================================================
+    - task: VivoDevOpsConfigCompliance@1
+      displayName: 'Check DevOps Config Compliance'
+      inputs:
+        workDir: ${{ parameters.workingDirectory }}
+        policySets: |
+          image-definition-files
+
+    # ==================================================================
+    # [Versionamento] Definição da versão (VersionManager)
+    # ==================================================================
+    - task: VersionManagerVivo@8
+      displayName: 'Next version'
+      inputs:
+        command: 'nextVersion'
+        branchingStrategy: ${{ parameters.branchingStrategy }}
+        versionFile: ${{ parameters.workingDirectory }}/${{ parameters.versionFile }}
+        bumpMethod: 'patch'
+        passthroughVersion: ${{ parameters.prValidationOnly }}
+      name: VersionManagerVivo
+
+    # ==================================================================
+    # [Docker Build & Push] Construção da Imagem com Template Central
+    # ==================================================================
+    - template: /framework/templates/docker-build-and-push.yaml
+      parameters:
+        imageName: ${{ parameters.imageName }}
+        imageTag: $(VersionManagerVivo.VERSION)
+        registryServiceConnection: '${{ parameters.registryServiceConnection }}'
+        buildArgs:
+          - 'APPLICATION_NAME=$(Build.Repository.Name)'
+          - 'APP_VERSION=$(VersionManagerVivo.VERSION)'
+          - 'VERSION=$(VersionManagerVivo.VERSION)'
+        dockerfilePath: ${{ parameters.dockerfilePath }}
+        buildContext: '${{ parameters.workingDirectory }}'
+        loginRegistryServiceConnections: ${{ parameters.loginRegistryServiceConnections }}
+        convisoCompany: ${{ parameters.convisoCompany }}
+
+# ==================================================================
+# Stage 3: VersionCommit - Commit e Tag da Versão de Release
+# Descrição: Atualiza versão no version.txt, cria commit e tag Git
+#            Executa apenas na master, quando não é PR de validação e quando Docker push está habilitado
+# ==================================================================
+- ${{ if eq(parameters.prValidationOnly, false) }}:
+  - stage: VersionCommit
+    displayName: 'Commit Version'
+    dependsOn: 
+    - DockerBuild
+    condition: succeeded()
+    jobs:
+    - job: CommitVersion
+      displayName: 'Commit Release Version'
+      pool: ${{ parameters.agentPool }}
+      steps:
+      # ==================================================================
+      # Checkout para Commit da Versão
+      # ==================================================================
+      - checkout: self
+        clean: true
+        persistCredentials: true
+        fetchDepth: 0
+      
+      # ==================================================================
+      # [Versionamento] Reafirma versão e realiza commit/tag
+      # ==================================================================
+      - task: VersionManagerVivo@8
+        displayName: 'Next version'
+        inputs:
+          command: 'nextVersion'
+          branchingStrategy: ${{ parameters.branchingStrategy }}
+          versionFile: ${{ parameters.workingDirectory }}/${{ parameters.versionFile }}
+          bumpMethod: 'patch'
+        name: VersionManagerVivo
+          
+      - task: VersionManagerVivo@8
+        displayName: 'Commit and Tag Version'
+        inputs:
+          command: 'commitVersion'
+          version: '$(VersionManagerVivo.VERSION)'
+          versionFile: '${{ parameters.workingDirectory }}/${{ parameters.versionFile }}'
+          createTag: true
+          pushChanges: true

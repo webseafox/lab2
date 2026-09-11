@@ -1,0 +1,144 @@
+steps:
+  - task: CmdLine@2
+    name: pipeline_result
+    displayName: "Pipeline Result"
+    continueOnError: true
+    inputs:
+      script: |
+        sleep 5
+
+        FAILED_ITEMS=""
+        FAILED_STAGES=""
+        PIPELINE_RESULT=""
+        PIPELINE_FAILED=""
+        PIPELINE_STAGE_FAILED=""
+        PIPELINE_JOB_FAILED=""
+        PIPELINE_TASK_FAILED=""
+        PIPELINE_ERROR_MESSAGE=""
+
+        echo "##[command]curl -s -u :$AZURE_DEVOPS_EXT_PAT $(System.CollectionUri)$(System.TeamProjectId)/_apis/build/builds/$(Build.BuildId)/timeline"
+        ALL_TIMELINE=$(curl -s -u :$AZURE_DEVOPS_EXT_PAT $(System.CollectionUri)$(System.TeamProjectId)/_apis/build/builds/$(Build.BuildId)/timeline)
+
+        process() {
+          for row in $(echo "$2" | jq -r '.[] | @base64'); do
+            _jq() {
+              echo "${row}" | base64 --decode | jq -r "${1}"
+            }
+
+            TASK_NAME=$(_jq '.name')
+            PARENT_ID=$(_jq '.parentId')
+            SEQUENCE="$TASK_NAME"
+
+            CURRENT_PARENT_ID=$PARENT_ID
+            FULL_HIERARCHY=true
+            STAGE_FOUND=false
+            JOB_FOUND=false
+
+            while true; do
+              PARENT_RECORD=$(echo "$1" | jq ".records[] | select(.id == \"$CURRENT_PARENT_ID\")")
+              PARENT_TYPE=$(echo "$PARENT_RECORD" | jq -r '.type')
+              PARENT_NAME=$(echo "$PARENT_RECORD" | jq -r '.name')
+              
+              if [ -z "$PARENT_TYPE" ]; then
+                FULL_HIERARCHY=false
+                break
+              fi
+              if [ "$PARENT_TYPE" == "Stage" ]; then
+                STAGE_FOUND=true
+              elif [ "$PARENT_TYPE" == "Job" ]; then
+                JOB_FOUND=true
+              fi
+              if [ "$PARENT_TYPE" != "Phase" ]; then
+                SEQUENCE="$PARENT_NAME -> $SEQUENCE"
+              fi
+              if [ "$PARENT_TYPE" == "Stage" ]; then
+                break
+              fi
+
+              CURRENT_PARENT_ID=$(echo "$PARENT_RECORD" | jq -r '.parentId')
+            done
+
+            if [ "$FULL_HIERARCHY" = true ] && [ "$STAGE_FOUND" = true ] && [ "$JOB_FOUND" = true ]; then
+              STATE=$(_jq '.state')
+              RESULT=$(_jq '.result')
+              ISSUE_MESSAGE=$(_jq '.issues[]?.message // empty')
+              START_TIME=$(_jq '.startTime')
+              FINISH_TIME=$(_jq '.finishTime')
+              LOG_ID=$(_jq '.log.id // empty')
+              LOG_URL=$(_jq '.log.url // empty')
+
+              if [ -n "$START_TIME" ] && [ "$START_TIME" != "null" ] && [ -n "$FINISH_TIME" ] && [ "$FINISH_TIME" != "null" ]; then
+                START_TIMESTAMP=$(date -d "$START_TIME" +%s%3N)
+                FINISH_TIMESTAMP=$(date -d "$FINISH_TIME" +%s%3N)
+                DURATION=$((FINISH_TIMESTAMP - START_TIMESTAMP))
+                DURATION_FORMATTED=$(printf '%02d:%02d:%02d.%03d' $((DURATION/3600000)) $((DURATION%3600000/60000)) $((DURATION%60000/1000)) $((DURATION%1000)))
+              else
+                DURATION_FORMATTED="-"
+              fi
+
+              if [ "$RESULT" != "failed" ]; then
+                echo "🟢 $SEQUENCE [$STATE :: $RESULT] (Duration: $DURATION_FORMATTED)"
+              else
+                echo "🔴 $SEQUENCE [$STATE :: $RESULT] (Duration: $DURATION_FORMATTED)"
+                echo "    💬 \"$ISSUE_MESSAGE\" [Log ID: $LOG_ID, Log URL: $LOG_URL]"
+
+                FAILED_ITEMS="${FAILED_ITEMS}${SEQUENCE};${ISSUE_MESSAGE};${LOG_ID};${LOG_URL}>"
+                FAILED_STAGES="${FAILED_STAGES}${PARENT_NAME};"
+              fi
+            fi
+          done
+        }
+
+        TIMELINE_TASK_FAILED=$(echo "$ALL_TIMELINE" | jq '[.records[] | select(.result == "failed" and .type == "Task")]')
+        process "$ALL_TIMELINE" "$TIMELINE_TASK_FAILED"
+
+        if [ "$FAILED_ITEMS" != "" ]; then
+          IFS=';' read -r STAGE_JOB_TASK ERROR_MESSAGE <<< "$FAILED_ITEMS"
+          IFS='>' read -r STAGE JOB TASK <<< "$STAGE_JOB_TASK"
+          IFS=';' read -r ERROR LOG_ID <<< "$ERROR_MESSAGE"
+
+          STAGE=$(echo "$STAGE" | sed 's/-$//' | xargs)
+          JOB=$(echo "$JOB" | sed 's/-$//' | xargs)
+          TASK=$(echo "$TASK" | sed 's/-$//' | xargs)
+
+          PIPELINE_RESULT="Failed"
+          PIPELINE_FAILED="$FAILED_ITEMS"
+          PIPELINE_STAGE_FAILED="$STAGE"
+          PIPELINE_JOB_FAILED="$JOB"
+          PIPELINE_TASK_FAILED="$TASK"
+          PIPELINE_ERROR_MESSAGE="$ERROR"
+
+          echo "##vso[task.complete result=Failed;]"
+        else
+          PIPELINE_RESULT="Finish"
+                echo "🟢 Pipeline without failures 🟢"
+        fi
+
+        if [ "$PIPELINE_RESULT" = "Failed" ]; then
+          echo ""
+          echo "##[debug] PIPELINE RESULT ...............................: $PIPELINE_RESULT"
+          echo "##[debug] STAGE IN ERROR ................................: $PIPELINE_STAGE_FAILED"
+          echo "##[debug] JOB IN ERROR ..................................: $PIPELINE_JOB_FAILED"
+          echo "##[debug] TASK IN ERROR .................................: $PIPELINE_TASK_FAILED"
+          echo "##[debug] ERROR MESSAGE .................................: $PIPELINE_ERROR_MESSAGE"
+        fi
+
+        # echo ""
+        # echo "##[group]All steps formatted"
+        # TIMELINE_ALL_ITEMS=$(echo "$ALL_TIMELINE" | jq '[.records[] | select(.type != "Phase")]')
+        # process "$ALL_TIMELINE" "$TIMELINE_ALL_ITEMS"
+        # echo "##[endgroup]"
+
+        echo ""
+        echo "##[group]All steps"
+        echo "$ALL_TIMELINE" | jq .
+        echo "##[endgroup]"
+
+        echo "##vso[task.setvariable variable=PIPELINE_RESULT;isoutput=true]$PIPELINE_RESULT"
+        echo "##vso[task.setvariable variable=PIPELINE_FAILED;isoutput=true]$PIPELINE_FAILED"
+        echo "##vso[task.setvariable variable=PIPELINE_STAGE_FAILED;isoutput=true]$PIPELINE_STAGE_FAILED"
+        echo "##vso[task.setvariable variable=PIPELINE_JOB_FAILED;isoutput=true]$PIPELINE_JOB_FAILED"
+        echo "##vso[task.setvariable variable=PIPELINE_TASK_FAILED;isoutput=true]$PIPELINE_TASK_FAILED"
+        echo "##vso[task.setvariable variable=PIPELINE_ERROR_MESSAGE;isoutput=true]$PIPELINE_ERROR_MESSAGE"
+    env:
+      AZURE_DEVOPS_EXT_PAT: $(System.AccessToken)

@@ -1,0 +1,157 @@
+parameters:
+- name: project_name
+  type: string
+  default: ''
+- name: message_title
+  type: string
+  default: 'Deploy Sap Commerce cloud - E-commerce B2C'
+- name: environment_code
+  type: string
+  default: ''
+- name: database_update_mode
+  type: string
+  default: ''
+- name: deploy_strategy
+  type: string
+  default: ''
+- name: branch_backend
+  type: string
+  default: ''
+- name: branch_frontend
+  type: string
+  default: ''
+- name: pipeline_status
+  type: string
+  default: ''
+- name: description_details
+  type: string
+  default: ''
+- name: source
+  type: string
+  default: 'DEPLOY_SAP_COMMERCE_CLOUD'
+- name: display_name
+  type: string
+  default: 'Send message to Teams chat'
+- name: condition
+  type: object
+  default: succeededOrFailed()
+
+steps:
+  - bash: |
+      if [ "$CHATOPS_USE_PROXY" != "true" ]; then
+        unset HTTP_PROXY
+        unset HTTPS_PROXY
+        unset NO_PROXY
+        unset http_proxy
+        unset https_proxy
+        unset no_proxy
+      fi
+
+      PIPELINE_STATUS="${{ parameters.pipeline_status }}"
+
+      STATUS_MESSAGE=""
+      if [ "$PIPELINE_STATUS" == "STARTED" ]; then
+        STATUS_MESSAGE="Status: <b>Executando</b> ⚙️"
+      elif [ "$PIPELINE_STATUS" == "HTTP_ERROR" ]; then
+        STATUS_MESSAGE="Status: <b>Erro HTTP</b> ❌"
+      elif [ "$PIPELINE_STATUS" == "SAP_ERROR" ]; then
+        STATUS_MESSAGE="Status: <b>Erro na SAP</b> ❌"
+      elif [ "$PIPELINE_STATUS" == "BUILD_COMPLETED" ]; then
+        STATUS_MESSAGE="Status: <b>Concluído</b> ✅"
+      elif [ "$PIPELINE_STATUS" == "DEPLOYED" ]; then
+        STATUS_MESSAGE="Status: <b>Concluído</b> ✅"
+      fi
+
+      AUTHOR="Solicitante: <b>$(Build.QueuedBy) ✋👀</b>"
+      if [ "$(Build.QueuedBy)" == "Microsoft.VisualStudio.Services.TFS" ]; then
+        AUTHOR="<b>Build iniciado via Trigger ✋👀</b>"
+      fi
+
+      MESSAGE_DATA="<b>${{ parameters.message_title }}</b><br><br>🚀🔗 <a href='$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)'>Link para a pipe</a> 🔗🚀<br><br> \
+        Pipeline: <b>$(Build.DefinitionName)</b> 🚧<br><br> \
+        $AUTHOR<br><br>"
+
+      if [ "${{ parameters.environment_code }}" != "" ]; then
+        if [ "${{ parameters.environment_code }}" != "Escolha um ambiente" ]; then
+          MESSAGE_DATA+="Ambiente: <b>${{ parameters.environment_code }}</b> 🏗️<br><br>"
+        else
+          MESSAGE_DATA+="O ambiente escolhido <b>❗❗❗ ${{ parameters.environment_code }} </b> não existe ❗❗❗<br><br>"
+        fi
+      fi
+
+      if [ "${{ parameters.deploy_strategy }}" != "" ]; then
+        MESSAGE_DATA+="Estratégia de Deploy: <b>${{ parameters.deploy_strategy }}</b> 🔝<br><br>"
+      fi
+
+      if [ "${{ parameters.database_update_mode }}" != "" ]; then
+        MESSAGE_DATA+="DB Update: <b>${{ parameters.database_update_mode }}</b> 💾<br><br>"
+      fi
+
+      if [ "${{ parameters.branch_frontend }}" != "" ]; then
+        MESSAGE_DATA+="Branch do Storefront: <b>${{ parameters.branch_frontend }}</b> 👓<br><br>"
+      fi
+
+      if [ "${{ parameters.branch_backend }}" != "" ]; then
+        MESSAGE_DATA+="Branch do Core customize: <b>${{ parameters.branch_backend }}</b> 🌄<br><br>"
+      fi
+
+      if [ "${{ parameters.description_details }}" != "" ]; then
+        MESSAGE_DATA+="Detalhes: <b>${{ parameters.description_details }}</b> 📋<br><br>"
+      fi
+
+      MESSAGE_DATA+="---<br><br>$STATUS_MESSAGE"
+
+      echo "##[command]*** INFORMAÇÕES SOBRE A PIPELINE ***"
+      echo "##[section]$MESSAGE_DATA"
+
+      IFS=
+      export SET_DESCRIPTION="$MESSAGE_DATA"
+      BODY_DATA='{"content": "${SET_DESCRIPTION}", "chatId": "${CHAT_MESSAGE_ID}", "source": "${{ parameters.source }}"}'
+      BODY_DATA=$(echo "$BODY_DATA" | envsubst)
+
+      echo "##[section]Enviando mensagem"
+      echo "##[section]${BODY_DATA}"
+
+      curl -X POST --location "${CHATOPS_NOTIFICATION_URL}" \
+          --header 'Content-Type: application/json' \
+          --data-raw "${BODY_DATA}"
+
+      SECOND_CHAT_ENVS=$(echo "$ENVIRONMENTS_TO_NOTIFY_CHAT_TWO" | tr ',' ' ')
+      SHOULD_NOTIFY_SECOND_CHAT="false"
+      for ENV_ITEM in $SECOND_CHAT_ENVS; do
+        if [ "$ENV_ITEM" == "${{ parameters.environment_code }}" ]; then
+          SHOULD_NOTIFY_SECOND_CHAT="true"
+          break
+        fi
+      done
+
+      if [ "$SEND_MESSAGE_SECOND_CHAT" == "TRUE" ] && [ "$SHOULD_NOTIFY_SECOND_CHAT" == "true" ]; then
+        SECOND_DEPLOY_MODE="Manual"
+        if [ "$(Build.Reason)" == "Schedule" ]; then
+          SECOND_DEPLOY_MODE="Agendado"
+        fi
+
+        SECOND_STATUS="Iniciado"
+        if [ "$PIPELINE_STATUS" == "BUILD_COMPLETED" ] || [ "$PIPELINE_STATUS" == "DEPLOYED" ]; then
+          SECOND_STATUS="Concluido"
+        fi
+
+        SECOND_MESSAGE="Status SAP Cloud<br>Deploy: ${SECOND_DEPLOY_MODE} - Ambiente: ${{ parameters.environment_code }} - Status: ${SECOND_STATUS}"
+        SECOND_BODY_DATA="{\"content\": \"$SECOND_MESSAGE\", \"chatId\": \"$CHAT_MESSAGE_ID_SECOND\", \"source\": \"${{ parameters.source }}\"}"
+
+        echo "##[section]Enviando mensagem resumida para o segundo chat"
+        echo "##[section]${SECOND_BODY_DATA}"
+
+        curl -X POST --location "${CHATOPS_NOTIFICATION_URL}" \
+            --header 'Content-Type: application/json' \
+            --data-raw "${SECOND_BODY_DATA}"
+      fi
+
+    displayName: ${{ parameters.display_name }}
+    env:
+      CHAT_MESSAGE_ID: $(CHAT_MESSAGE_ID)
+      CHAT_MESSAGE_ID_SECOND: $(CHAT_MESSAGE_ID_SECOND)
+      SEND_MESSAGE_SECOND_CHAT: $(SEND_MESSAGE_SECOND_CHAT)
+      ENVIRONMENTS_TO_NOTIFY_CHAT_TWO: $(ENVIRONMENTS_TO_NOTIFY_CHAT_TWO)
+      CHATOPS_NOTIFICATION_URL: $(CHATOPS_NOTIFICATION_URL)
+    condition: ${{ parameters.condition }}

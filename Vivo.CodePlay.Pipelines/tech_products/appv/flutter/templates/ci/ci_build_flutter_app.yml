@@ -1,0 +1,242 @@
+parameters:
+- name: qa_environment
+- name: use_flutter_version_latest
+  default: false
+  
+stages:
+
+- stage: build_test
+  displayName: "Build Dep & Test"
+  dependsOn:
+  - pipeline_init
+  jobs:
+  - job: build_app
+    displayName: Build & Test
+    pool: $(PRIVATE_AGENT_SHARED)
+    steps:
+
+    ## SETUP BUILD
+
+    - checkout: self
+      persistCredentials: true
+      clean: true
+
+    ## BUILD
+
+    - task: Cache@2
+      displayName: "Flutter Pub Cache"
+      inputs:
+        key: 'flutter pub v4 | "${{ parameters.qa_environment }}" | "$(Agent.OS)" | pubspec.yaml'
+        path: '$(Agent.ToolsDirectory)/.pub-cache'
+        cacheHitVar: PUB_CACHE_RESTORED
+
+    - script: |
+        mkdir -p $(Agent.ToolsDirectory)/.pub-cache
+        export PUB_CACHE=$(Agent.ToolsDirectory)/.pub-cache
+      displayName: 'Create and Export Pub Cache'
+
+    - ${{ if eq(parameters.use_flutter_version_latest, 'True' ) }}: 
+
+      # Install Flutter
+      - task: FlutterInstall@0
+        displayName: "Install Flutter SDK"
+        inputs:
+          mode: 'auto'
+          channel: 'stable'
+          version: 'custom'
+          customVersion: $(FLUTTER_VERSION_LATEST)
+
+    - ${{ else }}:
+
+      # Install Flutter
+      - task: FlutterInstall@0
+        displayName: "Install Flutter SDK"
+        inputs:
+          mode: 'auto'
+          channel: 'stable'
+          version: 'custom'
+          customVersion: $(FLUTTER_VERSION)
+          
+    - task: Bash@3
+      displayName: Update pubspec 
+      inputs:
+        targetType: 'inline'
+        script: |           
+
+          echo "##[debug]Current environment is: ${{ parameters.qa_environment }}"                    
+
+          current_branch=$(echo "$BUILD_SOURCEBRANCH" | awk -F/ '{print $NF}')
+          echo "##[debug]Current Branch: $current_branch"
+
+          # Update token se for preprod
+          if [[ ${{ parameters.qa_environment }} == "preprod" ]]; then
+
+            if [[ $current_branch == "release" || $current_branch == "master" ]]; then
+
+              # Update pubspec token
+              echo "##[debug]Update mapp_payment ref pubspec token preprod"
+              sed -i 's/#{MAPP_PAYMENT_REF}#/$(MAPP_PAYMENT_REF)/g' $(Build.SourcesDirectory)/pubspec.yaml
+
+            else
+            
+              # Clear pubspec token
+              echo "##[debug]Clear mapp_payment ref pubspec token"
+              sed -i 's/#{MAPP_PAYMENT_REF}#//g' $(Build.SourcesDirectory)/pubspec.yaml
+            
+            fi
+
+          else
+          
+            # Clear pubspec token
+            echo "##[debug]Clear mapp_payment ref pubspec token"
+            sed -i 's/#{MAPP_PAYMENT_REF}#//g' $(Build.SourcesDirectory)/pubspec.yaml
+
+          fi
+
+          echo "##[debug]Check pubspec.yaml"
+          cat $(Build.SourcesDirectory)/pubspec.yaml 
+
+    - script: |
+          export PUB_CACHE=$(Agent.ToolsDirectory)/.pub-cache
+          
+          # Usa System.CollectionUri para extrair a organização
+          COLLECTION_URI="$(System.CollectionUri)"
+          # Remove 'https://' e trailing '/'
+          ORG_PATH=${COLLECTION_URI#https://}
+          ORG_PATH=${ORG_PATH%/}
+          
+          # Extrai apenas o nome da organização
+          ORG_NAME=$(echo "$ORG_PATH" | cut -d'/' -f2)
+          
+          echo "##[debug]Collection: $COLLECTION_URI"
+          echo "##[debug]Organização: $ORG_NAME"
+          
+          # Configura Git com autenticação via System Access Token
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0="url.https://$(System.AccessToken)@dev.azure.com/${ORG_NAME}/.insteadOf"
+          export GIT_CONFIG_VALUE_0="https://${ORG_NAME}@dev.azure.com/${ORG_NAME}/"
+
+          flutter pub get --no-example --verbose
+          #Adicionado a pedido dos DEVs
+          #flutter packages pub run build_runner build --delete-conflicting-outputs
+          #flutter gen-l10n
+      displayName: "Flutter Get Dependencies"        
+
+    - task: FlutterCommand@0
+      displayName: "Flutter Diagnostics"
+      condition: failed()
+      inputs:
+        projectDirectory: '.'
+        arguments: 'doctor -v'
+      env:
+        ASDF_JAVA_VERSION: 'openjdk-17.0.2'         
+
+    - script: |
+        echo "##[debug]Executando comando: 'dart analyze --no-fatal-warnings' e exportando relatório para 'analyze-report.txt'"
+        dart analyze --no-fatal-warnings > analyze-report.txt
+        #dart analyze lib --no-fatal-warnings > analyze-report.txt 
+
+        echo "##[debug]Resultado da analise:"
+        cat analyze-report.txt
+      displayName: Dart Analyze 
+      workingDirectory: '$(Build.SourcesDirectory)'
+      continueOnError: true
+      env:
+        ASDF_JAVA_VERSION: 'openjdk-17.0.2'         
+
+    ## TEST
+
+    - task: FlutterTest@0
+      displayName: "Unit Tests"
+      inputs:
+        generateCodeCoverageReport: true
+        projectDirectory: '$(Build.SourcesDirectory)'
+      env:
+        ASDF_JAVA_VERSION: 'openjdk-17.0.2'         
+
+## Issue: https://github.com/flutter/flutter/issues/140639
+    - task: Bash@3
+      displayName: Dart Cobertura 
+      continueOnError: true
+      inputs:
+        workingDirectory: '$(Build.SourcesDirectory)'
+        targetType: inline
+        script: | 
+          export PUB_CACHE=$(Agent.ToolsDirectory)/.pub-cache        
+          export PATH="$PATH":"$PUB_CACHE/bin"    
+                
+          echo "##[debug]List folder: 'coverage' before"
+          pwd
+          ls -la coverage
+          echo "##[debug]Executando comando: 'dart pub global activate cobertura'"
+          dart pub global activate cobertura          
+          cd $(build.sourcesDirectory)
+          echo "##[debug]Executando comando: 'cobertura convert'"
+          cobertura convert
+          echo "##[debug]List folder: 'coverage' after"
+          pwd
+          ls -la coverage
+      env:
+        ASDF_JAVA_VERSION: 'openjdk-17.0.2'
+        
+    - task: PublishCodeCoverageResults@2
+      displayName: 'Publish Code Coverage Cobertura'
+      inputs:
+        codecoverageTool: cobertura
+        summaryFileLocation: '$(build.sourcesDirectory)/coverage/cobertura.xml'
+        failIfCoverageEmpty: true
+
+    # Check Code Coverage Threshold
+    - task: Bash@3
+      displayName: 'Check Code Coverage Threshold (80%)'
+      continueOnError: true
+      inputs:
+        workingDirectory: '$(Build.SourcesDirectory)'
+        targetType: inline
+        script: |
+          # Parse coverage percentage from cobertura.xml
+          if [ -f "coverage/cobertura.xml" ]; then
+            echo "##[debug]Checking coverage threshold in cobertura.xml"
+            
+            # Extract line coverage percentage from cobertura.xml
+            COVERAGE_PERCENT=$(grep -o 'line-rate="[0-9.]*"' coverage/cobertura.xml | head -1 | grep -o '[0-9.]*')
+            
+            if [ -z "$COVERAGE_PERCENT" ]; then
+              echo "##[error]Could not extract coverage percentage from cobertura.xml"
+              exit 1
+            fi
+            
+            # Convert to percentage (cobertura uses decimal format 0.0-1.0)
+            COVERAGE_PERCENT_INT=$(echo "$COVERAGE_PERCENT * 100" | bc -l | cut -d. -f1)
+            
+            echo "##[section]Code Coverage: ${COVERAGE_PERCENT_INT}%"
+            echo "##vso[task.setvariable variable=CodeCoveragePercent]${COVERAGE_PERCENT_INT}"
+            
+            # Check if coverage is below 80%
+            if [ "$COVERAGE_PERCENT_INT" -lt 80 ]; then
+              echo "##[error]Code coverage (${COVERAGE_PERCENT_INT}%) is below the required threshold of 80%"
+              echo "##[error]Please increase test coverage before proceeding"
+              exit 1
+            else
+              echo "##[section]✅ Code coverage (${COVERAGE_PERCENT_INT}%) meets the required threshold of 80%"
+            fi
+          else
+            echo "##[error]Coverage file not found: coverage/cobertura.xml"
+            exit 1
+          fi
+      env:
+        ASDF_JAVA_VERSION: 'openjdk-17.0.2'
+
+    - task: CopyFiles@2
+      displayName: 'Copy App to Staging Directory'
+      inputs:
+        TargetFolder: '$(Build.ArtifactStagingDirectory)'
+        OverWrite: true
+        CleanTargetFolder: true
+        Contents: '**/*'
+
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish App Artifact'
+      inputs:
+        ArtifactName: app
+        StoreAsTar: true  

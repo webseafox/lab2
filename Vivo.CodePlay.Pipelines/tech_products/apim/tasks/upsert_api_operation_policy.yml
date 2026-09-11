@@ -1,0 +1,79 @@
+parameters:
+- name: serviceConnectionSuffix
+  type: string
+  default: "$(subscriptionEnv)"
+- name: subscriptionId
+  type: string
+- name: resourceGroup
+  type: string
+- name: apimName
+  type: string
+- name: environment
+  type: string
+- name: apiName
+  type: string
+- name: apiRevision
+  type: string
+- name: condition
+  type: object
+  default: succeeded()
+
+steps:
+- task: AzureCLI@2
+  displayName: "Create / Update API Operations Policy"
+  condition: ${{ parameters.condition }}
+  inputs:
+    azureSubscription: $(serviceConnectionPrefixName)-${{ parameters.serviceConnectionSuffix }}
+    scriptType: bash
+    scriptLocation: inlineScript
+    inlineScript: |
+      set -euo pipefail
+
+      az account set --subscription "${{ parameters.subscriptionId }}"
+
+      if [ ! -d "./operations" ]; then
+        echo "Pasta 'operations/' não encontrada - pulando policies por operação"
+        exit 0
+      fi
+
+      TOKEN=$(az account get-access-token --query accessToken -o tsv)
+      API_REV_ID="/subscriptions/${{ parameters.subscriptionId }}/resourceGroups/${{ parameters.resourceGroup }}/providers/Microsoft.ApiManagement/service/${{ parameters.apimName }}/apis/${{ parameters.apiName }}-${{ parameters.environment }};rev=${{ parameters.apiRevision }}"
+
+      for OPERATION_DIR in ./operations/*/; do
+        if [ -d "$OPERATION_DIR" ]; then
+          OPERATION_ID=$(basename "$OPERATION_DIR")
+          POLICY_FILE="$OPERATION_DIR/policy.xml"
+
+          if [ ! -f "$POLICY_FILE" ]; then
+            continue
+          fi
+
+          OPERATION_POLICY_URL="https://management.azure.com$API_REV_ID/operations/$OPERATION_ID/policies/policy?api-version=2024-05-01"
+          BODY=$(jq -Rs --arg format "xml" '{properties: {format: $format, value: .}}' < "$POLICY_FILE")
+
+          echo "=== Atualizando policy da operação $OPERATION_ID ==="
+          if [[ "${PIPELINE_DEBUG_OUTPUT:-false}" == "true" ]]; then
+            echo "  → URL: $OPERATION_POLICY_URL"
+            echo "  → Request body: $BODY"
+          fi
+
+          HTTP_RESPONSE=$(curl -sS -w "\n%{http_code}" -X PUT \
+            "$OPERATION_POLICY_URL" \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Content-Type: application/json" \
+            --data "$BODY")
+
+          HTTP_BODY=$(echo "$HTTP_RESPONSE" | head -n -1)
+          HTTP_STATUS=$(echo "$HTTP_RESPONSE" | tail -n 1)
+
+          echo "  → HTTP Status: $HTTP_STATUS"
+
+          if [[ "$HTTP_STATUS" -lt 200 || "$HTTP_STATUS" -ge 300 ]]; then
+            echo "❌ Erro ao atualizar policy da operação $OPERATION_ID. HTTP Status: $HTTP_STATUS"
+            echo "  → Response: $HTTP_BODY"
+            exit 1
+          fi
+        fi
+      done
+
+      echo "✅ API Operations Policy criado ou atualizado com sucesso."

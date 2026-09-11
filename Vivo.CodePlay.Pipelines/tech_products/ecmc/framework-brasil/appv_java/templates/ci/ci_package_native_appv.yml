@@ -1,0 +1,196 @@
+parameters:
+  - name: gatesEnabled
+
+stages:
+- stage: ci_package_native
+  displayName: "CI - Package"
+  pool:
+    name: GeneralPurposeLinuxAgentsCI
+  dependsOn:
+  - environment_init
+  - ci_build
+  - ci_build_native
+  - ${{ if eq(parameters.gatesEnabled, True) }}:
+    - ci_quality_gate
+    - ci_security
+  condition: succeeded()
+
+  ## -> Loads variables from other stages.
+  variables:
+  - name: MAVEN_SETTINGS_LOCATION
+    value: $[ stageDependencies.environment_init.environment.outputs['settings_variables.MAVEN_SETTINGS_LOCATION'] ]
+  - name: MAVEN_CUSTOM_SETTINGS_CONTENT
+    value: $[ stageDependencies.environment_init.environment.outputs['custom_settings.MAVEN_CUSTOM_SETTINGS_CONTENT'] ]
+  - name: NEXUS_DEPS_USR
+    value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEPS_USR'] ]    
+  - name: NEXUS_DEPS_PSW
+    value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEPS_PSW'] ] 
+  - name: NEXUS_DEFAULT_USR
+    value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEFAULT_USR'] ]    
+  - name: NEXUS_DEFAULT_PSW
+    value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEFAULT_PSW'] ] 
+  - name: APP_VERSION
+    value: $[ stageDependencies.ci_build.build.outputs['new_version.NEW_VERSION'] ]
+  - name: ARTIFACT_NAME
+    value: $[ stageDependencies.ci_build_native.build.outputs['artifact_name.ARTIFACT_NAME'] ]
+  
+  jobs:
+
+  - job: "Package"
+    condition: succeeded()
+    displayName: "Package"    
+    steps:
+    
+    ## -> Download and uncompress the downloaded artifact.         
+    - task: DownloadBuildArtifacts@1
+      displayName: 'Download Build Artifacts'
+      inputs:
+        artifactName: app
+        cleanDestinationFolder: false
+        extractTars: true
+        parallelizationLimit: 8
+        downloadPath: $(System.ArtifactsDirectory)
+    - task: Bash@3
+      displayName: Artifacts Info
+      inputs:
+        targetType: inline
+        script: |
+          echo "##[debug] Artifact name: '$(ARTIFACT_NAME)'"
+
+          echo "##[debug] Target directory location: '$(pwd "$(DEFAULT_WORKDIR_ARTIFACTS)/$(ARTIFACT_NAME)")'"
+          echo "##[debug] Target directory path: '$(DEFAULT_WORKDIR_ARTIFACTS)/$(ARTIFACT_NAME)'"
+          echo "##[debug] Target directory content:'"
+          echo "$(ls -lh '$(DEFAULT_WORKDIR_ARTIFACTS)/$(ARTIFACT_NAME)')"
+          echo "##[debug] NEW_VERSION: $(APP_VERSION)"
+
+    - task: CmdLine@2
+      displayName: "Define Variables"
+      name: define_variables
+      inputs:
+        workingDirectory: '$(DEFAULT_WORKDIR_ARTIFACTS)/$(ARTIFACT_NAME)/'
+        script: |
+          echo "##[group] Docker Variables"
+          DOCKER_FILE=$(DEFAULT_WORKDIR_ARTIFACTS)/$(ARTIFACT_NAME)/.azuredevops/native.Dockerfile
+          echo "##[debug] DOCKER_FILE...........: ${DOCKER_FILE}"
+          
+          if [ -z "${PACKAGE_REPOSITORY}" ]; then
+            DOCKER_IMAGE_NAME=${IMAGE_NAME}
+          else
+            DOCKER_IMAGE_NAME=${PACKAGE_REPOSITORY}/${IMAGE_NAME}
+          fi
+
+          echo "##[debug] DOCKER_SERVICE_CONNECTION..: ${DOCKER_SERVICE_CONNECTION}"
+          echo "##[debug] DOCKER_IMAGE_NAME..........: ${DOCKER_IMAGE_NAME}"
+          echo "##[debug] DOCKER_IMAGE_TAG...........: ${APP_VERSION}"
+          echo "##vso[task.setvariable variable=DOCKER_IMAGE_NAME;isOutput=true]${DOCKER_IMAGE_NAME}"
+          echo "##vso[task.setvariable variable=DOCKER_IMAGE_TAG]${APP_VERSION}"
+          echo "##vso[task.setvariable variable=DOCKER_FILE]${DOCKER_FILE}"
+          echo "##[endgroup]"
+
+    # ==================================================================
+    # [Compliance] Verifica se o repositório está em conformidade com as políticas de configuração
+    # ==================================================================
+    - task: VivoDevOpsConfigCompliance@1
+      displayName: 'Check DevOps Config Compliance'
+      inputs:
+        workDir: $(DEFAULT_WORKDIR_ARTIFACTS)/$(ARTIFACT_NAME)
+        policySets: |
+          image-definition-files
+
+    - task: Docker@2
+      displayName: Docker Build
+      condition: succeeded()
+      inputs:
+        containerRegistry: $(DOCKER_SERVICE_CONNECTION)
+        command: build
+        repository: $(define_variables.DOCKER_IMAGE_NAME)
+        Dockerfile: $(DOCKER_FILE)
+        buildContext: '$(DEFAULT_WORKDIR_ARTIFACTS)/$(ARTIFACT_NAME)/'
+        arguments: --no-cache --build-arg APPLICATION_NAME=$(APPLICATION_NAME)
+        tags: >
+          $(DOCKER_IMAGE_TAG)
+
+    - task: Docker@2
+      displayName: Docker Push
+      name: dockerPushImage
+      condition: and(
+        succeeded(), 
+        or(
+        eq(variables['Build.SourceBranchName'],'master'),
+        eq(variables['Build.SourceBranchName'],'main'),
+        eq(variables['Build.SourceBranchName'],'prodlike'),
+        eq(variables['Build.SourceBranchName'],'preprod'),
+        eq(variables['Build.SourceBranchName'],'esteira1'),
+        eq(variables['Build.SourceBranchName'],'esteira2'),
+        eq(variables['Build.SourceBranchName'],'dev')))
+      inputs:
+        containerRegistry: $(DOCKER_SERVICE_CONNECTION)
+        command: push
+        repository: $(define_variables.DOCKER_IMAGE_NAME)
+        addPipelineData: true
+        addBaseImageData: true
+        tags: >
+          $(DOCKER_IMAGE_TAG)
+
+    - task: CmdLine@2
+      displayName: Export Image Digest
+      name: docker_digest
+      env:
+        DOCKER_OUTPUT: $(dockerPushImage.DockerOutput)
+      inputs:
+        script: |
+          if [ -f "${DOCKER_OUTPUT}" ]; then
+            echo "DOCKER_OUTPUT file does exist. Setting dockerPushImageSucceeded to 'true'."
+            echo "##vso[task.setvariable variable=dockerPushImageSucceeded;isOutput=true]true"
+          else
+            echo "DOCKER_OUTPUT file does not exist. Setting dockerPushImageSucceeded to 'false'."
+            echo "##vso[task.setvariable variable=dockerPushImageSucceeded;isOutput=true]false"
+          fi
+
+          echo "##[group] ${DOCKER_OUTPUT}"
+          cat ${DOCKER_OUTPUT}
+          echo "##[endgroup]"
+
+          DOCKER_DIGEST="$(cat ${DOCKER_OUTPUT} | grep "digest" | awk -F ' ' '{print $3}')"
+          echo "##[debug] DOCKER_DIGEST..........: ${DOCKER_DIGEST}"
+          echo "##vso[task.setvariable variable=DOCKER_DIGEST;isOutput=true]${DOCKER_DIGEST}"
+
+    - task: CmdLine@2
+      displayName: "Generate docker.json metadata"
+      env:
+        DOCKER_REGISTRY: $(DOCKER_DEFAULT_REGISTRY)
+        DOCKER_IMAGE_NAME: $(DOCKER_IMAGE_NAME)
+        DOCKER_IMAGE_TAG: $(DOCKER_IMAGE_TAG)
+        DOCKER_APP_NAME: $(APP_NAME)
+        DOCKER_APP_VERSION: $(APP_VERSION)
+      inputs:
+        script: |
+          cat <<EOF > docker.json
+          {
+            "DOCKER_REGISTRY": "${DOCKER_REGISTRY}",
+            "DOCKER_IMAGE_NAME": "${DOCKER_IMAGE_NAME}",
+            "DOCKER_IMAGE_TAG": "${DOCKER_IMAGE_TAG}",
+            "DOCKER_APP": "${DOCKER_APP_NAME}",
+            "DOCKER_APP_VERSION": "$(APP_VERSION)",
+            "DOCKER_IMAGE_NAME_FULL": "${DOCKER_REGISTRY}/${DOCKER_IMAGE_NAME}",
+            "GIT_TAG": "${DOCKER_IMAGE_TAG}"
+          }
+          EOF
+
+          echo "##[command] cat docker.json"
+          cat docker.json
+
+    - task: CopyFiles@2
+      displayName: 'Copy to Staging Directory'
+      inputs:
+        TargetFolder: '$(Build.ArtifactStagingDirectory)'
+        OverWrite: true
+        CleanTargetFolder: true
+        Contents: |
+          docker.json
+
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Artifact Docker'
+      inputs:
+        ArtifactName: docker
+        StoreAsTar: false

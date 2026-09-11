@@ -1,0 +1,115 @@
+parameters:
+- name: environment
+- name: packageVersion
+- name: packageName
+- name: appName
+
+variables:
+- group: lib-weblogic
+
+stages:
+- stage: cd_deploy
+  displayName: "CD - Deploy ${{ parameters.environment }}"
+  pool: GeneralPurposeLinuxAgentsCD
+  jobs:
+
+  - deployment: deploy
+    displayName: 'Deploy'
+    environment:
+      name: deploy-${{ parameters.environment }}
+    continueOnError: true
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+
+          - download: none
+
+          - checkout: self
+            fetchDepth: 1
+
+          - task: DownloadPackage@1
+            displayName: 'Download Maven Artifact from Azure Artifacts'
+            inputs:
+              packageType: 'maven'
+              feed: 'DevOps'
+              definition: '${{ parameters.packageName }}'
+              version: '${{ parameters.packageVersion }}'
+              downloadPath: '$(Build.ArtifactStagingDirectory)/downloaded-artifact'
+
+          - task: CmdLine@2
+            displayName: list packages and remove unwanted files
+            condition: succeeded()
+            continueOnError: false
+            inputs:
+              workingDirectory: $(Build.ArtifactStagingDirectory)/downloaded-artifact
+              targetType: inline
+              script: |
+                echo "##[group] Antes da exclusão:"
+                ls -l $(Build.ArtifactStagingDirectory)/downloaded-artifact
+                echo "##[endgroup]"
+                echo "Removendo arquivos que não terminam com .ear, .jar, .ejb ou web"
+                find $(Build.ArtifactStagingDirectory)/downloaded-artifact -type f ! \( \
+                  -name "*.ear" -o \
+                  -name "*.jar" -o \
+                  -name "*.ejb" -o \
+                  -name "*web" \
+                \) -exec rm -f {} +
+
+                echo "##[group] Depois da exclusão:"
+                ls -l $(Build.ArtifactStagingDirectory)/downloaded-artifact
+                echo "##[endgroup]"
+
+          - task: Bash@3
+            displayName: 'Define ARTIFACT_FILE variable'
+            inputs:
+              targetType: 'inline'
+              workingDirectory: $(Build.ArtifactStagingDirectory)/downloaded-artifact
+              script: |
+                ARTIFACT_FILE=$(ls | grep -E '\.ear$|\.jar$|\.ejb$|web$' | head -n 1)
+                echo "Arquivo encontrado: $ARTIFACT_FILE"
+                echo "##vso[task.setvariable variable=ARTIFACT_FILE]$ARTIFACT_FILE"
+
+          - task: YamlParseFromVivo@4
+            displayName: 'Set Weblogic Environment'
+            inputs:
+              type: 'file'
+              origin: $(Build.SourcesDirectory)/.azuredevops/config/${{ parameters.environment }}/weblogic.yml
+              jpaths: |
+                var WEBLOGIC_ADMIN_SERVER_URL = .weblogic['WEBLOGIC_ADMIN_SERVER_URL']
+                var WEBLOGIC_USER = .weblogic['WEBLOGIC_USER']
+                var WEBLOGIC_PASS = .weblogic['WEBLOGIC_PASS']
+                var WEBLOGIC_CLUSTER = .weblogic['WEBLOGIC_CLUSTER']
+                var WEBLOGIC_TIMEOUT = .weblogic['WEBLOGIC_TIMEOUT']
+          
+          - script: |
+              echo "WEBLOGIC_ADMIN_SERVER_URL: $(WEBLOGIC_ADMIN_SERVER_URL)"
+              echo "WEBLOGIC_USER: $(WEBLOGIC_USER)"
+              echo "WEBLOGIC_PASS: $(WEBLOGIC_PASS)"
+              echo "WEBLOGIC_CLUSTER: $(WEBLOGIC_CLUSTER)"
+              echo "WEBLOGIC_TIMEOUT: $(WEBLOGIC_TIMEOUT)"
+            displayName: "Get variables"
+
+          - template: /tech_products/dvps/scripts/weblogic-12.1/StartServers.yml
+            parameters:
+              WEBLOGIC_USER: $(WEBLOGIC_USER)
+              WEBLOGIC_PASS: $(WEBLOGIC_PASS)
+              WEBLOGIC_ADMIN_SERVER_URL: $(WEBLOGIC_ADMIN_SERVER_URL)
+              WEBLOGIC_TIMEOUT: $(WEBLOGIC_TIMEOUT)
+
+          - template: /tech_products/dvps/scripts/weblogic-12.1/UndeployAppRetired.yml
+            parameters:
+              WEBLOGIC_USER: $(WEBLOGIC_USER)
+              WEBLOGIC_PASS: $(WEBLOGIC_PASS)
+              WEBLOGIC_ADMIN_SERVER_URL: $(WEBLOGIC_ADMIN_SERVER_URL)
+              ARTIFACT_ID: ${{ parameters.appName }}
+
+          - template: /tech_products/dvps/scripts/weblogic-12.1/HotDeployApp.yml
+            parameters:
+              WEBLOGIC_USER: $(WEBLOGIC_USER)
+              WEBLOGIC_PASS: $(WEBLOGIC_PASS)
+              WEBLOGIC_ADMIN_SERVER_URL: $(WEBLOGIC_ADMIN_SERVER_URL)
+              ARTIFACT_ID: ${{ parameters.appName }}_${{ parameters.packageVersion }}
+              APPLICATIONS_SERVER_PATH_ARTIFACT_ID: $(Build.ArtifactStagingDirectory)/downloaded-artifact
+              ARTIFACT_FILE: $(ARTIFACT_FILE)
+              WEBLOGIC_CLUSTER: $(WEBLOGIC_CLUSTER)

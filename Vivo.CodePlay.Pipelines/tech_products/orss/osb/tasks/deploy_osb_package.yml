@@ -1,0 +1,63 @@
+parameters:
+- name: qa_environment
+  type: string
+- name: preserve
+  type: string
+
+stages:
+- stage: Deploy_${{ upper(parameters.qa_environment) }}
+  displayName: Deploy ${{ upper(parameters.qa_environment) }}
+  pool: $(PRIVATE_AGENT_DEFAULT_CD)
+  jobs:
+  - job: Deploy
+    steps:  
+    - task: Docker@2
+      displayName: "Login ACR"
+      inputs:
+        containerRegistry: 'ACR-DEVOPS'
+        command: 'login'
+
+    - task: DownloadPackage@1
+      displayName: "Download OSB Builder"
+      inputs:
+        packageType: 'upack'
+        feed: '/3d53bc62-8749-4931-ae46-a443b73bc87a'
+        view: 
+        definition: '$(OSB_BUILDER_ARTIFACTID).jar'
+        version: '$(OSB_BUILDER_VERSION)'
+        downloadPath: '$(Build.SourcesDirectory)'
+
+    - task: DownloadArtifactsNexusMavenRepositoryV3@3
+      displayName: "Download SBConfig"
+      inputs:
+        NexusConnection: 'NEXUS-DEVOPS'
+        RepositoryId: $(NEXUS_PUBLISH_REPOSITORY)
+        GroupId: $(NEXUS_PUBLISH_REPOSITORY_GROUP_ID)
+        ArtifactId: sbconfig_partial
+        BaseVersion: $(Build.SourceBranchName)
+        Packaging: jar
+        DownloadPath: $(Build.SourcesDirectory)
+
+    - bash: |
+          mv sbconfig_partial-$(Build.SourceBranchName).jar sbconfig.jar
+          docker run --rm --entrypoint sh \
+            -v $(Build.SourcesDirectory):/builds \
+            -w / \
+            --hostname azdevops-daet \
+            --dns=$(PRIMARY_DNS) \
+            --dns=$(SECONDARY_DNS) \
+            --dns-search=redecorp.br \
+            --add-host $(QA_${{ upper(parameters.qa_environment) }}_DEPLOY_HOST_LISTENER_NAME):$(QA_${{ upper(parameters.qa_environment) }}_DEPLOY_HOST_IP) \
+            $(JAVA_IMAGE) \
+            -c "cd builds; 
+            java -jar $(OSB_BUILDER_ARTIFACTID).jar \
+             -a osb-deploy \
+             -i sbconfig.jar \
+             -dh $(QA_${{ upper(parameters.qa_environment) }}_DEPLOY_HOST) \
+             -dp $(QA_${{ upper(parameters.qa_environment) }}_DEPLOY_PORT) \
+             -c $(Build.SourceBranchName) \
+             -u $(PIPELINE_DEPLOYER_USER) \
+             -p $(PIPELINE_DEPLOYER_PASS) \
+             -preserve ${{ parameters.preserve }} | tee deploy.log"
+             if grep -q Exception $(Build.SourcesDirectory)/deploy.log; then echo "##vso[task.complete result=Failed;]"; fi
+      displayName: "Deploy to OSB"

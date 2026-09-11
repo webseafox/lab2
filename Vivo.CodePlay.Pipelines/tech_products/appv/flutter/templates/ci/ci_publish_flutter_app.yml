@@ -1,0 +1,221 @@
+parameters:
+- name: qa_environment
+- name: release_notes
+- name: target
+- name: firebase_groups_android
+- name: firebase_groups_ios
+- name: skip_protect
+
+stages:
+
+- stage: publish
+  dependsOn:
+  - package
+  displayName: "Publish Firebase ${{ parameters.qa_environment }}"
+  pool: $(PRIVATE_AGENT_SHARED)
+  jobs:
+
+  - job: select_package
+    displayName: "Select Package"
+    steps:   
+      - task: Bash@3
+        displayName: Name Package 
+        name: export_package
+        inputs:
+          targetType: 'inline'
+          script: |           
+
+            if [[ ${{ parameters.skip_protect }} == False ]] || [[ ${{ parameters.qa_environment }} == 'release' ]] || [[ ${{ parameters.qa_environment }} == 'producao' ]]; then         
+            
+              echo "##[debug]Setting android Package Name Protected"
+              android_package_name='android_package_protected'
+              echo "##vso[task.setvariable variable=ANDROID_PACKAGE_NAME;isOutput=true;]$android_package_name"
+
+              echo "##[debug]Setting ios Package Name Protected"
+              ios_package_name='ios_package_protected'
+              echo "##vso[task.setvariable variable=IOS_PACKAGE_NAME;isOutput=true;]$ios_package_name"
+
+            else 
+
+              echo "##[debug]Setting android Package Name"
+              android_package_name='android_package'
+              echo "##vso[task.setvariable variable=ANDROID_PACKAGE_NAME;isOutput=true;]$android_package_name"
+
+              echo "##[debug]Setting ios Package Name"
+              ios_package_name='ios_package'
+              echo "##vso[task.setvariable variable=IOS_PACKAGE_NAME;isOutput=true;]$ios_package_name"
+
+            fi
+
+  - job: "Publish_android"
+    displayName: "Publish (Android)"
+    dependsOn:
+    - select_package
+    condition: | 
+                and(
+                  always(), 
+                  in('${{ parameters.target }}', 'android', 'both')
+                ) 
+    variables:
+      ANDROID_PACKAGE_NAME: $[ dependencies.select_package.outputs['export_package.ANDROID_PACKAGE_NAME'] ]    
+    pool:
+      vmImage: 'macOS-15'
+    steps:
+
+    - task: Bash@3
+      displayName: 'Create Release Notes File'
+      inputs:
+        targetType: 'inline'
+        script: |
+
+          current_branch=$(echo "$BUILD_SOURCEBRANCH" | awk -F/ '{print $NF}')
+          echo "Current branch is: $current_branch"      
+          build_reason="$BUILD_REASON"
+          echo "Build reason is: $build_reason"
+
+          if [[ "$build_reason" == "PullRequest" || "$build_reason" == "IndividualCI" ]]; then
+            firebase_release_notes="Current branch: $current_branch \n$BUILD_SOURCEVERSIONMESSAGE"
+            echo "PR & Push - Release Notes from PR or Push"
+
+          else 
+            firebase_release_notes="Current branch: $current_branch \n${{ parameters.release_notes }}"
+            echo "Manual - Release Notes from Current Branch and Parameters"
+
+          fi
+
+          echo "Creating release notes file..."
+          printf "%b\n" "$firebase_release_notes" > $(Build.SourcesDirectory)/$(RELEASE_NOTES_PATH)
+          echo "Release notes file created."
+          cat $(Build.SourcesDirectory)/$(RELEASE_NOTES_PATH)
+
+    - task: DownloadPipelineArtifact@2
+      displayName: 'Download Pipeline Artifact'
+      inputs:
+        buildType: current
+        artifactName: $(ANDROID_PACKAGE_NAME)
+        targetPath: '$(System.ArtifactsDirectory)'
+        itemPattern: '**'
+
+    # Desativado - usando token do firebase para upload
+    # - task: DownloadSecureFile@1
+    #   name: firebaseKey
+    #   displayName: 'Download Firebase Key'
+    #   inputs:
+    #     secureFile: $(FIREBASE_KEY_FILE_NAME)
+
+    - task: Bash@3
+      displayName: "Upload to firebase app distribution"
+      inputs:
+        targetType: "inline"
+        script: |
+          npm i -g firebase-tools
+          case "${{ parameters.qa_environment }}" in
+            preprod)
+              FIREBASE_APP_ID="$(FIREBASE_ANDROID_APP_ID_BETA)"
+              echo "Using BETA Firebase Android App ID: $FIREBASE_APP_ID"
+              ;;
+            producao)
+              FIREBASE_APP_ID="$(FIREBASE_ANDROID_APP_ID)"
+              echo "Using PRODUCTION Firebase Android App ID: $FIREBASE_APP_ID"
+              ;;
+            *)
+              FIREBASE_APP_ID="$(FIREBASE_ANDROID_APP_ID_BETA)"
+              echo "Using BETA Firebase Android App ID (default): $FIREBASE_APP_ID"
+              ;;
+          esac    
+          firebase appdistribution:distribute '$(System.ArtifactsDirectory)/$(APP_FILE_NAME_ANDROID).apk' \
+          --app "$FIREBASE_APP_ID" \
+          --release-notes-file '$(Build.SourcesDirectory)/$(RELEASE_NOTES_PATH)' \
+          --groups "${{ parameters.firebase_groups_android }}" \
+          --token "$(FIREBASE_KEY)"
+      # env:
+      #   GOOGLE_APPLICATION_CREDENTIALS: $(firebaseKey.secureFilePath)
+
+  - job: "Publish_ios"
+    displayName: "Publish (iOS)"
+    dependsOn:
+    - select_package
+    condition: | 
+                and(
+                  always(),
+                  in('${{ parameters.target }}', 'ios', 'both')
+                ) 
+    variables:
+      IOS_PACKAGE_NAME: $[ dependencies.select_package.outputs['export_package.IOS_PACKAGE_NAME'] ]    
+    pool:
+      vmImage: 'macOS-15'
+    steps:
+
+    - task: Bash@3
+      displayName: 'Create Release Notes File'
+      inputs:
+        targetType: 'inline'
+        script: |
+          current_branch=$(echo "$BUILD_SOURCEBRANCH" | awk -F/ '{print $NF}')
+          echo "Current branch is: $current_branch"      
+          build_reason="$BUILD_REASON"
+          echo "Build reason is: $build_reason"
+
+          if [[ "$build_reason" == "PullRequest" || "$build_reason" == "IndividualCI" ]]; then
+            firebase_release_notes="Current branch: $current_branch \n$BUILD_SOURCEVERSIONMESSAGE"
+            echo "PR & Push - Release Notes from PR or Push"
+
+          else 
+            firebase_release_notes="Current branch: $current_branch \n${{ parameters.release_notes }}"
+            echo "Manual - Release Notes from Current Branch and Parameters"
+
+          fi
+
+          echo "Creating release notes file..."
+          printf "%b\n" "$firebase_release_notes" > $(Build.SourcesDirectory)/$(RELEASE_NOTES_PATH)
+          echo "Release notes file created."
+          cat $(Build.SourcesDirectory)/$(RELEASE_NOTES_PATH)
+
+    - task: DownloadPipelineArtifact@2
+      displayName: 'Download Pipeline Artifact'
+      inputs:
+        buildType: current
+        artifactName: $(IOS_PACKAGE_NAME)
+        targetPath: '$(System.ArtifactsDirectory)'
+        itemPattern: '**'
+
+    # Desativado - usando token do firebase para upload
+    # - task: DownloadSecureFile@1
+    #   name: firebaseKey
+    #   displayName: 'Download Firebase Key'
+    #   inputs:
+    #     secureFile: $(FIREBASE_KEY_FILE_NAME)
+
+    - task: Bash@3
+      displayName: "Upload to firebase app distribution"
+      inputs:
+        targetType: "inline"
+        script: |
+          npm i -g firebase-tools
+          
+          case "${{ parameters.qa_environment }}" in
+            preprod)
+              FIREBASE_APP_ID="$(FIREBASE_IOS_APP_ID_BETA)"
+              APP_FILE_NAME_IOS="$(APP_BUNDLE_NAME_IOS_BETA)"
+              echo "Using BETA Firebase iOS App File Name: $APP_FILE_NAME_IOS"
+              ;;
+            producao)
+              FIREBASE_APP_ID="$(FIREBASE_IOS_APP_ID)"
+              APP_FILE_NAME_IOS="$(APP_BUNDLE_NAME_IOS_PROD)"
+              echo "Using PRODUCTION Firebase iOS App ID: $FIREBASE_APP_ID"
+              echo "Using PRODUCTION Firebase iOS App File Name: $APP_FILE_NAME_IOS"
+              ;;
+            *)
+              FIREBASE_APP_ID="$(FIREBASE_IOS_APP_ID_BETA)"
+              APP_FILE_NAME_IOS="$(APP_BUNDLE_NAME_IOS_BETA)"
+              echo "Using BETA Firebase iOS App File Name: $APP_FILE_NAME_IOS"
+              ;;
+          esac
+          
+          firebase appdistribution:distribute "$(System.ArtifactsDirectory)/${APP_FILE_NAME_IOS}.ipa" \
+            --app "$FIREBASE_APP_ID" \
+            --release-notes-file "$(Build.SourcesDirectory)/$(RELEASE_NOTES_PATH)" \
+            --groups "${{ parameters.firebase_groups_ios }}" \
+            --token "$(FIREBASE_KEY)"
+      # env:
+      #   GOOGLE_APPLICATION_CREDENTIALS: $(firebaseKey.secureFilePath)

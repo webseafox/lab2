@@ -1,0 +1,111 @@
+parameters:
+- name: environment
+  type: string
+- name: packageVersion
+  default: ''
+
+steps:
+  ## -> Download HELM Registry Credentials for NEXUS
+  - task: AzureKeyVault@2
+    displayName: 'Getting AKV credentials'
+    condition: and(
+      succeeded(),
+      ne(variables['HELM_REGISTRY_ACR_ENABLED'], 'true'))
+    timeoutInMinutes: 1
+    retryCountOnTaskFailure: 5
+    inputs:
+      azureSubscription: DevOpsSharedResources
+      KeyVaultName: $(AKV_DEVOPS_NAME)
+      SecretsFilter: 'HELM-REGISTRY-NEXUS-USERNAME, HELM-REGISTRY-NEXUS-PASSWORD'
+
+  ## -> Download HELM Registry Credentials for ACR
+  - task: AzureKeyVault@2
+    displayName: 'Getting AKV credentials'
+    condition: and(
+      succeeded(),
+      eq(variables['HELM_REGISTRY_ACR_ENABLED'], 'true'),
+      eq(variables['HELM-REGISTRY-ACR-USERNAME'], ''),
+      eq(variables['HELM-REGISTRY-ACR-PASSWORD'], ''))
+    timeoutInMinutes: 1
+    retryCountOnTaskFailure: 5
+    inputs:
+      azureSubscription: DevOpsSharedResources
+      KeyVaultName: $(AKV_DEVOPS_NAME)
+      SecretsFilter: 'HELM-REGISTRY-ACR-USERNAME, HELM-REGISTRY-ACR-PASSWORD'
+
+  ## -> Download Docker Registry Credentials
+  - task: AzureKeyVault@2
+    displayName: 'Getting AKV credentials'
+    condition: and(
+      succeeded(),
+      eq(variables['DOCKER-REGISTRY-USERNAME'], ''),
+      eq(variables['DOCKER-REGISTRY-PASSWORD'], ''))
+    timeoutInMinutes: 1
+    retryCountOnTaskFailure: 5
+    inputs:
+      azureSubscription: DevOpsSharedResources
+      KeyVaultName: $(AKV_DEVOPS_NAME)
+      SecretsFilter: 'DOCKER-REGISTRY-USERNAME, DOCKER-REGISTRY-PASSWORD'
+
+  ## -> Set HELM and DOCKER credentials to variables. This allows it to used in other stages, jobs or tasks.
+  - task: Bash@3
+    displayName: 'Set Credentials Variables'
+    name: credentials
+    condition: succeeded()
+    continueOnError: false
+    inputs:
+      targetType: 'inline'
+      script: |
+        echo "##[group] Secrets for HELM"
+        echo "##[debug] HELM-REGISTRY-NEXUS-USERNAME: $(HELM-REGISTRY-NEXUS-USERNAME). Use as >> HELM_REGISTRY_NEXUS_USERNAME. "
+        echo "##vso[task.setvariable variable=HELM_REGISTRY_NEXUS_USERNAME;isOutput=true;isSecret=true]$(HELM-REGISTRY-NEXUS-USERNAME)"
+        echo "##[debug] HELM-REGISTRY-NEXUS-PASSWORD: $(HELM-REGISTRY-NEXUS-PASSWORD). Use as >> HELM_REGISTRY_NEXUS_PASSWORD. "
+        echo "##vso[task.setvariable variable=HELM_REGISTRY_NEXUS_PASSWORD;isOutput=true;isSecret=true]$(HELM-REGISTRY-NEXUS-PASSWORD)"
+        echo "##[debug] HELM-REGISTRY-ACR-USERNAME: $(HELM-REGISTRY-ACR-USERNAME). Use as >> HELM_REGISTRY_ACR_USERNAME. "
+        echo "##vso[task.setvariable variable=HELM_REGISTRY_ACR_USERNAME;isOutput=true;isSecret=true]$(HELM-REGISTRY-ACR-USERNAME)"
+        echo "##[debug] HELM-REGISTRY-ACR-PASSWORD: $(HELM-REGISTRY-ACR-PASSWORD). Use as >> HELM_REGISTRY_ACR_PASSWORD. "
+        echo "##vso[task.setvariable variable=HELM_REGISTRY_ACR_PASSWORD;isOutput=true;isSecret=true]$(HELM-REGISTRY-ACR-PASSWORD)"
+        echo "##[endgroup]"
+
+        echo "##[group] Secrets for Docker"
+        echo "##[debug] DOCKER-REGISTRY-USERNAME: $(DOCKER-REGISTRY-USERNAME). Use as >> DOCKER_REGISTRY_USERNAME"
+        echo "##vso[task.setvariable variable=DOCKER_REGISTRY_USERNAME;isOutput=true;isSecret=true]$(DOCKER-REGISTRY-USERNAME)"
+        echo "##[debug] DOCKER-REGISTRY-PASSWORD: $(DOCKER-REGISTRY-PASSWORD). Use as >> DOCKER_REGISTRY_PASSWORD"
+        echo "##vso[task.setvariable variable=DOCKER_REGISTRY_PASSWORD;isOutput=true;isSecret=true]$(DOCKER-REGISTRY-PASSWORD)"
+        echo "##[endgroup]"
+        echo "##[debug] To open and check the information above, click the arrows on the left."
+      KeyVaultName: $(AKV_DEVOPS_NAME)
+      SecretsFilter: 'NEXUS-DEPS-USR, NEXUS-DEPS-PSW, NEXUS-DEFAULT-USR, NEXUS-DEFAULT-PSW'
+
+  ## -> Wether it is deploy Only, check if Docker image is available in the registry
+  - ${{ if ne(parameters.packageVersion, '')}}:
+    - task: Bash@3
+      displayName: 'Check Docker Image Availability'
+      condition: and(
+          succeeded(), 
+          ne(variables['DISABLE_IMAGE_CHECK'], 'true'))
+      retryCountOnTaskFailure: 5
+      inputs:
+        targetType: 'inline'
+        script: |
+          deployVersion="${{ parameters.packageVersion }}"
+          imageURL="$(NEXUS_ENDPOINT_API_REPOSITORY)/search?docker.imageName=${GOV_APP_ACRONYM}/${APP_NAME}&docker.imageTag=$deployVersion"
+
+          echo "##[debug] Image Tag  : $deployVersion"
+          echo "##[debug] Image Name : ${GOV_APP_ACRONYM}/${APP_NAME}"
+          echo "##[debug] Checking if the Docker image exists on Nexus..."
+
+          echo "##[group] Image Query Log"
+          statusCode=$(curl -u '$(credentials.DOCKER_REGISTRY_USERNAME):$(credentials.DOCKER_REGISTRY_PASSWORD)' -X GET "$imageURL")
+          echo "##[debug] HTTP result status code: $statusCode"
+          echo "##[endgroup]"
+
+          ## -> Check if the image exists
+          if [ -z "$statusCode" ] || [ "$(echo $statusCode | jq -r '.items | length')" -eq 0 ]; then
+            echo "##vso[task.logissue type=error] Docker image not found for ${GOV_APP_ACRONYM}/${APP_NAME}:$deployVersion"
+            echo "##[error] Please, check if the specified image and tag/version exists on Nexus, or Nexus availability."
+            echo "##[error] Wether everything is correct, rerun the Job."
+            echo "##vso[task.complete result=Failed;]"
+          else
+            echo "##[debug] Docker image found for ${GOV_APP_ACRONYM}/${APP_NAME}:$deployVersion"
+          fi

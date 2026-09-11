@@ -1,0 +1,172 @@
+parameters:
+  - name: jobName
+    type: string
+  - name: nextVersion
+    type: string
+  - name: commitSHA
+    type: string
+
+steps:
+  - task: Docker@2
+    displayName: "Docker Login"
+    condition: succeeded()
+    inputs:
+      containerRegistry: $(REGISTRY_SERVICE_CONNECTION)
+      command: login
+
+  - task: Docker@2
+    displayName: "Docker Login on ACR"
+    condition: succeeded()
+    inputs:
+      containerRegistry: $(REGISTRY_SERVICE_CONNECTION)
+      command: login
+
+  # ==================================================================
+  # [Compliance] Verifica se o repositório está em conformidade com as políticas de configuração
+  # ==================================================================
+  - task: VivoDevOpsConfigCompliance@1
+    displayName: 'Check DevOps Config Compliance'
+    inputs:
+      workDir: $(Build.SourcesDirectory)
+      policySets: |
+        image-definition-files
+
+  - task: Docker@2
+    displayName: "Docker Build"
+    condition: succeeded()
+    inputs:
+      containerRegistry: $(REGISTRY_SERVICE_CONNECTION)
+      command: build
+      repository: $(GOV_APP_ACRONYM)/$(Build.Repository.Name)
+      Dockerfile: $(Build.SourcesDirectory)/.azuredevops/runtime.Dockerfile
+      buildContext: '$(Build.SourcesDirectory)'
+      tags: $(Build.SourceBranchName),${{ parameters.nextVersion }}
+
+  - task: Bash@3
+    displayName: "Prepare Reports Directory"
+    inputs:
+      targetType: inline
+      script: |
+        mkdir -p $(Build.SourcesDirectory)/unit-reports $(Build.SourcesDirectory)/lint-reports $(Build.SourcesDirectory)/sec-reports
+        chmod 777 $(Build.SourcesDirectory)/unit-reports $(Build.SourcesDirectory)/lint-reports $(Build.SourcesDirectory)/sec-reports
+
+  - task: Docker@2
+    displayName: "Running Linting Tests"
+    inputs:
+      containerRegistry: $(REGISTRY_SERVICE_CONNECTION)
+      command: run
+      arguments: >
+        --rm
+        -v $(Build.SourcesDirectory)/lint-reports:/test-reports
+        $(REGISTRY_NAME)/$(GOV_APP_ACRONYM)/$(Build.Repository.Name):${{ parameters.nextVersion }}
+        sh -c "/home/myuser/venv/bin/python -m pylint -vv app --output=/test-reports/pylint-report.txt --output-format=text --score=yes 2>&1 || true"
+
+  - task: Bash@3
+    displayName: "Linting Results"
+    inputs:
+      targetType: inline
+      script: |
+        REPORT_FILE="$(Build.SourcesDirectory)/lint-reports/pylint-report.txt"
+        if [ -f "$REPORT_FILE" ]; then
+          if grep -q "Your code has been rated at" "$REPORT_FILE"; then
+            echo "📊 Pontuação do Pylint:"
+            grep "Your code has been rated at" "$REPORT_FILE"
+          else
+            echo "Nenhuma pontuação encontrada no relatório do pylint."
+          fi
+        else
+          echo "Arquivo de relatório do pylint não encontrado."
+        fi
+
+  - task: Docker@2
+    displayName: "Running Bandit Tests"
+    inputs:
+      containerRegistry: $(REGISTRY_SERVICE_CONNECTION)
+      command: run
+      arguments: >
+        --rm
+        -v $(Build.SourcesDirectory)/sec-reports:/test-reports
+        $(REGISTRY_NAME)/$(GOV_APP_ACRONYM)/$(Build.Repository.Name):${{ parameters.nextVersion }}
+        sh -c "/home/myuser/venv/bin/python -m bandit -r app -f json -o /test-reports/bandit-report.json || true"
+
+  - task: Bash@3
+    displayName: "Bandit Results"
+    inputs:
+      targetType: inline
+      script: |
+        REPORT="$(Build.SourcesDirectory)/sec-reports/bandit-report.json"
+        if [ -f "$REPORT" ]; then
+          echo "📊 Resumo de segurança:"
+          count=$(jq '.results | length' "$REPORT")
+          echo "Issues encontrados: $count"
+          jq -r '.results[:5][] | "\(.issue_severity): \(.test_name)"' "$REPORT"
+        else
+          echo "Relatório gerado ou arquivo não encontrado."
+        fi
+
+  - task: Docker@2
+    displayName: "Running Unit Tests"
+    inputs:
+      containerRegistry: $(REGISTRY_SERVICE_CONNECTION)
+      command: run
+      arguments: >
+        --rm
+        -v $(Build.SourcesDirectory)/unit-reports:/test-reports
+        $(REGISTRY_NAME)/$(GOV_APP_ACRONYM)/$(Build.Repository.Name):${{ parameters.nextVersion }}
+        sh -c "/home/myuser/venv/bin/python -m pytest tests --cov=app --cov-report=xml:/test-reports/coverage.xml --cov-report=term --junit-xml=/test-reports/junit-report.xml --tb=short --cov-config=.coveragerc"
+
+  - task: Docker@2
+    displayName: Docker Push
+    inputs:
+      containerRegistry: $(REGISTRY_SERVICE_CONNECTION)
+      repository: $(GOV_APP_ACRONYM)/$(Build.Repository.Name)
+      command: push
+      tags: $(Build.SourceBranchName),${{ parameters.nextVersion }}
+    condition: succeeded()
+  
+  - task: Bash@3
+    displayName: "Clean Up"
+    condition: always()
+    continueOnError: true
+    inputs:
+      targetType: inline
+      script: |
+        echo "##[command] docker rmi ${REGISTRY}/${IMAGE_REPOSITORY}:${IMAGE_VERSION}"
+        docker rmi ${REGISTRY}/${IMAGE_REPOSITORY}:${IMAGE_VERSION}
+    env:
+      REGISTRY: $(REGISTRY_NAME)
+      IMAGE_REPOSITORY: $(GOV_APP_ACRONYM)/$(Build.Repository.Name)
+      IMAGE_VERSION: ${{ parameters.nextVersion }}
+
+  - task: PublishPipelineArtifact@1
+    displayName: "Publishing Test Results"
+    inputs:
+      targetPath: '$(Build.SourcesDirectory)/unit-reports/junit-report.xml'
+      artifactName: junit-report
+      publishLocation: 'pipeline'
+
+  - task: PublishPipelineArtifact@1
+    displayName: "Publishing Code Coverage Results"
+    inputs:
+      targetPath: '$(Build.SourcesDirectory)/unit-reports/coverage.xml'
+      artifactName: coverage-report
+      publishLocation: 'pipeline'
+
+  - task: PublishPipelineArtifact@1
+    displayName: "Publishing Linting Results"
+    inputs:
+      targetPath: '$(Build.SourcesDirectory)/lint-reports/pylint-report.txt'
+      artifactName: pylint-report
+      publishLocation: 'pipeline'
+
+  - task: PublishPipelineArtifact@1
+    displayName: "Publishing Bandit Results"
+    inputs:
+      targetPath: '$(Build.SourcesDirectory)/sec-reports/bandit-report.json'
+      artifactName: bandit-report
+      publishLocation: 'pipeline'
+
+  - template: /tech_products/ecvv/templates/tasks/artifacts/publish_app.yml
+    parameters:
+      artifactPublishName: 'app'
+

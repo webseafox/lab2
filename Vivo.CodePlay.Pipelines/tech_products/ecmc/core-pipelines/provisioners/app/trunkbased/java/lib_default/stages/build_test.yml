@@ -1,0 +1,113 @@
+parameters:
+- name: enableDevflowValidations
+  type: boolean
+  default: False
+- name: run_integration_tests
+  type: boolean
+  default: False
+- name: run_mutation_tests
+  type: boolean
+  default: False
+
+stages:
+- stage: build_test
+  displayName: "Build & Test Library"
+  dependsOn: [pipeline_init]
+  variables:
+  - name: SYSTEM_ACCESSTOKEN
+    value: $(System.AccessToken)
+  jobs:
+  - job: build_test
+    displayName: "Build & Test Library"
+    pool:
+      vmImage: $(AZURE_VM_IMAGE)
+    steps:
+
+    # INIT PIPELINE INFO
+    - template: /tech_products/ecmc/core-pipelines/provisioners/app/trunkbased/java/templates/pipeline_info.yml
+
+    # Configure git
+    - template: /tech_products/ecmc/core-pipelines/provisioners/app/trunkbased/java/templates/init/configure_git.yml
+
+    # Download build artifacts from previous stage
+    - template: /tech_products/ecmc/core-pipelines/provisioners/app/trunkbased/java/templates/artifacts/download_stage_artifacts.yml
+      parameters:
+        artifactName: "$(ARTIFACTS_NAME)"
+        stageArtifactName: "init"
+
+    # LOAD PROJECT INFO FROM JSON
+    - template: /tech_products/ecmc/core-pipelines/provisioners/app/trunkbased/java/templates/init/load_project_info.yml
+      parameters:
+        projectInfoJsonPath: "$(PROJECT_INFO_JSON_PATH)"
+
+    # SET GLOBAL VALUES
+    - template: /tech_products/ecmc/core-pipelines/provisioners/app/trunkbased/java/templates/init/set_global_variables.yml
+
+    # Setup Java/Maven environment
+    - template: /tech_products/ecmc/core-pipelines/provisioners/app/trunkbased/java/templates/java/setup_java_environment.yml
+
+    # Cache Maven dependencies
+    - template: /tech_products/ecmc/core-pipelines/provisioners/app/trunkbased/java/templates/cache/cache_maven_dependencies.yml
+
+    # Build Library
+    - template: /tech_products/ecmc/core-pipelines/provisioners/app/trunkbased/java/templates/java/maven_build.yml
+      parameters:
+        mavenGoals: $(MAVEN_BUILD_GOALS)
+        mavenOptions: $(MAVEN_OPTIONS)
+
+    # Unit Tests (excluding integration tests)
+    - template: /tech_products/ecmc/core-pipelines/provisioners/app/trunkbased/java/templates/java/maven_test.yml
+      parameters:
+        mavenGoals: $(MAVEN_TEST_GOALS)
+        mavenOptions: $(MAVEN_OPTIONS)
+        publishTestResults: true
+        publishCodeCoverage: true
+        testDisplayName: "Unit Tests"
+
+    # Integration Tests (if enabled)
+    - ${{ if eq(parameters.run_integration_tests, True) }}:
+      - template: /tech_products/ecmc/core-pipelines/provisioners/app/trunkbased/java/templates/java/maven_test.yml
+        parameters:
+          mavenGoals: $(MAVEN_COMPONENT_TEST_GOALS)
+          mavenOptions: $(MAVEN_OPTIONS)
+          publishTestResults: true
+          testDisplayName: "Integration Tests"
+
+    # Mutation Tests (if enabled)
+    - ${{ if eq(parameters.run_mutation_tests, True) }}:
+      - template: /tech_products/ecmc/core-pipelines/provisioners/app/trunkbased/java/templates/java/maven_mutation_test.yml
+        parameters:
+          mavenGoals: $(MAVEN_MUTATION_TEST_GOALS)
+          mavenOptions: $(MAVEN_OPTIONS)
+          minimumMutationCoverage: $(MINIMUM_MUTATION_COVERAGE)
+
+    # Generate library artifacts (JAR, sources, javadoc)
+    - template: /tech_products/ecmc/core-pipelines/provisioners/app/trunkbased/java/templates/java/maven_package.yml
+      parameters:
+        mavenGoals: $(MAVEN_PACKAGE_GOALS)
+        mavenOptions: $(MAVEN_OPTIONS)
+        generateSources: $(SOURCES_JAR_ENABLED)
+        generateJavadoc: $(JAVADOC_JAR_ENABLED)
+
+    # Publish build artifacts
+    - template: /tech_products/ecmc/core-pipelines/provisioners/app/trunkbased/java/templates/artifacts/publish_stage_artifacts.yml
+      parameters:
+        artifactName: "$(ARTIFACTS_NAME)"
+        stageArtifactName: "build_test"
+        
+    # Store coverage results
+    - template: /tech_products/ecmc/core-pipelines/provisioners/app/trunkbased/java/templates/artifacts/publish_coverage_artifacts.yml
+      parameters:
+        codeCoverageArtifactName: "$(COVERAGE_ARTIFACTS_NAME)"
+
+    # Store library artifacts (JAR files)
+    - template: /tech_products/ecmc/core-pipelines/provisioners/app/trunkbased/java/templates/artifacts/publish_library_artifacts.yml
+      parameters:
+        libraryArtifactName: "$(LIBRARY_ARTIFACTS_NAME)"
+        jarArtifactPath: $(JAR_ARTIFACT_PATH)
+
+    # DevFlow validations (if enabled)
+    - ${{ if eq(parameters.enableDevflowValidations, True) }}:
+      - template: /tech_products/ecmc/core-pipelines/provisioners/app/trunkbased/java/templates/devflow/validate_test_coverage.yml
+        parameters:
+          minimumCoverage: $(MINIMUM_CODE_COVERAGE)

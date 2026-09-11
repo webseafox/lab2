@@ -1,0 +1,270 @@
+stages:
+  - stage: stage_publish
+    displayName: "Publish"
+    pool: $(POOL)
+    dependsOn:
+      - stage_prep
+      - stage_download
+      - stage_process
+      - stage_security_analysis
+    condition: |
+      and(
+        in(dependencies.stage_prep.result, 'Succeeded', 'SucceededWithIssues'),
+        in(dependencies.stage_download.result, 'Succeeded', 'Skipped'),
+        eq(dependencies.stage_process.result, 'Succeeded'),
+        eq(dependencies.stage_security_analysis.result, 'Succeeded')
+      )
+    jobs:
+      - job: publish_preparation
+        displayName: "Preparation"
+        variables:
+          - name: LOAD_IMAGE_LOG_FILE
+            value: $(Pipeline.Workspace)/load_image_log.txt
+        steps:
+          - checkout: none
+          - template: ../../../tasks/bash/get_job_agent.yml
+          - template: ../../../task_groups/artifact/download.yml
+            parameters:
+              displayName: Download Pipeline Artifact [$(SOURCE_CODE_FOLDER)]
+              artifactName: "$(SOURCE_CODE_FOLDER)"
+              targetPath: "$(SOURCE_CODE_FOLDER_PATH)"
+          - template: ../../../task_groups/artifact/download.yml
+            parameters:
+              displayName: Download Pipeline Artifact [$(TAR_IMAGES_FOLDER)]
+              artifactName: "$(TAR_IMAGES_FOLDER)"
+              targetPath: "$(TAR_IMAGES_FOLDER_PATH)"
+          # ==================================================================
+          # [Compliance] Verifica se o repositório está em conformidade com as políticas de configuração
+          # ==================================================================
+          - task: VivoDevOpsConfigCompliance@1
+            displayName: 'Check DevOps Config Compliance'
+            inputs:
+              workDir: $(SOURCE_CODE_FOLDER_PATH)
+              policySets: |
+                image-definition-files
+          - task: CmdLine@2
+            name: load_image
+            displayName: "Load Image"
+            inputs:
+              script: |
+                echo "##[debug] ACR BRM REPOSITORY ..............................................................: $(ACR_BRM_REPOSITORY)"
+                echo "##[debug] TAR IMAGES FOLDER PATH ..........................................................: $(TAR_IMAGES_FOLDER_PATH)"
+                echo "##[debug] PUSH PATH IN ACR ................................................................: $(PUSH_PATH_ACR)"
+                echo "##[debug] IMAGE CUSTOM TAG ................................................................: $(IMAGE_CUSTOM_TAG)"
+                echo ""
+
+                # This script loads the Oracle base images from the .tar files.
+                ATF=""
+                LOADED_IMAGES=""
+
+                echo "##[command]find $(TAR_IMAGES_FOLDER_PATH) -name "*.tar" 2>/dev/null) && echo "$ALL_TAR_FILES""
+                while IFS= read -r tar_file || [[ -n "$tar_file" ]]; do
+                  if [ "${#ATF}" -gt 0 ]; then
+                    ATF+=";$tar_file"
+                  else
+                    ATF+="$tar_file"
+                  fi
+                done <<< "$(ALL_TAR_FILES=$(find $(TAR_IMAGES_FOLDER_PATH) -type f \( -name "*.tar" -o -name "*.tar.gz" \) 2>/dev/null) && echo "$ALL_TAR_FILES")"
+                echo "##[debug] ALL TAR FILES ...................................................................: $ATF"
+
+                if [[ $(echo "$ATF" | tr ';' '\n' | wc -l) -gt 1 ]]; then
+                  echo "##[debug]⚠️ Multiple .tar files detected, $IMAGE_CUSTOM_TAG will not be applied"
+                fi
+                if [ "$(PUSH_PATH_ACR)" != "-" ] && [ "$(IMAGE_CUSTOM_TAG)" != "-" ]; then
+                  echo "##[debug]⚠️ The path in ACR will not be used: $PUSH_PATH_ACR"
+                fi
+
+                IFS=';' read -ra ADDR <<< "$ATF"
+                for tar_file in "${ADDR[@]}"; do
+                    printf "\n>>>>>>>>>> Found .tar File: $tar_file"
+                    printf "\n>>>>>>>>>>>>>>> Loading Image ...\n"
+
+                    echo "##[command]docker load --input $tar_file"
+                    LOADED_IMAGE=$(docker load --input $tar_file)
+
+                    IMG_APP_RAW=$(IFS=':' read -ra comp_file <<< $LOADED_IMAGE && echo "${comp_file[1]}" | tr -d '[:space:]')
+
+                    if [[ "$IMG_APP_RAW" == localhost/* ]]; then
+                      IMG_APP=${IMG_APP_RAW#localhost/}
+                    else
+                      IMG_APP=$IMG_APP_RAW
+                    fi
+                    
+                    IMG_VERSION=$(IFS=':' read -ra comp_file <<< $LOADED_IMAGE && echo "${comp_file[2]}" | tr -d '[:space:]')
+                    
+                    echo "##[debug] IMAGE LOADED ....................................................................: $IMG_APP_RAW:$IMG_VERSION"
+
+                    if [ "$(PUSH_PATH_ACR)" == "-" ]; then
+                      IMAGE_TAGGED=$(ACR_BRM_REPOSITORY)$IMG_APP:$IMG_VERSION
+                    else
+                      IMAGE_TAGGED=$(ACR_BRM_REPOSITORY)$(echo -n $(PUSH_PATH_ACR) | tr '[:upper:]' '[:lower:]')/$IMG_APP:$IMG_VERSION
+                    fi
+
+                    if [ "$(IMAGE_CUSTOM_TAG)" != "-" ] && [[ $(echo "$ATF" | tr ';' '\n' | wc -l) -le 1 ]]; then
+                      IMAGE_TAGGED=$(ACR_BRM_REPOSITORY)$(echo -n $(IMAGE_CUSTOM_TAG) | tr '[:upper:]' '[:lower:]')
+                    fi
+
+                    printf "\n>>>>>>>>>>>>>>> TAG Image from [docker.io/library/$IMG_APP_RAW:$IMG_VERSION] to [$IMAGE_TAGGED] ...\n"
+                    echo "##[command]docker tag $IMG_APP_RAW:$IMG_VERSION $IMAGE_TAGGED"
+                    docker tag $IMG_APP_RAW:$IMG_VERSION $IMAGE_TAGGED
+
+                    if [[ $tar_file == *"cm-"* ]] && [ "$(ORACLE_IMAGE_LINK)" != "-" ]; then
+                      if [ "$(PUSH_PATH_ACR)" == "-" ]; then
+                        IMG_TAG_CUSTOM=$(ACR_BRM_REPOSITORY)$IMG_APP:base_$IMG_VERSION
+                      else
+                        IMG_TAG_CUSTOM=$(ACR_BRM_REPOSITORY)$(echo $(PUSH_PATH_ACR) | tr '[:upper:]' '[:lower:]')/$IMG_APP:base_$IMG_VERSION
+                      fi
+
+                      printf "\n\n############### Customizing the CM Oracle Base Image [$IMG_APP_RAW:$IMG_VERSION] to [$IMG_TAG_CUSTOM] ...\n"
+                      
+                      echo "##[debug] CUSTOM IMAGE TAG ................................................................: $IMG_TAG_CUSTOM"
+
+                      echo "##[command]docker build --no-cache -f $(SOURCE_CODE_FOLDER_PATH)/cm/Dockerfile --build-arg CM_ORACLE_BASE_IMAGE=$IMG_APP_RAW:$IMG_VERSION -t $IMG_TAG_CUSTOM $(SOURCE_CODE_FOLDER_PATH)/cm 2>&1 | tee $(LOAD_IMAGE_LOG_FILE)"
+                      echo "##[group]Docker build $IMG_TAG_CUSTOM"
+                      docker build --no-cache -f $(SOURCE_CODE_FOLDER_PATH)/cm/Dockerfile --build-arg CM_ORACLE_BASE_IMAGE=$IMG_APP_RAW:$IMG_VERSION -t $IMG_TAG_CUSTOM $(SOURCE_CODE_FOLDER_PATH)/cm 2>&1 | tee $(LOAD_IMAGE_LOG_FILE)
+                      echo "##[endgroup]"
+
+                      if [ "${#LOADED_IMAGES}" -gt 0 ]; then
+                        LOADED_IMAGES+=";$IMG_TAG_CUSTOM"
+                      else
+                        LOADED_IMAGES+="$IMG_TAG_CUSTOM"
+                      fi
+                    fi
+
+                    if [ "${#LOADED_IMAGES}" -gt 0 ]; then
+                      LOADED_IMAGES+=";$IMAGE_TAGGED"
+                    else
+                      LOADED_IMAGES+="$IMAGE_TAGGED"
+                    fi
+
+                    echo "##[debug] IMAGES LOADED TAG ...............................................................: $LOADED_IMAGES"
+                done
+
+                echo "##vso[task.setvariable variable=LOADED_IMAGES;isoutput=true]$LOADED_IMAGES"
+
+                echo "========================================================== Images Loaded =========================================================="
+                docker images | grep $(ACR_BRM_REPOSITORY)
+                echo "==================================================================================================================================="
+            env:
+              DOCKER_BUILDKIT: 1
+          - template: ../../../tasks/bash/check_errors_v2.yml
+            parameters:
+              step: "Load Image"
+              outputFile: $(LOAD_IMAGE_LOG_FILE)
+
+      - job: confirm_publish
+        displayName: "Confirm Publish Images"
+        pool: server
+        dependsOn: publish_preparation
+        condition: in(dependencies.publish_preparation.result, 'Succeeded')
+        variables:
+          - name: LOADED_IMAGES
+            value: $[ dependencies.publish_preparation.outputs['load_image.LOADED_IMAGES'] ]
+        steps:
+          - task: ManualValidation@0
+            name: publish_validation
+            displayName: "Confirm Publish Images"
+            timeoutInMinutes: 180 # task times out in 3 hours
+            inputs:
+              notifyUsers: ""
+              instructions: "Do you confirm the publication of images [$(LOADED_IMAGES)]?"
+
+      - job: confirm_publish_details
+        displayName: "Approval Details"
+        dependsOn: confirm_publish
+        condition: in(dependencies.confirm_publish.result, 'Succeeded', 'Failed')
+        steps:
+          - checkout: none
+          - template: ../../../tasks/bash/approval_details.yml
+
+      - job: publish
+        displayName: "Publish Images"
+        dependsOn:
+          - publish_preparation
+          - confirm_publish
+          - confirm_publish_details
+        condition: |
+          and (
+            in(dependencies.publish_preparation.result, 'Succeeded'),
+            in(dependencies.confirm_publish.result, 'Succeeded'),
+            in(dependencies.confirm_publish_details.result, 'Succeeded')
+          )
+        variables:
+          - name: JOB_AGENT_NAME
+            value: $[ dependencies.publish_preparation.outputs['get_job_agent.JOB_AGENT_NAME'] ]
+          - name: LOADED_IMAGES
+            value: $[ dependencies.publish_preparation.outputs['load_image.LOADED_IMAGES'] ]
+        pool:
+          name: $(POOL)
+          demands:
+            - Agent.Name -equals $(JOB_AGENT_NAME)
+        steps:
+          - checkout: none
+          - task: Docker@2
+            displayName: "Docker Login in [$(DOCKER_ACR_REGISTRY)]"
+            inputs:
+              command: "login"
+              containerRegistry: $(DOCKER_ACR_REGISTRY_SERVICE_CONNECTION_NAME)
+          - task: CmdLine@2
+            displayName: "Publish in [$(ACR_BRM_REPOSITORY)]"
+            inputs:
+              script: |
+                echo "##[debug] ACR BRM REPOSITORY.........................................: $ACR_BRM_REPOSITORY"
+                echo "##[debug] LOADED IMAGES..............................................: $LOADED_IMAGES"
+
+                # This script publishes the loaded images to the specified registry.
+                IFS=';' read -ra ADDR <<< "$(LOADED_IMAGES)"
+                for img in "${ADDR[@]}"; do
+                  APP_IMG=${img##*/}
+                  printf "\n>>>>>>>>>> Publishing the image [$APP_IMG] to [$(ACR_BRM_REPOSITORY)] ...\n"
+
+                  echo "##[command]docker push $img"
+                  docker push $img
+                done
+            env:
+              DOCKER_BUILDKIT: 1
+          - task: Docker@2
+            displayName: "Docker Logout in [$(DOCKER_ACR_REGISTRY)]"
+            inputs:
+              command: "logout"
+              containerRegistry: $(DOCKER_ACR_REGISTRY_SERVICE_CONNECTION_NAME)
+
+      - job: publish_validate
+        displayName: "Validate"
+        dependsOn:
+          - publish_preparation
+          - confirm_publish
+          - confirm_publish_details
+          - publish
+        condition: |
+          and (
+            in(dependencies.publish_preparation.result, 'Succeeded'),
+            in(dependencies.confirm_publish.result, 'Succeeded'),
+            in(dependencies.confirm_publish_details.result, 'Succeeded'),
+            in(dependencies.publish.result, 'Succeeded')
+          )
+        variables:
+          - name: LOADED_IMAGES
+            value: $[ dependencies.publish_preparation.outputs['load_image.LOADED_IMAGES'] ]
+        steps:
+          - checkout: none
+          - task: CmdLine@2
+            displayName: "Validate Publish Oracle Images in [$(ACR_BRM_REPOSITORY)]"
+            inputs:
+              script: |
+                echo "##[debug] ACR REGISTRY NAME ...........................................: $(ACR_REGISTRY_NAME)"
+                echo "##[debug] ACR BRM REPOSITORY ..........................................: $ACR_BRM_REPOSITORY"
+                echo "##[debug] ACR USER ....................................................: $ACR_USER"
+                echo "##[debug] LOADED IMAGES ...............................................: $LOADED_IMAGES"
+
+                # This script validates the publication of the images in the specified registry.
+                IFS=';' read -ra ADDR <<< "$(LOADED_IMAGES)"
+                for img in "${ADDR[@]}"; do
+                  img=${img#$(ACR_BRM_REPOSITORY)}
+                  APP_IMG=$img
+
+                  printf "\n>>>>>>>>>> Validating the publication of image [$APP_IMG] in [$(ACR_BRM_REPOSITORY)] ...\n"
+
+                  echo "##[command]az acr repository show -n $(ACR_REGISTRY_NAME) --image fnix/$APP_IMG --output table -u $(ACR_USER) -p $(ACR_PASSWORD)"
+                  az acr repository show -n $(ACR_REGISTRY_NAME) --image fnix/$APP_IMG --output table -u $(ACR_USER) -p $(ACR_PASSWORD)
+                done

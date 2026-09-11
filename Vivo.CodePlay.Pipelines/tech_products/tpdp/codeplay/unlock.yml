@@ -1,0 +1,258 @@
+trigger: none
+
+parameters:
+- name: environment
+  displayName: Environment
+  type: string
+  default: dev
+  values: [dev, test, prod]
+
+- name: environmentType
+  displayName: environment Type
+  type: string
+  default: nonprod
+  values:
+  - nonprod
+  - prod
+
+- name: action
+  displayName: Action  
+  type: string
+  default: unlock
+  values: [unlock, status, force-unlock]
+
+- name: workDir
+  displayName: 'Diretório'
+  type: string
+  default: 'foundation'
+  values:
+  - foundation
+  - storage
+  - databricks
+
+- name: repository_name
+  displayName: 'Nome do Repositório'
+  type: string
+  default: comp-tpl-modelo-azure-databricks
+  values:
+  - comp-tf-azure-databricks
+  - comp-tpl-modelo-azure-databricks
+
+- name: jsonConfig
+  type: string
+
+variables:
+- name: valuesFile
+  value: 'values.json'
+# Configurações fixas do ambiente (seguindo padrão terraform init)
+- name: storageAccount
+  value: 'sttfstatedevopsshared'
+- name: resourceGroup
+  value: 'rg-devops-sharedservices'
+- name: serviceConnection
+  value: 'SharedResources'
+
+stages:
+- stage: UnlockTerraformState
+  displayName: 'Terraform State Unlock'
+  jobs:
+  - job: Unlock
+    displayName: 'Unlock Operation'
+    pool:
+      name: GeneralPurposeLinuxAgentsCD
+      
+    steps:
+    - checkout: self
+      displayName: 'Checkout project files'
+
+    - bash: |
+        echo '${{ parameters.jsonConfig }}' > values.json
+        echo "Arquivo values.json criado:"
+        cat values.json
+      displayName: 'Criar values.json a partir do parâmetro'
+
+    - powershell: |
+        # Ler path completo do values.json
+        $values = Get-Content "$(valuesFile)" | ConvertFrom-Json
+        
+        $fullPath = $values.fullPath
+        Write-Host "##[section]Configuration:"
+        Write-Host "Full Path from terraform error: $fullPath"
+        
+        # Validações básicas
+        if ([string]::IsNullOrWhiteSpace($fullPath)) {
+          Write-Host "##[error]❌ fullPath is required in values.json"
+          Write-Host "Copy the exact path from terraform error message"
+          exit 1
+        }
+        
+        # Parse container and blob path from full path
+        # Example: "nonprod/foundation.tfstate"
+        # Container: "terraform-state-dev"  
+        # Blob: "foundation.tfstate"
+        
+        $pathParts = $fullPath.Split('/', 2)
+        if ($pathParts.Length -ne 2) {
+          Write-Host "##[error]❌ Invalid path format. Expected: container/blob/path"
+          Write-Host "Example: nonprod/foundation.tfstate"
+          exit 1
+        }
+        
+        $containerName = $pathParts[0]
+        $blobPath = $pathParts[1]
+        
+        Write-Host "Parsed components:"
+        Write-Host "  Storage Account: $(storageAccount)"
+        Write-Host "  Resource Group: $(resourceGroup)"
+        Write-Host "  Container: [$containerName]"
+        Write-Host "  Blob Path: [$blobPath]"
+        Write-Host "  Action: ${{ parameters.action }}"
+        Write-Host ""
+        Write-Host "DEBUG - Exact values:"
+        Write-Host "  Container Length: $($containerName.Length)"
+        Write-Host "  Blob Path Length: $($blobPath.Length)"
+        Write-Host "  Container chars: $([System.Text.Encoding]::UTF8.GetBytes($containerName) -join ',')"
+        
+        # Passar valores para próximos steps
+        Write-Host "##vso[task.setvariable variable=containerName]$containerName"
+        Write-Host "##vso[task.setvariable variable=blobPath]$blobPath" 
+        Write-Host "##vso[task.setvariable variable=fullPath]$fullPath"
+      displayName: 'Parse Terraform State Path'
+      
+    - task: AzureCLI@2
+      displayName: 'Terraform State Unlock - $(fullPath)'
+      inputs:
+        azureSubscription: '$(serviceConnection)'
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          set -euo pipefail
+          
+          echo "##[section]Starting terraform state unlock operation..."
+          
+          STORAGE_ACCOUNT="$(storageAccount)"
+          CONTAINER="$(containerName)" 
+          BLOB_PATH="$(blobPath)"
+          ACTION="${{ parameters.action }}"
+          FULL_PATH="$(fullPath)"
+          
+          echo "Configuration received:"
+          echo "  Storage Account: [$STORAGE_ACCOUNT]"
+          echo "  Container: [$CONTAINER]"
+          echo "  Blob Path: [$BLOB_PATH]"
+          echo "  Full Path: [$FULL_PATH]"
+          echo "  Action: [$ACTION]"
+          echo ""
+          echo "DEBUG - Variable validations:"
+          echo "  STORAGE_ACCOUNT length: ${#STORAGE_ACCOUNT}"
+          echo "  CONTAINER length: ${#CONTAINER}"
+          echo "  BLOB_PATH length: ${#BLOB_PATH}"
+          
+          # Basic validations
+          if [ -z "$STORAGE_ACCOUNT" ]; then
+            echo "##[error]❌ STORAGE_ACCOUNT is empty"
+            exit 1
+          fi
+          
+          if [ -z "$CONTAINER" ]; then
+            echo "##[error]❌ CONTAINER is empty"
+            exit 1
+          fi
+          
+          if [ -z "$BLOB_PATH" ]; then
+            echo "##[error]❌ BLOB_PATH is empty"
+            exit 1
+          fi
+          
+          # Verificar se arquivo existe
+          echo "🔍 Checking if terraform state exists..."
+          echo "Command being executed:"
+          echo "az storage blob show --account-name \"$STORAGE_ACCOUNT\" --container-name \"$CONTAINER\" --name \"$BLOB_PATH\" --output none"
+          echo ""
+          if ! az storage blob show \
+            --account-name "$STORAGE_ACCOUNT" \
+            --container-name "$CONTAINER" \
+            --name "$BLOB_PATH" \
+            --output none 2>/dev/null; then
+            echo "##[error]❌ Terraform state file not found: $FULL_PATH"
+            echo ""
+            echo "🔧 Detailed diagnostics:"
+            echo "  Storage Account: $STORAGE_ACCOUNT"
+            echo "  Container: $CONTAINER" 
+            echo "  Blob Path: $BLOB_PATH"
+            echo ""
+            echo "Let's check what we can access..."
+            echo ""
+            echo "1. Testing basic Azure CLI connectivity:"
+            az account show --query "name" -o tsv 2>/dev/null || echo "❌ Azure CLI not authenticated properly"
+            echo ""
+            echo "2. Listing available storage accounts we can see:"
+            az storage account list --query "[].name" -o table 2>/dev/null || true
+            echo "" 
+            echo "3. Trying to list containers in target storage account:"
+            az storage container list --account-name "$STORAGE_ACCOUNT" --query "[].name" --output table 2>&1 || echo "❌ Cannot access storage account - check service connection permissions"
+            echo ""
+            echo "4. If container exists, trying to list blobs:"
+            if az storage container show --account-name "$STORAGE_ACCOUNT" --name "$CONTAINER" --output none 2>/dev/null; then
+              echo "✅ Container [$CONTAINER] exists, listing blobs:"  
+              az storage blob list --account-name "$STORAGE_ACCOUNT" --container-name "$CONTAINER" --query "[].name" --output table 2>/dev/null || echo "❌ Cannot list blobs in container"
+            else
+              echo "❌ Container [$CONTAINER] does not exist or no access"
+            fi
+            exit 1
+          fi
+          
+          # Verificar status atual do lease
+          echo "📊 Checking current lease status..."
+          LEASE_STATUS=$(az storage blob show \
+            --account-name "$STORAGE_ACCOUNT" \
+            --container-name "$CONTAINER" \
+            --name "$BLOB_PATH" \
+            --query "properties.lease.status" \
+            --output tsv 2>/dev/null || echo "unknown")
+          
+          echo "Current lease status: $LEASE_STATUS"
+          
+          if [[ "$ACTION" == "status" ]]; then
+            echo "##[section]📋 Status check completed"
+            echo "Lease Status: $LEASE_STATUS"
+            exit 0
+          fi
+          
+          # Se já está unlocked, não precisa fazer nada
+          if [[ "$LEASE_STATUS" == "available" || "$LEASE_STATUS" == "unlocked" ]]; then
+            echo "##[warning]✅ File is already unlocked - no action needed"
+            exit 0
+          fi
+          
+          # Executar unlock
+          echo "🔓 Executing unlock operation..."
+          if az storage blob lease break \
+            --account-name "$STORAGE_ACCOUNT" \
+            --container-name "$CONTAINER" \
+            --blob-name "$BLOB_PATH" \
+            --lease-break-period 0 \
+            --output none; then
+            echo "##[section]✅ SUCCESS: Terraform state unlocked successfully!"
+          else
+            echo "##[error]❌ Failed to unlock terraform state"
+            exit 1
+          fi
+          
+          # Verificação final
+          sleep 2
+          FINAL_STATUS=$(az storage blob show \
+            --account-name "$STORAGE_ACCOUNT" \
+            --container-name "$CONTAINER" \
+            --name "$BLOB_PATH" \
+            --query "properties.lease.status" \
+            --output tsv 2>/dev/null || echo "unknown")
+          
+          echo "##[section]📊 Final Status: $FINAL_STATUS"
+          
+          if [[ "$FINAL_STATUS" == "available" || "$FINAL_STATUS" == "unlocked" ]]; then
+            echo "🎉 Operation completed successfully!"
+          else
+            echo "##[error]Operation may have failed - status is still: $FINAL_STATUS"
+            exit 1
+          fi

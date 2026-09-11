@@ -1,0 +1,170 @@
+parameters:
+  - name: projectPrefix
+    type: string
+
+steps:
+  - checkout: CodeHealerSCA
+    clean: true
+    displayName: "Checkout CodeHealer Repository"
+
+  - task: AzureKeyVault@2
+    displayName: "Getting AKV Credentials"
+    timeoutInMinutes: 1
+    retryCountOnTaskFailure: 5
+    inputs:
+      azureSubscription: DevOpsSharedResources
+      KeyVaultName: $(AKV_DEVOPS_NAME)
+      SecretsFilter: "CONVISO-API-KEY"
+
+  - task: CmdLine@2
+    displayName: "Fetching SCA Targets from Conviso"
+    name: fetchMatrix
+    retryCountOnTaskFailure: 3
+    env:
+      CONVISO_STATUSES: $(CONVISO_STATUSES)
+      CONVISO_API_KEY: $(CONVISO-API-KEY)
+      CONVISO_COMPANY_ID: $(CONVISO_COMPANY_ID)
+      IGNORE_REPOS_REGEX: $(IGNORE_REPOS_REGEX)
+      REPOS_SCAN_LIMIT: $(REPOS_SCAN_LIMIT)
+      TARGET_VULN_COUNT: $(TARGET_VULN_COUNT)
+    inputs:
+      script: |
+        set -euo pipefail
+
+        COMPANY_ID="$CONVISO_COMPANY_ID"
+        PROJECT_PREFIX="${{ parameters.projectPrefix }}"
+        LIMIT="${REPOS_SCAN_LIMIT:-10}"
+        TARGET_VULN="${TARGET_VULN_COUNT:-5}"
+        IGNORE_REGEX="${IGNORE_REPOS_REGEX:-}"
+        PATTERN_SUFFIX="DevSecOps"
+        API_URL="https://api.app.convisoappsec.com/graphql"
+        STATUSES="${CONVISO_STATUSES:-IDENTIFIED}"
+
+        echo "##[section]Iniciando coleta de targets SCA npm | prefix=$PROJECT_PREFIX limit=$LIMIT target<=$TARGET_VULN | Statuses: $STATUSES | Ignore regex: $IGNORE_REGEX"
+
+        conviso_gql() {
+          local response
+          response=$(curl -sf --retry 3 --retry-delay 5 --retry-connrefused \
+            -X POST \
+            -H "x-api-key: $CONVISO_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "$1" "$API_URL")
+          if echo "$response" | jq -e '.errors' >/dev/null 2>&1; then
+            echo "##vso[task.logissue type=error]GraphQL error: $(echo "$response" | jq -c '.errors')"
+            exit 1
+          fi
+          echo "$response"
+        }
+
+        echo "##[debug] Chamada assets com prefix '$PROJECT_PREFIX'..."
+
+        ASSETS_PAYLOAD=$(jq -n -c --arg companyId "$COMPANY_ID" --arg name "$PROJECT_PREFIX" '{
+          "operationName": "AssetsPrefix",
+          "variables": {
+            "companyId": $companyId,
+            "search": { "name": $name, "sortBy": "updated_at", "order": "DESC" },
+            "limit": 500,
+            "page": 1
+          },
+          "query": "query AssetsPrefix($companyId: ID!, $limit: Int, $page: Int, $search: AssetsSearch) { assets(companyId: $companyId, limit: $limit, page: $page, search: $search) { collection { id name } metadata { totalCount } } }"
+        }')
+
+        ASSETS_RESPONSE=$(conviso_gql "$ASSETS_PAYLOAD")
+
+        TOTAL_ASSETS=$(echo "$ASSETS_RESPONSE" | jq '.data.assets.metadata.totalCount')
+        echo "##[debug] Total assets com prefix: $TOTAL_ASSETS"
+
+        if [[ "$TOTAL_ASSETS" -eq 0 ]]; then
+          echo "##vso[task.logissue type=warning]Nenhum asset encontrado com o prefix '$PROJECT_PREFIX'."
+          echo "##vso[task.setvariable variable=SCA_TARGETS;isOutput=true]{}"
+          exit 0
+        fi
+
+        ASSET_IDS=$(echo "$ASSETS_RESPONSE" | jq '[.data.assets.collection[].id]')
+        ASSET_MAP=$(echo "$ASSETS_RESPONSE" | jq '[.data.assets.collection[] | {key: .id, value: .name}] | from_entries')
+
+        echo "##[debug] Asset IDs extraídos: $(echo "$ASSET_IDS" | jq 'length')"
+        echo "##[debug] Checando issues HIGH+CRITICAL para os assets do prefix..."
+
+        ISSUES_PAYLOAD=$(jq -n -c \
+          --arg companyId "$COMPANY_ID" \
+          --argjson assetIds "$ASSET_IDS" \
+          --arg scaStatuses "$STATUSES" '{
+          "operationName": "ScaNpmIssues",
+          "variables": {
+            "companyId": $companyId,
+            "filters": {
+              "statuses":   ($scaStatuses | split(",")),
+              "severities": ["HIGH", "CRITICAL"],
+              "assetIds":   $assetIds
+            },
+            "pagination": { "page": 1, "perPage": 500 }
+          },
+          "query": "query ScaNpmIssues($companyId: ID!, $filters: IssuesFiltersInput, $pagination: PaginationInput!) { issues(companyId: $companyId, filters: $filters, pagination: $pagination) { collection { asset { id } severity ... on ScaFinding { detail { fileName } } } } }"
+        }')
+
+        ISSUES_RESPONSE=$(conviso_gql "$ISSUES_PAYLOAD")
+        ISSUES_COUNT=$(echo "$ISSUES_RESPONSE" | jq '.data.issues.collection | length')
+        echo "##[debug] Issues retornados para o prefix: $ISSUES_COUNT"
+
+        if [[ "$ISSUES_COUNT" -eq 0 ]]; then
+          echo "##vso[task.logissue type=warning]Nenhuma issue HIGH/CRITICAL identificada para os assets do prefix."
+          echo "##vso[task.setvariable variable=SCA_TARGETS;isOutput=true]{}"
+          exit 0
+        fi
+
+        MATRIX_JSON=$(jq -n -c \
+          --argjson issues   "$(echo "$ISSUES_RESPONSE" | jq '.data.issues.collection')" \
+          --argjson assetMap "$ASSET_MAP" \
+          --arg     suffix   "$PATTERN_SUFFIX" \
+          --arg     prefix   "$PROJECT_PREFIX" \
+          --arg     ignore   "$IGNORE_REGEX" \
+          --argjson target   "$TARGET_VULN" \
+          --argjson limit    "$LIMIT" '
+
+          ($issues
+            | map(select(
+                .detail.fileName != null
+                and (.detail.fileName | startswith("pkg:npm/"))
+              ))
+            | group_by(.asset.id)
+            | map({
+                id:        .[0].asset.id,
+                name:      $assetMap[.[0].asset.id],
+                vulnCount: length
+              })
+            | map(select(.vulnCount <= $target))
+            | map(select(
+                $ignore == ""
+                or ((.name | gsub(" \($suffix).*$"; "") | ltrimstr($prefix)) | test($ignore) | not)
+              ))
+            | sort_by(.vulnCount)
+            | .[0:$limit]
+            | map(
+                (.name | gsub(" \($suffix).*$"; ""))   as $cleanName |
+                ($cleanName | ltrimstr($prefix))        as $repoName  |
+                {
+                  (($repoName | gsub("[^a-zA-Z0-9_]"; "_"))): {
+                    "REPO_NAME":           $repoName,
+                    "DT_APP_DEFAULT_NAME": $cleanName,
+                    "CONVISO_ASSET_ID":    .id,
+                    "VULN_COUNT":          (.vulnCount | tostring)
+                  }
+                }
+              )
+            | add // {}
+          )
+        ')
+
+        SELECTED=$(echo "$MATRIX_JSON" | jq 'keys | length')
+
+        if [[ "$SELECTED" -eq 0 ]]; then
+          echo "##vso[task.logissue type=warning]Nenhum asset elegível após filtros."
+          MATRIX_JSON="{}"
+        else
+          echo "##[group]$SELECTED repositórios selecionados:"
+          echo "$MATRIX_JSON" | jq -r 'to_entries[] | "  \(.value.REPO_NAME) | npm HIGH+CRITICAL=\(.value.VULN_COUNT)"'
+          echo "##[endgroup]"
+        fi
+
+        echo "##vso[task.setvariable variable=SCA_TARGETS;isOutput=true]$(echo "$MATRIX_JSON" | jq -c .)"

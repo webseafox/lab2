@@ -1,0 +1,102 @@
+parameters:
+  - name: runSync
+    type: boolean
+
+steps:
+  # ==================================================================
+  # [Compliance] Verifica se o repositório está em conformidade com as políticas de configuração
+  # ==================================================================
+  - task: VivoDevOpsConfigCompliance@1
+    displayName: 'Check DevOps Config Compliance'
+    inputs:
+      policySets: |
+        image-definition-files
+
+  - task: Bash@3
+    displayName: "Run NPM Install via builder.Dockerfile"
+    condition: and(succeeded(), eq(variables['VERSION_OK'], 'true'), eq('${{ parameters.runSync }}', 'true'))
+    env:
+      HTTPS_PROXY: $(PROXY_AGENT_HTTPS)
+      HTTP_PROXY: $(PROXY_AGENT_HTTP)
+      NO_PROXY: $(PROXY_AGENT_NO_PROXY)
+      COMMAND_BUILD: $(COMMAND_BUILD)
+    inputs:
+      workingDirectory: $(REPO_NAME)
+      targetType: inline
+      script: |
+        echo "##[section]#################### NPM INSTALL VIA BUILDER ####################"
+
+        BUILDER_IMAGE_NAME="builder/node"
+        echo "##[debug] Builder Image Name: $BUILDER_IMAGE_NAME"
+
+        echo "##[group]Compilando a imagem base do builder"
+        docker build --no-cache --pull -t $BUILDER_IMAGE_NAME -f .azuredevops/builder.Dockerfile .
+        echo "##[endgroup]"
+
+        echo "##[debug] Command to be executed................: $COMMAND_BUILD"
+
+        echo "##[group]Rodando container de dependências"
+        docker run --rm \
+          --user="$(DOCKER_CMD_USERNAME):$(DOCKER_CMD_GROUP)" \
+          --network host \
+          --log-driver none \
+          -e NPM_CONFIG_USERCONFIG="/tmp/.npmrc" \
+          -e HTTPS_PROXY="$HTTPS_PROXY" \
+          -e HTTP_PROXY="$HTTP_PROXY" \
+          -e NO_PROXY="$NO_PROXY" \
+          -v $(pwd):/app \
+          -v $(pwd)/.npmrc:/tmp/.npmrc \
+          -w /app \
+          $BUILDER_IMAGE_NAME sh -c "$COMMAND_BUILD"
+
+        DOCKER_EXIT_CODE=$?
+        echo "##[endgroup]"
+
+        if [ $DOCKER_EXIT_CODE -ne 0 ]; then
+          echo "##vso[task.logissue type=error]Falha ao executar npm install via builder.Dockerfile."
+          echo "##vso[task.complete result=Failed;]"
+          exit $DOCKER_EXIT_CODE
+        fi
+
+  - task: Bash@3
+    displayName: "Docker Build (runtime.Dockerfile)"
+    condition: and(succeeded(), eq(variables['VERSION_OK'], 'true'), eq('${{ parameters.runSync }}', 'true'))
+    env:
+      HTTPS_PROXY: $(PROXY_AGENT_HTTPS)
+      HTTP_PROXY: $(PROXY_AGENT_HTTP)
+      NO_PROXY: $(PROXY_AGENT_NO_PROXY)
+    inputs:
+      workingDirectory: $(REPO_NAME)
+      targetType: inline
+      script: |
+        echo "##[section]#################### DOCKER BUILD RUNTIME ####################"
+
+        IMAGE_TAG="$(REPO_NAME)-sca:latest"
+        echo "##[debug] Building runtime image for Syft: $IMAGE_TAG"
+
+        echo "##[group]Docker Build Execution"
+        docker build --no-cache \
+          --build-arg APPLICATION_NAME="$(REPO_NAME)" \
+          --build-arg APP_VERSION="$(DT_APP_DEFAULT_VERSION)" \
+          --build-arg HTTP_PROXY="$HTTP_PROXY" \
+          --build-arg HTTPS_PROXY="$HTTPS_PROXY" \
+          --build-arg NO_PROXY="$NO_PROXY" \
+          -t "$IMAGE_TAG" \
+          -f .azuredevops/runtime.Dockerfile .
+        echo "##[endgroup]"
+
+  - task: SyftInstall@1
+    displayName: "Install Syft"
+    condition: and(succeeded(), eq(variables['VERSION_OK'], 'true'), eq('${{ parameters.runSync }}', 'true'))
+    inputs:
+      mode: custom
+      useCache: true
+      version: 1.19.0
+
+  - task: GenerateSbomSyft@1
+    displayName: "Generating SBOM with Syft"
+    condition: and(succeeded(), eq(variables['VERSION_OK'], 'true'), eq('${{ parameters.runSync }}', 'true'))
+    inputs:
+      useDockerImage: true
+      imageSource: "$(REPO_NAME)-sca:latest"
+      reportPath: "$(REPO_NAME)/cyclonedx_report.json"

@@ -1,0 +1,147 @@
+parameters:
+- name: qa_environment
+  type: string
+- name: run_component_test
+  type: boolean
+- name: skip_deploy
+  type: boolean
+  default: False
+- name: dev_namespace_to_deploy
+  type: string
+  default: ''
+- name: argocd_enabled
+  type: boolean
+  default: False
+- name: enableDevflowValidations
+  type: boolean
+  default: False
+
+variables:
+- template: /tech_products/srus/provisioners/app/trunkbased/python/api_default/variables/load.yml
+
+resources:
+  repositories:
+    - repository: FortifyExclusion
+      name: DevOps/Vivo.Fortify.Exclusions
+      type: git
+      ref: refs/heads/master
+      endpoint: CorePipelines
+    - repository: CorePipelinesScripts
+      name: DevOps/Vivo.Core.Pipelines.Scripts
+      type: git
+      ref: refs/heads/master
+      endpoint: CorePipelines
+
+stages:
+# CI / CD Flow
+
+## INIT
+- template: /tech_products/srus/provisioners/app/trunkbased/python/api_default/stages/init.yml
+
+- ${{ if or( and( ne(variables['Build.Reason'], 'PullRequest'), in(variables['Build.SourceBranch'], 'refs/heads/main', 'refs/heads/master')), and(startsWith(variables['Build.SourceBranch'], 'refs/heads/'), ne(parameters.dev_namespace_to_deploy, '')) ) }}:
+  ## VALIDATE PREDEFINED STANDARDS (COMMIT MESSAGES, BRANCH NAME ETC)
+  - ${{ if eq(parameters.enableDevflowValidations, True) }}:
+    - template: /tech_products/srus/provisioners/app/trunkbased/python/api_default/stages/validate_standards_dev_flow.yml
+  
+  ## BUILD & TEST
+  - template: /tech_products/srus/provisioners/app/trunkbased/python/api_default/stages/build_test.yml
+    parameters:
+      enableDevflowValidations: ${{ parameters.enableDevflowValidations }}
+
+  ## GATES
+  - template: /tech_products/srus/provisioners/app/trunkbased/python/api_default/stages/gates.yml
+    parameters:
+      environment: "${{parameters.qa_environment}}"
+
+  ## SECURITY
+  - template: /tech_products/srus/provisioners/app/trunkbased/python/api_default/stages/security.yml
+    parameters:
+      fortifyExclusionRepository: FortifyExclusion
+
+  ## PACKAGE
+  - template: /tech_products/srus/provisioners/app/trunkbased/python/api_default/stages/package.yml
+    parameters:
+      run_component_test: "${{parameters.run_component_test}}"
+      dev_namespace_to_deploy: ${{ parameters.dev_namespace_to_deploy }}
+
+- ${{ if or( and( ne(variables['Build.Reason'], 'PullRequest'), in(variables['Build.SourceBranch'], 'refs/heads/main', 'refs/heads/master')), and(startsWith(variables['Build.SourceBranch'], 'refs/heads/'), ne(parameters.dev_namespace_to_deploy, '')) ) }}:
+  - ${{ if eq(parameters.enableDevflowValidations, True) }}:
+  ## FINALIZE PRE VALIDATIONS 
+    - template: /tech_products/srus/provisioners/app/trunkbased/python/api_default/stages/pos_validate_standards_dev_flow.yml
+
+  ## VALIDATIONS
+  - template: /tech_products/srus/provisioners/app/trunkbased/python/api_default/stages/validation.yml
+
+  ## COMPONENT TEST
+  - template: /tech_products/srus/provisioners/app/trunkbased/python/api_default/stages/component_test.yml
+    parameters:
+      run_component_test: "${{parameters.run_component_test}}"
+
+  ## DEPLOY
+  - template: /tech_products/srus/provisioners/app/trunkbased/python/api_default/stages/deploy.yml
+    parameters:
+      ${{ if and( or(ne(parameters.qa_environment, ''), eq(parameters.qa_environment, 'dev') ), eq(parameters.dev_namespace_to_deploy, '') ) }}:
+        environment: ${{ parameters.qa_environment }}
+      argocd_enabled: ${{ parameters.argocd_enabled }}
+      ${{ elseif ne(parameters.dev_namespace_to_deploy, '') }}:
+        environment: ${{ parameters.dev_namespace_to_deploy }}
+      dev_namespace_to_deploy: ${{ parameters.dev_namespace_to_deploy }}
+      private_agent_pool: $(PRIVATE_AGENT_DEV)
+      kubeconfig: $(KUBECONFIG_DEV)
+      git_tag: true
+      helm_release_name_prefix: $(DEFAULT_PREFIX_HELM_RELEASE_NAME_DEV)
+      skip_deploy: ${{ parameters.skip_deploy }}
+
+# Manual Release Flow
+- ${{ if startsWith(variables['Build.SourceBranch'], 'refs/tags/') }}:
+  - template: /tech_products/srus/provisioners/app/trunkbased/python/api_default/stages/release.yml
+    parameters:
+      argocd_enabled: ${{ parameters.argocd_enabled }}
+      ${{ if eq(parameters.qa_environment, 'dev') }}:
+        environment: dev
+        private_agent_pool: $(PRIVATE_AGENT_DEV)
+        kubeconfig: $(KUBECONFIG_DEV)
+        git_tag: false
+        helm_release_name_prefix: $(DEFAULT_PREFIX_HELM_RELEASE_NAME_DEV)
+
+      ${{ if eq(parameters.qa_environment, 'esteira1') }}:
+        environment: esteira1
+        private_agent_pool: $(PRIVATE_AGENT_ESTEIRA1)
+        kubeconfig: $(KUBECONFIG_ESTEIRA1)
+        git_tag: false
+        helm_release_name_prefix: $(DEFAULT_PREFIX_HELM_RELEASE_NAME_ESTEIRA1)
+
+      ${{ if eq(parameters.qa_environment, 'esteira2') }}:
+        environment: esteira2
+        private_agent_pool: $(PRIVATE_AGENT_ESTEIRA2)
+        kubeconfig: $(KUBECONFIG_ESTEIRA2)
+        git_tag: false
+        helm_release_name_prefix: $(DEFAULT_PREFIX_HELM_RELEASE_NAME_ESTEIRA2)
+
+      ${{ if eq(parameters.qa_environment, 'preprod') }}:
+        environment: preprod
+        private_agent_pool: $(PRIVATE_AGENT_PREPROD)
+        kubeconfig: $(KUBECONFIG_PREPROD)
+        git_tag: false
+        helm_release_name_prefix: $(DEFAULT_PREFIX_HELM_RELEASE_NAME_PREPROD)
+
+      ${{ if eq(parameters.qa_environment, 'prodlike') }}:
+        environment: prodlike
+        private_agent_pool: $(PRIVATE_AGENT_PRODLIKE)
+        kubeconfig: $(KUBECONFIG_PRODLIKE)
+        git_tag: false
+        helm_release_name_prefix: $(DEFAULT_PREFIX_HELM_RELEASE_NAME_PRODLIKE)
+
+      ${{ if eq(parameters.qa_environment, 'producao') }}:
+        environment: producao
+        private_agent_pool: $(PRIVATE_AGENT_PRODUCAO)
+        kubeconfig: $(KUBECONFIG_PRODUCAO)
+        git_tag: false
+        helm_release_name_prefix: $(DEFAULT_PREFIX_HELM_RELEASE_NAME_PRODUCAO)
+
+      ${{ if eq(parameters.qa_environment, 'bsim') }}:
+        environment: bsim
+        private_agent_pool: $(PRIVATE_AGENT_PRODUCAO)
+        kubeconfig: $(KUBECONFIG_PRODUCAO)
+        git_tag: false
+        helm_release_name_prefix: $(DEFAULT_PREFIX_HELM_RELEASE_NAME_BSIM)

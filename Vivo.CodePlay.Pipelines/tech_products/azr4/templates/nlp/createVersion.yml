@@ -1,0 +1,98 @@
+# Template: Create and push next semantic git tag to Azure DevOps
+# This template reads `LAST_GIT_TAG` and `COMMIT_VERSIONING_TAG` (set by
+# `checkVersion.yml`), computes the next semantic version and pushes a tag
+# to the repository using `$(System.AccessToken)`.
+#
+# Requirements:
+# - `LAST_GIT_TAG` and `COMMIT_VERSIONING_TAG` must be set in the job
+#   (checkVersion template does this).
+# - Allow 'Grant access to the OAuth token' in pipeline settings so
+#   `$(System.AccessToken)` is available to scripts.
+
+parameters:
+  - name: tagPrefix
+    type: string
+    default: 'v'
+
+steps:
+  - bash: |
+      #!/bin/bash
+      set -euo pipefail
+      set -x
+
+      # Read variables set by checkVersion
+      LAST_TAG="$(LAST_GIT_TAG)"
+      COMMIT_TAG="$(COMMIT_VERSIONING_TAG)"
+      PREFIX="${{ parameters.tagPrefix }}"
+
+      echo "Last tag: $LAST_TAG"
+      echo "Commit versioning tag: $COMMIT_TAG"
+
+      # Normalize last tag (strip leading v/V)
+      if [ -n "$LAST_TAG" ]; then
+        NORMALIZED_TAG=$(echo "$LAST_TAG" | sed -E 's/^[vV]//')
+      else
+        NORMALIZED_TAG="0.0.0"
+      fi
+
+      # Parse semantic version
+      IFS='.' read -r MAJOR MINOR PATCH <<< "${NORMALIZED_TAG}"
+      MAJOR=${MAJOR:-0}
+      MINOR=${MINOR:-0}
+      PATCH=${PATCH:-0}
+
+      case "$COMMIT_TAG" in
+        *BREAKING*)
+          MAJOR=$((MAJOR+1))
+          MINOR=0
+          PATCH=0
+          ;;
+        *FEATURE*)
+          MINOR=$((MINOR+1))
+          PATCH=0
+          ;;
+        *)
+          PATCH=$((PATCH+1))
+          ;;
+      esac
+
+      NEXT_VERSION="${MAJOR}.${MINOR}.${PATCH}"
+      TAG_NAME="${PREFIX}${NEXT_VERSION}"
+
+      echo "Next version: $NEXT_VERSION"
+      echo "Tag name: $TAG_NAME"
+
+      # Set pipeline variable PRODUCT_VERSION for downstream steps
+      echo "##vso[task.setvariable variable=PRODUCT_VERSION]$NEXT_VERSION"
+
+      # Configure git user for tagging
+      git config user.email "build@local"
+      git config user.name "azure-pipeline"
+
+      # Ensure we have the latest refs
+      git fetch --prune --unshallow || true
+      git fetch --tags || true
+
+      # Avoid creating the tag if it already exists
+      if git rev-parse "$TAG_NAME" >/dev/null 2>&1; then
+        echo "Tag $TAG_NAME already exists locally, skipping tag creation"
+        exit 0
+      fi
+
+      # Create annotated tag
+      git tag -a "$TAG_NAME" -m "Release $TAG_NAME"
+
+      # Push tag to Azure DevOps using System.AccessToken
+      REPO_URL="$(Build.Repository.Uri)"
+      # Use a username placeholder 'build' with OAuth token
+      AUTH_URL=$(echo "$REPO_URL" | sed -E 's#(https://)(.*)#\1build:$(System.AccessToken)@\2#')
+
+      echo "Pushing tag $TAG_NAME to $REPO_URL"
+      git push "$AUTH_URL" "refs/tags/$TAG_NAME"
+
+      echo "Tag $TAG_NAME pushed successfully"
+    displayName: 'Create and push tag'
+    env:
+      LAST_GIT_TAG: $(LAST_GIT_TAG)
+      COMMIT_VERSIONING_TAG: $(COMMIT_VERSIONING_TAG)
+      System_AccessToken: $(System.AccessToken)

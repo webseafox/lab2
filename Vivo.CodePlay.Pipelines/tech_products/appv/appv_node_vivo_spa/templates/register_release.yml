@@ -1,0 +1,444 @@
+parameters:
+  - name: BUNDLE_NAME
+    type: string
+  - name: MANUAL_BUNDLE_VERSION
+    type: string
+  - name: AZURE_BLOB_CONTAINER_URL
+    type: string
+  - name: ROUTE_ORCHESTRATOR_URL
+    type: string
+  - name: skipReleaseCreation
+    type: boolean
+  - name: skipReleaseUpdate
+    type: boolean
+  - name: RELEASE_ENABLED_FLAG
+    type: boolean
+  - name: RELEASE_PREFETCH_FLAG
+    type: boolean
+  - name: qa_environment
+    type: string
+  - name: publishAssetManifest
+    type: boolean
+
+  - name: canaryDeploy
+    type: boolean
+  - name: INTERVAL_MINUTES
+  - name: INCREMENT_PERCENTAGE
+  - name: MAX_PERCENTAGE
+
+stages:
+  - stage: RegisterRelease
+    displayName: Register Release
+    pool:
+      name: GeneralPurposeLinuxAgentsCI
+    dependsOn:
+      - PublishRelease
+      - KeycloakAuth
+      - ci_build
+      - cd_environment_checklist
+    condition: succeeded()
+
+    variables:
+      - name: BUNDLE_VERSION
+        ${{ if ne(parameters.MANUAL_BUNDLE_VERSION, '') }}:
+          value: ${{ trim(parameters.MANUAL_BUNDLE_VERSION) }}
+        ${{ else }}:
+          value: $[ stageDependencies.ci_build.build.outputs['new_version.NEW_VERSION'] ]
+      
+      - name: KEYCLOAK_TOKEN
+        value: $[ stageDependencies.KeycloakAuth.GetKeycloakToken.outputs['CallKeycloakApi.KEYCLOAK_TOKEN'] ]
+      - name: BUNDLE_SIZE_OUTPUT
+        value: $[ stageDependencies.ci_build.build.outputs['collect_metadata.BUNDLE_SIZE_OUTPUT'] ]
+      - name: DEPENDENCIES_OUTPUT
+        value: $[ stageDependencies.ci_build.build.outputs['collect_metadata.DEPENDENCIES_OUTPUT'] ]
+      - name: publishAssetManifest
+        value: $(echo $(PUBLISH_ASSET_MANIFEST))
+      - name: IS_ROLLBACK
+        value: $[ stageDependencies.cd_environment_checklist.environment_checklist.outputs['compare_versions.IS_ROLLBACK'] ]
+      - name: ENABLED_VERSION
+        value: $[ stageDependencies.cd_environment_checklist.environment_checklist.outputs['compare_versions.ENABLED_VERSION'] ]
+
+    jobs:
+      - job: waitForValidation
+        displayName: Validação de rollback
+        pool: server
+        timeoutInMinutes: 4320 # 3 days
+        steps:
+          - task: ManualValidation@0
+            displayName: Aprovação de rollback
+            timeoutInMinutes: 1440 # 1 day
+            # Wait for approval if there is a rollback attempt in production environment
+            condition: and(succeeded(), eq(variables.IS_ROLLBACK, 'true'), eq('${{ parameters.qa_environment }}', 'prod'))
+            inputs:
+              notifyUsers: |
+                meuvivoecare.br@telefonica.com
+                ert-digital.br@telefonica.com
+                raphaels.silva@telefonica.com
+                rafaelc.gomes@telefonica.com
+                victor.pinheiro@telefonica.com
+                junior.francisco@telefonica.com
+              instructions: |
+                Foi identificado uma tentativa de ROLLBACK na execução da pipeline.
+                
+                Um relatório HTML com informações sobre a execução foi gerado na aba "HTML Viewer".
+                
+                Variáveis:
+                Ambiente (qa_environment): ${{ parameters.qa_environment }}
+                Rollback (IS_ROLLBACK): $(IS_ROLLBACK)
+                Versão do bundle desejado (MANUAL_BUNDLE_VERSION): ${{ parameters.MANUAL_BUNDLE_VERSION }}
+                Versão do bundle habilitado (ENABLED_VERSION): $(ENABLED_VERSION)
+                
+                Tem certeza de que quer fazer isso?
+              onTimeout: "reject"
+
+      - job: CreateModuleAndRelease
+        displayName: Create Module and Release
+        dependsOn:
+          - waitForValidation
+        condition: succeeded()
+        steps:
+          - task: DownloadBuildArtifacts@1
+            displayName: "Download Bundle Artifact"
+            condition: and( succeeded(), eq('${{ parameters.skipReleaseCreation }}', false ))
+            inputs:
+              artifactName: ${{parameters.BUNDLE_NAME}}-$(BUNDLE_VERSION)
+              cleanDestinationFolder: false
+              parallelizationLimit: 8
+              downloadPath: $(Build.SourcesDirectory)
+          
+          - task: Bash@3
+            displayName: "Set Metadata Variables"
+            continueOnError: true
+            inputs:
+              targetType: inline
+              script: |
+                echo "##[debug] BUNDLE_SIZE_OUTPUT: $(BUNDLE_SIZE_OUTPUT)"
+                echo "##[debug] DEPENDENCIES_OUTPUT: $(DEPENDENCIES_OUTPUT)"
+
+                if [ -z "$(BUNDLE_SIZE_OUTPUT)" ]; then
+                  echo "##[debug] BUNDLE_SIZE_OUTPUT is empty, reading from file."
+                  BUNDLE_SIZE_FILE="$(Build.SourcesDirectory)/${{parameters.BUNDLE_NAME}}-$(BUNDLE_VERSION)/metadata/bundle_size.txt"
+                  if [ -f "$BUNDLE_SIZE_FILE" ]; then
+                    BUNDLE_SIZE_VALUE=$(cat "$BUNDLE_SIZE_FILE" | tr -d '[:space:]')
+                    echo "##[debug] Read BUNDLE_SIZE_VALUE: $BUNDLE_SIZE_VALUE"
+                    BUNDLE_SIZE_OUTPUT=$BUNDLE_SIZE_VALUE
+                  else
+                    echo "##[error] Bundle size file not found at $BUNDLE_SIZE_FILE"
+                  fi
+                fi
+
+                if [ -z "$(DEPENDENCIES_OUTPUT)" ]; then
+                  echo "##[debug] DEPENDENCIES_OUTPUT is empty, reading from file."
+                  DEPENDENCIES_FILE="$(Build.SourcesDirectory)/${{parameters.BUNDLE_NAME}}-$(BUNDLE_VERSION)/metadata/dependencies.json"
+                  if [ -f "$DEPENDENCIES_FILE" ]; then
+                    DEPENDENCIES_VALUE=$(cat "$DEPENDENCIES_FILE" | tr -d '[:space:]')
+                    echo "##[debug] Read DEPENDENCIES_VALUE: $DEPENDENCIES_VALUE"
+                    DEPENDENCIES_OUTPUT=$DEPENDENCIES_VALUE
+                  else
+                    echo "##[error] Dependencies file not found at $DEPENDENCIES_FILE"
+                  fi
+                fi
+
+                echo "##vso[task.setvariable variable=BUNDLE_SIZE]$BUNDLE_SIZE_OUTPUT"
+                echo "##vso[task.setvariable variable=DEPENDENCIES]$DEPENDENCIES_OUTPUT"
+
+          - task: framework-brasil-route-orchestrator-create-module@0
+            displayName: Create Module
+            inputs:
+              AZURE_BLOB_CONTAINER_URL: ${{parameters.AZURE_BLOB_CONTAINER_URL}}
+              BUNDLE_NAME: ${{parameters.BUNDLE_NAME}}
+              KEYCLOAK_JWT: $(KEYCLOAK_TOKEN)
+              ROUTE_ORCHESTRATOR_URL: ${{parameters.ROUTE_ORCHESTRATOR_URL}}
+            name: create_module
+
+          - ${{if eq(parameters.skipReleaseCreation, false) }}: 
+            - task: framework-brasil-route-orchestrator-create-release@0
+              condition: and(succeeded(), eq('${{ parameters.skipReleaseCreation }}', false))
+              displayName: Create Release
+              inputs:
+                AZURE_BLOB_CONTAINER_URL: ${{parameters.AZURE_BLOB_CONTAINER_URL}}
+                BUILD_SOURCESDIRECTORY: $(Build.SourcesDirectory)
+                BUNDLE_NAME: ${{parameters.BUNDLE_NAME}}
+                BUNDLE_VERSION: $(BUNDLE_VERSION)
+                BUNDLE_SIZE: $(BUNDLE_SIZE)
+                ENVIRONMENT: ${{parameters.qa_environment}}
+                GIT_PROJECT_DIR: /
+                KEYCLOAK_JWT: $(KEYCLOAK_TOKEN)
+                ROUTE_ORCHESTRATOR_URL: ${{parameters.ROUTE_ORCHESTRATOR_URL}}
+                DEPENDENCIES: $(DEPENDENCIES)
+              name: create_release
+
+          - ${{if and( eq(parameters.canaryDeploy, true), eq(parameters.skipReleaseCreation, true) ) }}:
+            - task: Bash@3
+              condition: succeeded()
+              displayName: "Find Release"
+              name: create_release
+              env:
+                URL: "${{parameters.ROUTE_ORCHESTRATOR_URL}}/microfrontends/$(create_module.MICROFRONTEND_ID)"
+                TOKEN: $(KEYCLOAK_TOKEN)
+                DESIRED_VERSION: $(BUNDLE_VERSION)
+              inputs:
+                targetType: inline
+                script: |
+                  ACCESS_TOKEN=$(echo "$TOKEN" | jq -r '.access_token')
+                  if [ -z "$ACCESS_TOKEN" ] || [ "$ACCESS_TOKEN" = "null" ]; then
+                      echo "##[error]Failed to extract access_token from TOKEN JSON object."
+                      exit 1
+                  fi
+
+                  echo "##[debug] URL: '$URL'"
+
+                  RESPONSE=$(curl --location "$URL" \
+                      --header "Authorization: Bearer $ACCESS_TOKEN" \
+                      --header "Content-Type: application/json" \
+                      --silent --write-out "%{http_code}" --output response.json 2> curl_error.log)
+
+                  HTTP_STATUS=${RESPONSE: -3}
+                  echo "##[debug] HTTP_STATUS: $HTTP_STATUS"
+
+                  RESPONSE_BODY=$(cat response.json 2>/dev/null || echo "")
+                  rm -f response.json curl_error.log
+                  echo "##[debug] RESPONSE_BODY: $RESPONSE_BODY"
+
+                  if [ $HTTP_STATUS -lt 200 ] || [ $HTTP_STATUS -gt 299 ]; then
+                      echo "##vso[task.logissue type=error] API call failed. HTTP Status: $HTTP_STATUS"
+                      exit 1
+                  fi
+
+                  # Extract the object from releases array where version matches DESIRED_VERSION
+                  RELEASE=$(echo "$RESPONSE_BODY" | jq -c --arg version "$DESIRED_VERSION" '.releases[] | select(.version == $version) | del(.dependencies)')
+
+                  if [ -z "$RELEASE" ]; then
+                      echo "##vso[task.logissue type=error] No release found with version $DESIRED_VERSION."
+                      exit 1
+                  fi
+
+                  echo "Found release: $RELEASE"
+
+                  RELEASE_ID=$(echo "$RELEASE" | jq -r '._id // ""')
+                  RELEASE_VERSION=$(echo "$RELEASE" | jq -r '.version // ""')
+                  RELEASE_OBJECT=$(echo "$RELEASE")
+
+                  echo "##[debug]Release ID: $RELEASE_ID"
+                  echo "##[debug]Release Version: $RELEASE_VERSION"
+
+                  echo "##vso[task.setvariable variable=RELEASE_ID;isOutput=true]$RELEASE_ID"
+                  echo "##vso[task.setvariable variable=RELEASE_VERSION;isOutput=true]$RELEASE_VERSION"
+                  echo "##vso[task.setvariable variable=RELEASE_OBJECT;isOutput=true]$RELEASE_OBJECT"
+
+          - script: |
+                  echo "##[debug] create-module variables"
+                  echo "##[debug] MICROFRONTEND_ID: $(create_module.MICROFRONTEND_ID)"
+                  echo "##[debug] MICROFRONTEND_NAME: $(create_module.MICROFRONTEND_NAME)"
+                  echo "##[debug] ENABLED_RELEASE_VERSION: $(create_module.ENABLED_RELEASE_VERSION)"
+
+                  if [ "$PARAMETERS_SKIPRELEASECREATION" = "false" ]; then
+                    echo "##[debug] create-release variables"
+                    echo "##[debug] MICROFRONTEND_ID: $(create_release.MICROFRONTEND_ID)"
+                    echo "##[debug] MICROFRONTEND_NAME: $(create_release.MICROFRONTEND_NAME)"
+                    echo "##[debug] RELEASE_ID: $(create_release.RELEASE_ID)"
+                    echo "##[debug] RELEASE_VERSION: $(create_release.RELEASE_VERSION)"
+                    echo "##[debug] RELEASE_OBJECT: $(create_release.RELEASE_OBJECT)"
+                  fi
+            displayName: Tasks Output Variables
+
+      - deployment: EnableRelease
+        condition: and(succeeded(), eq('${{ parameters.skipReleaseUpdate }}', false))
+        displayName: Enable Release
+        dependsOn: CreateModuleAndRelease
+        variables:
+          RELEASE_ID: $[ dependencies.CreateModuleAndRelease.outputs['create_release.RELEASE_ID'] ]
+          RELEASE_VERSION: $[ dependencies.CreateModuleAndRelease.outputs['create_release.RELEASE_VERSION'] ]
+          RELEASE_OBJECT: $[ dependencies.CreateModuleAndRelease.outputs['create_release.RELEASE_OBJECT'] ]
+          MICROFRONTEND_ID: $[ dependencies.CreateModuleAndRelease.outputs['create_module.MICROFRONTEND_ID'] ]
+          MICROFRONTEND_NAME: $[ dependencies.CreateModuleAndRelease.outputs['create_module.MICROFRONTEND_NAME'] ]
+          ENABLED_RELEASE_VERSION: $[ dependencies.CreateModuleAndRelease.outputs['create_module.ENABLED_RELEASE_VERSION'] ]
+        ${{if eq(parameters.qa_environment, 'prod')}}: 
+            environment: $(DEPLOY_ENVIRONMENT_PROD)
+        ${{if ne(parameters.qa_environment, 'prod')}}:
+            environment: $(DEPLOY_ENVIRONMENT_LIB)
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+              - checkout: self
+                displayName: Checkout Source Code
+                name: checkout_source_code
+                fetchTags: false
+                clean: true
+
+              - ${{if eq(parameters.canaryDeploy, false)}}:
+                - task: framework-brasil-route-orchestrator-update-release@0
+                  displayName: Update release
+                  inputs:
+                    BUILD_SOURCESDIRECTORY: $(Build.SourcesDirectory)
+                    BUNDLE_NAME: ${{parameters.BUNDLE_NAME}}
+                    BUNDLE_VERSION: $(BUNDLE_VERSION)
+                    ENVIRONMENT: ${{parameters.qa_environment}}
+                    GIT_PROJECT_DIR: /
+                    KEYCLOAK_JWT: $(KEYCLOAK_TOKEN)
+                    ROUTE_ORCHESTRATOR_URL: ${{parameters.ROUTE_ORCHESTRATOR_URL}}
+                    ENABLED: ${{parameters.RELEASE_ENABLED_FLAG}}
+                    PREFETCH: ${{parameters.RELEASE_PREFETCH_FLAG}}
+
+              - ${{if eq(parameters.canaryDeploy, true)}}:
+                - script: |
+                    echo "##[debug] MICROFRONTEND_ID: $(MICROFRONTEND_ID)"
+                    echo "##[debug] MICROFRONTEND_NAME: $(MICROFRONTEND_NAME)"
+                    echo "##[debug] RELEASE_ID: $(RELEASE_ID)"
+                    echo "##[debug] RELEASE_VERSION: $(RELEASE_VERSION)"
+                    echo "##[debug] RELEASE_OBJECT: $(RELEASE_OBJECT)"
+                    echo "##[debug] ENABLED_RELEASE_VERSION: $(ENABLED_RELEASE_VERSION)"
+                  displayName: Tasks Output Variables
+
+                - task: Bash@3
+                  condition: succeeded()
+                  displayName: "Calculate Canary Deploy Duration"
+                  env:
+                    INTERVAL_MINUTES: ${{parameters.INTERVAL_MINUTES}}
+                    INCREMENT_PERCENTAGE: ${{parameters.INCREMENT_PERCENTAGE}}
+                    MAX_PERCENTAGE: ${{parameters.MAX_PERCENTAGE}}
+                  inputs:
+                    targetType: inline
+                    script: |
+                      if [ "$INCREMENT_PERCENTAGE" -eq 0 ]; then
+                          echo "##[error]increment_percentage cannot be 0."
+                          exit 1
+                      fi
+                      if [ "$MAX_PERCENTAGE" -le 0 ]; then
+                          echo "##[error]max_percentage must be greater than 0."
+                          exit 1
+                      fi
+                      if [ "$INTERVAL_MINUTES" -le 0 ]; then
+                          echo "##[error]interval_minutes must be greater than 0."
+                          exit 1
+                      fi
+
+                      # Calculate number of increments (ceiling of max_percentage / increment_percentage)
+                      INCREMENTS=$(( (MAX_PERCENTAGE + INCREMENT_PERCENTAGE - 1) / INCREMENT_PERCENTAGE ))
+
+                      TOTAL_MINUTES=$((INCREMENTS * INTERVAL_MINUTES))
+
+                      echo "##[debug]Interval (minutes): $INTERVAL_MINUTES"
+                      echo "##[debug]Increment percentage: $INCREMENT_PERCENTAGE"
+                      echo "##[debug]Max percentage: $MAX_PERCENTAGE"
+                      echo "##[debug]Number of increments: $INCREMENTS"
+                      echo "##[debug]Total duration: $TOTAL_MINUTES minutes"
+
+                      echo "##vso[task.setvariable variable=CANARY_DEPLOY_DURATION]$TOTAL_MINUTES"
+
+                - task: Bash@3
+                  condition: succeeded()
+                  displayName: "Generate Start and End Dates"
+                  env:
+                    TOTAL_MINUTES: $(CANARY_DEPLOY_DURATION)
+                  inputs:
+                    targetType: inline
+                    script: |
+                      # Generate current date in ISO 8601
+                      START_DATE=$(date -u +"%Y-%m-%dT%H:%M:%S.%3NZ")
+                      echo "##[debug]Generated START_DATE: $START_DATE"
+
+                      END_DATE=$(date -u -d "$(date -u -Iseconds -d "$START_DATE") + $((TOTAL_MINUTES * 60)) seconds" +"%Y-%m-%dT%H:%M:%S.%3NZ" 2>/dev/null)
+                      echo "##[debug]Generated END_DATE: $END_DATE"
+
+                      if [ $? -ne 0 ]; then
+                          echo "##[error]Failed to calculate end date."
+                          exit 1
+                      fi
+
+                      echo "##[debug]Start date: $START_DATE"
+                      echo "##[debug]Total duration: $TOTAL_MINUTES minutes"
+                      echo "##[debug]End date: $END_DATE"
+
+                      echo "##vso[task.setvariable variable=START_DATE]$START_DATE"
+                      echo "##vso[task.setvariable variable=END_DATE]$END_DATE"
+
+                - task: Bash@3
+                  condition: succeeded()
+                  displayName: "Create Rollout Config Object"
+                  env:
+                    URL: "${{parameters.ROUTE_ORCHESTRATOR_URL}}/microfrontends/$(MICROFRONTEND_ID)/rollout-config"
+                    TOKEN: $(KEYCLOAK_TOKEN)
+                    INTERVAL_MINUTES: ${{parameters.INTERVAL_MINUTES}}
+                    ENABLED: true
+                    PERCENTAGE: 0
+                    CANARY_VERSION: $(RELEASE_VERSION)
+                    INCREMENT_PERCENTAGE: ${{parameters.INCREMENT_PERCENTAGE}}
+                    MAX_PERCENTAGE: ${{parameters.MAX_PERCENTAGE}}
+                    REQUEST_COUNTER: 0
+                    START_DATE: $(START_DATE)
+                    END_DATE: $(END_DATE)
+                    STABLE_VERSION: $(ENABLED_RELEASE_VERSION)
+                    CANARY_REQUESTS: 0
+                    STABLE_REQUESTS: 0
+                    CYCLE: 10
+                    CANARY_RELEASE: $(RELEASE_OBJECT)
+                  inputs:
+                    targetType: inline
+                    script: |
+                        PAYLOAD=$(jq -n \
+                            --argjson interval_minutes "$INTERVAL_MINUTES" \
+                            --argjson enabled "$ENABLED" \
+                            --argjson percentage "$PERCENTAGE" \
+                            --arg canary_version "$CANARY_VERSION" \
+                            --argjson increment_percentage "$INCREMENT_PERCENTAGE" \
+                            --argjson max_percentage "$MAX_PERCENTAGE" \
+                            --argjson request_counter "$REQUEST_COUNTER" \
+                            --arg start_date "$START_DATE" \
+                            --arg end_date "$END_DATE" \
+                            --arg stable_version "$STABLE_VERSION" \
+                            --argjson canary_requests "$CANARY_REQUESTS" \
+                            --argjson stable_requests "$STABLE_REQUESTS" \
+                            --argjson cycle "$CYCLE" \
+                            --argjson canary_release "$CANARY_RELEASE" \
+                            '{
+                                interval_minutes: $interval_minutes,
+                                enabled: $enabled,
+                                percentage: $percentage,
+                                canary_version: $canary_version,
+                                increment_percentage: $increment_percentage,
+                                max_percentage: $max_percentage,
+                                request_counter: $request_counter,
+                                start_date: $start_date,
+                                end_date: $end_date,
+                                stable_version: $stable_version,
+                                canary_requests: $canary_requests,
+                                stable_requests: $stable_requests,
+                                cycle: $cycle,
+                                canary_release: $canary_release
+                            }')
+
+                        ACCESS_TOKEN=$(echo "$TOKEN" | jq -r '.access_token')
+                        if [ -z "$ACCESS_TOKEN" ] || [ "$ACCESS_TOKEN" = "null" ]; then
+                            echo "##[error] Failed to extract access_token from TOKEN JSON object."
+                            exit 1
+                        fi
+
+                        echo "##[debug] URL: '$URL'"
+                        echo "##[debug] PAYLOAD: '$PAYLOAD'"
+
+                        RESPONSE=$(curl --location "$URL" \
+                            --header "Authorization: Bearer $ACCESS_TOKEN" \
+                            --header "Content-Type: application/json" \
+                            --data "$PAYLOAD" \
+                            --silent --write-out "%{http_code}" --output response.json 2> curl_error.log)
+
+                        HTTP_STATUS=$RESPONSE
+                        echo "##[debug] HTTP_STATUS: $HTTP_STATUS"
+
+                        RESPONSE_BODY=$(cat response.json 2>/dev/null || echo "")
+                        rm -f response.json curl_error.log
+                        echo "##[debug] RESPONSE_BODY: $RESPONSE_BODY"
+
+                        if [ $HTTP_STATUS -lt 200 ] || [ $HTTP_STATUS -gt 299 ]; then
+                            echo "##vso[task.logissue type=error] API call failed. HTTP Status: $HTTP_STATUS"
+                            exit 1
+                        fi
+
+              - ${{if eq(parameters.publishAssetManifest, true)}}:
+                - template: /tech_products/appv/appv_node_vivo_spa/templates/publish_asset_manifest.yml
+                  parameters:
+                    BUNDLE_NAME: ${{parameters.BUNDLE_NAME}}
+                    ENVIRONMENT: ${{parameters.qa_environment}}
+                    #applicationName: $(APPLICATION_NAME)

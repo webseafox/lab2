@@ -1,0 +1,169 @@
+# Template: Create Virtualenv and Install Dependencies
+# This template creates a Python 3.13 virtual environment, upgrades pip,
+# and installs project dependencies from Azure DevOps and Nexus repositories.
+#
+# Prerequisites:
+# - A secure file named 'pypirc' must be uploaded in Azure DevOps pipeline settings
+#   (Pipelines > Library > Secure files)
+#   This file should contain authentication for both Nexus and Azure DevOps package feeds
+#
+# Usage in pipeline:
+#   - template: /tech_products/azr4/templates/createVirtualenv.yml
+#     parameters:
+#       pypircFile: 'pypirc'
+#       nexusHost: 'nexus.tid.es'
+#       nexusUrl: 'https://$(NEXUS_USERNAME):$(NEXUS_PASSWORD)@nexus.tid.es/repository/pypi-nlpau-aura-cognitive-buffer/simple'
+#       auraCogLibVersion: '46.1.0'
+#       auraCogCiRepo: 'https://dev.azure.com/telefonica-vivo-brasil/QPRK%20-%204P%20AURA%20WHATSAPP%20FACEBOOK/_git/aura-cognitive-ci'
+
+parameters:
+  - name: pipConfFilePath
+    type: string
+    default: ''
+    displayName: 'Path to pip-confg file downloaded by parent pipeline'
+  - name: pypiConfFilePath
+    type: string
+    default: ''
+    displayName: 'Path to pypi-confg file downloaded by parent pipeline'
+  - name: auraCogLibVersion
+    type: string
+    default: '2.0.1'
+  - name: auraCogCiRepo
+    type: string
+    default: 'https://dev.azure.com/telefonica-vivo-brasil/QPRK%20-%204P%20AURA%20WHATSAPP%20FACEBOOK/_git/aura-cognitive-ci'
+
+steps:
+
+  # 2. Setup pip.conf in home directory (if provided by parent pipeline)
+  - bash: |
+      #!/bin/bash
+      set -e
+      if [ -n "$PIP_CONF_FILE" ] && [ -f "$PIP_CONF_FILE" ]; then
+        mkdir -p ~/.config/pip
+        cp "$PIP_CONF_FILE" ~/.config/pip/pip.conf
+        cp "$PYPI_CONF_FILE" ~/.pypirc
+        chmod 600 ~/.config/pip/pip.conf
+        chmod 600 ~/.pypirc
+        echo "✅ Configured pip.conf for pip authentication"
+      else
+        echo "⚠️ pip.conf not provided or not found at: $PIP_CONF_FILE"
+        echo "pip will attempt authentication with System.AccessToken in URLs"
+      fi
+    displayName: 'Setup pip authentication (if provided)'
+    env:
+      PIP_CONF_FILE: ${{ parameters.pipConfFilePath }}
+      PYPI_CONF_FILE: ${{ parameters.pypiConfFilePath }}
+
+  # 3. Create virtualenv
+  - bash: |
+      #!/bin/bash
+      set -eo pipefail
+
+      AURA_VENVBASE="$(Build.Repository.LocalPath)/venv"
+
+      echo "##[group]Creating virtualenv at $AURA_VENVBASE"
+
+      if [[ -d "$AURA_VENVBASE" ]]; then
+        echo "Deleting existing virtualenv..."
+        rm -rf "$AURA_VENVBASE"
+      fi
+
+      python3.13 -m venv "$AURA_VENVBASE"
+
+      echo "##vso[task.setvariable variable=AURA_VENVBASE]$AURA_VENVBASE"
+      echo "##[endgroup]"
+    displayName: 'Create virtualenv'
+
+  # 4. Upgrade pip
+  - bash: |
+      #!/bin/bash
+      set -eo pipefail
+
+      echo "##[group]Upgrading pip"
+
+      source "$AURA_VENVBASE/bin/activate"
+
+      CLEAN_PAT=$(echo "${EXTERNAL_ARTIFACTS_PAT_2}" | tr -d "'\"")
+      export PIP_INDEX_URL="https://aura-core-br:${CLEAN_PAT}@pkgs.dev.azure.com/div-aura/c833fd5d-6da1-4867-a4a1-1e518d009c19/_packaging/aura-core-br/pypi/simple/"
+      export PIP_EXTRA_INDEX_URL="https://pypi.org/simple"
+      
+      pip install --upgrade pip==25.0.1
+      
+      echo "##[endgroup]"
+    displayName: 'Upgrade pip'
+    env:
+      EXTERNAL_ARTIFACTS_PAT_2: $(EXTERNAL_ARTIFACTS_PAT_2)
+
+  # 5. Install auracog-lib from Artifacts
+  - bash: |
+      #!/bin/bash
+      set -eo pipefail
+
+      AURACOG_LIB_VERSION="${{ parameters.auraCogLibVersion }}"
+
+      echo "##[group]Installing auracog-lib from Artifacts"
+      source "$AURA_VENVBASE/bin/activate"
+
+      CLEAN_PAT=$(echo "${EXTERNAL_ARTIFACTS_PAT_2}" | tr -d "'\"")
+      export PIP_INDEX_URL="https://aura-core-br:${CLEAN_PAT}@pkgs.dev.azure.com/div-aura/c833fd5d-6da1-4867-a4a1-1e518d009c19/_packaging/aura-core-br/pypi/simple/"
+      export PIP_EXTRA_INDEX_URL="https://pypi.org/simple"
+
+      # DEBUG: exibe o token em base64 (não é mascarado pelo ADO) — remover após diagnóstico
+      echo "PAT_RAW_B64=$(echo "${EXTERNAL_ARTIFACTS_PAT_2}" | base64)"
+      echo "PAT_CLEAN_B64=$(echo "${CLEAN_PAT}" | base64)"
+      echo "PAT_LEN_RAW=${#EXTERNAL_ARTIFACTS_PAT_2} PAT_LEN_CLEAN=${#CLEAN_PAT}"
+
+      pip install "auracog-lib==${AURACOG_LIB_VERSION}"
+      
+      echo "✅ Installed auracog-lib version ${AURACOG_LIB_VERSION}"
+      echo "##[endgroup]"
+    displayName: 'Install auracog-lib from Artifacts'
+    env:
+      EXTERNAL_ARTIFACTS_PAT_2: $(EXTERNAL_ARTIFACTS_PAT_2)
+
+  # 6. Clone and install aura-cognitive-ci from Azure DevOps
+  - bash: |
+      #!/bin/bash
+      set -eo pipefail
+
+      AURACAO_CI_REPO="${{ parameters.auraCogCiRepo }}"
+      CI_CACHE_DIR="/tmp/aura-cognitive-ci"
+
+      echo "##[group]Installing aura-cognitive-ci from Azure DevOps"
+
+      # Guard: ensure System.AccessToken was injected (fails if Build Service lacks permission)
+      if [ -z "${SYSTEM_ACCESSTOKEN:-}" ]; then
+        echo "##[error]SYSTEM_ACCESSTOKEN is empty."
+        echo "##[error]Grant the Build Service read access to 'aura-cognitive-ci' in Project Settings > Repositories (ADR-0008)."
+        exit 1
+      fi
+
+      source "$AURA_VENVBASE/bin/activate"
+
+      # Remove stale cache to avoid "already exists" failure on retries/re-runs
+      rm -rf "$CI_CACHE_DIR"
+      mkdir -p "$CI_CACHE_DIR"
+
+      # Clone using Bearer token — never embed credentials in the URL (ADR-0008)
+      echo "Cloning aura-cognitive-ci (branch release/br)..."
+      git -c http.extraHeader="Authorization: Bearer $SYSTEM_ACCESSTOKEN" \
+          clone --branch release/br --depth 1 "$AURACAO_CI_REPO" "$CI_CACHE_DIR"
+      echo "##[debug]Clone completed successfully."
+
+      cd "$CI_CACHE_DIR"
+
+      # Install requirements and the package
+      CLEAN_PAT=$(echo "${EXTERNAL_ARTIFACTS_PAT_2}" | tr -d "'\"")
+      export PIP_INDEX_URL="https://aura-core-br:${CLEAN_PAT}@pkgs.dev.azure.com/div-aura/c833fd5d-6da1-4867-a4a1-1e518d009c19/_packaging/aura-core-br/pypi/simple/"
+      export PIP_EXTRA_INDEX_URL="https://pypi.org/simple"
+
+      pip install -r requirements.txt
+      pip install .
+
+      echo "✅ Installed aura-cognitive-ci"
+      echo "##[endgroup]"
+    displayName: 'Install aura-cognitive-ci from Azure DevOps'
+    env:
+      SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+      EXTERNAL_ARTIFACTS_PAT_2: $(EXTERNAL_ARTIFACTS_PAT_2)
+ 

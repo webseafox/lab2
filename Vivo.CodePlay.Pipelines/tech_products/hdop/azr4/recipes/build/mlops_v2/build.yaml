@@ -1,0 +1,70 @@
+jobs:
+- job: build
+  pool: GeneralPurposeLinuxAgents4P
+  condition: true
+  steps:
+  - template: /tech_products/hdop/templates/steps/version_update.yaml
+  - script: mkdir temp_result
+    displayName: 'Create temp_result dir'
+  - template: /tech_products/hdop/templates/steps/execute_in_docker.yaml
+    parameters:
+      image: 'registry.telefonicabigdata.com/ml-python:2.0.7'
+      # imagem: https://git.telefonicabigdata.com/devops-commons/images-bases-4p/ml-python/-/blob/main/Dockerfile?ref_type=heads
+      args: --add-host=flytealias:$(FLYTE_HOST)
+      script: |
+        #!/bin/bash
+        set -e
+        python3 -V
+        export PATH=$PATH:/.local/bin:$PWD/bin:$PWD/.local/bin:/home/devops/.local/bin
+        echo "##[debug] PATH: ${PATH}"
+        echo "##[debug] ===== ${FLYTE_HOST}"
+        ping -c 3 flytealias || true
+        export CFLAGS="-std=c99"
+        echo "##[debug] Install python requirements.txt"
+        pip3 install flytekit xgboost
+        pip3 install -r requirements.txt
+        mkdir -p /opt/cloudera/parcels/CDH/jars/
+        mkdir -p /opt/cloudera/parcels/CDH/lib/hive_warehouse_connector/
+        echo "##[debug] Install python MLops libs"
+        curl https://dev-wiki-mlops.telefonicabigdata.com/hive-warehouse-connector-assembly-1.0.0.7.1.7.1000-141.jar -o /opt/cloudera/parcels/CDH/jars/hive-warehouse-connector-assembly-1.0.0.7.1.7.1000-141.jar
+        curl https://dev-wiki-mlops.telefonicabigdata.com/pyspark_hwc-1.0.0.7.1.7.1000-141.zip -o /opt/cloudera/parcels/CDH/lib/hive_warehouse_connector/pyspark_hwc-1.0.0.7.1.7.1000-141.zip
+        echo "##[debug] Configure Flyte"
+        mkdir -p $HOME/.flyte/
+        echo "admin:" > $HOME/.flyte/config.yaml
+        echo "    endpoint: flytealias:8089" >> $HOME/.flyte/config.yaml
+        echo "    authType: Pkce" >> $HOME/.flyte/config.yaml
+        echo "    insecure: true" >> $HOME/.flyte/config.yaml
+        echo "logger:" >> $HOME/.flyte/config.yaml
+        echo "    show-source: true" >> $HOME/.flyte/config.yaml
+        echo "    level: 0" >> $HOME/.flyte/config.yaml
+        cat $HOME/.flyte/config.yaml
+        echo "##[debug] Install Flyte"
+        curl -sL https://ctl.flyte.org/install | bash
+        sed -i "s/{{VERSION}}/${VERSION}/g" lib/workflow.py
+        sed -i "s/{{PROJECT_NAME}}/${PROJECT_NAME}/g" lib/workflow.py
+        echo "##[debug] Register Flyte"
+        pyflyte register --project nbx --domain development --service-account flyte-backend-flyte-binary lib/workflow.py
+        echo "##[debug] pyinstaller"
+        echo "## [command] pyinstaller ${PYINSTALLER_ARGS} --onefile ${MAIN_FILE_PATH}"
+        pyinstaller ${PYINSTALLER_ARGS} --onefile ${MAIN_FILE_PATH}
+      envs:
+        FLYTE_HOST: $(FLYTE_HOST)
+        PROJECT_NAME: $(PROJECT_NAME)
+        VERSION: $(set_version.VERSION)
+        PYINSTALLER_ARGS: $(PYINSTALLER_ARGS)
+        MAIN_FILE_PATH: $(MAIN_FILE_PATH)
+  - script: |
+        mkdir dist_${PROJECT_NAME}
+        cp -r model/ config/ lib/ dist/* dist_${PROJECT_NAME}/   
+        tar -zcvf ${TAR_FILE_PATH} ./dist_${PROJECT_NAME}/*
+        ls -la
+    displayName: 'Generate .tar'
+    env:
+      TAR_FILE_PATH: $(PROJECT_NAME)-$(set_version.VERSION).tar.gz
+      PROJECT_NAME: $(PROJECT_NAME)
+
+  - task: PublishPipelineArtifact@1
+    inputs:
+      targetPath: $(PROJECT_NAME)-$(set_version.VERSION).tar.gz
+      artifact: 'ml_model'
+      publishLocation: 'pipeline'

@@ -1,0 +1,79 @@
+parameters:
+  - name: adobeRemoteUrl
+    type: string
+    default: $(adobe_remote_url)
+  - name: adobeBranch
+    type: string
+    default: ""
+  - name: gitPushParameter
+    type: string
+    default: ""
+
+variables:
+  - template: /tech_products/ecmc/adbb-aem/provisioners/aem/b2c/lib_default/variables/load.yml
+
+resources:
+  repositories:
+    - repository: FortifyExclusion
+      name: DevOps/Vivo.Fortify.Exclusions
+      type: git
+      ref: refs/heads/master
+      endpoint: CorePipelines
+    - repository: CorePipelines
+      name: DevOps/Vivo.Core.Pipelines
+      type: git
+      ref: refs/tags/v1
+      endpoint: CorePipelines
+
+stages:
+  # 1. Build e Check Version (Apenas em master, main, releases e stage)
+  - ${{ if or(in(variables['Build.SourceBranch'], 'refs/heads/master', 'refs/heads/main', 'refs/heads/master-migracao'), startsWith(variables['Build.SourceBranch'], 'refs/heads/release'), startsWith(variables['Build.SourceBranch'], 'refs/heads/stage')) }}:
+      - template: /tech_products/ecmc/adbb-aem/provisioners/aem/b2c/lib_default/stages/check_version.yml
+
+      - template: /tech_products/ecmc/adbb-aem/provisioners/aem/b2c/lib_default/stages/build.yml
+        parameters:
+          dependsOn:
+          - check_version
+
+  # 2. Quality Gates e Security (Rodam em TODAS as branches agora, seguindo o padrão CodePlay)
+  - template: /tech_products/ecmc/adbb-aem/provisioners/aem/b2c/lib_default/stages/quality_gates.yml
+
+  - template: /tech_products/ecmc/adbb-aem/provisioners/aem/b2c/lib_default/stages/security.yml
+    parameters:
+      fortifyExclusionRepository: FortifyExclusion
+
+  # 3. Publish (Sempre publica artifacts, exceto em PRs de validação)
+  - ${{ if ne(variables['Build.Reason'], 'PullRequest') }}:
+      - template: /tech_products/ecmc/adbb-aem/provisioners/aem/b2c/lib_default/stages/publish.yml
+        parameters:
+          # Se for branch principal, precisa esperar o build E os scans de segurança/qualidade
+          ${{ if or(in(variables['Build.SourceBranch'], 'refs/heads/master', 'refs/heads/main', 'refs/heads/master-migracao'), startsWith(variables['Build.SourceBranch'], 'refs/heads/release'), startsWith(variables['Build.SourceBranch'], 'refs/heads/stage')) }}:
+            dependsOn:
+            - build
+            - quality_gates
+            - security
+          # Se for branch de feature, espera apenas os scans (pois não tem build)
+          ${{ else }}:
+            dependsOn:
+            - quality_gates
+            - security
+
+  # 4. Sync
+  - template: /tech_products/ecmc/adbb-aem/provisioners/aem/b2c/default/stages/sync.yml
+    parameters:
+      gitPushParameter: "${{parameters.gitPushParameter}}"
+      adobeBranch: "${{parameters.adobeBranch}}"
+      ${{ if eq(variables['Build.Reason'], 'PullRequest') }}:
+        ${{ if or(in(variables['Build.SourceBranch'], 'refs/heads/master', 'refs/heads/main', 'refs/heads/master-migracao'), startsWith(variables['Build.SourceBranch'], 'refs/heads/release'), startsWith(variables['Build.SourceBranch'], 'refs/heads/stage')) }}:
+          dependsOn:
+          - build
+          - quality_gates
+          - security
+        ${{ else }}:
+          dependsOn:
+          - quality_gates
+          - security
+      ${{ else }}:
+        dependsOn:
+        - publish_maven
+

@@ -1,0 +1,1 @@
+(gc C:\Siebel_Devops\DEV2\ambientes\new_sifs.log) -replace '/', '\' | Out-File -encoding ASCII C:\Siebel_Devops\DEV2\ambientes\new_sifs.log

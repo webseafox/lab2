@@ -1,0 +1,131 @@
+parameters:
+- name: apiName
+- name: apiVersion
+- name: apiOrganizationID
+- name: componentName
+- name: componentVersion
+
+steps:
+- script: |
+    set -e
+
+    echo "##[debug] API_MANAGER_BASE_URL.....: ${API_MANAGER_BASE_URL}"
+    echo "##[debug] API_NAME.................: ${API_NAME}"
+    echo "##[debug] API_VERSION..............: ${API_VERSION}"
+    echo "##[debug] API_ORGANIZATION_ID......: ${API_ORGANIZATION_ID}"
+    echo "##[debug] API_TYPE.................: ${API_TYPE}"
+    echo "##[debug] NEXUS_URL................: ${NEXUS_URL}"
+    echo "##[debug] NEXUS_REPOSITORY.........: ${NEXUS_REPOSITORY}"
+    echo "##[debug] COMPONENT_GROUP..........: ${COMPONENT_GROUP}"
+    echo "##[debug] COMPONENT_NAME...........: ${COMPONENT_NAME}"
+    echo "##[debug] COMPONENT_VERSION........: ${COMPONENT_VERSION}"
+
+    if [[ "${API_TYPE}" == "swagger" ]]; then
+      COMPONENT_EXTENSION="json"
+    elif [[ "${API_TYPE}" == "wsdl" ]]; then
+      COMPONENT_EXTENSION="wsdl"
+    else
+      echo "##vso[task.logissue type=error] Invalid API_TYPE. Accepted values: swagger, wsdl."
+      echo "##vso[task.complete result=Failed;]"
+      exit
+    fi
+
+    echo "##[debug] COMPONENT_EXTENSION......: ${COMPONENT_EXTENSION}"
+
+    FULL_IMPORT_FROM_URL="${NEXUS_URL}/${NEXUS_REPOSITORY}/${COMPONENT_GROUP}/${COMPONENT_NAME}/${COMPONENT_VERSION}/${COMPONENT_NAME}-${COMPONENT_VERSION}.${COMPONENT_EXTENSION}"
+    echo "##[debug] FULL_IMPORT_FROM_URL....: ${FULL_IMPORT_FROM_URL}"
+
+    echo "##[group] Create Backend API. POST /apirepo/importFromUrl"
+    API_BACKEND_ID="$(curl -s -k -X POST "${API_MANAGER_BASE_URL}/apirepo/importFromUrl" \
+      --header "accept: application/json" \
+      --header "content-type: application/x-www-form-urlencoded" \
+      --user "${ADMIN_USERNAME}:${ADMIN_PASSWORD}" \
+      --data-urlencode "url=${FULL_IMPORT_FROM_URL}" \
+      --data-urlencode "name=${API_NAME}" \
+      --data-urlencode "type=${API_TYPE}" \
+      --data-urlencode "organizationId=${API_ORGANIZATION_ID}" \
+      --data-urlencode "integral=false" \
+      --data-urlencode "username=${NEXUS_USERNAME}" \
+      --data-urlencode "password=${NEXUS_PASSWORD}" | jq -r '.id // empty')"
+
+    echo "##[debug] API_BACKEND_ID...........: ${API_BACKEND_ID}"
+    echo "##vso[task.setvariable variable=API_BACKEND_ID;]${API_BACKEND_ID}"
+
+    if [ -z "${API_BACKEND_ID}" ]; then
+      echo "##vso[task.logissue type=error] Error when creating Backend API. Please check the API manager logs."
+      echo "##vso[task.complete result=Failed;]"
+      exit
+    fi
+    echo "##[endgroup]"
+
+    echo "##[group] Create Frontend API. POST /proxies"
+    REQUEST_BODY='{ "apiId": "'${API_BACKEND_ID}'" }'
+    echo "##[debug] REQUEST_BODY...............: ${REQUEST_BODY}"
+    curl -s -k -X POST "${API_MANAGER_BASE_URL}/proxies" \
+      --user "${ADMIN_USERNAME}:${ADMIN_PASSWORD}" \
+      -H "Content-Type: application/json" \
+      --data-raw "${REQUEST_BODY}" > $(Agent.TempDirectory)/frontend_api_response.json
+
+    BACKEND_API_ID_RESPONSE="$(jq -r '.apiId // empty' $(Agent.TempDirectory)/frontend_api_response.json)"
+    FRONTEND_API_ID_RESPONSE="$(jq -r '.id // empty' $(Agent.TempDirectory)/frontend_api_response.json)"
+    API_NAME_RESPONSE="$(jq -r '.name // empty' $(Agent.TempDirectory)/frontend_api_response.json)"
+    API_VERSION_RESPONSE="$(jq -r '.version // empty' $(Agent.TempDirectory)/frontend_api_response.json)"
+    API_CREATED_ON_RESPONSE="$(jq -r '.createdOn // empty' $(Agent.TempDirectory)/frontend_api_response.json)"
+    API_CREATED_BY_RESPONSE="$(jq -r '.createdBy // empty' $(Agent.TempDirectory)/frontend_api_response.json)"
+    API_STATE_RESPONSE="$(jq -r '.state // empty' $(Agent.TempDirectory)/frontend_api_response.json)"
+
+    echo "##[debug] BACKEND_API_ID_RESPONSE....: ${BACKEND_API_ID_RESPONSE}"
+    echo "##[debug] FRONTEND_API_ID_RESPONSE...: ${FRONTEND_API_ID_RESPONSE}"
+    echo "##[debug] API_NAME_RESPONSE..........: ${API_NAME_RESPONSE}"
+    echo "##[debug] API_VERSION_RESPONSE.......: ${API_VERSION_RESPONSE}"
+    echo "##[debug] API_CREATED_ON_RESPONSE....: ${API_CREATED_ON_RESPONSE}"
+    echo "##[debug] API_CREATED_BY_RESPONSE....: ${API_CREATED_BY_RESPONSE}"
+    echo "##[debug] API_STATE_RESPONSE.........: ${API_STATE_RESPONSE}"
+    echo "##vso[task.setvariable variable=FRONTEND_API_ID;isOutput=true]${FRONTEND_API_ID_RESPONSE}"
+
+    if [ -z "${FRONTEND_API_ID_RESPONSE}" ]; then
+      echo "##vso[task.logissue type=error] Error when creating Frontend API. Please check the API manager logs."
+      echo "##vso[task.complete result=Failed;]"
+      exit
+    fi
+    echo "##[endgroup]"
+
+    echo "##[group] Edit Config Frontend File '${AGENT_TEMPDIRECTORY}/edited_config_frontend.json'"
+    jq --arg idBackend "${BACKEND_API_ID_RESPONSE}" \
+      --arg idFrontend "${FRONTEND_API_ID_RESPONSE}" \
+      --arg idOrganization "${API_ORGANIZATION_ID}" \
+      --arg name "${API_NAME_RESPONSE}" \
+      --arg versionApi "${API_VERSION}" \
+      --arg createdOn "${API_CREATED_ON_RESPONSE}" \
+      --arg createdBy "${API_CREATED_BY_RESPONSE}" \
+      --arg state "${API_STATE_RESPONSE}" \
+      '.apiId = $idBackend | .id = $idFrontend | .organizationId = $idOrganization | .name = $name | .version = $versionApi | .createdOn = $createdOn | .createdBy = $createdBy | .serviceProfiles._default.apiId = $idBackend | .state = $state' \
+      configFrontend.json > ${AGENT_TEMPDIRECTORY}/edited_config_frontend.json
+    
+    cat ${AGENT_TEMPDIRECTORY}/edited_config_frontend.json
+    echo "##[endgroup]"
+
+    echo "##[group] Configure Frontend. PUT /proxies/${FRONTEND_API_ID_RESPONSE}"
+    curl -s -i -k --fail -X PUT "${API_MANAGER_BASE_URL}/proxies/${FRONTEND_API_ID_RESPONSE}" \
+      --user "${ADMIN_USERNAME}:${ADMIN_PASSWORD}" \
+      -H "Content-Type: application/json" \
+      -d "@${AGENT_TEMPDIRECTORY}/edited_config_frontend.json"
+    echo "##[endgroup]"
+  displayName: Virtualization
+  name: virtualization
+  workingDirectory: $(Build.SourcesDirectory)
+  env:
+    API_MANAGER_BASE_URL: $(API_MANAGER_BASE_URL)
+    ADMIN_USERNAME: $(ADMIN_USERNAME)
+    ADMIN_PASSWORD: $(ADMIN_PASSWORD)
+    API_NAME: ${{ parameters.apiName }}
+    API_VERSION: ${{ parameters.apiVersion }}
+    API_ORGANIZATION_ID: ${{ parameters.apiOrganizationID }}
+    API_TYPE: $(API_TYPE)
+    NEXUS_URL: $(NEXUS_REPOSITORY_URL)
+    NEXUS_REPOSITORY: $(NEXUS_REPOSITORY)
+    NEXUS_USERNAME: $(NEXUS-DEFAULT-USR)
+    NEXUS_PASSWORD: $(NEXUS-DEFAULT-PSW)
+    COMPONENT_GROUP: $(NEXUS_COMPONENT_GROUP)
+    COMPONENT_NAME: ${{ parameters.componentName }}
+    COMPONENT_VERSION: ${{ parameters.componentVersion }}

@@ -1,0 +1,100 @@
+parameters:
+  environment: ''
+
+jobs:
+- deployment: deployment
+  pool: GeneralPurposeLinuxAgents4P
+  environment: 
+    name: deploy-${{ parameters.environment }}
+  strategy:
+    runOnce:   
+      deploy:
+        steps:
+        - checkout: self
+          persistCredentials: true
+        - template: /tech_products/azr4/templates/steps/clone_submodules.yaml
+          parameters:
+            cloneGitSubmodules: 'true'
+            azureDevOpsPATToken: $(AZ_DEVOPS_PAT_TOKEN)
+            forceModuleUrl: https://telefonica-vivo-brasil@dev.azure.com/telefonica-vivo-brasil/VVIA%20-%20VIVO%20IA/_git/mlflow_admin_tools
+        - script: |
+            export
+            ls -la
+        - template: /tech_products/azr4/templates/steps/get_latest_version.yaml
+        - template: /tech_products/azr4/templates/steps/execute_in_docker.yaml
+          parameters:
+            image: 'registry.telefonicabigdata.com/ml-python:1.0.0'
+            args: --add-host=flytealias:$(FLYTE_HOST)
+            envs:
+            - key: 'VERSION'
+              value: $(get_version.VERSION)
+            - key: 'PROJECT_NAME'
+              value: $(PROJECT_NAME)
+            - key: 'FLYTE_HOST'
+              value: $(FLYTE_HOST)
+            - key: 'MAIN_FILE_PATH'
+              value: $(MAIN_FILE_PATH)
+            - key: 'PYINSTALLER_ARGS'
+              value: $(PYINSTALLER_ARGS)
+            - key: 'MLFLOW_ADMIN_TOOLS_DIR'
+              value: $(MLFLOW_ADMIN_TOOLS_DIR)
+            - key: 'SHOULD_NOT_EXECUTE_TRANSITION_MODEL'
+              value: $(SHOULD_NOT_EXECUTE_TRANSITION_MODEL)
+            script: |
+              #!/bin/bash
+              set -e
+              echo "##[group] Setup Agent"
+              python3 -V
+              export PATH=$PATH:/.local/bin:$PWD/bin:$PWD/.local/bin:/home/devops/.local/bin
+              echo "##[debug] PATH: ${PATH}"
+              echo "##[debug] ===== ${FLYTE_HOST}"
+              ping -c 3 flytealias || true
+              #python3 -m venv .venv
+              #source .venv/bin/activate
+              echo "##[debug] install flytekit xgboost"
+              pip3 install flytekit xgboost
+              echo ===== ${FLYTE_HOST}
+              ping -c 3 flytealias || true
+              mkdir -p ~/.flyte/
+              echo "##[debug] Configure Flyte"
+              echo "admin:" > ~/.flyte/config.yaml
+              echo "    endpoint: flytealias:8089" >> ~/.flyte/config.yaml
+              echo "    authType: Pkce" >> ~/.flyte/config.yaml
+              echo "    insecure: true" >> ~/.flyte/config.yaml
+              echo "logger:" >> ~/.flyte/config.yaml
+              echo "    show-source: true" >> ~/.flyte/config.yaml
+              echo "    level: 0" >> ~/.flyte/config.yaml
+              cat ~/.flyte/config.yaml
+              
+              export CFLAGS="-std=c99"
+
+              echo "##[debug] Install dependencies"
+              pip install -r requirements.txt
+              echo "##[debug] Install Flytekit"
+              pip install flytekit==1.9.0
+              echo "##[debug] Install Flytekit CLI"
+              curl -sL https://ctl.flyte.org/install | bash
+              echo "##[debug] Configure lib"
+              sed -i "s/{{VERSION}}/${VERSION}/g" lib/schedule.py
+              sed -i "s/{{PROJECT_NAME}}/${PROJECT_NAME}/g" lib/schedule.py
+              cat lib/schedule.py
+              echo "##[endgroup]"
+
+              echo "##[group] Build"
+              echo "##[debug] Build"
+              echo "##[command] pyflyte register --project nbx --domain development --service-account flyte-backend-flyte-binary lib/schedule.py"
+              pyflyte register --project nbx --domain development --service-account flyte-backend-flyte-binary lib/schedule.py
+              echo "##[command] lp_version=$(bin/flytectl get launchplan -p nbx -d development ${PROJECT_NAME}_predict --output json | jq -r '.[0].id.version')"
+              lp_version=$(bin/flytectl get launchplan -p nbx -d development ${PROJECT_NAME}_predict --output json | jq -r '.[0].id.version')
+
+              echo "##[debug] lp_version: ${lp_version}"
+              if [ -z "${SHOULD_NOT_EXECUTE_TRANSITION_MODEL}" ]; then
+                  cd mlflow_admin_tools
+                  echo "##[debug] Setting model stage to Production"
+                  pip install poetry==1.5.1
+                  export POETRY_VIRTUALENVS_IN_PROJECT=true
+                  poetry install
+                  echo "##[command] python -m mlflow_admin_tools set-stage --model-name ${PROJECT_NAME} --from-stage Staging --to-stage Production"
+                  python -m mlflow_admin_tools set-stage --model-name ${PROJECT_NAME} --from-stage Staging --to-stage Production
+              fi
+              echo "##[endgroup]"

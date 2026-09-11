@@ -1,0 +1,292 @@
+parameters:
+- name: downloadSettings
+  type: boolean
+  default: false
+steps:
+- ${{ if parameters.downloadSettings }}:
+  - template: /tech_products/azr4/templates/steps/setup_maven_settings.yaml
+    parameters:
+      nameSuffix: '_version'
+- ${{ else }}:
+  - script: echo parameters.downloadSettings is set to ${{ parameters.downloadSettings }}
+    displayName: 'debug VERSION_FILE_PATH'
+- bash: |
+    #!/bin/bash
+    setVersionGitlabFlow() {
+        # Extrair o nome do branch e o commit
+        local branch_name=$(echo "$GIT_BRANCH" | awk -F'/' '{print $NF}')
+        local commit_short=$(echo "$GIT_COMMIT" | cut -c1-8)
+
+        # Construir a versão
+        local version="${branch_name}-${commit_short}"
+
+        # Definir o ambiente com base no nome do branch
+        case "$branch_name" in
+            "main")
+                ENVIRONMENT="prod"
+                ;;
+            "develop")
+                ENVIRONMENT="dev"
+                ;;
+            "homolog")
+                ENVIRONMENT="hml"
+                ;;
+            *)
+                ENVIRONMENT="dev"
+                ;;
+        esac
+
+        # Exportar a variável de ambiente
+        export ENVIRONMENT
+        echo "##vso[task.setvariable variable=ENVIRONMENT;isOutput=true]${ENVIRONMENT}" >&2
+        echo "$version"
+    }
+
+    setVersionReleaseFlow() {
+        # Obter major e minor
+        local mM
+        IFS='.' read -r major minor <<< "$(getMajorAndMinor)"
+        echo "##[debug] Major: ${major}, Minor: ${minor}" >&2
+
+        # Obter lista de tags
+        local tags
+        tags=$(git tag --list)
+        echo "##[debug] tags: ${tags//$'\n'/, }."  >&2
+
+        # Filtrar tags que correspondem ao padrão major.minor.patch
+        local filteredTags=()
+        while IFS= read -r tag; do
+            if [[ "$tag" =~ ^${major}\.${minor}\.[0-9]+$ ]]; then
+                filteredTags+=("$tag")
+            fi
+        done <<< "$tags"
+
+        local patch=0
+        if [ ${#filteredTags[@]} -eq 0 ]; then
+            echo "${major}.${minor}.${patch}"
+            return
+        fi
+
+        # Encontrar o maior valor de patch
+        for version in "${filteredTags[@]}"; do
+            IFS='.' read -r _ _ p <<< "$version"
+            if [ "$p" -gt "$patch" ]; then
+                patch="$p"
+            fi
+        done
+
+        echo "##[debug] Latest patch: ${patch}" >&2
+        local release=$((patch + 1))
+        echo "${major}.${minor}.${release}"
+    }
+
+    setVersionGitlabFlowSemantic() {
+        echo "##[debug] Setting Version using Gitlab Flow Semantic with branch prefix" >&2
+
+        # Define the regex pattern for semantic versioning
+        local versionPattern='([0-9]+)\.([0-9]+)\.([0-9]+)'
+
+        # Extract the current version from package.json
+        current_version=$(grep '"version"' package.json | sed -E 's/.*"version": *"([^"]*)".*/\1/')
+        echo "##[debug] Current version in package.json: $current_version" >&2
+
+        # Extract the branch name
+        branch_name=$(echo "$GIT_BRANCH" | sed 's|.*/||') # Remove refs/heads or refs/tags prefixes
+        echo "##[debug] Branch name: $branch_name" >&2
+
+        # Check if the current version includes a branch prefix
+        if [[ "$current_version" =~ ^${branch_name}- ]]; then
+            # Strip the branch name prefix to get the base version
+            base_version=${current_version#${branch_name}-}
+            echo "##[debug] Base version extracted from prefixed version: $base_version" >&2
+        else
+            # Assume the current version is not prefixed
+            base_version=$current_version
+            echo "##[debug] No branch prefix detected, using current version as base: $base_version" >&2
+        fi
+
+        # Validate the base version format
+        if [[ "$base_version" =~ $versionPattern ]]; then
+            major="${BASH_REMATCH[1]}"
+            minor="${BASH_REMATCH[2]}"
+            patch="${BASH_REMATCH[3]}"
+            echo "##[debug] Extracted semantic version: $major.$minor.$patch" >&2
+        else
+            echo "##[error] No valid semantic version found in package.json after stripping branch prefix" >&2
+            exit 1
+        fi
+
+        # Increment the minor version
+        minor=$((minor + 1))
+
+        # Reset the patch version to 0
+        patch=0
+
+        # Construct the new semantic version
+        new_version="$major.$minor.$patch"
+        echo "##[debug] New semantic version: $new_version" >&2
+
+        # Combine the branch name with the new version
+        prefixed_version="${branch_name}-${new_version}"
+        echo "##[debug] Prefixed version: $prefixed_version" >&2
+
+        # Update the version in package.json
+        local tmpPackage="$TEMP_PATH/package.json"
+        jq --arg version "$prefixed_version" '.version = $version' package.json > "$tmpPackage" && mv "$tmpPackage" package.json
+
+        # Export the prefixed version as an environment variable
+        export VERSION="$prefixed_version"
+        echo "##vso[task.setvariable variable=VERSION;isOutput=true]${VERSION}" >&2
+
+        # Return the prefixed version
+        echo "$VERSION"
+    }
+
+    getMajorAndMinor() {
+        echo "##[debug] Getting Branch Major and Minor Version" >&2
+        
+        # Definir o padrão de regex para extrair major e minor
+        local versionPattern='([0-9]+)\.([0-9]+)'
+        
+        # Usar regex para encontrar a versão no nome do branch
+        if [[ "$GIT_BRANCH" =~ $versionPattern ]]; then
+            local major="${BASH_REMATCH[1]}"
+            local minor="${BASH_REMATCH[2]}"
+        else
+            echo "##[error] Wrong Branch Name Pattern - please use 'release/<M>.<m>'" >&2
+            exit 1
+        fi
+        
+        # Retornar major e minor
+        echo "##[debug] major: ${major}, minor: ${minor}" >&2
+        echo "$major.$minor"
+    }
+
+    setVersionStb() {
+        local version
+        local major
+        local minor
+        local patch
+        local release
+
+        # Tentar obter a versão mais recente
+        version=$(git describe --tags $(git rev-list --tags --max-count=1) 2>/dev/null)
+        if [ $? -eq 0 ]; then
+            # Extrair os componentes da versão
+            IFS='.' read -r major minor patch <<< "$version"
+            # Incrementar o componente patch
+            release=$((patch + 1))
+            # Retornar a nova versão
+            echo "${major}.${minor}.${release}"
+        else
+            # Em caso de erro, imprimir mensagem e retornar versão padrão
+            echo "##[debug] Unable to get version, using version 1.0.0" >&2
+            echo "1.0.0"
+        fi
+    }
+
+    # Funções para atualizar a versão
+    updatePackageJsonVersion() {
+        local tmpPackage="$TEMP_PATH/package.json"
+        jq --arg version "$VERSION" '.version = $version' package.json > "$tmpPackage" && mv "$tmpPackage" package.json
+    }
+
+    updatePomXmlVersion() {
+        local settings_args="${MAVEN_SETTINGS_ARGS}"
+
+        if [ -z "${settings_args}" ]; then
+            settings_args="-s ${MAVEN_SETTINGS}"
+            if [ -n "${MAVEN_SETTINGS_SECURITY}" ]; then
+                settings_args="${settings_args} -Dsettings.security=${MAVEN_SETTINGS_SECURITY}"
+            fi
+        fi
+
+        echo "##[command] mvn ${settings_args} versions:set -DnewVersion=${VERSION} -Dmaven.install.skip=true -Dskip -DskipTests"
+        mvn ${settings_args} versions:set -DnewVersion=${VERSION} -Dmaven.install.skip=true -Dskip -DskipTests
+    }
+
+    updateVersionFileVersion() {
+        echo "${VERSION}" > ${VERSION_FILE_PATH}
+    }
+
+    updateBuildSbtVersion() {
+        sed -i "s/version := .*/version := \"${VERSION}\"/" build.sbt
+        sed -i "s/name := \"\\(.*\\)\"/name := \"${PROJECT_NAME}\"/" build.sbt
+        sed -i "s/SBT_APP_VERSION=.*/SBT_APP_VERSION=\"${VERSION}\"/" framework/config/config-global-*.sh
+        sed -i "s/SBT_APP_NAME=\"\\(.*\\)\"/SBT_APP_NAME=\"${PROJECT_NAME}\"/" framework/config/config-global-*.sh
+    }
+
+    updateMainGoVersion() {
+        sed -i "s/var version = .*/var version = \"${VERSION}\"/" main.go
+    }
+    echo "##[debug] Generating new Version with ${BRANCHING_MODEL} and file path '${VERSION_FILE_PATH}'"
+    # Verificar o modelo de branching e definir a versão
+    if [[ "$BRANCHING_MODEL" == "gitlabflow" || "$BRANCHING_MODEL" == "gitlab-flow" ]]; then
+        echo "##[debug] Setting Version using Gitlab Flow"
+        VERSION=$(setVersionGitlabFlow)
+    elif [[ "$BRANCHING_MODEL" == "releaseflow" ||  "$BRANCHING_MODEL" == "release-flow" ]]; then
+    echo "##[debug] Setting Version using Release Flow"
+        VERSION=$(setVersionReleaseFlow)
+    elif [[ "$BRANCHING_MODEL" == "gitlabflow-semantic" ]]; then
+    echo "##[debug] Setting Version using Gitlab Flow Semantic"
+        VERSION=$(setVersionGitlabFlowSemantic)
+    else
+        echo "##[debug] Setting Version using Trunk Based"
+        VERSION=$(setVersionStb)
+    fi
+
+    # Exportar a versão para o ambiente
+    export VERSION
+    echo "##vso[task.setvariable variable=VERSION;isOutput=true]${VERSION}"
+
+    # Imprimir a mensagem de atualização da versão
+    echo "##[debug] Updating Version ${VERSION} in ${VERSION_FILE_PATH}"
+
+    # Verificar se VERSION_FILE_PATH está definido
+    if [ -n "$VERSION_FILE_PATH" ]; then
+        # Extrair o nome do arquivo
+        if [[ "$VERSION_FILE_PATH" == *" "* ]]; then
+            # Usar apenas o primeiro arquivo
+            VERSION_FILE_PATH=$(echo "$VERSION_FILE_PATH" | awk '{print $1}')
+        fi
+        FILE_NAME=$(basename "$VERSION_FILE_PATH")
+
+
+        # Usar um case para chamar a função apropriada
+        case "$FILE_NAME" in
+            "package.json")
+                updatePackageJsonVersion
+                ;;
+            "pom.xml")
+                updatePomXmlVersion
+                ;;
+            "VERSION")
+                updateVersionFileVersion
+                ;;
+            "build.sbt")
+                updateBuildSbtVersion
+                ;;
+            "main.go")
+                updateMainGoVersion
+                ;;
+            *)
+                echo "##[error] Update method to ${VERSION_FILE_PATH} not found, please contact devops4p.br@telefonica.com"
+                exit 1
+                ;;
+        esac
+        if [ $? -ne 0 ]; then
+            echo "##[error] Failed to update ${VERSION_FILE_PATH}"
+            exit 1
+        fi
+        echo "##[debug] ${VERSION_FILE_PATH} Successfully updated"
+        cat ${VERSION_FILE_PATH}
+    fi
+  env:
+    BRANCHING_MODEL: $(BRANCHING_STRATEGY)
+    VERSION_FILE_PATH: $(variables.version_file_path)
+    GIT_BRANCH: $(Build.SourceBranchName)
+    GIT_COMMIT: $(Build.SourceVersion)
+    TEMP_PATH: $(Agent.TempDirectory)
+    AZURE_DEVOPS_PAT: $(System.AccessToken)
+  name: 'set_version'
+

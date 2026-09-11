@@ -1,0 +1,59 @@
+parameters:
+- name: environment
+  type: string
+- name: gitTag
+- name: pythonVersion
+  type: string
+- name: incrementLevel
+  default: patch
+
+stages:
+- stage: Publish
+  displayName: Publish
+  dependsOn:
+    - extract_version
+    - package
+    - validation
+  pool: $(PRIVATE_AGENT_DEFAULT)
+  jobs:
+    - deployment: publish
+      condition: and(
+                    succeeded(),
+                    not(startsWith(variables['Build.SourceBranch'], 'refs/tags/')),
+                    or(
+                      eq(variables['Build.SourceBranch'], 'refs/heads/main'),
+                      eq(variables['Build.SourceBranch'], 'refs/heads/master')
+                    )
+                  )
+      workspace:
+        clean: all
+      variables:
+        LIB_CURRENT_VERSION: $[ stageDependencies.extract_version.get_version.outputs['export_current_version.LIB_VERSION'] ]
+        LIB_NEW_VERSION: $[ stageDependencies.package.bump_version.outputs['component_bump_version.LIB_NEW_VERSION'] ]
+      environment: "deploy-${{parameters.environment}}"
+      displayName: Publish Library
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+              - download: current
+                artifact: Library
+              - template: /task_groups/publish/python_lib_publish.yml
+                parameters:
+                  pythonVersion: ${{parameters.pythonVersion}}
+          on:
+            success:
+              steps:
+                - template: /provisioners/app/trunkbased/python/lib_default/steps/publish/success.yml
+                  parameters:
+                    gitTag: ${{parameters.gitTag}}
+                    pythonVersion: ${{parameters.pythonVersion}}
+                    currentVersion: $(LIB_CURRENT_VERSION)
+                    newVersion: $(LIB_NEW_VERSION)
+                    incrementLevel: ${{ parameters.incrementLevel }}
+                - template: /tasks/telemetry/telemetry.yml
+                
+            failure:
+              steps:
+                - template: /provisioners/app/trunkbased/python/lib_default/steps/publish/failure.yml
+                - template: /tasks/telemetry/telemetry.yml

@@ -1,0 +1,213 @@
+parameters:
+- name: pythonVersion
+  type: string
+- name: databricksHost
+  type: string
+- name: databricksToken
+  type: string
+
+steps:
+- bash: |
+    echo "##[debug]Creating deployNotebooks.py script..."
+    cat << EOF > deployNotebooks.py
+    # deployNotebooks.py
+    import getopt
+    import json
+    import sys
+    import requests
+    import os
+    import base64
+    from multiprocessing import Pool
+    from multiprocessing import cpu_count
+
+
+    def main():
+        reqParams = [
+            "shard", "token", "notebooksPath", "workspacePath"]
+        helpMessage = """Usage: installWhlLibrary.py
+            -s <shard>
+            -t <token>
+            -n <notebooksPath>
+            -d <workspacePath>"""
+
+        databricksHost = ""
+        token = ""
+        notebooksPath = ""
+        workspacePath = ""
+
+        try:
+            opts, _ = getopt.getopt(
+                sys.argv[1:],
+                "hstcld",
+                [
+                    "shard=",
+                    "token=",
+                    "notebooksPath=",
+                    "workspacePath="
+                ],
+            )
+        except getopt.GetoptError:
+            print(helpMessage)
+            sys.exit(2)
+
+        if not opts:
+            print(helpMessage)
+            sys.exit(2)
+        elif not ['-h'] == [opt[0] for opt in opts]:
+            paramsCheck = [
+                p for p in reqParams if "--" + p not in [opt[0] for opt in opts]
+            ]
+            if paramsCheck:
+                print("The following parameters are required: " + str(paramsCheck))
+                exit(2)
+
+        for opt, arg in opts:
+            if opt == "-h":
+                print(helpMessage)
+                sys.exit()
+            elif opt in ("-s", "--shard"):
+                databricksHost = arg
+            elif opt in ("-t", "--token"):
+                token = arg
+            elif opt in ("-n", "--notebooksPath"):
+                notebooksPath = arg
+            elif opt in ("-d", "--workspacePath"):
+                workspacePath = arg
+
+        print("-s is " + databricksHost)
+        print("-t is " + token)
+        print("-n is " + notebooksPath)
+        print("-d is " + workspacePath)
+
+        deployNotebooks(databricksHost, token, notebooksPath, workspacePath)
+
+
+    def deployNotebooks(shard, token, notebooksPath, workspacePath):
+        print("Deploying Notebooks to databricks...")
+
+        print("Getting List of Notebooks to deploy...")
+        notebooksList = listNotebooks(notebooksPath)
+
+        print("Processing '" + str(len(notebooksList)) + "' notebooks")
+
+        argList = [
+            (shard, token, notebooksPath, workspacePath, path, notebookFile)
+            for path, notebookFile in notebooksList
+        ]
+
+        print(
+            "Using '" + str(cpu_count())
+            + "' CPU(s) to process the notebooks deployment."
+        )
+        with Pool(cpu_count()) as pool:
+            pool.map(
+                deployNotebookWrapper,
+                argList
+            )
+
+
+    def deployNotebookWrapper(args):
+        deployNotebook(*args)
+
+
+    def deployNotebook(
+            shard, token, notebooksPath, workspacePath, path, notebookFile):
+        notebookDirPath = path.replace(notebooksPath, workspacePath)
+        notebookSource = os.path.join(path, notebookFile)
+        notebookTarget = os.path.join(notebookDirPath, notebookFile)
+
+        # ensure that path exists before import a notebook file
+        createWorkspaceDir(shard, token, notebookDirPath)
+        importNotebook(shard, token, notebookSource, notebookTarget)
+
+
+    def importNotebook(shard, token, notebookFile, workspacePath):
+        print("Importing Notebook '" + notebookFile + "' to databricks...")
+        with open(notebookFile, "rb") as file:
+            fileContent = file.read(-1)
+
+            postData = {
+                "path": workspacePath,
+                "format": "SOURCE",
+                "content": base64.b64encode(fileContent).decode(),
+                "language": "PYTHON",
+                "overwrite": True,
+            }
+
+            resp = requests.post(
+                shard + "/api/2.0/workspace/import",
+                data=json.dumps(postData),
+                auth=("token", token)
+            )
+
+            if resp.status_code == 200:
+                print("Notebook '" + notebookFile + "' imported successfully")
+            else:
+                print(
+                    "An error occurred while importing Notebook '"
+                    + notebookFile + "' to databricks. "
+                    + getApiErrorMessage(resp)
+                )
+                exit(1)
+
+
+    def createWorkspaceDir(shard, token, dirPath):
+        resp = requests.post(
+            shard + "/api/2.0/workspace/mkdirs",
+            data=json.dumps({"path": dirPath}),
+            auth=("token", token)
+        )
+        if resp.status_code != 200:
+            print(
+                "An error occurred while creating directory '" + dirPath + "'. "
+                + getApiErrorMessage(resp)
+            )
+            exit(1)
+
+
+    def listNotebooks(notebooksPath):
+        return [
+            (root, file)
+            for root, _, files in os.walk(notebooksPath)
+            for file in files
+        ]
+
+
+    def getApiErrorMessage(resp: requests.Response):
+        message = "An error occurred while requesting REST API. "
+        message += "Requested URL: '" + resp.url + "'. "
+        message += "Http error code: '" + str(resp.status_code) + "'. "
+        respObj = json.loads(resp.text)
+        if respObj.get("error_code"):
+            message += "API Error code: '" + respObj["error_code"] + "'. "
+        if respObj.get("message"):
+            message += " - Message: '" + respObj["message"] + "'."
+        return message
+
+
+    if __name__ == "__main__":
+        main()
+
+    EOF
+  displayName: Creating Deploy Notebooks script
+
+- template: /tech_products/ecvv/templates/tasks/python/run_bash_on_docker.yml
+  parameters:
+    pythonVersion: "${{ parameters.pythonVersion }}"
+    scriptNameOrCmd: |
+        echo "##[debug]Criando ambiente virtual python..."
+        python -m venv .venv
+
+        echo "##[debug]Ativando ambiente virtual python..."
+        source .venv/bin/activate
+
+        echo "##[debug]Instalando biblioteca requests..."
+        pip install requests
+        
+        echo "##[debug]Executando deploy dos Notebooks no databricks..."
+        python deployNotebooks.py \
+          --shard=${{ parameters.databricksHost }} \
+          --token=${{ parameters.databricksToken }} \
+          --notebooksPath=notebooks \
+          --workspacePath=/Shared/ORQUESTRADOR
+    displayName: Deploying Notebooks

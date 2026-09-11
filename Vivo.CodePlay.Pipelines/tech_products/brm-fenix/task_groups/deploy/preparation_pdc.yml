@@ -1,0 +1,75 @@
+parameters:
+- name: commandsFilesTargetFolder
+- name: deployCommandsTargetFile
+
+steps:
+  # JCR UPGRADE BRM 15: o CD resolve source_code localmente, sem baixar o artefato de Files.
+  # - template: ../../task_groups/artifact/download.yml
+  #   parameters:
+  #     displayName: Download Pipeline Artifact [source_with_shared_files]
+  #     artifactName: source_with_shared_files
+  #     targetPath: $(Agent.BuildDirectory)/source_code
+- template: ../../task_groups/checkout/checkout.yml
+  parameters:
+    repository: self
+    path: source_code
+
+  # JCR UPGRADE BRM 15: o CD resolve pricing-config e os componentes de pricing localmente.
+- template: ../../task_groups/checkout/checkout.yml
+  parameters:
+    repository: "git://CLDM - CLOUD BRM/obrm-pricing-config@$(Build.SourceBranchName)"
+    path: pricing-config
+
+- template: ../../tasks/pdc/process_folders.yml
+  parameters:
+    workingDirectory: $(Pipeline.Workspace)/pricing-config/pricing_config
+    XMLFilesFolderToDeploy: $(Agent.BuildDirectory)/pricing-config-components-to-deploy
+
+- template: ../../tasks/bash/replace_variables.yml
+  parameters:
+    sourceFile: $(DEPLOY_COMMANDS_FILE)
+    transpiledFileTargetFolder: ${{ parameters.commandsFilesTargetFolder }}
+    transpiledFileName: ${{ parameters.deployCommandsTargetFile }}
+    extraVars: "PRICING_CONFIG_COMPONENTS_TO_DEPLOY=$(PRICING_CONFIG_COMPONENTS_TO_DEPLOY);APP_EXECUTION_MODE=$(_APP_EXECUTION_MODE);OPERATION_HOST_COMMANDS_PATH=$(OPERATION_HOST_COMMANDS_PATH);ENVIRONMENT=$(ENVIRONMENT);OPERATION_HOST_HELM_PATH=$(OPERATION_HOST_HELM_PATH);HELM_CHART_FILE=$(HELM_CHART_FILE);BRM_CORE_RELEASE_VERSION=$(BRM_CORE_RELEASE_VERSION)"
+
+- ${{ each pcc in split('01_customfields,02_metadata,03_config,04_pricing', ',') }}:
+  - script: echo "##vso[task.setVariable variable=IS_ENABLED;]$([[ "$(PRICING_CONFIG_COMPONENTS_TO_DEPLOY)" == *"${{ pcc }}"* ]] && echo "true" || echo "false")"
+    displayName: "Checks if ${{ pcc }} should be executed"
+  - template: ../../tasks/bash/replace_variables.yml
+    parameters:
+      sourceFile: $(PDC_IMPORT_EXPORT_XML_COMMANDS_FILE)
+      transpiledFileTargetFolder: ${{ parameters.commandsFilesTargetFolder }}
+      transpiledFileName: export_xml_commands_$(ENVIRONMENT)_${{ split(pcc, '_')[1] }}
+      extraVars: "HELM_DRY_RUN=$(HELM_DRY_RUN);BRM_CORE_RELEASE_VERSION=$(BRM_CORE_RELEASE_VERSION);OPERATION_HOST_HELM_PATH=$(OPERATION_HOST_HELM_PATH);OPERATION=export;COMPONENT=${{ split(pcc, '_')[1] }};IE_FILENAME=$(PDC_EXPORT_FILE_NAME_PREFIX);EXTRA_CMD_LINE_ARGS=\"\""
+      condition: eq(variables.IS_ENABLED, 'true')
+  - template: ../../tasks/bash/replace_variables.yml
+    parameters:
+      sourceFile: $(PDC_IMPORT_EXPORT_XML_COMMANDS_FILE)
+      transpiledFileTargetFolder: ${{ parameters.commandsFilesTargetFolder }}
+      transpiledFileName: import_xml_commands_$(ENVIRONMENT)_${{ split(pcc, '_')[1] }}
+      extraVars: "HELM_DRY_RUN=$(HELM_DRY_RUN);BRM_CORE_RELEASE_VERSION=$(BRM_CORE_RELEASE_VERSION);OPERATION_HOST_HELM_PATH=$(OPERATION_HOST_HELM_PATH);OPERATION=import;COMPONENT=${{ split(pcc, '_')[1] }};IE_FILENAME=${{ pcc }}.xml;EXTRA_CMD_LINE_ARGS=\"-ow -ignoreID\""
+      condition: eq(variables.IS_ENABLED, 'true')
+
+# Transfer the deploy commands file to the target environment using SSH.
+- template: ../../task_groups/ssh/file_transfer.yml
+  parameters:
+    sshEndpoint: BRM_BASTION_$(ENVIRONMENT)
+    sourceFolder: ${{ parameters.commandsFilesTargetFolder }}
+    targetFolder: $(OPERATION_HOST_COMMANDS_PATH)/
+    targetEnvironment: $(OPERATION_HOST_ENVIRONMENT)
+    fileName: ${{ parameters.deployCommandsTargetFile }}
+
+- template: ../../task_groups/pdc/export_xml_files.yml
+  parameters:
+    pdcImportExportXMLCommandsSourceFile: $(PDC_IMPORT_EXPORT_XML_COMMANDS_FILE)
+    pdcImportExportXMLCommandsTranspiledFileTargetFolder: ${{ parameters.commandsFilesTargetFolder }}
+    exportXMLLogsFile: export_xml-logs
+    pricingConfigComponentsToDeploy: $(PRICING_CONFIG_COMPONENTS_TO_DEPLOY)
+- template: ../../task_groups/pdc/backup_xml_files.yml
+  parameters:
+    pricingConfigComponentsToDeploy: $(PRICING_CONFIG_COMPONENTS_TO_DEPLOY)
+- template: ../../task_groups/pdc/import_xml_files.yml
+  parameters:
+    pricingConfigComponentsToDeploy: $(PRICING_CONFIG_COMPONENTS_TO_DEPLOY)
+    # JCR UPGRADE BRM 15: o CD nao baixa mais o artefato pricing-config-components-to-deploy.
+    skipDownloadArtifact: true

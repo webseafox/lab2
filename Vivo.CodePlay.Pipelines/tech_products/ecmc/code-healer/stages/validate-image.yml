@@ -1,0 +1,161 @@
+parameters:
+  - name: image
+    type: string
+
+steps:
+  - task: AzureKeyVault@2
+    displayName: "Carregar credenciais do ACR e Nexus"
+    timeoutInMinutes: 1
+    retryCountOnTaskFailure: 5
+    inputs:
+      azureSubscription: DevOpsSharedResources
+      KeyVaultName: $(AKV_DEVOPS_NAME)
+      SecretsFilter: "DOCKER-REGISTRY-ACR-USERNAME, DOCKER-REGISTRY-ACR-PASSWORD, NEXUS-DEPS-USR, NEXUS-DEPS-PSW"
+
+  - task: Docker@2
+    displayName: "Docker login (ACR)"
+    inputs:
+      containerRegistry: $(DOCKER_ACR_REGISTRY_SERVICE_CONNECTION_NAME)
+      command: login
+
+  - bash: |
+      echo "##[section]#################### VALIDAR E BAIXAR IMAGEM ####################"
+      set -e
+
+      image="$IMAGE"
+      image_registry="${image%%/*}"
+      provider="ACR"
+      registry="$ACR_REGISTRY_NAME"
+
+      acr_prefix="${PROVIDER_ACR_PREFIX:-$ACR_REGISTRY_NAME}"
+      if [[ "$image_registry" == *.azurecr.io || "$image" == "$acr_prefix"/* || "$image" == "$acr_prefix":* || "$image_registry" == "$ACR_REGISTRY_NAME" ]]; then
+        provider="ACR"
+        registry="$ACR_REGISTRY_NAME"
+      else
+        provider="NEXUS"
+        registry="$NEXUS_REGISTRY"
+      fi
+
+      echo "##[debug] Provedor identificado: $provider"
+      echo "##[debug] Registro selecionado: $registry"
+
+      if [ "$provider" = "NEXUS" ]; then
+        echo "##[debug] Autenticando no registro Nexus..."
+        echo "$NEXUS_PASSWORD" | docker login "$NEXUS_REGISTRY" --username "$NEXUS_USERNAME" --password-stdin >/dev/null
+      fi
+
+      echo "##[group]Pull da imagem"
+      echo "##[command] docker pull $image"
+      if ! docker pull "$image"; then
+        echo "##[endgroup]"
+        echo "##vso[task.setvariable variable=IMAGE_EXISTS]false"
+        echo "##vso[task.logissue type=error]Não foi possível baixar a imagem do registry: $image (verifique se ela existe e se as credenciais têm permissão de pull)"
+        echo "##vso[task.complete result=Failed;]"
+        exit 1
+      fi
+      echo "##[endgroup]"
+
+      echo "##vso[task.setvariable variable=IMAGE_EXISTS]true"
+    displayName: "Validar e baixar imagem"
+    env:
+      IMAGE: ${{ parameters.image }}
+      ACR_REGISTRY_NAME: $(DOCKER_ACR_REGISTRY)
+      NEXUS_REGISTRY: $(DOCKER_NEXUS_REGISTRY)
+      NEXUS_USERNAME: $(NEXUS-DEPS-USR)
+      NEXUS_PASSWORD: $(NEXUS-DEPS-PSW)
+      PROVIDER_ACR_PREFIX: $(PROVIDER_ACR_PREFIX)
+      PROVIDERS_NEXUS_PREFIX: $(PROVIDERS_NEXUS_PREFIX)
+
+  - task: AzureCLI@2
+    displayName: "Verificar versão corrigida existente no ACR"
+    condition: and(succeeded(), eq(variables['IMAGE_EXISTS'], 'true'))
+    inputs:
+      azureSubscription: DevOpsSharedResources
+      scriptType: bash
+      scriptLocation: inlineScript
+      inlineScript: |
+        echo "##[section]#################### VERIFICAR VERSÃO CORRIGIDA EXISTENTE NO ACR ####################"
+
+        image="$IMAGE"
+        acr_registry="$ACR_REGISTRY_NAME"
+        acr_name="${acr_registry%%.*}"
+        sigla=$(printf '%s' "$SYSTEM_TEAMPROJECT" | awk '{print tolower($1)}')
+
+        image_without_registry="${image#*/}"
+        base_repo="${image_without_registry%:*}"
+        case "$base_repo" in
+          "$sigla"/*) repo_path="$base_repo" ;;
+          *) repo_path="${sigla}/${base_repo}" ;;
+        esac
+
+        # Extrai tag original
+        last_segment="${image##*/}"
+        if [[ "$last_segment" == *:* ]]; then
+          tag_original="${image##*:}"
+        else
+          tag_original=""
+        fi
+
+        echo "##[debug] Repositório ACR verificado: $repo_path"
+        echo "##[debug] Tag original da imagem: ${tag_original:-<sem-tag>}"
+
+
+        echo "##[command] az acr repository show-tags --name $acr_name --repository $repo_path --output tsv"
+
+        existing_tags=$(az acr repository show-tags \
+          --name "$acr_name" \
+          --repository "$repo_path" \
+          --username "$ACR_USERNAME" \
+          --password "$ACR_PASSWORD" \
+          --output tsv)
+
+        echo "##[debug] Tags existentes no ACR para este repositório: $existing_tags"
+        if [[ "$tag_original" =~ ^(.+)\.([0-9]+)$ ]]; then
+          version_prefix="${BASH_REMATCH[1]}"
+          max_patch="${BASH_REMATCH[2]}"
+        else
+          version_prefix=""
+          max_patch=0
+        fi
+        latest_corrected=""
+
+        while IFS= read -r current_tag; do
+          [ -z "$current_tag" ] && continue
+          if [ -n "$version_prefix" ]; then
+            case "$current_tag" in
+              "${version_prefix}."*)
+                candidate="${current_tag##*.}"
+                if [[ "$candidate" =~ ^[0-9]+$ ]] && [ "$candidate" -gt "$max_patch" ]; then
+                  max_patch="$candidate"
+                  latest_corrected="${acr_registry}/${repo_path}:${current_tag}"
+                fi
+                ;;
+            esac
+          else
+            case "$current_tag" in
+              [0-9]*.0.0)
+                current_version="${current_tag%.0.0}"
+                if [[ "$current_version" =~ ^[0-9]+$ ]] && [ "$current_version" -gt "$max_patch" ]; then
+                  max_patch="$current_version"
+                  latest_corrected="${acr_registry}/${repo_path}:${current_tag}"
+                fi
+                ;;
+            esac
+          fi
+        done <<< "$existing_tags"
+
+        if [ -n "$latest_corrected" ]; then
+          echo "##[debug] Versão corrigida encontrada no ACR: $latest_corrected"
+          echo "##vso[task.setvariable variable=HAS_CORRECTED_IN_ACR]true"
+          echo "##vso[task.setvariable variable=LATEST_CORRECTED_IMAGE]$latest_corrected"
+        else
+          echo "##[debug] Nenhuma versão corrigida encontrada no ACR para esta imagem."
+          echo "##vso[task.setvariable variable=HAS_CORRECTED_IN_ACR]false"
+          echo "##vso[task.setvariable variable=LATEST_CORRECTED_IMAGE]"
+        fi
+    env:
+      IMAGE: ${{ parameters.image }}
+      ACR_REGISTRY_NAME: $(DOCKER_ACR_REGISTRY)
+      SYSTEM_TEAMPROJECT: $(System.TeamProject)
+      ACR_USERNAME: $(DOCKER-REGISTRY-ACR-USERNAME)
+      ACR_PASSWORD: $(DOCKER-REGISTRY-ACR-PASSWORD)

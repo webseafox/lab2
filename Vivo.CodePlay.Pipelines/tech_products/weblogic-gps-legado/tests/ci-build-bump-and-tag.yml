@@ -1,0 +1,124 @@
+
+
+trigger:
+  branches:
+    include:
+      - '*'
+  paths:
+    include:
+      - '*'
+    exclude:
+      - docs/*
+   
+parameters:
+- name: useMavenCache
+  displayName: Usar cache do maven
+  type: boolean
+  default: True
+
+#Incluir Variaveis da Library
+variables:
+  - name: ASDF_JDK_8
+    value: "adoptopenjdk-8.0.352+8"
+  - name: System.debug
+    value: "true"
+
+stages:
+- stage: build
+  displayName: Build
+  jobs:
+  - job: package
+    displayName: Build, Test and Pack
+    pool: DefaultDevOpsAgents
+    steps:
+    - checkout: self
+      fetchDepth: 1
+      persistCredentials: true
+
+    # https://dev.azure.com/telefonica-vivo-brasil/MIGR-Gps2/_library?itemType=SecureFiles
+    - task: DownloadSecureFile@1      
+      displayName: 'Get settings-gps2.xml'
+      name: GPS2_NEXUS_SETTINGS
+      continueOnError: false
+      inputs:
+        actionOnNoFiles: 'error'
+        secureFile: settings-gps2.xml
+
+    - task: AzureKeyVault@2
+      inputs:
+        azureSubscription: 'DevOpsSharedResources'
+        KeyVaultName: 'kv-azdevops-shared'
+        SecretsFilter: 'NEXUS-DEPS-USR, NEXUS-DEPS-PSW, SONARQUBE-TOKEN'
+        RunAsPreJob: true
+
+    - task: XmlParseFromVivo@4
+      displayName: Get pom.xml info
+      name: pom_info
+      inputs:
+        type: 'file'
+        origin: $(Build.SourcesDirectory)/pom.xml
+        jpaths: |
+          var POM_XML_VERSION = .project.version._text
+
+    - task: SemverIncrementCustomFromVivo@5
+      displayName: Semver Increment 'patch'
+      name: new_version
+      continueOnError: false
+      inputs:
+        currentversion: $(POM_XML_VERSION)
+        outputVariableName: "NEW_VERSION"
+        template: "${NEW_COERCED_VERSION}"
+        releaseType: "patch"
+    
+    - task: Maven@3
+      displayName: "Maven versions:set"
+      env:
+        PUB_CREDENTIAL_USR: $(NEXUS-DEPS-USR)
+        PUB_CREDENTIAL_PSW: $(NEXUS-DEPS-PSW)
+        DEPS_CREDENTIAL_USR: $(NEXUS-DEPS-USR)
+        DEPS_CREDENTIAL_PSW: $(NEXUS-DEPS-PSW)
+        ASDF_JAVA_VERSION: $(ASDF_JDK_8)
+      inputs:
+          options: >-
+            -Dmaven.test.skip=true 
+            -DnewVersion=$(new_version.NEW_VERSION)
+            -s $(GPS2_NEXUS_SETTINGS.secureFilePath)
+          mavenPomFile: $(Build.SourcesDirectory)/pom.xml
+          mavenOptions: '-Xmx3072m'
+          javaHomeOption: 'JDKVersion'
+          goals: 'versions:set'
+
+
+    - task: Bash@3
+      displayName: Commit new version
+      name: commit_new_version
+      continueOnError: false
+      inputs:
+        targetType: inline
+        script: |-
+          git stash save pom.xml
+          git stash save **/pom.xml
+          
+          git clean -fdX
+          
+          # export TAG="$(new_version.NEW_VERSION)"
+          export TAG="$(new_version.NEW_VERSION)-codeplay"
+
+          echo "##[command] git checkout ${BUILD_SOURCEBRANCHNAME} --"
+          git fetch
+          git checkout ${BUILD_SOURCEBRANCHNAME} --
+          git pull --rebase origin ${BUILD_SOURCEBRANCHNAME}
+          git stash pop
+
+          echo "##[command] git commit"
+          git add **/pom.xml
+          git add pom.xml
+
+          git commit -m "[skip ci] CodePlay bump version ${TAG}"
+
+          echo "##[command]git tag ${TAG}"
+          git tag ${TAG} -m "Version has been updated to ${TAG}"
+
+          echo "##[command] git push origin ${BUILD_SOURCEBRANCHNAME}"
+          git push origin --tags ${BUILD_SOURCEBRANCHNAME}
+

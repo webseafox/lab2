@@ -1,0 +1,108 @@
+parameters:
+- name: copy_publish_to_artifacts
+  type: boolean
+  default: False
+- name: branch_frontend
+  type: string
+  default: ''
+- name: branch_backend
+  type: string
+  default: ''
+- name: environment_code
+  type: string
+
+stages:
+- stage: pipeline_init
+  displayName: "Start pipeline"
+  pool:
+    name: $(PRIVATE_AGENT_DEFAULT)
+  jobs:
+    - job: first_steps
+      workspace:
+        clean: all
+      displayName: "Running init"
+      steps:
+        - checkout: self
+          fetchDepth: 1
+          persistCredentials: true
+
+        - bash: |
+            ENVIRONMENT_CODE="${{ parameters.environment_code }}"
+            echo "ENVIRONMENT_CODE is \"$ENVIRONMENT_CODE\""
+            ENVIRONMENT_VERIFY=$(echo "$ENVIRONMENT_CODE" | grep "Escolha")
+            if [[ "$ENVIRONMENT_VERIFY" != "" ]]; then
+              echo "##[error]O ambiente escolhido \"$ENVIRONMENT_CODE\" não é válido"
+              exit 1
+            fi
+
+            BUILD_ID=$(Build.BuildId)            
+
+            cd $(Build.SourcesDirectory)
+            
+            set -e
+
+            echo "##[section]BUILD.SOURCEBRANCH: ................. $(Build.SourceBranch)"
+            
+            if [[ "$IS_DEV_BRANCH" == "True" ]]; then
+              echo "##[section]DEV TESTS | DEV BRANCH"
+              CURRENT_VERSION=$(date '+%Y%m%d.%H%M%S') 
+              NEW_VERSION="${CURRENT_VERSION}.${BUILD_ID}-DEV"
+              echo "##[command]TEMP BRANCH NAME: ................... $NEW_VERSION"   
+            else
+              CURRENT_VERSION=$(cat VERSION)
+              if [[ "$UPDATE_VERSION" == "True" ]]; then
+                IFS='.' read -ra VERSION_PARTS <<< "$CURRENT_VERSION"
+                PATCH_VERSION=$((${VERSION_PARTS[2]} + 1))
+                CURRENT_VERSION="${VERSION_PARTS[0]}.${VERSION_PARTS[1]}.${PATCH_VERSION}"
+                NEW_VERSION="v${CURRENT_VERSION}.${BUILD_ID}"     
+              else
+                NEW_VERSION="v${CURRENT_VERSION}.${BUILD_ID}"    
+              fi
+            fi
+
+            NEW_VERSION_FILE=$CURRENT_VERSION
+            echo "##[section]NEW VERSION: ........................ $NEW_VERSION"        
+            echo "##[section]CHANGE SEMANTIC VERSION: ............ $UPDATE_VERSION"
+            echo "##[section]CURRENT VERSION: .................... $CURRENT_VERSION"
+            echo "##[section]BUILD_ID: ........................... $BUILD_ID" 
+
+            echo "##vso[task.setvariable variable=NEW_VERSION_FILE]$NEW_VERSION_FILE"
+            echo "##vso[task.setvariable variable=IS_DEV_BRANCH;isOutput=true]$IS_DEV_BRANCH"
+            echo "##vso[task.setvariable variable=NEW_VERSION;isOutput=true]$NEW_VERSION"
+
+
+          name: set_build_version
+          displayName: 'Set new Version'
+          env:
+            UPDATE_VERSION: ${{ and(in(variables['Build.SourceBranch'], 'refs/heads/main', 'refs/heads/master'), in(variables['Build.Reason'], 'IndividualCI', 'BatchedCI'))  }}
+            IS_DEV_BRANCH: ${{ and(eq(variables['Build.Reason'], 'Manual'), ne(parameters.branch_frontend, ''), ne(parameters.branch_backend, '')) }}
+          
+        - ${{ if and(in(variables['Build.SourceBranch'], 'refs/heads/main', 'refs/heads/master'), in(variables['Build.Reason'], 'IndividualCI', 'BatchedCI')) }}:
+          - template: /tech_products/ecmc/sap-commerce/tasks/versioning/send_commit_with_new_version.yaml
+            parameters:
+              isCore: true
+              workingDirectory: $(Build.SourcesDirectory)/$(Build.Repository.Name)
+
+        - ${{ if eq(parameters.copy_publish_to_artifacts, True) }}:
+          - bash: |
+              FILE=$(Build.SourcesDirectory)/$(Build.Repository.Name)/catalog-info.yaml
+              if [ ! -f "$FILE" ]; then
+                echo "##[error] Unable to find catalog-info.yaml file $FILE"
+                exit 1
+              fi
+            displayName: "Check for catalog-info.yml"
+
+          - task: CopyFiles@2
+            displayName: "Copy catalog-info.yaml to Staging Directory"
+            inputs:
+              TargetFolder: "$(Build.ArtifactStagingDirectory)"
+              OverWrite: true
+              CleanTargetFolder: true
+              Contents: |
+                $(Build.SourcesDirectory)/catalog-info.yaml
+
+          - task: PublishPipelineArtifact@1
+            displayName: "Publish catalog-info.yaml"
+            inputs:
+              artifactName: "catalog-info"
+              targetPath: "$(Build.ArtifactStagingDirectory)"

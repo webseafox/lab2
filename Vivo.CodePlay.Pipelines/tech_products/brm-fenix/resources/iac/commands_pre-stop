@@ -1,0 +1,193 @@
+echo -ne "\n####################################################################################################"
+echo -n "######################################### PRE-STOP ACTIONS #########################################"
+echo "####################################################################################################"
+
+BRM_NAMESPACES="brm15-apps" # $(kubectl get namespaces | grep -E 'brm.*apps|apps.*brm' | awk '{print $1}' | tr '\n' ' ' | sed 's/ $//')
+
+echo -n "##[debug] ACTION ....................................................: $ACTION"
+echo -n "##[debug] NODE IPS ..................................................: $NODE_IPS"
+echo -n "##[debug] OPERATION_HOST_ENVIRONMENT ................................: $OPERATION_HOST_ENVIRONMENT"
+echo "##[debug] BRM NAMESPACES ............................................: $BRM_NAMESPACES"
+
+for NAMESPACE in $BRM_NAMESPACES; do
+    BRM_VERSION=$(echo "$NAMESPACE" | grep -o '[0-9]\+')
+
+    echo "========================================= $NAMESPACE [$BRM_VERSION] =========================================="
+
+    echo "##[group][[$NAMESPACE]] >> 1/11 >>>>>>>> Shutdown Domains ..."
+    echo "##[command][[$NAMESPACE]] helm -n $NAMESPACE upgrade brm$BRM_VERSION-core /midias/$OPERATION_HOST_ENVIRONMENT/helm-charts/package-oc-cn-helm-chart --reuse-values --timeout 5m --set ocpdc.isEnabled=false --set ocbc.bc.isEnabled=false --set ocbc.bcws.isEnabled=false"
+    helm -n $NAMESPACE upgrade brm$BRM_VERSION-core /midias/$OPERATION_HOST_ENVIRONMENT/helm-charts/package-oc-cn-helm-chart --reuse-values --timeout 5m --set ocpdc.isEnabled=false --set ocbc.bc.isEnabled=false --set ocbc.bcws.isEnabled=false
+    echo "##[endgroup]"
+
+    echo "##[group][[$NAMESPACE]] >> 2/11 >>>>>>>> Waiting PDC, billingcare and billingcare-extension Shutdown ..."
+    echo "##[command][[$NAMESPACE]] kubectl -n $NAMESPACE get pods --ignore-not-found | grep -E \"bcws.*admin.*|billingcare.*admin.*|pdc.*admin.*\" 2> /dev/null"
+    for ((counter=1; counter<=60; counter++)); do
+        CHEKPODS=`kubectl -n $NAMESPACE get pods --ignore-not-found | grep -E "bcws.*admin.*|billingcare.*admin.*|pdc.*admin.*" 2> /dev/null`
+
+        if [ -z "$CHEKPODS" ]; then
+            echo "[[$NAMESPACE]] ✅ All admins shutdown."
+            break
+        fi
+        
+        if [ $counter -eq 30 ]; then
+            echo "[[$NAMESPACE]] ⚠️ WARNING: Halfway timeout reached. Admin pods are still running - Contingency action: Forcing deletion of domains ..."
+            for domains in $(kubectl -n $NAMESPACE get domains --no-headers | awk '{print $1}'); do
+                echo "[[$NAMESPACE]] >> Forcing deletion of domain [$domains] ..."
+                echo "##[command][[$NAMESPACE]] kubectl -n $NAMESPACE delete domain $domains --grace-period=0 --force"
+                kubectl -n $NAMESPACE delete domain $domains --grace-period=0 --force
+            done
+
+        fi
+
+        echo "[[$NAMESPACE]] ⏳ [$counter/60] Waiting for admins shutdown. Checking again in 10 seconds ..."
+        sleep 10
+    done
+
+    if [ $counter -eq 60 ]; then
+        echo "[[$NAMESPACE]] ❌ ERROR: Timeout reached. Admins failed to shutdown after 60 attempts."
+    fi
+    echo "##[endgroup]"
+
+    echo "##[group][[$NAMESPACE]] >> 3/11 >>>>>>>> Remove All Jobs ..."
+    echo "##[command][[$NAMESPACE]] kubectl -n $NAMESPACE delete jobs --all --ignore-not-found"
+    kubectl -n $NAMESPACE delete jobs --all --ignore-not-found
+    echo "##[endgroup]"
+
+    echo "##[group][[$NAMESPACE]] >> 4/11 >>>>>>>> Scaling down deployments ..."
+    NSFNAME=""
+    echo "##[command][[$NAMESPACE]] kubectl -n $NAMESPACE get deployments --no-headers | awk '{print \$1}'"
+    for replicas in $(kubectl -n $NAMESPACE get deployments --no-headers | awk '{print $1}'); do 
+        if [ -z "$replicas" ]; then
+            echo "[[$NAMESPACE]] ⚠️ No deployments found to scale down."
+            continue
+        fi
+
+        if [[ "$replicas" != *"nfs"* ]]; then
+            echo "[[$NAMESPACE]] >> Scaling down deployment [$replicas] ..."
+            echo "##[command][[$NAMESPACE]] kubectl -n $NAMESPACE scale deployments $replicas --replicas=0"
+            kubectl -n $NAMESPACE scale deployments $replicas --replicas=0
+        else
+            NSFNAME=$replicas
+        fi
+    done
+    echo "##[endgroup]"
+
+    echo "##[group][[$NAMESPACE]] >> 5/11 >>>>>>>> Scaling down statefulsets ..."
+    echo "##[command][[$NAMESPACE]] kubectl -n $NAMESPACE get statefulsets --no-headers | awk '{print \$1}'"
+    for statefulsets in $(kubectl -n $NAMESPACE get statefulsets --no-headers | awk '{print $1}'); do 
+        if [ -z "$statefulsets" ]; then
+            echo "[[$NAMESPACE]] ⚠️ No statefulsets found to scale down."
+            continue
+        fi
+
+        echo "[[$NAMESPACE]] >> Scaling down statefulsets [$statefulsets] ..."
+        echo "##[command][[$NAMESPACE]] kubectl -n $NAMESPACE scale statefulsets $statefulsets --replicas=0"
+        kubectl -n $NAMESPACE scale statefulsets $statefulsets --replicas=0
+    done
+    echo "##[endgroup]"
+    
+    echo "##[group][[$NAMESPACE]] >> 6/11 >>>>>>>> Deleting deployments ..."
+    echo "##[command][[$NAMESPACE]] kubectl -n $NAMESPACE get deployments --no-headers | awk '{print \$1}'"
+    for deploy in $(kubectl -n $NAMESPACE get deployments --no-headers | awk '{print $1}'); do 
+        if [ -z "$deploy" ]; then
+            echo "[[$NAMESPACE]] ⚠️ No deployments do delete."
+            continue
+        fi
+
+        if [[ "$deploy" != *"nfs"* ]]; then
+            echo "[[$NAMESPACE]] >> Deleting deployment [$deploy] ..."
+            echo "##[command][[$NAMESPACE]] kubectl -n $NAMESPACE delete deployments $deploy --ignore-not-found"
+            kubectl -n $NAMESPACE delete deployments $deploy --ignore-not-found
+        fi
+    done
+    echo "##[endgroup]"
+
+    echo "##[group][[$NAMESPACE]] >> 7/11 >>>>>>>> Deleting replicasets ..."
+    echo "##[command][[$NAMESPACE]] kubectl -n $NAMESPACE get replicasets --no-headers | awk '{print \$1}'"
+    for replicas in $(kubectl -n $NAMESPACE get replicasets --no-headers | awk '{print $1}'); do 
+        if [ -z "$replicas" ]; then
+            echo "[[$NAMESPACE]] ⚠️ No replicasets do delete."
+            continue
+        fi
+
+        if [[ "$replicas" != *"nfs"* ]]; then
+            echo "[[$NAMESPACE]] >> Deleting replicaset [$replicas] ..."
+            echo "##[command][[$NAMESPACE]] kubectl -n $NAMESPACE delete replicasets $replicas --ignore-not-found"
+            kubectl -n $NAMESPACE delete replicasets $replicas --ignore-not-found
+        fi
+    done
+    echo "##[endgroup]"
+
+    echo "##[group][[$NAMESPACE]] >> 8/11 >>>>>>>> Deleting services ..."
+    echo "##[command][[$NAMESPACE]] kubectl -n $NAMESPACE get services --no-headers | awk '{print \$1}'"
+    for services in $(kubectl -n $NAMESPACE get services --no-headers | awk '{print $1}'); do 
+        if [ -z "$services" ]; then
+            echo "[[$NAMESPACE]] ⚠️ No services do delete."
+            continue
+        fi
+
+        if [[ "$services" != *"nfs"* ]]; then
+            echo "[[$NAMESPACE]] >> Deleting service [$services] ..."
+            echo "##[command][[$NAMESPACE]] kubectl -n $NAMESPACE delete services $services --ignore-not-found"
+            kubectl -n $NAMESPACE delete services $services --ignore-not-found
+        fi
+    done
+    echo "##[endgroup]"
+
+    echo "##[group][[$NAMESPACE]] >> 9/11 >>>>>>>> Waiting for pods to terminate ..."
+    echo "##[command][[$NAMESPACE]] kubectl -n $NAMESPACE get pods --ignore-not-found --no-headers | grep -v \"$NSFNAME\" 2> /dev/null"
+    for ((counter=1; counter<=60; counter++)); do
+        CHEKPODS=`kubectl -n $NAMESPACE get pods --ignore-not-found --no-headers | grep -v "$NSFNAME" 2> /dev/null`
+
+        if [ -z "$CHEKPODS" ]; then
+            echo "[[$NAMESPACE]] ✅ All pods terminated."
+            break
+        fi
+
+        echo "[[$NAMESPACE]] ⏳ [$counter/60] Waiting for pods to terminate. Checking again in 10 seconds"
+        echo "${CHEKPODS}"
+
+        sleep 10
+    done
+    
+    if [ $counter -eq 60 ]; then
+        echo "[[$NAMESPACE]] ⚠️ WARNING: Timeout reached. Pods failed to terminate after 60 attempts. Executing contingency action: Forcing deletion of remaining pods ..."
+        echo "##[command][[$NAMESPACE]] kubectl -n $NAMESPACE get pods --ignore-not-found --no-headers | grep -v \"$NSFNAME\" | awk '{print \$1}'"
+        for pod in $(kubectl -n $NAMESPACE get pods --ignore-not-found --no-headers | grep -v "$NSFNAME" | awk '{print $1}'); do
+            echo "[[$NAMESPACE]] >> Forcing deletion of pod [$pod] ..."
+            echo "##[command][[$NAMESPACE]] kubectl -n $NAMESPACE delete pod $pod --grace-period=0 --force"
+            kubectl -n $NAMESPACE delete pod $pod --grace-period=0 --force
+        done
+    fi
+    echo "##[endgroup]"
+
+    echo "##[group][[$NAMESPACE]] >> 10/11 >>>>>>>> Scaling down NFS deployment $NSFNAME ..."
+    echo "##[command][[$NAMESPACE]] kubectl -n $NAMESPACE scale deployments $NSFNAME --replicas=0"
+    kubectl -n $NAMESPACE scale deployments $NSFNAME --replicas=0
+    echo "##[endgroup]"
+    
+    echo "##[group][[$NAMESPACE]] >> 11/11 >>>>>>>> All Jobs and Pods ..."
+    echo ">> All Jobs"
+    echo "##[command][[$NAMESPACE]] kubectl -n $NAMESPACE get jobs --ignore-not-found"
+    kubectl -n $NAMESPACE get jobs --ignore-not-found
+    echo "=============================="
+    echo ">> All Pods"
+    echo "##[command][[$NAMESPACE]] kubectl -n $NAMESPACE get pods --ignore-not-found"
+    kubectl -n $NAMESPACE get pods --ignore-not-found
+    echo "##[endgroup]"
+
+    echo "[[$NAMESPACE]] ⏱️ End of process: $(date)"
+
+    echo ""
+    echo "===================================== end of $NAMESPACE ======================================="
+done
+
+echo ">>>>>>>>>>>>>>>>>>>>>>>>>>>>>> Draining Nodes"
+for ip in $NODE_IPS; do
+    echo "##[group]>>>>> Node $ip"
+    
+    echo "##[command]kubectl drain $ip --ignore-daemonsets --force --grace-period=0 --delete-emptydir-data --disable-eviction --timeout=600s"
+    kubectl drain $ip --ignore-daemonsets --force --grace-period=0 --delete-emptydir-data --disable-eviction --timeout=600s
+    
+    echo "##[endgroup]"
+done

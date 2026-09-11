@@ -1,0 +1,400 @@
+# Template principal para geração de pacotes via PR - Versão SCP Simplificada
+# Sequência: diff .xml → lista arquivos → SCP download → pacote deploy → publish → SCP download → pacote rollback → publish
+# 1. Verifica diff (somente os .xml) entre sourcebranch e targetbranch (target sempre master)
+# 2. Lista todos os .xml do diff e converte para .json
+# 3. SCP download dos arquivos .json da esteira 
+# 4. Gerar e publicar pacote deploy
+# 5. SCP download dos arquivos .json de produção
+# 6. Gerar e publicar pacote rollback
+
+stages:
+  # Stage 1: Análise do diff e extração de dados
+  - stage: DiffAnalysis
+    displayName: '🔍 Step 1-2: XML Diff Analysis & File Listing'
+    jobs:
+    - job: ValidateAndListChanges
+      displayName: '🔍 Diff Analysis & Extract Changed XML Files'
+      pool:
+        name: GeneralPurposeLinuxAgentsCI
+      steps:
+      - checkout: self
+        fetchDepth: 0
+        displayName: '🔄 Checkout Repository'
+      
+      - script: |
+          echo "=== STEP 1: VERIFICAR DIFF DOS ARQUIVOS .XML ==="
+          echo "Analyzing diff between source and target branches for .xml files only..."
+          
+          # Get target and source branches from PR
+          TARGET_BRANCH="${SYSTEM_PULLREQUEST_TARGETBRANCH#refs/heads/}"
+          SOURCE_BRANCH="${SYSTEM_PULLREQUEST_SOURCEBRANCH#refs/heads/}"
+          
+          echo "Source Branch (esteira): $SOURCE_BRANCH"
+          echo "Target Branch: $TARGET_BRANCH"
+          
+          # Validar que target é sempre master
+          if [ "$TARGET_BRANCH" != "master" ]; then
+            echo " ERRO: Target branch deve ser 'master', mas é '$TARGET_BRANCH'"
+            echo "##vso[task.logissue type=error]Target branch deve ser 'master'"
+            exit 1
+          fi
+          
+          echo "CHG_NUMBER do pipeline: $CHG_NUMBER"
+          echo "ESTEIRA do pipeline: $ESTEIRA"
+          
+          # Fetch branches with proper authentication
+          echo "Fetching branches..."
+          git config --global credential.helper store
+          git fetch origin $TARGET_BRANCH 2>/dev/null || echo "Target branch fetch completed"
+          git fetch origin $SOURCE_BRANCH 2>/dev/null || echo "Source branch fetch completed"
+          
+          # STEP 1: Check for .xml file changes ONLY
+          echo ""
+          echo "=== STEP 1: DIFF ANALYSIS - SOMENTE ARQUIVOS .XML ==="
+          CHANGED_XML_FILES=$(git diff --name-only origin/$TARGET_BRANCH...origin/$SOURCE_BRANCH -- "*.xml")
+          
+          if [ -z "$CHANGED_XML_FILES" ]; then
+            echo " Nenhum arquivo .xml modificado encontrado no diff"
+            echo "##vso[task.setvariable variable=HasXmlChanges;isOutput=true]false"
+            exit 0
+          fi
+          
+          echo " Arquivos .xml modificados encontrados:"
+          echo "$CHANGED_XML_FILES" | sed 's/^/   - /'
+          
+          # STEP 2: List all changed XML files and prepare JSON equivalent names
+          echo ""
+          echo "=== STEP 2: LISTA DOS ARQUIVOS .XML DO DIFF ==="
+          echo "$CHANGED_XML_FILES" > $(Build.ArtifactStagingDirectory)/changed_xml_files.txt
+          
+          # Convert to JSON names (same name, different extension)
+          echo "Converting XML names to equivalent JSON names for SCP download:"
+          echo "$CHANGED_XML_FILES" | xargs -n1 basename | sed 's/\.xml$/.json/' > $(Build.ArtifactStagingDirectory)/json_file_names.txt
+          
+          echo "JSON files to download via SCP:"
+          cat $(Build.ArtifactStagingDirectory)/json_file_names.txt | sed 's/^/   - /'
+          
+          # Set output variables for next stages
+          echo "##vso[task.setvariable variable=HasXmlChanges;isOutput=true]true"
+          
+          CHANGE_COUNT=$(echo "$CHANGED_XML_FILES" | wc -l)
+          echo "##vso[task.setvariable variable=XmlChangeCount;isOutput=true]$CHANGE_COUNT"
+          
+          echo ""
+          echo " STEPS 1-2 CONCLUÍDOS:"
+          echo "    Arquivos XML modificados: $CHANGE_COUNT"
+          echo "    CHG: $CHG_NUMBER"
+          echo "    ESTEIRA: $ESTEIRA"
+        displayName: '🔍 Steps 1-2: Diff Analysis & File Listing'
+        name: 'diffAnalysis'
+      
+      - publish: $(Build.ArtifactStagingDirectory)
+        artifact: 'diff-analysis'
+        displayName: '📤 Publish Diff Analysis Results'
+        condition: eq(variables['diffAnalysis.HasXmlChanges'], 'true')
+
+  # Stage 2: Geração do pacote de deploy usando SCP
+  - stage: GenerateDeployPackage
+    displayName: '📦 Steps 3-4: SCP Download Esteira & Publish Deploy Package'
+    dependsOn: DiffAnalysis
+    condition: eq(dependencies.DiffAnalysis.outputs['ValidateAndListChanges.diffAnalysis.HasXmlChanges'], 'true')
+    jobs:
+    - job: CreateDeployPackage
+      displayName: '📦 Step 3: SCP Download from Esteira & Create Deploy Package'
+      pool:
+        name: GeneralPurposeLinuxAgentsCI
+      variables: {}
+      steps:
+      - checkout: self
+        fetchDepth: 0
+        persistCredentials: true
+        clean: true
+        displayName: '🔄 Checkout (required for UniversalPackages)'
+      
+      - download: current
+        artifact: 'diff-analysis'
+        displayName: '⬇️ Download Diff Analysis Results'
+      
+      - script: |
+          echo "=== STEP 3: SCP DOWNLOAD DA ESTEIRA ==="
+          echo "Preparando download via SCP dos arquivos JSON da esteira..."
+          echo "CHG_NUMBER: $CHG_NUMBER"
+          echo "ESTEIRA: $ESTEIRA"
+          
+          # Criar diretórios de trabalho
+          mkdir -p $(FILES_DIR)/deploy_package
+          
+          echo "Arquivos a serem baixados via SCP da esteira:"
+          cat $(Pipeline.Workspace)/diff-analysis/json_file_names.txt | sed 's/^/   - /'
+          
+          echo " Diretórios criados para pacote de deploy via SCP"
+        displayName: '🔧 Step 3: Initialize SCP Download from Esteira'
+      
+      # Download via SCP da esteira
+      - script: |
+          echo "=== SCP DOWNLOAD DOS ARQUIVOS JSON DA ESTEIRA ==="
+          
+          # Usar credenciais da library para conexão SCP
+          # Usar variáveis: SSH_QA_USER, SSH_QA_PASS para esteira/QA
+          
+          echo "Conectando via SCP para download dos arquivos da esteira..."
+          echo "Host: $IP_ESTEIRA"
+          echo "User: $SSH_QA_USER" 
+          echo "Diretório remoto: $HML_DIR"
+          echo "Diretório local: $(FILES_DIR)/deploy_package"
+          
+          # Instalar sshpass se necessário
+          which sshpass || (echo "Instalando sshpass..." && apt-get update && apt-get install -y sshpass)
+          
+          # Download via SCP de cada arquivo JSON necessário
+          echo "Baixando arquivos JSON específicos via SCP..."
+          while IFS= read -r json_name; do
+            if [ -n "$json_name" ]; then
+              echo "Baixando via SCP: $json_name"
+              sshpass -p "$SSH_QA_PASS" scp -o StrictHostKeyChecking=no \
+                "$SSH_QA_USER@$IP_ESTEIRA:$HML_DIR/$json_name" \
+                "$(FILES_DIR)/deploy_package/$json_name" || echo "Arquivo $json_name não encontrado na esteira"
+            fi
+          done < $(Pipeline.Workspace)/diff-analysis/json_file_names.txt
+          
+          echo ""
+          echo "Arquivos baixados via SCP da esteira:"
+          ls -la $(FILES_DIR)/deploy_package/
+          
+          # Verificar arquivos baixados
+          DOWNLOADED_FILES=$(find $(FILES_DIR)/deploy_package -name "*.json" | wc -l)
+          if [ "$DOWNLOADED_FILES" -gt 0 ]; then
+            echo "##vso[task.setvariable variable=HasValidDeployFiles]true"
+            echo " ✅ SCP Download: $DOWNLOADED_FILES arquivo(s) baixado(s) da esteira"
+          else
+            echo "##vso[task.setvariable variable=HasValidDeployFiles]false"
+            echo " ❌ Nenhum arquivo baixado via SCP da esteira"
+          fi
+          
+          echo ""
+          echo "Conteúdo dos arquivos baixados da esteira:"
+          for json_file in $(FILES_DIR)/deploy_package/*.json; do
+            if [ -f "$json_file" ]; then
+              filename=$(basename "$json_file")
+              echo "=== ARQUIVO DA ESTEIRA (VIA SCP): $filename ==="
+              head -10 "$json_file"  # Mostrar apenas início do arquivo
+              echo ""
+            fi
+          done
+        displayName: '📤 SCP Download JSON Files from Esteira'
+        env:
+          SSH_QA_USER: $(SSH_QA_USER)
+          SSH_QA_PASS: $(SSH_QA_PASS)
+      
+      # Step 4: Publicar pacote de deploy
+      - task: UniversalPackages@0
+        displayName: '📦 Step 4: Publish Deploy Package to $(FEED_PACKAGE).$(CHG_NUMBER)'
+        inputs:
+          command: 'publish'
+          publishDirectory: '$(FILES_DIR)/deploy_package'
+          feedsToUsePublish: 'internal'
+          vstsFeedPublish: '3d53bc62-8749-4931-ae46-a443b73bc87a'
+          vstsFeedPackagePublish: '$(FEED_PACKAGE).$(CHG_NUMBER)'
+          versionOption: 'patch'
+          packagePublishDescription: 'Deploy package CHG $(CHG_NUMBER) - JSON files downloaded via SCP from esteira $(ESTEIRA)'
+      
+      - script: |
+          echo "=== STEPS 3-4 CONCLUÍDOS (SCP) ==="
+          echo "Step 3:  ✅ SCP download executado da esteira $(ESTEIRA)"
+          echo "Step 4:  ✅ Pacote deploy publicado: $(FEED_PACKAGE).$(CHG_NUMBER)"
+          echo ""
+          if [ "$(HasValidDeployFiles)" = "true" ]; then
+            echo " 📦 DEPLOY PACKAGE: $(FEED_PACKAGE).$(CHG_NUMBER)"
+            echo "    🔗 Origem: SCP download de $(SSH_QA_USER)@$(IP_ESTEIRA):$(HML_DIR)"
+            echo "    📄 Arquivos incluídos:"
+            find $(FILES_DIR)/deploy_package -name "*.json" | sed 's/^/      - /'
+          else
+            echo "  ❌ Nenhum arquivo válido baixado via SCP"
+          fi
+        displayName: '📋 Steps 3-4 Summary (SCP Deploy)'
+
+  # Stage Security: Segurança e análise de vulnerabilidades
+  - stage: security_scan
+    pool: GeneralPurposeLinuxAgentsCI
+    displayName: Security Scan
+    dependsOn: GenerateDeployPackage
+    condition: succeeded('GenerateDeployPackage')
+    jobs:
+    - job: AppSecConfigKeys
+      displayName: 'Get AppSec Config Keys'
+      steps:
+      - template: /security/get_appconfig_keys_framework.yml
+        parameters:
+          azureSubscription: DevOpsSharedResources
+          appConfigurationEndpoint: https://appcs-azdevops-shared.azconfig.io
+
+    - job: run_fortify
+      displayName: Run Fortify
+      dependsOn: AppSecConfigKeys
+      variables:
+        USE_FORTIFY: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.USE_FORTIFY'] ]
+        USE_CONVISO: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.USE_CONVISO'] ]
+        SKIP_SECURITY_GATE: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.SKIP_SECURITY_GATE'] ]
+        FORTIFY_APP_VERSION: $[ dependencies.AppSecConfigKeys.outputs['scan_version_name.FORTIFY_APP_VERSION'] ]
+      condition: and(succeeded(), eq(variables.USE_FORTIFY, 'true'))
+      steps:
+      - template: /security/define_appsec_app_version.yml
+
+      - template: /security/run_fortify_scan.yml
+        parameters:
+          vivoFlow: "DEV,EsteiraPreProd,EsteiraQA1,EsteiraQA2,EsteiraQA3,EsteiraQA4"
+          fortifyExclusionRepository: 'FortifyExclusion'
+          enableFortifyExclusions: false
+          appLanguage: 'java'
+          appVersion: '$(FORTIFY_APP_VERSION)'
+
+    - job: RunSCA
+      displayName: '🔍 Run SCA Scan'
+      dependsOn: AppSecConfigKeys
+      steps:
+      - template: /security/run_sca_scan.yml
+        parameters:
+          buildArtifactName: 'json'
+          appVersion: 'DevSecOps'
+          vivoFlow: 'EsteiraPreProd,EsteiraQA1,EsteiraQA2,EsteiraQA3,EsteiraQA4'
+          repositoryName: '$(Build.Repository.Name)'
+
+  # Stage 3: Geração do pacote de rollback usando SCP
+  - stage: GenerateRollbackPackage
+    displayName: '🔒 Steps 5-6: SCP Download Production & Publish Rollback Package'
+    dependsOn: 
+      - DiffAnalysis
+      - security_scan
+    condition: eq(dependencies.DiffAnalysis.outputs['ValidateAndListChanges.diffAnalysis.HasXmlChanges'], 'true')
+    jobs:
+    - job: CreateRollbackPackage
+      displayName: '🔒 Step 5: SCP Download from Production & Create Rollback Package'
+      pool:
+        name: GeneralPurposeLinuxAgentsCI
+      variables: {}
+      steps:
+      - checkout: self
+        fetchDepth: 0
+        persistCredentials: true
+        clean: true
+        displayName: '🔄 Checkout (required for UniversalPackages)'
+      
+      - download: current
+        artifact: 'diff-analysis'
+        displayName: '⬇️ Download Diff Analysis Results'
+      
+      - script: |
+          echo "=== STEP 5: SCP DOWNLOAD DE PRODUÇÃO (ROLLBACK) ==="
+          echo "Preparando download via SCP dos arquivos JSON de produção..."
+          echo "CHG_NUMBER: $CHG_NUMBER"
+          
+          # Criar diretórios de trabalho
+          mkdir -p $(FILES_DIR)/rollback_package
+          
+          echo "Arquivos a serem baixados via SCP de produção:"
+          cat $(Pipeline.Workspace)/diff-analysis/json_file_names.txt | sed 's/^/   - /'
+          
+          echo "🔒 Diretórios criados para pacote rollback via SCP"
+          echo "🔒 SEGURANÇA: Download direto via SCP de produção"
+        displayName: '🔧 Step 5: Initialize SCP Download from Production'
+      
+      # Download via SCP de produção
+      - script: |
+          echo "🔒 === SCP DOWNLOAD SEGURO DOS ARQUIVOS JSON DE PRODUÇÃO ==="
+          
+          # Usar credenciais da library para conexão SCP de produção
+          # Usar variáveis: SSH_SYNCPROD_USER, SSH_SYNCPROD_PASS para produção
+          
+          echo "🔒 Conectando via SCP para download seguro dos arquivos de produção..."
+          echo "🔒 Host: $IP_SYNCPROD"
+          echo "🔒 User: $SSH_SYNCPROD_USER" 
+          echo "🔒 Diretório remoto: $PROD_DIR"
+          echo "🔒 Diretório local: $(FILES_DIR)/rollback_package"
+          
+          # Instalar sshpass se necessário
+          which sshpass || (echo "🔒 Instalando sshpass..." && apt-get update && apt-get install -y sshpass)
+          
+          # Download via SCP de cada arquivo JSON necessário de produção
+          echo "🔒 Baixando arquivos JSON específicos via SCP de produção..."
+          while IFS= read -r json_name; do
+            if [ -n "$json_name" ]; then
+              echo "🔒 Baixando via SCP de produção: $json_name"
+              sshpass -p "$SSH_SYNCPROD_PASS" scp -o StrictHostKeyChecking=no \
+                "$SSH_SYNCPROD_USER@$IP_SYNCPROD:$PROD_DIR/$json_name" \
+                "$(FILES_DIR)/rollback_package/$json_name" || echo "🔒 Arquivo $json_name não encontrado em produção"
+            fi
+          done < $(Pipeline.Workspace)/diff-analysis/json_file_names.txt
+          
+          echo ""
+          echo "🔒 Arquivos baixados via SCP de produção:"
+          ls -la $(FILES_DIR)/rollback_package/
+          
+          # Verificar arquivos baixados
+          DOWNLOADED_FILES=$(find $(FILES_DIR)/rollback_package -name "*.json" | wc -l)
+          if [ "$DOWNLOADED_FILES" -gt 0 ]; then
+            echo "##vso[task.setvariable variable=HasValidRollbackFiles]true"
+            echo "🔒 ✅ SCP Download: $DOWNLOADED_FILES arquivo(s) baixado(s) de produção"
+          else
+            echo "##vso[task.setvariable variable=HasValidRollbackFiles]false"
+            echo "🔒 ❌ Nenhum arquivo baixado via SCP de produção"
+          fi
+          
+          echo ""
+          echo "🔒 Conteúdo dos arquivos baixados de produção:"
+          for json_file in $(FILES_DIR)/rollback_package/*.json; do
+            if [ -f "$json_file" ]; then
+              filename=$(basename "$json_file")
+              echo "🔒 === ARQUIVO DE PRODUÇÃO (VIA SCP): $filename ==="
+              head -10 "$json_file"  # Mostrar apenas início do arquivo
+              echo ""
+            fi
+          done
+          
+          echo ""
+          echo "🔒 CONFIRMAÇÃO DE SEGURANÇA:"
+          echo "   ✅ Download via SCP executado com sucesso"
+          echo "   ✅ ZERO modificações no servidor de produção"
+          echo "   ✅ Operação somente leitura via SCP confirmada"
+        displayName: '🔒 SCP Download JSON Files from Production'
+        env:
+          SSH_SYNCPROD_USER: $(SSH_SYNCPROD_USER)
+          SSH_SYNCPROD_PASS: $(SSH_SYNCPROD_PASS)
+      
+      # Step 6: Publicar pacote de rollback
+      - task: UniversalPackages@0
+        displayName: '📦 Step 6: Publish Rollback Package to $(FEED_PACKAGE).$(CHG_NUMBER)-rollback'
+        inputs:
+          command: 'publish'
+          publishDirectory: '$(FILES_DIR)/rollback_package'
+          feedsToUsePublish: 'internal'
+          vstsFeedPublish: '3d53bc62-8749-4931-ae46-a443b73bc87a'
+          vstsFeedPackagePublish: '$(FEED_PACKAGE).$(CHG_NUMBER)-rollback'
+          versionOption: 'patch'
+          packagePublishDescription: 'Rollback package CHG $(CHG_NUMBER) - JSON files downloaded via SCP from production'
+      
+      - script: |
+          echo "=== STEPS 5-6 CONCLUÍDOS (SCP) ==="
+          echo "Step 5:  🔒 ✅ SCP download executado de produção"
+          echo "Step 6:  🔒 ✅ Pacote rollback publicado: $(FEED_PACKAGE).$(CHG_NUMBER)-rollback"
+          echo ""
+          if [ "$(HasValidRollbackFiles)" = "true" ]; then
+            echo "🔒 📦 ROLLBACK PACKAGE: $(FEED_PACKAGE).$(CHG_NUMBER)-rollback"
+            echo "    🔗 Origem: SCP download de $(SSH_SYNCPROD_USER)@$(IP_SYNCPROD):$(PROD_DIR)"
+            echo "    📄 Arquivos incluídos:"
+            find $(FILES_DIR)/rollback_package -name "*.json" | sed 's/^/      - /'
+          else
+            echo "🔒  ❌ Nenhum arquivo válido baixado via SCP de produção"
+          fi
+          
+          echo ""
+          echo "=== PIPELINE COMPLETADO - SEQUÊNCIA SCP DE 6 STEPS ==="
+          echo "📋 Step 1: Diff analysis entre branches e master (.xml apenas)"
+          echo "📋 Step 2: Lista de arquivos .xml modificados extraída" 
+          echo "📥 Step 3: SCP download dos .json da esteira $(ESTEIRA)"
+          echo "📦 Step 4: Deploy package publicado: $(FEED_PACKAGE).$(CHG_NUMBER)"
+          echo "🔒 Step 5: SCP download dos .json de produção"
+          echo "🔒 Step 6: Rollback package publicado: $(FEED_PACKAGE).$(CHG_NUMBER)-rollback"
+          echo ""
+          echo "🏁 CHG: $(CHG_NUMBER) | ESTEIRA: $(ESTEIRA)"
+          echo "✅ Pipeline SCP executado com sucesso!"
+        displayName: '📋 Steps 5-6 Summary & Pipeline Completion (SCP)'

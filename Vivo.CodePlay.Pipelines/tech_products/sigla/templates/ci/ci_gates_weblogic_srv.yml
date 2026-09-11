@@ -1,0 +1,222 @@
+parameters:
+- name: qa_environment
+
+stages:
+
+- stage: gates
+  displayName: "Quality Gates"
+  dependsOn: 
+  - build_test
+  pool: $(PRIVATE_AGENT_DEFAULT)
+  jobs:
+  
+  - job: governance
+    condition: and(succeeded(), eq(variables.flowIsTagging, false), eq(lower(variables.GOVAPP_INTEGRATION_ENABLED), 'true'))
+    displayName: Governance Policies Check
+    steps:
+
+    - script: |
+        if [ ! -f "catalog-info.yaml" ]; then
+          echo "##vso[task.logissue type=error] Unable to find catalog-info.yaml file (path=$(pwd))."
+        fi
+
+        COMPONENT_NAME="$(yq -r 'select(documentIndex == 0) | .metadata.name | select (.!=null)' catalog-info.yaml)"
+        echo "##vso[task.setvariable variable=COMPONENT_NAME]${COMPONENT_NAME}"
+        echo "##vso[task.setvariable variable=CATALOG_INFO_FILE_CONTENT]$(cat catalog-info.yaml)"
+      name: export_catalog_info
+      displayName: Reading Catalog Info File
+      
+
+    - bash: |
+        version=$(grep version pom.xml | grep -v '<?xml' | grep '<version>'|head -n 1|awk '{print $1}'| cut -d'>' -f 2 | cut -d'<' -f 1)
+        echo "##vso[task.setvariable variable=APP_VERSION]$version"
+        echo "##[debug] Exporting variable 'APP_VERSION': $version"
+      name: export_current_version
+      displayName: Extract App Version 
+
+    - task: VivoGovernance@1
+      inputs:
+        breakglass: $(GOVAPP_BREAK_GLASS)
+        cluster: "$(GOVAPP_CLUSTER)"
+        component: "$(COMPONENT_NAME)"
+        deployment: "$(COMPONENT_NAME)"
+        environment: "${{ parameters.qa_environment }}" 
+        namespace: "$(GOVAPP_NAMESPACE)"
+        operation: "validate"
+        serverEndpoint: $(GOVAPP_SERVICE_CONNECTION_NAME)
+        version: "$(APP_VERSION)"
+        catalogInfo: $(CATALOG_INFO_FILE_CONTENT)
+      continueOnError: true
+      condition: eq(lower(variables.GOVAPP_INTEGRATION_ENABLED), 'true')
+
+  - job: sonarqube
+    condition: and(succeeded(), in(variables['Build.SourceBranch'], 'refs/heads/master'), ne(variables.skip_sonarqube, true))
+    displayName: Code Analysis
+    variables:
+    - name: APP_VERSION
+      value: $[ stageDependencies.build_test.bump_version.outputs['component_bump_version.APP_NEW_VERSION'] ]    
+    steps:
+    - script: |
+        if [ ! -f "catalog-info.yaml" ]; then
+          echo "##vso[task.logissue type=error] Unable to find catalog-info.yaml file (path=$(pwd))."
+          exit 1
+        fi
+
+        SONAR_PROJECT_KEY="$(yq -r 'select(documentIndex == 0) | .metadata.annotations."sonarqube.org/project-key" | select (.!=null)' catalog-info.yaml)"
+
+        echo "##[debug] SONAR_PROJECT_KEY..........: ${SONAR_PROJECT_KEY}"
+        echo "##vso[task.setvariable variable=SONAR_PROJECT_KEY]${SONAR_PROJECT_KEY}"
+      displayName: "Extract catalog-info.yaml - Sonar Project Key"
+  
+    - task: AzureKeyVault@2  
+      displayName: 'Getting AKV credentials'
+      timeoutInMinutes: 1
+      retryCountOnTaskFailure: 5  
+      inputs:    
+        azureSubscription: DevOpsSharedResources    
+        KeyVaultName: $(AKV_DEVOPS_NAME)
+        SecretsFilter: 'SONARQUBE-TOKEN'
+
+    - task: DownloadBuildArtifacts@1
+      displayName: 'Download Build Artifacts'
+      inputs:
+        artifactName: app
+        parallelizationLimit: 20
+        extractTars: true
+
+    - bash: |
+        url="$(SONARQUBE_URL)"
+        token="${SONARQUBE_TOKEN}"
+        project_key="$(SONAR_PROJECT_KEY)"
+        project_name="$(System.TeamProject)-$(Build.Repository.Name)"
+        app_quality_gate="$(SONARQUBE_PROJECT_QUALITYGATE)"
+        default_quality_gate="$(SONARQUBE_DEFAULT_QUALITYGATE)"
+
+        # If no custom quality gate was provided, use default.
+        if [[ -z $app_quality_gate ]]; then
+            app_quality_gate="$default_quality_gate"
+        fi
+
+        # Checks if the project exists. If not, creates it.
+        project_exists=$(curl -s -X POST -u $token: "$url/api/projects/search?projects=$project_key" | jq '.paging.total' | sed 's/null/0/g')
+
+        if [ "$project_exists" -ne 1 ]; then
+            project_status=$(curl -s -X POST -o ./.tmp.sonar.out -w "%{http_code}" -u $token: "$url/api/projects/create?name=$project_name&project=$project_key&visibility=public")
+
+            if [ "$project_status" -eq 200 ]; then
+                echo "SonarQube project created for $project_name"
+            else
+                echo "Error creating SonarQube project for $project_name...($(cat ./.tmp.sonar.out | jq '.errors[0].msg'))"
+            fi
+        fi
+
+        # Checks if the project's Quality Gate exists. If not, use default.
+        app_quality_gate_status=$(curl -s -o /dev/null -w "%{http_code}" -u $token: "$url/api/qualitygates/show?name=$app_quality_gate")
+
+        if [ "$app_quality_gate_status" -eq 200 ]; then
+            echo "Quality Gate found ($app_quality_gate)"
+        else
+            echo "Quality Gate not found ($app_quality_gate). Using default..."
+            
+            app_quality_gate="$default_quality_gate"
+        fi
+
+        # Links the project to its Quality Gate
+        echo "Ensuring project is linked to Quality Gate..."
+
+        status=$(curl -s -X POST -o /dev/null -w "%{http_code}" -u $token: "$url/api/qualitygates/select?gateName=$app_quality_gate&projectKey=$project_key")
+
+        if [ "$status" -ne 204 ]; then
+            echo "Error while linking application to Quality Gate!"
+        fi
+
+        rm -rf ./.tmp.sonar.out
+      displayName: 'Setup Project & Quality Gate'
+      env:
+        SONARQUBE_TOKEN: $(SONARQUBE-TOKEN)
+
+    - task: SonarSource.sonarqube.15B84CA1-B62F-4A2A-A403-89B77A063157.SonarQubePrepare@5
+      displayName: 'Prepare analysis on SonarQube'
+      inputs:
+        SonarQube: '$(SONARQUBE_SERVICE_CONNECTION_NAME)'
+        scannerMode: CLI
+        configFile: '$(SONARQUBE_CONFIG_FILE)'
+        extraProperties: |
+          sonar.scm.disabled=True
+          sonar.java.libraries=$(LIBRARIES_PATH)/**/*.jar
+          sonar.java.test.libraries=$(LIBRARIES_PATH)/**/*.jar
+          sonar.projectBaseDir=$(DEFAULT_WORKDIR_ARTIFACTS)
+          sonar.inclusions=**
+          sonar.projectKey=$(SONAR_PROJECT_KEY)
+          sonar.projectName=$(System.TeamProject)-$(Build.Repository.Name)
+          sonar.projectVersion=$(APP_VERSION)
+          sonar.analysis.repositoryName=$(Build.Repository.Name)
+          sonar.analysis.buildId=$(Build.BuildId)
+          sonar.analysis.repositoryId=$(Build.Repository.ID)
+          sonar.analysis.projectName=$(System.TeamProject)
+          sonar.analysis.projectId=$(System.TeamProjectId)
+          sonar.links.homepage=$(System.TeamFoundationCollectionUri)$(System.TeamProject)
+          sonar.links.ci=$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)&_a=summary
+          sonar.links.issue=$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_workitems
+          sonar.links.scm=$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_git/$(Build.Repository.Name)
+          sonar.scanner.metadataFilePath=$(Agent.TempDirectory)/sonar/$(Build.BuildId)/report-task.txt
+          sonar.qualitygate.wait=true
+          sonar.qualitygate.timeout=300
+      env:
+        NODE_EXTRA_CA_CERTS: $(CACORP_LOCATION)
+
+    - script: |
+        echo "##[debug] SONAR_PROJECT_KEY...........: ${SONAR_PROJECT_KEY}"
+      displayName: Show sonar project key
+      env:
+        SONAR_PROJECT_KEY: $(SONAR_PROJECT_KEY)
+
+    - task: SonarSource.sonarqube.6D01813A-9589-4B15-8491-8164AEB38055.SonarQubeAnalyze@5
+      displayName: 'Run Code Analysis'
+      continueOnError: true
+      env:
+        ASDF_JAVA_VERSION: "openjdk-11.0.2"
+
+    - script: |
+        echo "##[debug] REPORT_TASK_NAME....: $(pwd)/${REPORT_TASK_NAME}"
+        cat ${REPORT_TASK_NAME}
+
+        SONAR_TASK_ID="$(cat ${REPORT_TASK_NAME} | grep -o 'ceTaskId=[^,]*' | awk -F= '{print $2}')"
+        echo "##[debug] SONAR_TASK_ID.......: ${SONAR_TASK_ID}"
+
+        echo "##vso[task.setvariable variable=SONAR_TASK_ID;isOutput=true]${SONAR_TASK_ID}"
+      displayName: Get Sonar TaskId
+      name: sonar_task_id
+      workingDirectory: $(Agent.TempDirectory)/sonar/$(Build.BuildId)
+      env:
+        REPORT_TASK_NAME: "report-task.txt"
+
+    - task: SonarSource.sonarqube.291ed61f-1ee4-45d3-b1b0-bf822d9095ef.SonarQubePublish@5
+      displayName: 'Publish Quality Gate Result'
+      continueOnError: true
+      env:
+        NODE_EXTRA_CA_CERTS: $(CACORP_LOCATION)
+
+    - script: |
+        echo "##[debug] SONAR_TASK_ID...............: ${SONAR_TASK_ID}"
+        
+        SONAR_TASK_URL="${SONARQUBE_URL}/api/ce/task?id=${SONAR_TASK_ID}"
+        echo "##[debug] SONAR_TASK_URL..............: ${SONAR_TASK_URL}"
+        ANALYSIS_ID="$(curl -s -u "${SONARQUBE_TOKEN}:" "${SONAR_TASK_URL}" | jq -r '.task.analysisId')"
+        echo "##[debug] ANALYSIS_ID.................: ${ANALYSIS_ID}"
+
+        SONAR_PROJECT_STATUS_URL="${SONARQUBE_URL}/api/qualitygates/project_status?analysisId=${ANALYSIS_ID}"
+        echo "##[debug] SONAR_PROJECT_STATUS_URL....: ${SONAR_PROJECT_STATUS_URL}"
+        ANALYSIS_STATUS="$(curl -s -u "${SONARQUBE_TOKEN}:" "${SONAR_PROJECT_STATUS_URL}" | jq -r '.projectStatus.status')"
+        echo "##[debug] ANALYSIS_STATUS.............: ${ANALYSIS_STATUS}"
+
+        if [[ "${ANALYSIS_STATUS}" == "ERROR" ]]; then
+          echo "##vso[task.logissue type=error;] Sonar Quality Gate status is ERROR - View details on step Run Code Analysis."
+          echo "##vso[task.complete result=Failed;]"
+        fi
+      displayName: 'Break build on quality gate failure'
+      continueOnError: true
+      env:
+        SONARQUBE_TOKEN: $(SONARQUBE-TOKEN)
+        SONARQUBE_URL: $(SONARQUBE_URL)
+        SONAR_TASK_ID: $(sonar_task_id.SONAR_TASK_ID)

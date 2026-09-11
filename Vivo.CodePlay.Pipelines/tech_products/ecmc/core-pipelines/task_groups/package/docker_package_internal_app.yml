@@ -1,0 +1,52 @@
+parameters:
+- name: artifactName
+  default: app
+- name: environment
+  default: ""
+
+steps:
+
+- template: /tech_products/ecmc/core-pipelines/tasks/artifacts/download_app_with_copy.yml
+  parameters:
+    downloadPath: "$(System.ArtifactsDirectory)"
+    workingDirectory: "$(Build.SourcesDirectory)"
+    filesToCopy: "$(DEVFLOW_FILES_TO_COMMIT)"
+
+- bash: |
+    echo "##[command]Adicionando arquivos para commit da nova versão: ${DEVFLOW_FILES_TO_COMMIT}"
+    git add ${DEVFLOW_FILES_TO_COMMIT}
+  displayName: "Add files to commit new version"
+  workingDirectory: $(Build.SourcesDirectory)
+  env:
+    DEVFLOW_FILES_TO_COMMIT: $(DEVFLOW_FILES_TO_COMMIT)
+  condition: and(
+              succeeded(),
+              eq(variables.flowIsTagging, false),
+              eq(variables.flowIsMain, true)
+            )
+
+- template: /tech_products/ecmc/core-pipelines/tasks/docker/export_image_tags.yml
+  parameters:
+    namespace: $(GOV_APP_ACRONYM)
+    appSystem: $(APP_SYSTEM)
+    appName: $(APP_NAME)
+    appVersion: $(APP_VERSION)
+    environment: ${{ parameters.environment }}
+
+- template: /tech_products/ecmc/core-pipelines/tasks/docker/build_publish_image_internal_app.yml
+  parameters:
+    appName: $(APP_NAME)
+    dockerImageName: $(DOCKER_IMAGE_NAME)
+    dockerImageTag: $(DOCKER_IMAGE_TAG)
+    appVersion: $(APP_VERSION)
+
+- ${{ if in(variables['Build.SourceBranch'], 'refs/heads/main', 'refs/heads/master') }}:
+  - template: /tech_products/ecmc/core-pipelines/tasks/python/update_repo_version_v2.yml
+    parameters:
+      newVersion: "$(APP_VERSION)"
+      conditionUv: and(succeeded(), eq(variables.BUMP_VERSION_ENABLED, true), eq(variables['VERSION_MANAGER_TYPE'], 'uv'))
+      conditionVersionFile: and(succeeded(), eq(variables.BUMP_VERSION_ENABLED, true), eq(variables['VERSION_MANAGER_TYPE'], 'version_file'))
+
+- template: /tech_products/ecmc/core-pipelines/tasks/docker/export_metadata.yml
+
+- template: /tech_products/ecmc/core-pipelines/tasks/artifacts/publish_docker.yml

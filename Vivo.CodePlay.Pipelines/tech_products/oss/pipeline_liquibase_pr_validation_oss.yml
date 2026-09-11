@@ -1,0 +1,102 @@
+## -> Parameters:
+parameters:
+- name: skipDeploy
+  type: boolean
+  default: true
+- name: enableRollback
+  type: boolean
+  default: true
+
+## -> Resources:
+resources:
+  repositories:
+
+  ## -> Fortify
+  - repository: FortifyExclusion
+    name: DevOps/Vivo.Fortify.Exclusions
+    type: git
+    ref: refs/heads/master
+    endpoint: CorePipelines
+
+## -> Initialize global variables
+variables:
+- group: ${{variables['Build.Repository.Name']}}
+- template: /tech_products/oss/initialize/variables_global.yml
+- template: /tech_products/oss/initialize/variables_docker.yml
+- template: /tech_products/oss/initialize/variables_java.yml
+- template: /tech_products/oss/initialize/variables_gates.yml
+
+## -> Set TARGET_BRANCH variable to be used in the variables_liquibase.yml template
+## -> As the its trigger by PR the var Build.SourceBranchName is not available and environment parameter will be used instead
+- ${{ if in(variables['System.PullRequest.targetBranchName'],'dev','esteira1','esteira2','preprod','prodlike','producao' )}}:
+  - name: TARGET_BRANCH
+    value: ${{variables['System.PullRequest.targetBranchName']}}
+- ${{ else }}:
+  - name: TARGET_BRANCH
+    value: dev
+
+- template: /tech_products/oss/initialize/variables_liquibase.yml
+  parameters:
+    environment: ${{ variables.TARGET_BRANCH }}
+    skipDeploy: ${{ parameters.skipDeploy }}
+
+stages:
+## -> Pull Request Validation
+- stage: PR_Validation
+  displayName: "PR - Validation"
+  pool:
+    name: $(AGENT_POOL_CD)
+
+  jobs:
+
+  - job: PR_Validation
+    displayName: PR - Validation
+    steps:
+    ## -> Checkout the code
+    - checkout: self
+      displayName: Checkout Code
+      name: checkout_code
+      submodules: true
+      persistCredentials: true
+
+    ## -> Login to docker registry
+    - task: Docker@2
+      displayName: "Docker login VCR"
+      inputs:
+        containerRegistry: "VCR-DOCKER"
+        command: login
+
+    ## -> Build Liquibase docker image
+    - task: Bash@3
+      displayName: 'Build Liquibase Image'
+      continueOnError: false
+      inputs:
+        targetType: inline
+        script: |
+            ## -> Set pipeline tag for ENVIRONMENT
+            echo "##vso[build.addbuildtag]environment=$(ENVIRONMENT)"
+
+            echo "##[group] Show Dockerfile"
+            cat .azuredevops/builder.Dockerfile
+            echo "##[endgroup]"
+
+            echo "##[debug] Building the docker image from .azuredevops/builder.Dockerfile"
+            docker build -t "builder/java" -f .azuredevops/builder.Dockerfile .
+
+    ## -> Checks your changelog and identifies any possible errors with Liquibase syntax that may cause the update command to fail.
+    - task: LiquibaseMvnVivoLiquibase@4
+      displayName: 'Validate Changelogs'
+      inputs:
+        goal: 'validate'
+
+    ## -> Validate rollback scripts
+    - ${{ if eq(parameters.enableRollback, true) }}:
+      - task: LiquibaseMvnVivoLiquibase@4
+        displayName: 'Validate Rollback Scripts'
+        inputs:
+          goal: 'futureRollbackSQL'
+          extraAttributes: >-
+            -Dliquibase.outputFile=rollback-preview-$(artifact_name.ARTIFACT_NAME)-$(ENVIRONMENT)-$(System.JobAttempt).sql
+            -Dliquibase.contexts=$(ENVIRONMENT)
+            -Dliquibase.labels=$(LIQUIBASE_LABELS)
+            -Dliquibase.logLevel=FINE

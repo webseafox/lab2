@@ -1,0 +1,210 @@
+parameters:
+
+- name: environment
+  displayName: 'Escolha o ambiente para publicar'
+  type: string
+  default: preprod
+  values:
+  - preprod
+  - producao
+
+- name: envSufixMap
+  type: object
+  default:
+    preprod: -preprod
+    producao: 
+
+- name: vivonow_chg
+  displayName: 'Numero CHG do VivoNow, somente para "production"'
+  default: CHG0000001
+
+variables:
+- name: System.debug
+  value: 'true'
+
+stages:
+- stage:
+  displayName: "Ensure config files"
+  pool: GeneralPurposeLinuxAgentsCD
+  jobs:
+  - job: 
+    displayName: "Ensure files"
+    steps:
+    - checkout: self
+      fetchDepth: 1
+    # TODO: talvez no futuro
+    # - task: YamlParseFromVivo@4
+    #   displayName: 'Get Metadata Info'
+    #   inputs:
+    #     type: 'file'
+    #     origin: "catalog-info.yaml"
+    #     jpaths: |-
+    #       var CATALOG_YAML_ACRONYM = .metadata.annotations['techarch.governance-app.acronym']
+    #       var CATALOG_YAML_MODULE = .metadata.annotations['techarch.governance-app.module']
+
+    - script: |- # shell
+        echo "##vso[build.addbuildtag]nodejs"
+        echo "##vso[build.addbuildtag]azuredevops"
+        echo "##vso[build.addbuildtag]extension"
+        echo "##vso[build.addbuildtag]cd-lite"
+        # TODO: talvez no futuro
+        # echo "##vso[build.addbuildtag]$(CATALOG_YAML_ACRONYM)"
+        # echo "##vso[build.addbuildtag]$(CATALOG_YAML_MODULE)"
+      displayName: 'Set tags'
+
+    - task: EnsureFile@4
+      displayName: 'Ensure .nvmrc'
+      inputs:
+        fileName: '.nvmrc'
+        createIfNotExist: true
+        defaultContent: 'v18.15.0'
+
+    - task: EnsureFile@4
+      displayName: 'Ensure .npmrc'
+      inputs:
+        fileName: '.npmrc'
+        createIfNotExist: true
+        defaultContent: |
+          registry=https://pkgs.dev.azure.com/telefonica-vivo-brasil/_packaging/DevOps/npm/registry/
+          always-auth=true
+
+    - task: NodeTool@0
+      displayName: 'Ensure Node'
+      inputs:
+        versionSource: 'fromFile'
+        versionFilePath: '.nvmrc'
+
+    - task: CopyFiles@2
+      displayName: 'Staging Artifacts'
+      inputs:
+        SourceFolder: $(Build.SourcesDirectory)
+        TargetFolder: $(Build.ArtifactStagingDirectory)
+        Contents: |
+          .npmrc
+        CleanTargetFolder: true
+        OverWrite: true
+        flattenFolders: false
+
+    - task: PublishBuildArtifacts@1
+      displayName: "Push Artifacts"
+      inputs:
+        ArtifactName: 'generated-sources'
+        PathtoPublish: $(Build.ArtifactStagingDirectory)
+
+- stage:
+  displayName: 'VivoNow Gate'
+  pool: GeneralPurposeLinuxAgentsCD
+  jobs:
+  - job:
+    displayName: 'Check on (VivoNow)'
+    condition: eq('${{ parameters.environment }}', 'production')
+    steps:
+
+    - task: AxiosFromVivo@4
+      displayName: 'Fetch CHG'
+      inputs:
+        type: 'text'
+        origin: |
+          var options = {
+            method: 'GET',
+            url: 'http://10.41.252.111:9010/vivonow/viewer/${{ parameters.vivonow_chg }}'
+          };
+        variablePrefix: 'VIVO_NOW_CHG_'
+      env:
+        NODE_EXTRA_CA_CERTS: $(CACORP_LOCATION)
+
+    - task: RegexMatch@4
+      displayName: 'Query CHG'
+      inputs:
+        source: $(VIVO_NOW_CHG_BODY)
+        regex: '/(<title>)(.*)(<\/title>)/ig'
+        outVarPrefix: 'CHG_FOUND_'
+
+    - script: exit 1
+      displayName: 'Check CHG'
+      condition: not(variables['CHG_FOUND_HAS_MATCH'])
+
+- stage:
+  displayName: 'Deploy on (${{ parameters.environment }})'
+  pool: GeneralPurposeLinuxAgentsCD
+  variables:
+  - name: System.debug
+    value: "true"
+  jobs:
+    - job:
+      steps:
+      - checkout: self
+
+      - script: >
+          echo "##vso[task.setvariable variable=VSSEXTENSION_JSON_FILE]$(find vss-extension.json | head -n 1)"
+        displayName: "Find vss-extension.json file"
+
+      - task: JsonParseFromVivo@4
+        displayName: 'Get vss-extension.json info'
+        inputs:
+          type: 'file'
+          origin: $(VSSEXTENSION_JSON_FILE)
+          jpaths: |
+            var VSSEXTENSION_JSON_ID = .id
+            var VSSEXTENSION_JSON_VERSION = .version
+            var VSSEXTENSION_JSON_NAME = .name
+
+      - task: UniversalPackages@0
+        displayName: "Download a Universal Package"
+        condition: succeeded()
+        continueOnError: false
+        inputs:
+          command: download
+          vstsFeed: "3d53bc62-8749-4931-ae46-a443b73bc87a"
+          vstsFeedPackage: $(VSSEXTENSION_JSON_ID)
+          vstsPackageVersion: $(VSSEXTENSION_JSON_VERSION)
+          downloadDirectory: $(Build.ArtifactStagingDirectory)
+
+      - task: TfxInstaller@5
+        displayName: 'Ensure Tfx CLI'
+        inputs:
+          version: 'v0.x'
+        env:
+          NPM_CONFIG_USERCONFIG: .npmrc
+
+      - task: PackageAzureDevOpsExtension@5
+        displayName: 'Package VSIX'
+        inputs:
+          rootFolder: $(Build.ArtifactStagingDirectory)
+          localizationRoot: $(Build.ArtifactStagingDirectory)
+          extensionId: $(VSSEXTENSION_JSON_ID)${{ parameters.envSufixMap[parameters.environment] }}
+          extensionName: $(VSSEXTENSION_JSON_NAME)${{ parameters.envSufixMap[parameters.environment] }}
+          updateTasksVersion: false
+
+      - script: |-
+          echo "##vso[task.setvariable variable=VSIX_FILE]$(ls *.vsix | head -n 1)"
+        displayName: "Find vsix file"
+
+      - task: PublishAzureDevOpsExtension@5
+        continueOnError: true
+        displayName: 'Publish extension on ${{ parameters.environment }} '
+        inputs:
+          connectTo: 'VsTeam'
+          connectedServiceName: 'vso-telefonica-vivo-brasil${{ parameters.envSufixMap[parameters.environment] }}'
+          fileType: 'vsix'
+          vsixFile: $(VSIX_FILE)
+          updateTasksVersion: false
+          shareWith: telefonica-vivo-brasil${{ parameters.envSufixMap[parameters.environment] }}
+          
+      - task: IsAzureDevOpsExtensionValid@5
+        displayName: 'Validate the private extension on the marketplace'
+        inputs:
+          connectTo: "VsTeam"
+          connectedServiceName: "vso-telefonica-vivo-brasil${{ parameters.envSufixMap[parameters.environment] }}" 
+          method: 'vsix'
+          vsixFile: $(VSIX_FILE)
+
+      - task: InstallAzureDevOpsExtension@5
+        displayName: 'Install on (${{ parameters.environment }})'
+        inputs:
+          connectTo: 'VsTeam'
+          connectedServiceName: 'vso-telefonica-vivo-brasil${{ parameters.envSufixMap[parameters.environment] }}'
+          method: 'vsix'
+          vsixFile: $(VSIX_FILE)
+          accounts: https://dev.azure.com/telefonica-vivo-brasil${{ parameters.envSufixMap[parameters.environment] }}
+

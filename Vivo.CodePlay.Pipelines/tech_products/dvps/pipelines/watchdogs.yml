@@ -1,0 +1,615 @@
+﻿# Pipeline CI - [Azure DevOps Watch Dog] V1.0
+# Objetivo: Realizar monitoramento de acessos nominais no Azure DevOps com validação,
+# teste de configuração e execução de verificações de segurança das últimas 12 horas.
+# Os logs e relatórios CSV são publicados como artefatos.
+
+trigger:
+  branches:
+    include:
+    - master
+  paths:
+    include:
+    - watchdogs_script/WatchDogs.py
+    - watchdogs_script/requirements.txt
+    - watchdogs_script/send_teams.py
+    - WhiteList/whitelist_projects.json
+    - WhiteList/whitelist_users.json
+
+variables:
+- group: Watchdogs
+- name: pythonVersion
+  value: '3.9'
+- name: workingDirectory
+  value: '$(System.DefaultWorkingDirectory)'
+
+stages:
+- stage: WatchDogExecution
+  displayName: '🔍 Azure DevOps Watch Dog Execution'
+  jobs:
+  - job: SecurityMonitoring
+    pool: GeneralPurposeLinuxAgentsCI
+    displayName: '🛡️ Security Monitoring Job'
+    timeoutInMinutes: 30
+    
+    steps:
+    # Step 1: Checkout do código fonte
+    - checkout: self
+      displayName: '📥 Checkout Source Code'
+      persistCredentials: true
+    
+    # Step 3: Instalação das dependências
+    - script: |
+        echo "=== 📦 INSTALANDO DEPENDÊNCIAS ==="
+        python -m venv .venv
+        source .venv/bin/activate
+        python -m pip install --upgrade pip
+        pip install -r script_watchdogs/requirements.txt
+        echo "✅ Dependências instaladas com sucesso"
+      displayName: '📦 Install Dependencies'
+      workingDirectory: '$(workingDirectory)'
+    
+    # Step 4: Configuração das variáveis de ambiente (sem proxy)
+    - script: |
+        echo "=== ⚙️ CONFIGURANDO VARIÁVEIS DE AMBIENTE ==="
+        
+        # Ativar ambiente virtual
+        source .venv/bin/activate
+        echo "🔌 Ambiente virtual ativado"
+        
+        # Verificar se variáveis obrigatórias estão definidas
+        echo "🔍 Verificando variáveis obrigatórias..."
+        
+        if [ -z "$AZURE_DEVOPS_URL" ]; then
+          echo "❌ AZURE_DEVOPS_URL não definida"
+          exit 1
+        else
+          echo "✅ AZURE_DEVOPS_URL: $AZURE_DEVOPS_URL"
+        fi
+        
+        if [ -z "$AZURE_PAT" ]; then
+          echo "❌ AZURE_PAT não definida"
+          exit 1
+        else
+          echo "✅ AZURE_PAT: [REDACTED - $(echo $AZURE_PAT | cut -c1-4)****]"
+        fi
+        
+        if [ -z "$TEAMS_WEBHOOK_URL" ]; then
+          echo "❌ TEAMS_WEBHOOK_URL não definida"
+          exit 1
+        else
+          echo "✅ TEAMS_WEBHOOK_URL: [REDACTED - webhook configurado]"
+        fi
+        
+        # Criar arquivo .env para o script Python (apenas variáveis essenciais)
+        echo "📝 Criando arquivo .env..."
+        echo "AZURE_DEVOPS_URL=$AZURE_DEVOPS_URL" > .env
+        echo "AZURE_PAT=$AZURE_PAT" >> .env
+        echo "TEAMS_WEBHOOK_URL=$TEAMS_WEBHOOK_URL" >> .env
+        
+        # Verificar se arquivo .env foi criado corretamente
+        if [ -f ".env" ]; then
+          echo "✅ Arquivo .env criado com sucesso"
+          echo "📄 Variáveis configuradas no .env:"
+          echo "   - AZURE_DEVOPS_URL"
+          echo "   - AZURE_PAT"
+          echo "   - TEAMS_WEBHOOK_URL"
+        else
+          echo "❌ Falha ao criar arquivo .env"
+          exit 1
+        fi
+        
+        echo "🌐 Configuração: CONEXÃO DIRETA (sem proxy)"
+        echo "🔒 Variáveis de ambiente configuradas e protegidas"
+        echo "🎯 STEP 4 CONCLUÍDO - Configuração de ambiente finalizada!"
+      displayName: '⚙️ Step 4: Configure Environment Variables (Direct Connection)'
+      workingDirectory: '$(workingDirectory)'
+      env:
+        AZURE_DEVOPS_URL: $(AZURE_DEVOPS_URL)
+        AZURE_PAT: $(AZURE_PAT)
+        TEAMS_WEBHOOK_URL: $(TEAMS_WEBHOOK_URL)
+    
+    # Step 5: Teste de conectividade (Azure DevOps API + Teams Webhook)
+    - script: |
+        echo "=== 🔧 TESTANDO CONECTIVIDADE DO WATCH DOG ==="
+        
+        # Ativar ambiente virtual
+        source .venv/bin/activate
+        echo "🔌 Ambiente virtual ativado"
+        
+        # Executar teste de conectividade REAL
+        echo "🧪 Executando teste de conectividade..."
+        echo "📡 Testando Azure DevOps API..."
+        echo "📱 Testando Teams Webhook..."
+        
+        cd script_watchdogs
+        python watchdogs.py --test-config
+        test_result=$?
+        
+        if [ $test_result -eq 0 ]; then
+          echo "✅ TESTE DE CONECTIVIDADE PASSOU!"
+          echo "✅ Azure DevOps API: CONECTADO"
+          echo "✅ Teams Webhook: CONECTADO"
+          echo "🎯 Sistema validado e pronto para monitoramento"
+        else
+          echo "❌ TESTE DE CONECTIVIDADE FALHOU!"
+          echo "❌ Verifique conectividade de rede"
+          echo "❌ Verifique validade das credenciais"
+          exit 1
+        fi
+        
+        echo "🎯 STEP 5 CONCLUÍDO - Conectividade testada e validada!"
+      displayName: '🔧 Step 5: Test Real Connectivity (API + Webhook)'
+      workingDirectory: '$(workingDirectory)'
+      env:
+        AZURE_DEVOPS_URL: $(AZURE_DEVOPS_URL)
+        AZURE_PAT: $(AZURE_PAT)
+        TEAMS_WEBHOOK_URL: $(TEAMS_WEBHOOK_URL)
+    
+    # Step 5.5: Validação dos arquivos JSON de whitelist
+    - script: |
+        echo "=== 📋 VALIDANDO ARQUIVOS JSON DE WHITELIST ==="
+        
+        # Ativar ambiente virtual
+        source .venv/bin/activate
+        echo "🔌 Ambiente virtual ativado"
+        
+        echo "🔍 Verificando arquivos JSON de whitelist na pasta WhiteList/"
+        
+        # Verificar se a pasta WhiteList existe
+        if [ ! -d "WhiteList" ]; then
+          echo "❌ PASTA WhiteList/ NÃO ENCONTRADA!"
+          echo "❌ O sistema de whitelist requer os arquivos JSON:"
+          echo "   - WhiteList/whitelist_users.json"
+          echo "   - WhiteList/whitelist_projects.json"
+          exit 1
+        fi
+        
+        # Verificar arquivo whitelist_users.json
+        if [ -f "WhiteList/whitelist_users.json" ]; then
+          echo "✅ WhiteList/whitelist_users.json: ENCONTRADO"
+          
+          # Validar se é JSON válido
+          if python -c "import json; json.load(open('WhiteList/whitelist_users.json'))" 2>/dev/null; then
+            echo "✅ WhiteList/whitelist_users.json: JSON VÁLIDO"
+            
+            # Verificar estrutura básica
+            users_count=$(python -c "import json; config=json.load(open('WhiteList/whitelist_users.json')); print(len(config.get('authorized_users', [])))" 2>/dev/null || echo "0")
+            version=$(python -c "import json; config=json.load(open('WhiteList/whitelist_users.json')); print(config.get('version', 'N/A'))" 2>/dev/null || echo "N/A")
+            
+            echo "✅ WhiteList/whitelist_users.json: ESTRUTURA VÁLIDA"
+            echo "📊 Usuários autorizados encontrados: $users_count"
+            echo "📋 Versão do arquivo: $version"
+          else
+            echo "❌ WhiteList/whitelist_users.json: JSON INVÁLIDO!"
+            exit 1
+          fi
+        else
+          echo "❌ WhiteList/whitelist_users.json: NÃO ENCONTRADO!"
+          exit 1
+        fi
+        
+        # Verificar arquivo whitelist_projects.json
+        if [ -f "WhiteList/whitelist_projects.json" ]; then
+          echo "✅ WhiteList/whitelist_projects.json: ENCONTRADO"
+          
+          # Validar se é JSON válido
+          if python -c "import json; json.load(open('WhiteList/whitelist_projects.json'))" 2>/dev/null; then
+            echo "✅ WhiteList/whitelist_projects.json: JSON VÁLIDO"
+            
+            # Verificar estrutura básica
+            patterns_count=$(python -c "import json; config=json.load(open('WhiteList/whitelist_projects.json')); print(len(config.get('authorized_project_patterns', [])))" 2>/dev/null || echo "0")
+            version=$(python -c "import json; config=json.load(open('WhiteList/whitelist_projects.json')); print(config.get('version', 'N/A'))" 2>/dev/null || echo "N/A")
+            
+            echo "✅ WhiteList/whitelist_projects.json: ESTRUTURA VÁLIDA"
+            echo "📊 Padrões de projeto encontrados: $patterns_count"
+            echo "📋 Versão do arquivo: $version"
+          else
+            echo "❌ WhiteList/whitelist_projects.json: JSON INVÁLIDO!"
+            exit 1
+          fi
+        else
+          echo "❌ WhiteList/whitelist_projects.json: NÃO ENCONTRADO!"
+          exit 1
+        fi
+        
+        echo "✅ VALIDAÇÃO DE WHITELIST CONCLUÍDA COM SUCESSO!"
+        echo "🎯 Sistema de whitelist configurado e operacional"
+        echo "🎯 STEP 5.5 CONCLUÍDO - Arquivos JSON validados!"
+      displayName: '📋 Step 5.5: Validate WhiteList JSON Files'
+      workingDirectory: '$(workingDirectory)'
+    
+    # Step 6: Verificação de segurança (últimas 12 horas)
+    - script: |
+        echo "=== 🔍 EXECUTANDO VERIFICAÇÃO DE SEGURANÇA ==="
+        
+        # Ativar ambiente virtual
+        source .venv/bin/activate
+        echo "🔌 Ambiente virtual ativado"
+        
+        # Navegar para o diretório do script
+        cd script_watchdogs
+        
+        # Limpar cache de eventos para garantir que alertas sejam enviados
+        echo "🧹 Limpando cache de eventos para nova execução..."
+        rm -f .event_cache.txt 2>/dev/null || true
+        echo "✅ Cache limpo - eventos serão processados novamente"
+        
+        # Executar verificação de segurança das últimas 12 horas
+        echo "🔍 Iniciando verificação de segurança..."
+        echo "⏰ Período: Últimas 12 horas"
+        echo "🎯 Buscando eventos críticos de acessos nominais"
+        echo "📊 Análise de grupos, permissões e tokens"
+        
+        python watchdogs.py --check --hours 12
+        check_result=$?
+        
+        if [ $check_result -eq 0 ]; then
+          echo "✅ VERIFICAÇÃO DE SEGURANÇA CONCLUÍDA!"
+          echo "📊 Análise completa das últimas 12 horas finalizada"
+          echo "📧 Alertas enviados para Teams (se houver eventos)"
+          echo "📄 Relatório CSV gerado (se houver eventos)"
+        else
+          echo "❌ VERIFICAÇÃO DE SEGURANÇA FALHOU!"
+          echo "❌ Código de saída: $check_result"
+          echo "❌ Verifique logs para detalhes do erro"
+          exit 1
+        fi
+        
+        # Verificar se CSV foi gerado
+        if [ -f "eventos_audit_full.csv" ]; then
+          echo "📄 Arquivo CSV gerado: eventos_audit_full.csv"
+          echo "📊 Relatório completo de eventos disponível"
+          echo "📏 Tamanho do arquivo: $(du -h eventos_audit_full.csv | cut -f1)"
+          echo "📝 Linhas no arquivo: $(wc -l < eventos_audit_full.csv)"
+        else
+          echo "ℹ️  Nenhum arquivo CSV gerado (sem eventos críticos detectados)"
+        fi
+        
+        echo "🎯 STEP 6 CONCLUÍDO - Verificação de segurança finalizada!"
+      displayName: '🔍 Step 6: Security Check (Last 12 Hours)'
+      workingDirectory: '$(workingDirectory)'
+      env:
+        AZURE_DEVOPS_URL: $(AZURE_DEVOPS_URL)
+        AZURE_PAT: $(AZURE_PAT)
+        TEAMS_WEBHOOK_URL: $(TEAMS_WEBHOOK_URL)
+    
+    # Step 7: Commit e Push do CSV para repositório
+    - script: |
+        echo "=== 📝 VERSIONANDO ARQUIVO CSV ==="
+        
+        # Ativar ambiente virtual
+        source .venv/bin/activate
+        echo "🔌 Ambiente virtual ativado"
+        
+        # Navegar para o diretório do script onde foi gerado o CSV
+        cd script_watchdogs
+        
+        # Verificar se o arquivo CSV foi gerado
+        if [ -f "eventos_audit_full.csv" ]; then
+          echo "📄 Arquivo CSV encontrado: eventos_audit_full.csv"
+          echo "📊 Preparando para versionamento..."
+          
+          # Voltar para o diretório raiz do repositório
+          cd ..
+          
+          # Criar diretório csv se não existir
+          mkdir -p csv
+          
+          # Copiar o arquivo CSV para o local correto com o nome desejado
+          cp script_watchdogs/eventos_audit_full.csv csv/teste.csv
+          echo "📁 Arquivo copiado para: csv/teste.csv"
+          
+          # Configurar Git (usar informações do pipeline)
+          git config user.name "Azure DevOps Pipeline"
+          git config user.email "pipeline@telefonicati.onmicrosoft.com"
+          
+          # Sempre adicionar timestamp único ao arquivo para forçar mudança
+          echo "" >> csv/teste.csv
+          echo "# Executado em: $(date '+%Y-%m-%d %H:%M:%S UTC')" >> csv/teste.csv
+          echo "# Pipeline: $(Build.BuildNumber)" >> csv/teste.csv
+          echo "# Build ID: $(Build.BuildId)" >> csv/teste.csv
+          
+          # Adicionar o arquivo ao Git
+          git add csv/teste.csv
+          
+          # Sempre fazer commit (cada execução é única)
+          timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+          commit_message="🔍 Watch Dog Report #$(Build.BuildNumber) - $timestamp [ci skip]
+          
+          📊 Relatório de Segurança Azure DevOps
+          ⏰ Período: Últimas 12 horas
+          📁 Arquivo: csv/teste.csv
+          🔧 Pipeline: $(Build.BuildNumber)
+          🌿 Branch: $(Build.SourceBranchName)
+          📈 Eventos: $(wc -l < csv/teste.csv | tr -d ' ') linhas
+          🕐 Timestamp: $timestamp UTC"
+          
+          git commit -m "$commit_message"
+          
+          # Fazer push
+          git push origin HEAD:$(Build.SourceBranchName)
+          
+          # Capturar hash do commit para referência
+          commit_hash=$(git rev-parse HEAD)
+          commit_short_hash=$(git rev-parse --short HEAD)
+          
+          echo "✅ NOVO COMMIT CRIADO COM SUCESSO!"
+          echo "📝 Commit Hash: $commit_hash"
+          echo "🔗 Commit Curto: $commit_short_hash"
+          echo "📂 Arquivo atualizado: csv/teste.csv"
+          echo "🌐 Branch: $(Build.SourceBranchName)"
+          echo "🔢 Build: $(Build.BuildNumber)"
+          
+          # Salvar informações do commit para uso no relatório Teams
+          cd ..
+          echo "$commit_short_hash" > commit_short_hash.txt
+          echo "https://dev.azure.com/telefonica-vivo-brasil/DevOps/_git/Teste.Script_?path=/csv/teste.csv&version=GC$commit_hash" > commit_url.txt
+          
+          echo "🔗 URL gerada: https://dev.azure.com/telefonica-vivo-brasil/DevOps/_git/Teste.Script_?path=/csv/teste.csv&version=GC$commit_hash"
+          
+        else
+          echo "ℹ️  Arquivo CSV não encontrado (eventos_audit_full.csv)"
+          echo "📝 Nenhum evento crítico foi detectado na verificação"
+          echo "🔄 Nada para versionar neste ciclo"
+          
+          # Criar arquivo vazio para indicar que não houve eventos
+          mkdir -p csv
+          echo "# Nenhum evento crítico detectado em $(date '+%Y-%m-%d %H:%M:%S')" > csv/teste.csv
+          echo "# Verificação realizada com sucesso - sem alertas" >> csv/teste.csv
+          
+          git config user.name "Azure DevOps Pipeline"
+          git config user.email "pipeline@telefonicati.onmicrosoft.com"
+          git add csv/teste.csv
+          
+          if ! git diff --staged --quiet; then
+            git commit -m "📊 Watch Dog - Sem eventos críticos detectados ($(date '+%Y-%m-%d %H:%M:%S')) [ci skip]"
+            git push origin HEAD:$(Build.SourceBranchName)
+            echo "✅ Status 'sem eventos' versionado com sucesso"
+          fi
+        fi
+        
+        echo "🎯 STEP 7 CONCLUÍDO - Versionamento do CSV finalizado!"
+      displayName: '📝 Step 7: Commit & Push CSV Report'
+      workingDirectory: '$(workingDirectory)'
+    
+    # Step 8: Envio de relatório consolidado para Teams (usando método original)
+    - script: |
+        echo "=== 📱 ENVIANDO RELATÓRIO TEAMS ==="
+        
+        # Ativar ambiente virtual
+        source .venv/bin/activate
+        echo "🔌 Ambiente virtual ativado"
+        
+        # Verificar se arquivo CSV foi gerado e preparar informações para o Teams
+        if [ -f "csv/teste.csv" ]; then
+          echo "📄 Arquivo CSV encontrado: csv/teste.csv"
+          
+          # Contar eventos no CSV (desconsiderar header e comentários)
+          event_count=$(grep -v "^#" csv/teste.csv | grep -v "^Ação" | wc -l | tr -d ' ')
+          echo "📊 Eventos encontrados no CSV: $event_count"
+          
+          # Obter informações do commit
+          commit_hash=$(git rev-parse --short HEAD)
+          commit_url="https://dev.azure.com/telefonica-vivo-brasil/DevOps/_git/Teste.Script_?path=/csv/teste.csv&version=GC$(git rev-parse HEAD)"
+          
+          echo "🔗 Hash do commit: $commit_hash"
+          echo "🌐 URL do CSV: $commit_url"
+          
+          # Salvar informações para o script Python usar
+          echo "$commit_url" > commit_url.txt
+          echo "$commit_hash" > commit_short_hash.txt
+          echo "$event_count" > event_count.txt
+          
+          echo "📝 Informações salvas para envio do Teams"
+        else
+          echo "ℹ️  Arquivo CSV não encontrado"
+          echo "0" > event_count.txt
+          echo "" > commit_url.txt
+          echo "" > commit_short_hash.txt
+        fi
+        
+        # Navegar para o diretório do script e executar o método original
+        cd script_watchdogs
+        
+        echo "🚀 Executando método original send_consolidated_teams_report()..."
+        echo "📱 Usando formato completo com design original do analisebkp.py"
+        
+        # Executar o método original do watchdogs.py para envio consolidado
+        python -c "
+        import sys
+        import os
+        import csv
+        import pandas as pd
+        from datetime import datetime
+        sys.path.append('.')
+        
+        # Importar classes necessárias
+        from watchdogs import AzureDevOpsWatchDog, AuditEvent
+        
+        # Carregar informações do commit
+        try:
+            with open('../commit_url.txt', 'r') as f:
+                commit_url = f.read().strip()
+        except:
+            commit_url = ''
+            
+        try:
+            with open('../commit_short_hash.txt', 'r') as f:
+                commit_hash = f.read().strip()
+        except:
+            commit_hash = ''
+        
+        # Preparar informações do pipeline
+        build_number = os.environ.get('BUILD_BUILDNUMBER', 'N/A')
+        branch_name = os.environ.get('BUILD_SOURCEBRANCHNAME', 'N/A')
+        
+        print(f'📊 Step 8: Lendo eventos reais do CSV gerado no Step 6')
+        print(f'🔧 Build: {build_number}')
+        print(f'🌿 Branch: {branch_name}')
+        print(f'🔗 URL CSV: {commit_url}')
+        
+        # Ler eventos REAIS do CSV gerado no Step 6
+        events_reais = []
+        csv_path = '../csv/teste.csv'
+        
+        try:
+            if os.path.exists(csv_path):
+                print(f'📄 Lendo CSV: {csv_path}')
+                
+                # Ler CSV usando pandas (mesmo formato do Step 6)
+                df = pd.read_csv(csv_path, sep=';', encoding='utf-8-sig')
+                print(f'📊 Total de linhas no CSV: {len(df)}')
+                
+                # Filtrar linhas que não são comentários
+                df_eventos = df[~df['Ação'].str.startswith('#', na=False)]
+                print(f'📊 Eventos válidos encontrados: {len(df_eventos)}')
+                
+                # Converter cada linha do CSV em AuditEvent real
+                for index, row in df_eventos.iterrows():
+                    try:
+                        # Extrair dados da linha do CSV
+                        acao = str(row.get('Ação', ''))
+                        usuario_afetado = str(row.get('Usuário Afetado', ''))
+                        grupo = str(row.get('Grupo', ''))
+                        executado_por = str(row.get('Executado por', ''))
+                        email = str(row.get('Email', ''))
+                        ip = str(row.get('IP', ''))
+                        user_agent = str(row.get('User Agent', ''))
+                        data_br = str(row.get('Data/Hora (BR)', ''))
+                        detalhes = str(row.get('Detalhes', ''))
+                        
+                        # Converter data brasileira de volta para UTC
+                        try:
+                            data_obj = datetime.strptime(data_br, '%d/%m/%Y %H:%M:%S')
+                            # Adicionar 3 horas para converter de Brasil para UTC
+                            data_utc = data_obj.replace(hour=(data_obj.hour + 3) % 24)
+                        except:
+                            data_utc = datetime.now()
+                        
+                        # Mapear ação para action_id
+                        action_id_map = {
+                            'Adição de membro em grupo': 'Group.UpdateGroupMembership.Add',
+                            'Remoção de membro de grupo': 'Group.UpdateGroupMembership.Remove',
+                            'Modificação de permissões': 'Security.ModifyPermissions',
+                            'Adição de permissões': 'Security.AddPermissions',
+                            'Remoção de permissões': 'Security.RemovePermissions',
+                            'Criação de Personal Access Token': 'Token.CreatePersonalAccessToken',
+                            'Revogação de Personal Access Token': 'Token.RevokePersonalAccessToken',
+                            'Criação de projeto': 'Project.CreateProject',
+                            'Exclusão de projeto': 'Project.DeleteProject'
+                        }
+                        action_id = action_id_map.get(acao, acao)
+                        
+                        # Criar AuditEvent real com dados do CSV
+                        event = AuditEvent(
+                            id=f'csv_event_{index}',
+                            timestamp=data_utc,
+                            action_id=action_id,
+                            category='Security',
+                            actor_display_name=executado_por,
+                            actor_email=email,
+                            details={
+                                'target_user': usuario_afetado,
+                                'group_name': grupo,
+                                'raw_details': detalhes
+                            },
+                            ip_address=ip,
+                            user_agent=user_agent
+                        )
+                        events_reais.append(event)
+                        
+                    except Exception as e:
+                        print(f'⚠️  Erro ao processar linha {index}: {e}')
+                        continue
+                
+                print(f'✅ {len(events_reais)} eventos reais carregados do CSV')
+                
+            else:
+                print(f'⚠️  CSV não encontrado: {csv_path}')
+                events_reais = []
+                
+        except Exception as e:
+            print(f'❌ Erro ao ler CSV: {e}')
+            events_reais = []
+        
+        # Executar método original com dados REAIS e design do analisebkp.py
+        try:
+            # Instanciar a classe AzureDevOpsWatchDog
+            service = AzureDevOpsWatchDog()
+            
+            if events_reais:
+                print(f'🚀 Enviando relatório com {len(events_reais)} eventos REAIS')
+                print('🎨 Usando design original do analisebkp.py (linha 517)')
+                
+                # Chamar método original com eventos reais
+                service.send_consolidated_teams_report(
+                    events=events_reais,  # Eventos REAIS do CSV
+                    commit_url=commit_url if commit_url else None,
+                    commit_hash=commit_hash if commit_hash else None
+                )
+                
+                print('✅ Relatório Teams enviado com eventos REAIS!')
+                print(f'📊 Eventos processados: {len(events_reais)}')
+                
+            else:
+                print('📝 Nenhum evento real encontrado - enviando relatório vazio')
+                
+                # Enviar relatório indicando que não há eventos
+                payload_vazio = {
+                    '@type': 'MessageCard',
+                    '@context': 'http://schema.org/extensions',
+                    'summary': 'Azure DevOps Watch Dog - Nenhum evento crítico',
+                    'themeColor': '32CD32',  # Verde
+                    'title': '🛡️ Azure DevOps Watch Dog - Relatório Completo de Segurança',
+                    'sections': [
+                        {
+                            'activityTitle': '📊 Resumo Executivo',
+                            'activitySubtitle': 'Verificação de segurança concluída sem eventos críticos',
+                            'facts': [
+                                {'name': '🔴 Eventos Nominais (Críticos)', 'value': '0'},
+                                {'name': '🟡 Eventos Azure Service (Médios)', 'value': '0'},
+                                {'name': '🟢 Eventos SVC (Baixos)', 'value': '0'},
+                                {'name': '📊 Total de Eventos', 'value': '0'},
+                                {'name': '🔧 Pipeline', 'value': build_number},
+                                {'name': '🌿 Branch', 'value': branch_name},
+                                {'name': '🕐 Executado em', 'value': datetime.now().strftime('%d/%m/%Y %H:%M:%S')}
+                            ]
+                        },
+                        {
+                            'activityTitle': '🛡️ Status do Sistema', 
+                            'activitySubtitle': 'Sistema de monitoramento funcionando corretamente',
+                            'facts': [
+                                {'name': 'Status', 'value': '✅ Nenhum evento crítico detectado'},
+                                {'name': 'Período', 'value': 'Últimas 12 horas'},
+                                {'name': 'Monitoramento', 'value': '🟢 Ativo e funcionando'}
+                            ]
+                        }
+                    ]
+                }
+                
+                import requests
+                response = requests.post(
+                    os.environ.get('TEAMS_WEBHOOK_URL'),
+                    json=payload_vazio,
+                    timeout=30
+                )
+                
+                if response.status_code == 200:
+                    print('✅ Relatório vazio enviado com sucesso!')
+                else:
+                    print(f'❌ Falha ao enviar relatório vazio: {response.status_code}')
+                
+        except Exception as e:
+            print(f'❌ Erro ao executar envio: {e}')
+            import traceback
+            traceback.print_exc()
+            sys.exit(1)
+        "
+        
+        echo "🎯 STEP 8 CONCLUÍDO - Relatório Teams enviado com design original!"
+      displayName: '📱 Step 8: Send Teams Report (Original Design)'
+      workingDirectory: '$(workingDirectory)'
+      env:
+        TEAMS_WEBHOOK_URL: $(TEAMS_WEBHOOK_URL)
+        BUILD_BUILDNUMBER: $(Build.BuildNumber)
+        BUILD_SOURCEBRANCHNAME: $(Build.SourceBranchName)

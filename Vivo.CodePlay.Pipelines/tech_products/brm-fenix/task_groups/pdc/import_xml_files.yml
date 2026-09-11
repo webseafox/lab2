@@ -1,0 +1,98 @@
+parameters:
+- name: pricingConfigComponentsToDeploy
+  # JCR UPGRADE BRM 15: permitir que o CD ignore o download do artefato pricing-config-components-to-deploy.
+- name: skipDownloadArtifact
+  default: false
+
+steps:
+  # JCR UPGRADE BRM 15: manter o download do artefato para fluxos legados.
+- ${{ if eq(parameters.skipDownloadArtifact, false) }}:
+  - template: ../../task_groups/artifact/download.yml
+    parameters:
+      displayName: Download Pipeline Artifact [pricing-config-components-to-deploy]
+      artifactName: pricing-config-components-to-deploy
+      targetPath: $(Agent.BuildDirectory)/pricing-config-components-to-deploy
+
+  # JCR UPGRADE BRM 15: o CD resolve pricing-config-components-to-deploy localmente em preparation_pdc.
+  # - template: ../../task_groups/artifact/download.yml
+  #   parameters:
+  #     displayName: Download Pipeline Artifact [pricing-config-components-to-deploy]
+  #     artifactName: pricing-config-components-to-deploy
+  #     targetPath: $(Agent.BuildDirectory)/pricing-config-components-to-deploy
+      
+- template: ../../task_groups/ssh/file_transfer.yml
+  parameters:
+    sshEndpoint: BRM_BASTION_$(ENVIRONMENT)
+    sourceFolder: $(Agent.BuildDirectory)/pricing-config-components-to-deploy
+    targetFolder: $(OPERATION_HOST_HELM_PATH)/pricing-config-components-to-deploy
+    targetEnvironment: $(OPERATION_HOST_ENVIRONMENT)
+    fileName: pricing-config-components-to-deploy
+
+- task: SSH@0
+  displayName: "Import XML Files to pdc-bre-deployment pod"
+  name: import_xml_files
+  inputs:    
+    sshEndpoint: BRM_BASTION_$(ENVIRONMENT)
+    runOptions: 'inline'
+    inline: |
+      PC_XML_FILES=""
+
+      echo "##[debug] PDC-BRE-DEPLOYMENT-* POD..............: $(PDC_BRE_DEPLOYMENT_POD)"
+
+      IFS=',' read -ra ADDR <<< "${{ parameters.pricingConfigComponentsToDeploy }}"
+      for component in "${ADDR[@]}"; do
+        XML_FILE_NAME_IN_POD="${component}.xml"
+        echo ">>>>> ${component} >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>"
+        echo "##[debug] XML FILE NAME.......................: ${component}"
+        echo "##[debug] XML FILE NAME IN POD................: $XML_FILE_NAME_IN_POD"        
+
+        echo "##[command]kubectl cp $(OPERATION_HOST_HELM_PATH)/pricing-config-components-to-deploy/${component}.xml $(PDC_BRE_DEPLOYMENT_POD):/u01/PDC_BRM_SHARE/$XML_FILE_NAME_IN_POD"
+        kubectl cp $(OPERATION_HOST_HELM_PATH)/pricing-config-components-to-deploy/${component}.xml $(PDC_BRE_DEPLOYMENT_POD):/u01/PDC_BRM_SHARE/$XML_FILE_NAME_IN_POD 2>&1 >/dev/null
+
+        if [ "${#PC_XML_FILES}" -gt 0 ]; then
+          PC_XML_FILES+=",$XML_FILE_NAME_IN_POD"
+        else
+          PC_XML_FILES+="$XML_FILE_NAME_IN_POD"
+        fi
+      done
+
+      echo "##[debug] PRICING-CONFIG XML FILES..............: $PC_XML_FILES"
+
+      echo "##vso[task.setvariable variable=PRICING_CONFIG_IMPORTED_FILE_NAME;]$PC_XML_FILES"
+
+      echo "##[command]rm -Rf $(OPERATION_HOST_HELM_PATH)/pricing-config-components-to-deploy"
+      rm -Rf $(OPERATION_HOST_HELM_PATH)/pricing-config-components-to-deploy
+    readyTimeout: '20000'
+    failOnStdErr: false
+
+- task: SSH@0
+  displayName: "Validate Import XML Files"
+  inputs:    
+    sshEndpoint: BRM_BASTION_$(ENVIRONMENT)
+    runOptions: 'inline'
+    inline: |
+      echo "##[debug] PDC-BRE-DEPLOYMENT-* POD..............: $(PDC_BRE_DEPLOYMENT_POD)"
+      echo "##[debug] PRICING-CONFIG XML FILES..............: $(PRICING_CONFIG_IMPORTED_FILE_NAME)"
+
+      IFS=',' read -ra ADDR <<< "$(PRICING_CONFIG_IMPORTED_FILE_NAME)"
+      for component in "${ADDR[@]}"; do
+        echo ">>>>> ${component} >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>"
+
+        echo "##[command]kubectl exec -i $(PDC_BRE_DEPLOYMENT_POD) bash -- ls -la /u01/PDC_BRM_SHARE/ | grep ${component} | awk '{print $9}'"
+        VALIDATE=$(kubectl exec -i $(PDC_BRE_DEPLOYMENT_POD) bash -- ls -la /u01/PDC_BRM_SHARE/ | grep -w ${component} | awk '{print $9}')
+
+        if [[ $VALIDATE == "${component}" ]]; then
+          echo ">>>>> [$VALIDATE] Import Successfully Completed <<<<<"
+        else
+          echo "##vso[task.logissue type=error;]Export not executed !!!"
+          echo "##vso[task.complete result=Failed;]"
+
+          exit 1
+        fi
+      done
+
+      echo ">>>>> XML FILES >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>"
+      echo "##[command]kubectl exec -i $(PDC_BRE_DEPLOYMENT_POD) bash -- ls -la /u01/PDC_BRM_SHARE/"
+      kubectl exec -i $(PDC_BRE_DEPLOYMENT_POD) bash -- ls -la /u01/PDC_BRM_SHARE/
+    readyTimeout: '20000'
+    failOnStdErr: false

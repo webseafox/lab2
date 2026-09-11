@@ -1,0 +1,118 @@
+parameters:
+- name: fortifyScanDirectory
+  type: string
+  default: '$(Build.SourcesDirectory)/$(Build.Repository.Name)'
+
+- name: vivoFlow
+  type: string
+  default: 'none'
+
+- name: enableFortifyExclusions
+  displayName: 'Faz checkout do repositório Fortify Exclusions'
+  type: boolean
+  default: false
+
+- name: convisoCompanyId
+  type: string
+  default: '430'
+  displayName: 'Conviso Company ID'
+
+steps:
+## --- Checkout FortifyExclusion repository ---------------- ##
+## Deve estar configurado no .azuredevops/azure-pipeline-ci.yml
+## Além de habilitar o parametro enableFortifyExclusions
+# resources:
+#   repositories:
+#     - repository: FortifyExclusion
+#       name: DevOps/Vivo.Fortify.Exclusions
+#       type: git
+#       ref: refs/heads/master
+#       endpoint: CorePipelines
+  - ${{ if eq(parameters.enableFortifyExclusions, true) }}:
+    - checkout: FortifyExclusion
+      path: 'fortify-exclusions'
+      fetchDepth: 1  
+## --------------------------------------------------------- ##
+      
+  - ${{ if or(eq(parameters.vivoFlow, 'none'),and(ne(parameters.vivoFlow, 'none'),or(eq(variables['Build.SourceBranchName'], 'master'),eq(variables['Build.SourceBranchName'], 'main'),startsWith(variables['Build.SourceBranchName'], 'release/'),contains(parameters.vivoFlow, variables['Build.SourceBranchName']))))}}:
+
+    ## -> Download Security Tokens
+    - task: AzureKeyVault@2
+      displayName: 'Getting AKV Security Credentials'
+      timeoutInMinutes: 1
+      retryCountOnTaskFailure: 5  
+      inputs:    
+        azureSubscription: DevOpsSharedResources    
+        KeyVaultName: '$(AKV_DEVOPS_NAME)'
+        SecretsFilter: 'FORTIFY-SSC-CLI-TOKEN, FORTIFY-SCANCENTRAL-CLIENT-TOKEN, CONVISO-API-KEY'
+
+      ## -> Set Fortify credentials to variables. This allows it to used in other stages, jobs or tasks.
+    - task: Bash@3
+      displayName: 'Set Security Credentials Variables'
+      name: security_credentials
+      condition: succeeded()
+      continueOnError: false
+      inputs:
+        targetType: inline
+        script: |
+          echo "##[group] Secrets for Security"
+          
+          echo "##[debug] FORTIFY-SSC-CLI-TOKEN: $(FORTIFY-SSC-CLI-TOKEN). Use as >> FORTIFY_SSC_CLI_TOKEN. "
+          echo "##vso[task.setvariable variable=FORTIFY_SSC_CLI_TOKEN;isSecret=true]$(FORTIFY-SSC-CLI-TOKEN)"
+
+          echo "##[debug] FORTIFY-SCANCENTRAL-CLIENT-TOKEN: $(FORTIFY-SCANCENTRAL-CLIENT-TOKEN). Use as >> FORTIFY_SCANCENTRAL_CLIENT_TOKEN. "
+          echo "##vso[task.setvariable variable=FORTIFY_SCANCENTRAL_CLIENT_TOKEN;isSecret=true]$(FORTIFY-SSC-CLI-TOKEN)"
+
+          echo "##[debug] CONVISO-API-KEY: $(CONVISO-API-KEY). Use as >> CONVISO_API_KEY. "
+          echo "##vso[task.setvariable variable=CONVISO_API_KEY;isSecret=true]$(CONVISO-API-KEY)"
+
+          echo "##[endgroup]"
+          echo "##[debug] To open and check the information above, click the arrows on the left."
+
+
+    ## -> VivoAppSecTools
+    - task: VivoAppSecTools@1
+      displayName: 'Vivo AppSec Tools Run SAST'
+      name: run_sast
+      inputs:
+        command: 'runSast'  
+        azdoProjectName: '$(System.TeamProject)-$(Build.Repository.Name)'
+        azdoProjectVersion: 'DevSecOps'
+        azdoRepositoryName: '$(Build.Repository.Name)'
+        fortifySSCToken: '$(FORTIFY_SSC_CLI_TOKEN)'
+        fortifyAppDefaultVersion: 'DevSecOps'       
+        scanDirectory: '${{ parameters.fortifyScanDirectory }}'
+        convisoApiKey: '$(CONVISO_API_KEY)' 
+        evaluateSecurityGate: true
+        debugLogging: true
+        convisoCompanyId: '${{ parameters.convisoCompanyId }}'     
+
+
+    # Publicar artefatos condicionalmente
+    - task: PublishBuildArtifacts@1
+      condition: and(succeeded(), ne(variables['run_sast.FORTIFY_REPORT_PATH'], ''))
+      inputs:
+        pathToPublish: '$(run_sast.FORTIFY_REPORT_PATH)'
+        artifactName: 'fortify-security-report'
+      displayName: 'Publicar Relatório Fortify'      
+
+  - ${{ else }}:
+  
+    - task: Bash@3
+      displayName: 'Security Scan Skipped'
+      condition: and(succeeded(), eq(variables['run_sast.SHOULD_SKIP_SECURITY_GATE'], true))
+      inputs:
+        targetType: inline
+        script: |
+          YELLOW='\033[1;33m'
+          BLUE='\033[0;34m'
+          NC='\033[0m' # No Color
+          echo -e "${YELLOW}==================================[ AÇÃO: SCAN IGNORADO (SKIPPED) ]==================================${NC}"
+          echo -e "Modo de Operação Ativo: ${YELLOW}VivoFlow${NC}"
+          echo -e "Branch Atual: ${YELLOW}$(Build.SourceBranchName)${NC}"
+          echo -e "Regras de Validação em Vigor: ${YELLOW}master, main, release/*, ${{ join(', ', parameters.vivoFlow) }}${NC}"
+          echo ""
+          echo -e "${YELLOW}MOTIVO: O scan de segurança foi intencionalmente ignorado pois o branch '$(Build.SourceBranchName)' não corresponde a nenhuma das regras de validação ativas.${NC}"
+          echo ""
+          echo -e "${BLUE}Dica: Se este branch deveria ser validado, acione a Equipe de AppSec appsec_vivo.br@telefonica.com${NC}"
+          echo -e "${YELLOW}====================================================================================================${NC}"             

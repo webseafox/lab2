@@ -1,0 +1,89 @@
+parameters:
+- name: imageName
+  type: string
+- name: imageTag
+  type: string
+  default: $(Build.BuildId)
+- name: dockerfilePath
+  type: string
+  default: '**/Dockerfile'
+- name: buildContext
+  type: string
+  default: '.'
+- name: registryServiceConnection
+  type: string
+- name: loginRegistryServiceConnections
+  type: object
+  default: []
+- name: pushImage
+  type: boolean
+  default: true
+- name: buildArgs
+  type: object
+  default: []
+- name: convisoCompany
+  type: string
+  default: 430
+
+steps:
+# Login nos Container Registries
+- ${{ each registry in parameters.loginRegistryServiceConnections }}:
+  - task: Docker@2
+    displayName: 'Login to Registry - ${{ registry }}'
+    inputs:
+      command: 'login'
+      containerRegistry: '${{ registry }}'
+
+# Build da imagem Docker com boas práticas de segurança
+- task: Docker@2
+  displayName: 'Build Docker Image'
+  inputs:
+    command: 'build'
+    dockerfile: '${{ parameters.dockerfilePath }}'
+    buildContext: '${{ parameters.buildContext }}'
+    repository: '${{ parameters.imageName }}'
+    containerRegistry: '${{ parameters.registryServiceConnection }}'
+    tags: ${{ parameters.imageTag }}
+    ${{ if gt(length(parameters.buildArgs), 0) }}:
+      arguments: --build-arg ${{ join(' --build-arg ', parameters.buildArgs) }}
+
+- task: CmdLine@2
+  displayName: 'Inspect Docker Image'
+  name: inspect
+  inputs:
+    script: |-
+      docker image ls
+      FULL_IMAGE_NAME=$(docker images --format '{{.Repository}}:{{.Tag}}' | grep '${{ parameters.imageName }}:${{ parameters.imageTag }}')
+      echo "##[debug] FULL_IMAGE_NAME: $FULL_IMAGE_NAME"
+      echo "##vso[task.setvariable variable=FULL_IMAGE_NAME]${FULL_IMAGE_NAME}"
+      echo "##[debug] Inspect Image"
+      docker inspect $FULL_IMAGE_NAME
+
+# ==================================================================
+# CAPACIDADE: SCA SCAN (SCA)
+# ==================================================================
+# Descrição: Análise de composição de software (SCA) usando Dependency Track, com integração à Conviso e publicação de artefatos.
+# Documentação: https://dvps.redecorp.azr/portal/codeplay/capacidades/catalog
+# Observações: Exporta variáveis e publica artefatos para uso no Security Gate.
+# ==================================================================
+
+# Escaneamento de segurança da imagem (opcional)
+- template: /security/define_appsec_app_version.yml
+
+- template: /security/run_sca_scan_docker.yml
+  parameters:
+    imageSource: $(FULL_IMAGE_NAME) # OBS: A variável FULL_IMAGE_NAME é definida na task 'Inspect Docker Image' acima
+    appVersion: "$(FORTIFY_APP_VERSION)" # OBS: A variável FORTIFY_APP_VERSION é definida no template /security/define_appsec_app_version.yml
+    convisoCompany: ${{ parameters.convisoCompany }}
+
+# Push da imagem para o registry
+- ${{ if eq(parameters.pushImage, true) }}:
+  - task: Docker@2
+    displayName: 'Push Docker Image'
+    inputs:
+      command: 'push'
+      repository: '${{ parameters.imageName }}'
+      containerRegistry: '${{ parameters.registryServiceConnection }}'
+      tags: ${{ parameters.imageTag }}
+
+

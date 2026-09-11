@@ -1,0 +1,52 @@
+parameters:
+- name: incrementLevel
+  default: patch
+- name: enableDevflowValidations
+  type: boolean
+  default: False
+- name: bumpVersionOnManual
+  type: boolean
+  default: false
+
+stages:
+- stage: build_test
+  displayName: "Build & Test"
+  dependsOn:
+    - pipeline_init
+    - ${{ if eq(parameters.enableDevflowValidations, True) }}:
+      - repo_validations
+  pool: $(PRIVATE_AGENT_DEFAULT)
+  jobs:
+    - job: bump_version
+      displayName: Bumping Version
+      steps:
+      - template: /tech_products/ecmc/core-pipelines/tasks/git/checkout_last_commit.yml
+        parameters:
+          branchName: "$(Build.SourceBranchName)"
+      - template: /tech_products/ecmc/core-pipelines/tasks/maven/extract_api_version.yml
+        parameters:
+          currentVersionVariableOut: CURRENT_VERSION
+      - template: /tech_products/ecmc/core-pipelines/tasks/versioning/bump_version.yml
+        parameters:
+          currentVersion: $(CURRENT_VERSION)
+          newVersionVariableOut: NEW_VERSION
+          incrementLevel: ${{ parameters.incrementLevel }}
+          bumpVersionOnManual: ${{ parameters.bumpVersionOnManual }}
+
+    - job: build_test
+      displayName: Build & Test & Coverage
+      dependsOn:
+          - bump_version
+      variables:
+      - name: NEW_VERSION
+        value: $[ dependencies.bump_version.outputs['component_bump_version.NEW_VERSION'] ]
+      steps:
+      - template: /tech_products/ecmc/core-pipelines/tasks/bash/welcome.yml
+      - template: /tech_products/ecmc/core-pipelines/task_groups/build/maven_build_test.yml
+        parameters:
+          newVersion: "$(NEW_VERSION)"
+      - template: /tech_products/ecmc/core-pipelines/task_groups/tests/publish_tests_reports.yml
+        parameters:
+          testResultsFilesPattern: "**/surefire-reports/*.xml"
+          coverageFilePattern: "**/site/jacoco/jacoco.xml"
+          codeCoverageTool: "JaCoCo"

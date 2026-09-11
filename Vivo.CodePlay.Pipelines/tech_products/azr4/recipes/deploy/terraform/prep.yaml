@@ -1,0 +1,219 @@
+parameters:
+  environment: ''
+  chg_number: ''
+
+jobs:
+- job: preparation
+  pool: GeneralPurposeLinuxAgents4P
+  steps:
+  - checkout: self
+    persistCredentials: true
+    clean: true
+  - script: |
+      #!/bin/bash
+      echo "##[debug] TF_LOG: $TF_LOG"
+      echo "##[debug] SYSTEM_DEBUG: $SYSTEM_DEBUG"
+      if [[ "${SYSTEM_DEBUG}" == "True" || "${SYSTEM_DEBUG}" == "true" ]]; then
+        echo "##[debug] Change TF_LOG to DEBUG"
+        export TF_LOG=DEBUG
+      else
+        export TF_LOG=${TF_LOG}
+      fi
+      echo "##[debug] TF_LOG: $TF_LOG"
+      echo "##vso[task.setvariable variable=TF_LOG;issecret=false]$TF_LOG"
+    name: set_tf_log
+    displayName: 'Set TF Log'
+    env:
+      TF_LOG: $(TF_LOG)
+      SYSTEM_DEBUG: $(SYSTEM_DEBUG)
+  - script: |
+      export
+      set -e
+      if [ -z "${TARGET_DIR}" ]; then
+        echo "TARGET_DIR is not defined"
+        exit 1
+      fi
+      ls ${TARGET_DIR}
+      if [ ! -d ${TARGET_DIR} ]; then
+        echo "Directory ${TARGET_DIR} does not exist"
+        exit 1
+      fi
+      echo "##[debug] Directory ${TARGET_DIR} exists"
+    displayName: 'Verify if target directory exists'
+    env: 
+      TARGET_DIR: $(TARGET_DIR)
+  - template: /tech_products/azr4/templates/steps/download_nexus_artifact.yaml
+    parameters:
+      file: 'getcred-cli-linux-amd64'
+      folder: 'devops'
+      outputFilePath: $(Agent.TempDirectory)/getcred
+      version: "1.0.4"
+      chmod: 755
+  - task: Bash@3
+    name: get_cred
+    displayName: 'Get Azure Credentials'
+    continueOnError: false
+    inputs:
+      targetType: inline
+      script: |
+        set -e
+        echo "##[debug] Getting Azure credentials with getcred"
+        echo "##[debug] TENANT_ID: $ARM_TENANT_ID, CLIENT_ID: $AZURE_CLIENT_ID"
+        echo "##[command] $GETCRED_PATH get client-id --project-name $GET_CRED_SUB_NAME"
+        ARM_CLIENT_ID=$($GETCRED_PATH get client-id --project-name $GET_CRED_SUB_NAME)
+        echo "##[command] $GETCRED_PATH get client-secret --project-name $GET_CRED_SUB_NAME"
+        ARM_CLIENT_SECRET=$($GETCRED_PATH get client-secret --project-name $GET_CRED_SUB_NAME)
+        echo "##[command] $GETCRED_PATH get subscription-id --project-name $GET_CRED_SUB_NAME"
+        ARM_SUBSCRIPTION_ID=$($GETCRED_PATH get subscription-id --project-name $GET_CRED_SUB_NAME)
+        echo "##vso[task.setvariable variable=ARM_CLIENT_ID;issecret=true;isOutput=true]$ARM_CLIENT_ID"
+        echo "##vso[task.setvariable variable=ARM_CLIENT_SECRET;issecret=true;isOutput=true]$ARM_CLIENT_SECRET"
+        echo "##vso[task.setvariable variable=ARM_SUBSCRIPTION_ID;issecret=true;isOutput=true]$ARM_SUBSCRIPTION_ID"
+        echo "##[debug] ARM_CLIENT_ID: $ARM_CLIENT_ID, ARM_SUBSCRIPTION_ID: $ARM_SUBSCRIPTION_ID"
+    env:
+      GET_CRED_SUB_NAME: $(GET_CRED_SUB_NAME)
+      GETCRED_PATH: $(Agent.TempDirectory)/getcred
+      AZURE_TENANT_ID: $(TF_AZURE_TENANT_ID)
+      AZURE_CLIENT_ID: $(TF_AZURE_CLIENT_ID)
+      AZURE_CLIENT_SECRET: $(TF_AZURE_CLIENT_SECRET)
+      AZURE_KEY_VAULT_URI: https://pro-devops-kv.vault.azure.net/
+  # - task: AzureKeyVault@2
+  #   displayName: 'Get Key Vault Credentials'
+  #   inputs:    
+  #     azureSubscription: DevOpsSharedResources    
+  #     KeyVaultName: $(AKV_DEVOPS_NAME)
+  #     SecretsFilter: 'AZ-DEVOPS-PAT-TOKEN'
+  - script: |
+      #!/bin/bash
+      set -e
+      echo "##[debug] Setting up git credentials"
+      AZDO_ACCESS_TOKEN=$(echo -n :${AZ_DEVOPS_PAT_TOKEN} | base64 -w0)
+      git config --global http.https://telefonica-vivo-brasil@dev.azure.com/telefonica-vivo-brasil/AZR4%20-%204P%20AZURE/_git/policies.extraHeader "AUTHORIZATION: Basic ${AZDO_ACCESS_TOKEN}"
+      git config --global http.https://telefonica-vivo-brasil@dev.azure.com/telefonica-vivo-brasil/AZR4%20-%204P%20AZURE/_git/terraform-modules.extraHeader "AUTHORIZATION: Basic ${AZDO_ACCESS_TOKEN}"
+      git config --global url."https://telefonica-vivo-brasil@dev.azure.com/telefonica-vivo-brasil/AZR4%20-%204P%20AZURE/_git/terraform-modules".insteadOf https://git.telefonicabigdata.com/vivo/4p-core/infra-as-code/terraform-modules
+      echo "##[command] git config -l"
+      git config -l
+    displayName: 'Set Git Credentials'
+    env:
+      AZ_DEVOPS_PAT_TOKEN: $(AZ_DEVOPS_PAT_TOKEN)
+      #AZDO_ACCESS_TOKEN: $(AZ-DEVOPS-PAT-TOKEN)
+  - script: |
+      #!/bin/bash
+      set -e
+      echo "##[debug] Initializing Terraform in ${TARGET_DIR}, tenant: ${ARM_TENANT_ID}, subscription: ${ARM_SUBSCRIPTION_ID}, client-id: ${ARM_CLIENT_ID}"
+      terraform -chdir=${TARGET_DIR} init
+    displayName: 'Terraform Init'
+    env:
+      TARGET_DIR: $(TARGET_DIR)
+      ARM_CLIENT_ID: $(get_cred.ARM_CLIENT_ID)
+      ARM_CLIENT_SECRET: $(get_cred.ARM_CLIENT_SECRET)
+      ARM_SUBSCRIPTION_ID: $(get_cred.ARM_SUBSCRIPTION_ID)
+      ARM_TENANT_ID: $(TF_ARM_TENANT_ID)
+      TF_LOG: $(set_tf_log.TF_LOG)
+  - task: Bash@3
+    name: plan
+    displayName: 'Terraform Plan'
+    continueOnError: false
+    inputs:
+      targetType: inline
+      script: |
+        #!/bin/bash
+        set -e
+        ARGS=""
+        if [[ "${FORCE_REPLACE_APIM_API}" == "true" || "${FORCE_REPLACE_APIM_API}" == "True" ]]; then
+          echo "##[debug] Force replace is enabled"
+          ARGS="-replace module.api.azurerm_api_management_api.api"
+        fi
+        echo "[command] terraform -chdir=${TARGET_DIR} plan -out=${TF_PLAN_PATH} ${ARGS}"
+        terraform -chdir=${TARGET_DIR} plan -out=${TF_PLAN_PATH} ${ARGS}
+        terraform -chdir=${TARGET_DIR} show -json ${TF_PLAN_PATH} > ${TF_PLAN_JSON_PATH}
+        echo "##vso[task.setvariable variable=TF_PLAN_PATH]${TF_PLAN_PATH}"
+        echo "##vso[task.setvariable variable=TF_PLAN_JSON_PATH]${TF_PLAN_JSON_PATH}"
+    env:
+      TARGET_DIR: $(TARGET_DIR)
+      ARM_CLIENT_ID: $(get_cred.ARM_CLIENT_ID)
+      ARM_CLIENT_SECRET: $(get_cred.ARM_CLIENT_SECRET)
+      ARM_SUBSCRIPTION_ID: $(get_cred.ARM_SUBSCRIPTION_ID)
+      ARM_TENANT_ID: $(ARM_TENANT_ID)
+      BUILD_ID: $(Build.BuildId)
+      TF_LOG: $(set_tf_log.TF_LOG)
+      TF_PLAN_PATH: $(Build.ArtifactStagingDirectory)/$(Build.BuildId).tfplan
+      TF_PLAN_JSON_PATH: $(Build.ArtifactStagingDirectory)/$(Build.BuildId).tfplan.json
+      FORCE_REPLACE_APIM_API: $(FORCE_REPLACE_APIM_API)
+  - script: |
+      #!/bin/bash
+      echo "tf-summarize 0.3.14" >> .tool-versions
+      if ! command -v tf-summarize &> /dev/null
+      then
+          echo "tf-summarize could not be found"
+          echo "Installing tf-summarize"
+          asdf plugin add tf-summarize
+          asdf install tf-summarize latest
+          asdf global tf-summarize latest
+      fi
+      echo "[debug] tf-summarize"
+      tf-summarize $TF_PLAN_JSON_PATH
+      echo "[debug] tf-summarize tree"
+      tf-summarize -tree -draw $TF_PLAN_JSON_PATH
+      changes=$(terraform -chdir=${TARGET_DIR} show -no-color $TF_PLAN_PATH | tail -2 | grep -v '^$')
+      echo "# Terraform Plan Summary" > ${SUMMARY_MD_PATH}
+      echo "## Changes" >> ${SUMMARY_MD_PATH}
+      echo "$changes" >> ${SUMMARY_MD_PATH}
+      echo "" >> ${SUMMARY_MD_PATH}
+      tf-summarize -md $TF_PLAN_JSON_PATH >> ${SUMMARY_MD_PATH}
+      echo "## Tree" >> ${SUMMARY_MD_PATH}
+      echo "" >> ${SUMMARY_MD_PATH}
+      echo "\`\`\`" >> ${SUMMARY_MD_PATH}
+      tf-summarize -separate-tree -draw $TF_PLAN_JSON_PATH >> ${SUMMARY_MD_PATH}
+      echo "" >> ${SUMMARY_MD_PATH}
+      echo "\`\`\`" >> ${SUMMARY_MD_PATH}
+      echo "##vso[task.uploadsummary]${SUMMARY_MD_PATH}"
+      echo "##vso[task.logissue type=warning][ATENCÃO] $changes Veja detalhes em 'Extensions' ou nos logs"
+      cat ${SUMMARY_MD_PATH}
+    displayName: 'Summarize Terraform Plan'
+    continueOnError: true
+    env:
+      TF_PLAN_PATH: $(TF_PLAN_PATH)
+      TARGET_DIR: $(TARGET_DIR)
+      SUMMARY_MD_PATH: $(Build.ArtifactStagingDirectory)/tfplan.md
+  - script: |
+      #!/bin/bash
+      set -e
+      ARCH=$(arch)
+      SYSTEM=$(uname)
+      cd ${TEMP_DIR_PATH}
+      echo "##[command] wget https://github.com/open-policy-agent/conftest/releases/download/v${CONFTEST_VERSION}/conftest_${CONFTEST_VERSION}_${SYSTEM}_${ARCH}.tar.gz"
+      wget "https://github.com/open-policy-agent/conftest/releases/download/v${CONFTEST_VERSION}/conftest_${CONFTEST_VERSION}_${SYSTEM}_${ARCH}.tar.gz"
+      tar xzf conftest_${CONFTEST_VERSION}_${SYSTEM}_${ARCH}.tar.gz
+      rm -f conftest_${CONFTEST_VERSION}_${SYSTEM}_${ARCH}.tar.gz
+      export CONFTEST_PATH=${TEMP_DIR_PATH}/conftest
+      chmod +x ${CONFTEST_PATH}
+      ls -la
+      echo "##vso[task.setvariable variable=CONFTEST_PATH]${CONFTEST_PATH}"
+      ${CONFTEST_PATH} --version
+    displayName: 'Download Conftest'
+    name: download_conftest
+    env:
+      CONFTEST_VERSION: '0.56.0'
+      TEMP_DIR_PATH: $(Agent.TempDirectory)
+  - script: |
+      #!/bin/bash
+      set -e
+      printf "REPO_REL_DIR: ${TARGET_DIR}\nHEAD_REPO_NAME: ${REPOSITORY_NAME}\nPROJECT_NAME: ${PROJECT_NAME}\n" > ${DATA_YAML_FILE}
+      cat ${DATA_YAML_FILE}
+      ${CONFTEST_PATH} test ${TF_PLAN_JSON_PATH} $TARGET_DIR/*.tf --update git::https://telefonica-vivo-brasil@dev.azure.com/telefonica-vivo-brasil/AZR4%20-%204P%20AZURE/_git/policies//cloudops --data ${DATA_YAML_FILE} --combine
+    displayName: 'Run Conftest'
+    env:
+      TARGET_DIR: $(TARGET_DIR)
+      CONFTEST_PATH: $(download_conftest.CONFTEST_PATH)
+      DATA_YAML_FILE: $(TARGET_DIR)/data.yaml
+      TF_PLAN_JSON_PATH: $(TF_PLAN_JSON_PATH)
+      REPOSITORY_NAME: $(GET_CRED_SUB_NAME)
+      PROJECT_NAME: $(TERRAFORM_PROJECT_NAME)
+  - task: PublishBuildArtifacts@1
+    displayName: 'Publish Artifact'
+    condition: and(succeeded(), eq(variables['EXECUTE_APPLY'], 'true'))
+    continueOnError: false
+    inputs:
+      PathtoPublish: $(TF_PLAN_PATH)
+      ArtifactName: tfplan
+      StoreAsTar: true

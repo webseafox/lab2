@@ -1,0 +1,122 @@
+
+
+trigger:
+  branches:
+    include:
+      - '*'
+  paths:
+    include:
+      - '*'
+    exclude:
+      - docs/*
+ 
+  
+parameters:
+- name: useMavenCache
+  displayName: Usar cache do maven
+  type: boolean
+  default: True
+
+#Incluir Variaveis da Library
+variables:
+  - name: ASDF_JDK_11
+    value: "openjdk-11.0.2"
+  - name: System.debug
+    value: "true"
+  - name: USE_MAVEN_CACHE
+    ${{ if not(not(parameters.useMavenCache)) }}:
+      value: ''
+    ${{ if not(parameters.useMavenCache) }}:
+      value: '-U'  
+
+
+stages:
+- stage: build
+  displayName: Build
+  jobs:
+  - job: package
+    displayName: Build, Test and Pack
+    pool: GeneralPurposeLinuxAgentsCI
+    steps:
+    - checkout: self
+      fetchDepth: 1
+
+    - task: AzureKeyVault@2
+      inputs:
+        azureSubscription: 'DevOpsSharedResources'
+        KeyVaultName: 'kv-azdevops-shared'
+        SecretsFilter: 'NEXUS-DEPS-USR, NEXUS-DEPS-PSW, SONARQUBE-TOKEN'
+        RunAsPreJob: true
+
+    - task: XmlParseFromVivo@4
+      displayName: Get pom.xml info
+      name: pom_info
+      inputs:
+        type: 'file'
+        origin: $(Build.SourcesDirectory)/pom.xml
+        jpaths: |
+          var POM_XML_VERSION = .project.version._text
+          var FRONTEND_NAME = .project.properties['frontend-name']._text
+          var FRONTEND_VERSION = .project.properties['frontend-version']._text
+
+    - task: Bash@3
+      displayName: Copy files
+      continueOnError: false
+      inputs:
+        targetType: inline
+        script: |-
+            curl --user $(NEXUS-DEPS-USR):$(NEXUS-DEPS-PSW) https://nexus.telefonica.com.br/repository/conv86-npm/@conv86/$(FRONTEND_NAME)/-/$(FRONTEND_NAME)-$(FRONTEND_VERSION).tgz -O
+            tar -zxvf $(FRONTEND_NAME)-$(FRONTEND_VERSION).tgz
+            rm $(FRONTEND_NAME)-$(FRONTEND_VERSION).tgz
+            mkdir -p src/main/webapp
+            cp -r package/dist/ressarcimento src/main/webapp/
+            rm -rf package
+
+    - task: Maven@3
+      displayName: Maven Test and Pack
+      continueOnError: False
+      env:
+        ASDF_JAVA_VERSION: $(ASDF_JDK_11)
+      inputs:
+          options: >-
+            -Dmaven.test.skip=true
+            $(USE_MAVEN_CACHE)
+            -Dnpm.repositoryUrl="https://nexus.telefonica.com.br/repository/conv86-npm"
+            -Dnpm.username="$(NEXUS-DEPS-USR)"
+            -Dnpm.password="$(NEXUS-DEPS-PSW)"
+
+          mavenPomFile: $(Build.SourcesDirectory)/pom.xml
+          mavenOptions: '-Xmx3072m'
+          javaHomeOption: 'JDKVersion'
+          publishJUnitResults: false
+          testResultsFiles: $(Build.SourcesDirectory)/**/surefire-reports/TEST-*.xml
+          goals: 'package'
+
+
+    ## -> Copy files for staging area
+    - task: CopyFiles@2
+      name: t_copy_file
+      displayName: 'Staging Artifacts'
+      condition: succeeded()
+      continueOnError: false
+      inputs:
+        SourceFolder: '$(build.sourcesdirectory)'
+        TargetFolder: '$(Build.ArtifactStagingDirectory)'
+        Contents: |
+          **/target/*.*ar
+          **/target/*.ejb
+          **/pom.xml
+          **/surefire-reports/TEST-*.xml
+          pom.xml
+        CleanTargetFolder: true
+        OverWrite: true
+        flattenFolders: false
+
+    ## -> Compress artifacts into tar. This allows to use less space and to be used in other stages, jobs or tasks.           
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Artifacts'
+      condition: succeeded()
+      continueOnError: false
+      inputs:
+        ArtifactName: bin
+    

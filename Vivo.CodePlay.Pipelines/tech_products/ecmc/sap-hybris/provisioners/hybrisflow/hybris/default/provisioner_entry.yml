@@ -1,0 +1,77 @@
+parameters:
+- name: environmentCode
+  type: string
+  values:
+  - s1
+  - s2
+  - s3
+
+- name: databaseUpdateMode
+  type: string
+  values:
+  - NONE
+  - UPDATE
+
+- name: deployStrategy
+  type: string
+  values:
+  - RECREATE
+  - ROLLING_UPDATE
+
+- name: buildAndDeploySap
+  type: boolean
+  default: true
+
+variables:
+- template: /tech_products/ecmc/sap-hybris/provisioners/hybrisflow/hybris/default/variables/load.yml
+
+resources:
+  repositories:
+  - repository: CorePipelines
+    name: DevOps/Vivo.Core.Pipelines
+    type: git
+    ref: refs/heads/master
+
+  - repository: FortifyExclusion
+    name: DevOps/Vivo.Fortify.Exclusions
+    type: git
+    ref: refs/heads/master
+    endpoint: CorePipelines
+
+  - repository: EcmcPythonScripts
+    name: ECMC - Ecomm Cloud B2C/src-devops-scripts
+    type: git
+    ref: refs/heads/master
+    endpoint: CorePipelines
+
+stages:
+- template: /tech_products/ecmc/sap-hybris/provisioners/hybrisflow/hybris/default/stages/init.yml
+
+- template: /tech_products/ecmc/sap-hybris/provisioners/hybrisflow/hybris/default/stages/build_test.yml
+
+# QUALITY GATE
+- template: /tech_products/ecmc/sap-hybris/provisioners/hybrisflow/hybris/default/stages/gates.yaml
+
+# SECURITY
+- template: /tech_products/ecmc/sap-hybris/provisioners/hybrisflow/hybris/default/stages/security.yml
+  parameters:
+    fortifyExclusionRepository: FortifyExclusion
+
+- ${{ if eq(parameters.buildAndDeploySap, true) }}:
+  - ${{ if and(or(startsWith(variables['Build.SourceBranch'], 'refs/heads/stage/'), startsWith(variables['Build.SourceBranch'], 'refs/heads/project/')), in(variables['Build.Reason'], 'IndividualCI', 'BatchedCI', 'Manual', 'Schedule')) }}:
+    - template: /tech_products/ecmc/sap-hybris/provisioners/hybrisflow/hybris/default/stages/build_sap.yml
+
+    - template: /tech_products/ecmc/sap-hybris/provisioners/hybrisflow/hybris/default/stages/deploy_sap.yml
+      parameters:
+        environmentCode: ${{ parameters.environmentCode }}
+        databaseUpdateMode: ${{ parameters.databaseUpdateMode }}
+        deployStrategy: ${{ parameters.deployStrategy }}
+
+    - template: /tech_products/ecmc/sap-commerce/provisioners/gitflow/src-sap-commerce-cloud/stages/run_stress_test.yaml
+      parameters:
+        environmentCode: ${{ parameters.environmentCode }}
+        dependsOn: "deploy"
+
+    # Stage has condition false
+    #- template:  /tech_products/ecmc/sap-hybris/provisioners/hybrisflow/hybris/default/stages/healthcheck.yml
+

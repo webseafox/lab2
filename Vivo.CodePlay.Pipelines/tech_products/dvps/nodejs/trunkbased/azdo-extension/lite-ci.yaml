@@ -1,0 +1,288 @@
+parameters:
+
+- name: packageFolder
+  displayName: 
+    Pasta para empacotar, diretorio do onde estara o 
+    vss-extension.json e os arquivos transpilados. 
+    Ex. "dist", "package"'
+  type: string
+  default: './'
+
+variables:
+- name: System.debug
+  value: 'true'
+
+stages:
+- stage:
+  displayName: "Ensure config files"
+  pool: GeneralPurposeLinuxAgentsCI
+  jobs:
+  - job: 
+    displayName: "Ensure files"
+    steps:
+    - checkout: self
+      fetchDepth: 1
+    # TODO: talvez no futuro
+    # - task: YamlParseFromVivo@4
+    #   displayName: 'Get Metadata Info'
+    #   inputs:
+    #     type: 'file'
+    #     origin: "catalog-info.yaml"
+    #     jpaths: |-
+    #       var CATALOG_YAML_ACRONYM = .metadata.annotations['techarch.governance-app.acronym']
+    #       var CATALOG_YAML_MODULE = .metadata.annotations['techarch.governance-app.module']
+
+    - script: |- # shell
+        echo "##vso[build.addbuildtag]nodejs"
+        echo "##vso[build.addbuildtag]azuredevops"
+        echo "##vso[build.addbuildtag]extension"
+        echo "##vso[build.addbuildtag]ci-lite"
+        # TODO: talvez no futuro
+        # echo "##vso[build.addbuildtag]$(CATALOG_YAML_ACRONYM)"
+        # echo "##vso[build.addbuildtag]$(CATALOG_YAML_MODULE)"
+      displayName: 'Set tags'
+
+    - task: EnsureFile@4
+      displayName: 'Ensure .nvmrc'
+      inputs:
+        fileName: '.nvmrc'
+        createIfNotExist: true
+        defaultContent: 'v18.15.0'
+
+    - task: EnsureFile@4
+      displayName: 'Ensure .npmrc'
+      inputs:
+        fileName: '.npmrc'
+        createIfNotExist: true
+        defaultContent: |
+          registry=https://pkgs.dev.azure.com/telefonica-vivo-brasil/_packaging/DevOps/npm/registry/
+          always-auth=true
+
+    - task: NodeTool@0
+      displayName: 'Ensure Node'
+      inputs:
+        versionSource: 'fromFile'
+        versionFilePath: '.nvmrc'
+
+    - task: Npm@1
+      displayName: 'Ensure standard-version'
+      inputs:
+        command: 'custom'
+        customCommand: 'install standard-version'
+        customRegistry: 'useFeed'
+        customFeed: '3d53bc62-8749-4931-ae46-a443b73bc87a'
+
+    - script: "./node_modules/.bin/standard-version --skip.tag --skip.commit"
+      displayName: "Bump version (generic)"
+
+    - task: CopyFiles@2
+      displayName: 'Staging Artifacts'
+      inputs:
+        SourceFolder: $(Build.SourcesDirectory)
+        TargetFolder: $(Build.ArtifactStagingDirectory)
+        Contents: |
+          .npmrc
+          tasks/*/*/task*json
+          tasks/*/*/package*json
+          package*json
+          vss-extension*json
+        # .nvmrc
+        CleanTargetFolder: true
+        OverWrite: true
+        flattenFolders: false
+
+    - task: PublishBuildArtifacts@1
+      displayName: "Push Artifacts"
+      inputs:
+        ArtifactName: 'generated-sources'
+        PathtoPublish: $(Build.ArtifactStagingDirectory)
+
+- stage:
+  displayName: 'Build'
+  pool: GeneralPurposeLinuxAgentsCI
+  condition: succeeded()
+  jobs:
+  # - job:
+  #   displayName: 'Jira Commit Integration'
+  #   steps:
+  #   - checkout: self
+  #     fetchDepth: 1
+
+  #   - task: Regex@4
+  #     displayName: 'Filter Commit Message'
+  #     inputs:
+  #       source: $(Build.SourceVersionMessage)
+  #       regex: '/^[^:]+ {0,}: {0,}(([^| ]+) {0,}\| {0,}([^| ]+) {0,}\| {0,}(.+) {0,})/gm'
+
+
+  #   - task: TypeScriptRunner@4
+  #     displayName: 'Get Commit Info'
+  #     condition: eq(variables['REGEX_HAS_MATCH'], 'true')
+  #     inputs:
+  #       azureDevOpsEndpoint: 'Azure DevOps Api Generic'
+  #       script: |- # typescript
+  #         const { BUILD_REPOSITORY_ID } = process.env;
+  #         const commits = await (await connection.getGitApi()).getCommits(BUILD_REPOSITORY_ID, {$top: 1});
+          
+  #         set_variable('COMMITTER_NAME)', commits[0].committer.name);
+  #         set_variable('COMMIT_DATE)', commits[0].committer.date);
+
+    # - task: KafkaProducer@0.0.16
+    #   displayName: 'Publicar informações no tópico'
+    #   condition: eq(variables['REGEX_HAS_MATCH'], 'true')
+    #   inputs:
+    #     kafkaOamEndpoint: 'KafkaEsteiraDigitalProd'
+    #     kafkaProducerClientId: 'esteira-digital-group'
+    #     kafkaServer: 'oauth.bootstrap.apps.ocp-kafka-prd.redecorp.br:443'
+    #     commitDate: $(COMMIT_DATE)
+    #     commitId: $(Build.SourceVersion)
+    #     commitMessage: $(Build.SourceVersionMessage)
+    #     committerName: $(COMMITTER_NAME)
+    #     repoName: $(Build.Repository.Name)
+    #     kafkaTopic: "integracao-azure-jira-branch-master"
+    #     debug: true
+
+  - job: build
+    displayName: 'Build, Unit Test and Pack'
+    steps:
+
+    - { checkout: self, fetchDepth: 1, persistCredentials: true }
+
+    - task: DownloadBuildArtifacts@1
+      displayName: 'Download Artifact'
+      inputs:
+        buildType: 'current'
+        artifactName: 'generated-sources'
+        downloadPath: $(System.ArtifactsDirectory)
+
+    - task: CopyFiles@2
+      displayName: 'Overwrite generated sources'
+      inputs: 
+        SourceFolder: $(System.ArtifactsDirectory)/generated-sources
+        Contents: '**'
+        TargetFolder: './'
+        OverWrite: true
+
+    - task: NodeTool@0
+      displayName: 'Ensure Node'
+      inputs: { versionSource: 'fromFile', versionFilePath: '.nvmrc' }
+
+    - task: npmAuthenticate@0
+      displayName: 'Npm Artifacts Authentication'
+      inputs: { workingFile: ".npmrc" }
+     
+    - task: JsonParseFromVivo@4
+      displayName: 'Get package.json info'
+      inputs:
+        type: 'file'
+        origin: 'package.json'
+        jpaths: |
+          var PACKAGE_JSON_NAME = .name
+          var PACKAGE_JSON_VERSION = .version
+          var PACKAGE_JSON_RELEASE = .scripts.release
+          var PACKAGE_JSON_BUILD = .scripts.build
+          var PACKAGE_JSON_TEST = .scripts.test
+          var PACKAGE_JSON_COVERAGE = .scripts.coverage
+          var PACKAGE_JSON_LINT = .scripts.lint
+    
+    - task: Npm@1
+      displayName: "Install dependencies"
+      inputs:
+        command: 'custom'
+        customCommand: 'i -ddd'
+        customRegistry: 'useFeed'
+        customFeed: '3d53bc62-8749-4931-ae46-a443b73bc87a'
+
+    - task: Npm@1
+      condition: not(eq(variables['PACKAGE_JSON_LINT'], ''))
+      continueOnError: true
+      displayName: 'Run Lint'
+      inputs:
+        command: 'custom'
+        customCommand: 'run lint'
+
+    - task: Npm@1
+      condition: not(eq(variables['PACKAGE_JSON_BUILD'], ''))
+      displayName: 'Transpile and Bundle'
+      inputs:
+        command: 'custom'
+        customCommand: 'run build'
+
+    - task: JsonParseFromVivo@4
+      displayName: 'Get vss-extension.json info'
+      inputs:
+        type: 'file'
+        origin: ${{parameters.packageFolder}}/vss-extension.json
+        jpaths: |
+          var VSSEXTENSION_JSON_ID = .id
+          var VSSEXTENSION_JSON_NAME = .name
+          var VSSEXTENSION_JSON_VERSION = .version
+
+    - task: Npm@1
+      condition: not(eq(variables['PACKAGE_JSON_TEST'], ''))
+      continueOnError: true
+      displayName: Run Test
+      inputs:
+        command: 'custom'
+        customCommand: 'run test'
+
+    - task: Npm@1
+      condition: not(eq(variables['PACKAGE_JSON_COVERAGE'], ''))
+      continueOnError: true
+      displayName: Run Coverage
+      inputs:
+        command: 'custom'
+        customCommand: 'run coverage'
+
+    - task: PublishTestResults@2
+      condition: not(eq(variables['PACKAGE_JSON_TEST'], ''))
+      inputs:
+        testResultsFormat: 'JUnit'
+        mergeTestResults: true
+
+    - task: Bash@3
+      displayName: 'Commit new version'
+      continueOnError: false
+      inputs:
+        targetType: inline
+        script: |- # shell
+          git switch -c $(Build.SourceBranch)
+          
+          git add package.json vss-extension*json tasks/**/task*.json
+          git commit -m "[skip ci] CodePlay bump version $(PACKAGE_JSON_VERSION)"
+          git tag $(PACKAGE_JSON_VERSION) -m "Version has been updated to $(PACKAGE_JSON_VERSION)"
+          git push origin --tags HEAD:$(Build.SourceBranchName)
+          
+          echo "##[command]  git switch -c $(Build.SourceBranch)"
+          echo "##[command] git add package.json vss-extension*json tasks/**/task*.json"
+          echo "##[command] git commit -m \"[skip ci] CodePlay bump version $(PACKAGE_JSON_VERSION)\""
+          echo "##[command] git tag $(PACKAGE_JSON_VERSION) -m \"Version has been updated to $(PACKAGE_JSON_VERSION)\""
+          echo "##[command] git push origin --tags HEAD:$(Build.SourceBranchName)"
+
+    - task: CopyFiles@2
+      displayName: 'Staging Artifacts'
+      inputs:
+        SourceFolder: ${{ parameters.packageFolder }}
+        TargetFolder: $(Build.ArtifactStagingDirectory)/${{ parameters.packageFolder }}
+        CleanTargetFolder: true
+        OverWrite: true
+        flattenFolders: false
+
+    - task: UniversalPackages@0
+      displayName: Publish a Universal Package
+      inputs:
+        command: publish
+        publishDirectory: $(Build.ArtifactStagingDirectory)/${{ parameters.packageFolder }}
+        feedsToUsePublish: "internal"
+        vstsFeedPublish: "3d53bc62-8749-4931-ae46-a443b73bc87a"
+        vstsFeedPackagePublish: $(VSSEXTENSION_JSON_ID)
+        packagePublishDescription: ""
+        versionOption: "custom"
+        versionPublish: $(VSSEXTENSION_JSON_VERSION)
+
+    - task: PublishBuildArtifacts@1
+      displayName: "Push Artifacts"
+      inputs:
+        ArtifactName: 'bin'
+        PathtoPublish: $(Build.ArtifactStagingDirectory)
+      

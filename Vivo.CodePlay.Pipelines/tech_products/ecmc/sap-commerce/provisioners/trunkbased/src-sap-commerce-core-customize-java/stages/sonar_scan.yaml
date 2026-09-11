@@ -1,0 +1,55 @@
+stages:
+- stage: sonar_scan
+  displayName: "Sonar scan"
+  pool:
+    name: $(PRIVATE_AGENT_DEFAULT)
+    # demands: Agent.Version -gtVersion 2.210.1
+  dependsOn:
+    - pipeline_init
+    - build_test
+  jobs:
+    - job: "sonar_scan"
+      displayName: "About Sonar Scan"
+      steps:
+        - checkout: none
+        - bash: |
+            BRANCH=$(echo "$(Build.SourceBranch)" | sed 's/refs\/heads\///g')
+            SONAR_PROJECT_DASH_URL="${SONARQUBE_URL}/dashboard?id=$(SONAR_PROJECT_KEY)&branch=$BRANCH"
+            SONAR_PROJECT_STATUS_URL="${SONARQUBE_URL}/api/qualitygates/project_status?projectKey=$(SONAR_PROJECT_KEY)&branch=$BRANCH"
+            echo "##[command]SONAR_PROJECT_STATUS_URL....: ${SONAR_PROJECT_STATUS_URL}"
+            
+            ANALYSIS_STATUS=$(curl --max-time $CURL_HTTP_TIMEOUT  -s -u "$(SONARQUBE_TOKEN_SCC):" "${SONAR_PROJECT_STATUS_URL}")
+            ALL_DATA=$(jq '.' <<< $ANALYSIS_STATUS)
+
+            while read data; do
+              ACTUAL_VALUE="0"
+              
+              while read conditions; do
+                METRIC_KEY=$(echo "$conditions" | jq -r .metricKey)
+
+                if [[ $METRIC_KEY == "new_coverage" ]]; then
+                  ACTUAL_VALUE=$(echo "$conditions" | jq -r .actualValue)
+                fi
+              done < <(echo "$data" | jq -c '.conditions[]')
+
+              WORK_ITEM_TYPE="task"
+                WORK_ITEM_TITLE="Sap Commerce cloud - Sonar Scan - E-commerce B2C"
+
+                WORK_ITEM_DATA="🚀🔗 <a href='$SONAR_PROJECT_DASH_URL'>Link para o Scan no Sonar</a> 🔗🚀<br><br> \
+                  Branch: $BRANCH</b> 🌿<br> \
+                  Cobertura de testes (%): <b>$ACTUAL_VALUE</b> 📊<br> \
+                  ---<br>"
+
+                CREATE_WIT=$(az boards work-item create \
+                  --title "$WORK_ITEM_TITLE" \
+                  --description "$WORK_ITEM_DATA" \
+                  --type $WORK_ITEM_TYPE \
+                  --project "$(System.TeamProject)" \
+                  --org "$(System.TeamFoundationCollectionUri)" \
+                  --fields "System.AreaPath=ECMC - Ecomm Cloud B2C\\Sonar-CORE-CUSTOMIZE" "System.IterationPath=ECMC - Ecomm Cloud B2C")
+                
+                echo "##[section]Create work item: $CREATE_WIT"
+            done < <(echo "$ALL_DATA" | jq -c '.[]')
+          displayName: 'Evaluate sonar scan'
+          env: 
+            AZURE_DEVOPS_EXT_PAT: $(SYSTEM_ACCESS_TOKEN_JOBS)

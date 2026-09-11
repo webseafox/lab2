@@ -1,0 +1,198 @@
+parameters:
+- name: use_flutter_version_latest
+  default: false
+
+stages:
+- stage: build_test
+  displayName: "Build & Analyse"
+  jobs:
+  - job: build_app
+    displayName: "Build & Analyse"
+    pool: $(PRIVATE_AGENT_SHARED)
+    steps:
+    - checkout: self
+      persistCredentials: true
+      clean: true
+
+    - task: Cache@2
+      displayName: "Flutter Pub Cache"
+      inputs:
+        key: 'flutter pub | "$(Agent.OS)" | pubspec.yaml'
+        path: '$(Agent.ToolsDirectory)/.pub-cache'
+        cacheHitVar: PUB_CACHE_RESTORED
+
+    - script: |
+        mkdir -p $(Agent.ToolsDirectory)/.pub-cache
+        export PUB_CACHE=$(Agent.ToolsDirectory)/.pub-cache
+      displayName: 'Create and Export Pub Cache'
+
+    - ${{ if eq(parameters.use_flutter_version_latest, 'True') }}:
+
+      - task: FlutterInstall@0
+        displayName: "Install Flutter SDK"
+        inputs:
+          mode: auto
+          channel: stable
+          version: custom
+          customVersion: $(FLUTTER_VERSION_LATEST)
+
+      - task: Bash@3
+        displayName: "Flutter/Dart Version (post-install)"
+        inputs:
+          targetType: inline
+          script: |
+            flutter --version
+            dart --version
+
+    - ${{ else }}:
+      # Install Flutter
+      - task: FlutterInstall@0
+        displayName: "Install Flutter SDK"
+        inputs:
+          mode: 'auto'
+          channel: 'stable'
+          version: 'custom'
+          customVersion: $(FLUTTER_VERSION)
+          
+      - task: Bash@3
+        displayName: "Flutter/Dart Version (env)"
+        inputs:
+          targetType: inline
+          script: |
+            flutter --version
+            dart --version
+
+    - task: Bash@3
+      displayName: "Flutter Clean"
+      inputs:
+        targetType: inline
+        script: |
+          flutter clean
+
+    - script: |
+          export PUB_CACHE=$(Agent.ToolsDirectory)/.pub-cache
+          
+          # Usa System.CollectionUri para extrair a organização
+          COLLECTION_URI="$(System.CollectionUri)"
+          # Remove 'https://' e trailing '/'
+          ORG_PATH=${COLLECTION_URI#https://}
+          ORG_PATH=${ORG_PATH%/}
+          
+          # Extrai apenas o nome da organização
+          ORG_NAME=$(echo "$ORG_PATH" | cut -d'/' -f2)
+          
+          echo "##[debug]Collection: $COLLECTION_URI"
+          echo "##[debug]Organização: $ORG_NAME"
+          
+          # Configura Git com autenticação via System Access Token
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0="url.https://$(System.AccessToken)@dev.azure.com/${ORG_NAME}/.insteadOf"
+          export GIT_CONFIG_VALUE_0="https://${ORG_NAME}@dev.azure.com/${ORG_NAME}/"
+
+          flutter pub get
+      displayName: "Flutter Get Dependencies"       
+
+    - task: FlutterCommand@0
+      displayName: "Flutter Diagnostics"
+      condition: failed()
+      inputs:
+        projectDirectory: "."
+        arguments: "doctor -v"
+      env:
+        ASDF_JAVA_VERSION: "openjdk-17.0.2"
+
+    - task: Bash@3
+      displayName: "Dart Analyze"
+      continueOnError: true
+      inputs:
+        workingDirectory: "$(Build.SourcesDirectory)"
+        targetType: inline
+        script: |
+          dart analyze lib --no-fatal-warnings > analyze-report.txt
+          cat analyze-report.txt
+      env:
+        ASDF_JAVA_VERSION: "openjdk-17.0.2"
+
+    - task: FlutterTest@0
+      displayName: "Unit Tests"
+      continueOnError: true
+      inputs:
+        generateCodeCoverageReport: true
+        projectDirectory: "$(Build.SourcesDirectory)"
+      env:
+        ASDF_JAVA_VERSION: "openjdk-17.0.2"
+
+    - task: Bash@3
+      displayName: "Dart Cobertura"
+      continueOnError: true
+      inputs:
+        workingDirectory: "$(Build.SourcesDirectory)"
+        targetType: inline
+        script: |
+          
+          export PUB_CACHE=$(Agent.ToolsDirectory)/.pub-cache
+          export PATH="$PATH":"$PUB_CACHE/bin"
+
+          #pwd
+          #ls -la coverage
+          
+          # Instala cobertura globalmente
+          dart pub global activate cobertura
+
+          # Converte o relatório LCOV para Cobertura XML
+          cd "$(Build.SourcesDirectory)"
+          cobertura convert
+
+      env:
+        ASDF_JAVA_VERSION: "openjdk-17.0.2"
+
+    - task: PublishCodeCoverageResults@2
+      displayName: "Publish Code Coverage Cobertura"
+      inputs:
+        codecoverageTool: cobertura
+        summaryFileLocation: "$(Build.SourcesDirectory)/coverage/cobertura.xml"
+
+    - task: Bash@3
+      displayName: "Check Code Coverage Threshold (80%)"
+      continueOnError: true
+      inputs:
+        workingDirectory: "$(Build.SourcesDirectory)"
+        targetType: inline
+        script: |
+          if [ -f "coverage/cobertura.xml" ]; then
+            COVERAGE_PERCENT=$(grep -o 'line-rate="[0-9.]*"' coverage/cobertura.xml | head -1 | grep -o '[0-9.]*')
+            if [ -z "$COVERAGE_PERCENT" ]; then
+              echo "##[error]Could not extract coverage percentage from cobertura.xml"
+              exit 1
+            fi
+            COVERAGE_PERCENT_INT=$(echo "$COVERAGE_PERCENT * 100" | bc -l | cut -d. -f1)
+            echo "##[section]Code Coverage: ${COVERAGE_PERCENT_INT}%"
+            echo "##vso[task.setvariable variable=CodeCoveragePercent]${COVERAGE_PERCENT_INT}"
+            if [ "$COVERAGE_PERCENT_INT" -lt 80 ]; then
+              echo "##[error]Code coverage (${COVERAGE_PERCENT_INT}%) is below the required threshold of 80%"
+              echo "##[error]Please increase test coverage before proceeding"
+              exit 1
+            else
+              echo "##[section]✅ Code coverage (${COVERAGE_PERCENT_INT}%) meets the required threshold of 80%"
+            fi
+          else
+            echo "##[error]Coverage file not found: coverage/cobertura.xml"
+            exit 1
+          fi
+      env:
+        ASDF_JAVA_VERSION: "openjdk-17.0.2"
+
+    - task: CopyFiles@2
+      displayName: "Copy Lib to Staging Directory"
+      inputs:
+        TargetFolder: "$(Build.ArtifactStagingDirectory)"
+        OverWrite: true
+        CleanTargetFolder: true
+        Contents: "**/*"
+
+    - task: PublishBuildArtifacts@1
+      displayName: "Publish Lib Artifact"
+      inputs:
+        ArtifactName: "app"
+        StoreAsTar: true
+

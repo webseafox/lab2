@@ -1,0 +1,321 @@
+parameters:
+
+- name: variable_groups
+  displayName: Lista de Variables Groups para complementar variaveis e segredos.
+  default: []
+  type: object
+
+- name: environment
+  displayName: 'Escolha o ambiente para publicar'
+  type: string
+  default: dev
+  values:
+  - dev
+  - production
+
+- name: vivonow_chg
+  displayName: 'Numero CHG do VivoNow, somente para "production"'
+  default: CHG0000001
+
+- name: variables
+  displayName: 'Sobrescreve ou adiciona novas variaveis globais'
+  type: object
+  default: []
+
+variables:
+- name: System.debug
+  value: 'true'
+- ${{ each group_name in parameters.variable_groups }}:
+  - group: ${{ group_name }}
+
+- name: ASDF_JDK_8
+  value: "adoptopenjdk-8.0.352+8"
+- name: ASDF_JDK_11
+  value: "openjdk-11.0.2"
+- name: ASDF_JDK_17
+  value: "openjdk-17.0.2"
+- name: ASDF_JDK_21
+  value: "adoptopenjdk-21.0.4+7.0.LTS"
+
+- name: ASDF_JDK_SAP17
+  value: "sapmachine-17.0.10"
+
+- name: RELEASE_TYPE
+  ${{ if eq('${{ parameters.environment }}', 'production') }}:
+    value: 'RELEASE'
+  ${{ else }}:
+    value: 'SNAPSHOT'
+
+- ${{ each variable in parameters.variables }}:
+  - name: ${{ variable.name }}
+    value: ${{ variable.value }}
+
+stages:
+- stage:
+  displayName: 'Release version'
+  pool: GeneralPurposeLinuxAgentsCI
+  condition: eq('${{ parameters.environment }}', 'production')
+  jobs:
+  - job:
+    displayName: 'Check previous (SNAPSHOT)'
+    steps:
+    - checkout: self
+      fetchDepth: 1
+      persistCredentials: true
+
+    - script: 
+        echo "$(RELEASE_TYPE)"
+
+    - task: XmlParse@4
+      displayName: 'Get pom.xml info'
+      inputs:
+        source: file://$(Build.SourcesDirectory)/pom.xml
+        queries: |-
+          var POM_XML_VERSION = .project.version._text | replace(r/([0-9\.]+)-.+/, '$1')
+          var POM_XML_GROUP_ID = .project.groupId._text
+          var POM_XML_ARTIFACT_ID = .project.artifactId._text
+
+    - task: YamlParseFromVivo@4
+      displayName: 'Get Metadata Info'
+      inputs:
+        type: 'file'
+        origin: "catalog-info.yaml"
+        jpaths: |-
+          var CATALOG_YAML_ACRONYM = .metadata.annotations['techarch.governance-app.acronym']
+          var CATALOG_YAML_JAVA_LANGUAGE_VERSION = .metadata.annotations['arqtech.telefonica.com.br/language-version']
+
+
+    - script: |- # shell
+        echo "##vso[build.addbuildtag]artifacts"
+        echo "##vso[build.addbuildtag]java-$(CATALOG_YAML_JAVA_LANGUAGE_VERSION)"
+        echo "##vso[build.addbuildtag]maven"
+        echo "##vso[build.addbuildtag]cd-lite"
+        echo "##vso[build.addbuildtag]$(CATALOG_YAML_ACRONYM)"
+      displayName: 'Set tags'
+
+    - task: TemplateInline@4
+      displayName: 'Bind "ASDF_JAVA_VERSION"'
+      inputs:
+        source: |
+          var ASDF_JAVA_VERSION = {{ ASDF_JDK_$(CATALOG_YAML_JAVA_LANGUAGE_VERSION) }}
+
+    - script: | # shell
+        asdf install java $(ASDF_JAVA_VERSION)
+        asdf install maven 3.9.9
+        echo "##vso[task.setvariable variable=ASDF_MAVEN39_PATH]$(asdf where maven 3.9.9)"
+      displayName: 'Ensure tools versions'
+
+    - task: ListFilesAndFolders@4
+      displayName: 'Find Custom Maven Settings file'
+      inputs:
+        script: 'var://MAVEN_SETTINGS_FILES = **/*settings.xml'
+        dot: true
+
+    - task: PythonRunner@4
+      displayName: 'Ensure Maven Config'
+      inputs:
+        script: | # py
+          import os
+          set_variable('MAVEN_CUSTOM_SETTINGS',
+            (os.getenv('MAVEN_SETTINGS_FILES') or '/home/svc_devopscorp/.m2/settings.xml')
+            .split(',')[0]
+          )
+
+    # mvn dependency:get -Dartifact=$2:$3:$4:$5 -DremoteRepositories=$1 -Dtransitive=false
+    # mvn dependency:copy -Dartifact=$2:$3:$4:$5 -DremoteRepositories=$1 -Dtransitive=false -DoutputDirectory=$6
+    - task: Maven@4
+      displayName: 'Pull from Artifacts (SNAPSHOT)'
+      env:
+        ASDF_JAVA_VERSION: $(ASDF_JAVA_VERSION)
+        NEXUS_DEPS_USR: $(NEXUS-DEPS-USR)
+        NEXUS_DEPS_PSW: $(NEXUS-DEPS-PSW)
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+      inputs:
+        options: >-
+          -gs /home/svc_devopscorp/.m2/settings.xml
+          -s $(MAVEN_CUSTOM_SETTINGS)
+          -Dmaven.repo.local=/home/svc_devopscorp/.m2/repository
+          -Dartifact=$(POM_XML_GROUP_ID):$(POM_XML_ARTIFACT_ID):$(POM_XML_VERSION)-SNAPSHOT
+          -Dtransitive=false
+        # mavenPomFile: $(Build.SourcesDirectory)/pom.xml
+        mavenOptions: "-Xmx3072m"
+        mavenVersionOption: 'Path'
+        mavenDirectory: $(ASDF_MAVEN39_PATH)
+        javaHomeOption: "JDKVersion"
+        publishJUnitResults: false
+        # testResultsFiles: $(Build.SourcesDirectory)/**/surefire-reports/TEST-*.xml
+        goals: "dependency:get"
+
+
+- stage:
+  displayName: 'Push to Artifacts (RELEASE)'
+  pool: GeneralPurposeLinuxAgentsCI
+  jobs:
+  - job: artifacts
+    displayName: 'Push to Artifacts (RELEASE)'
+    steps:
+
+    - checkout: self
+      
+    - task: XmlParse@4
+      displayName: 'Get pom.xml info'
+      inputs:
+        source: file://$(Build.SourcesDirectory)/pom.xml
+        queries: |-
+          var POM_XML_VERSION = .project.version._text | replace(r/([0-9\.]+)-.+/, '$1')
+
+    - task: YamlParseFromVivo@4
+      displayName: 'Get Metadata Info'
+      inputs:
+        type: 'file'
+        origin: $(Build.SourcesDirectory)/catalog-info.yaml
+        jpaths: |-
+          var CATALOG_YAML_JAVA_LANGUAGE_VERSION = .metadata.annotations['arqtech.telefonica.com.br/language-version']
+
+    - task: TemplateInline@4
+      displayName: 'Bind "ASDF_JAVA_VERSION"'
+      inputs:
+        sourceType: 'text'
+        source: |
+          var ASDF_JAVA_VERSION = {{ ASDF_JDK_$(CATALOG_YAML_JAVA_LANGUAGE_VERSION) }}
+
+    - script: | # shell
+        
+        asdf install java $(ASDF_JAVA_VERSION)
+        asdf install maven 3.9.9
+        echo "##vso[task.setvariable variable=ASDF_MAVEN39_PATH]$(asdf where maven 3.9.9)"
+      displayName: 'Ensure tools versions'
+
+    - task: ListFilesAndFolders@4
+      displayName: 'Find Custom Maven Settings file'
+      inputs:
+        script: 'var://MAVEN_SETTINGS_FILES = **/*settings.xml'
+        dot: true
+
+    - task: PythonRunner@4
+      displayName: 'Ensure Maven Config'
+      inputs:
+        script: | # py
+          import os
+          set_variable('MAVEN_CUSTOM_SETTINGS',
+            (os.getenv('MAVEN_SETTINGS_FILES') or '/home/svc_devopscorp/.m2/settings.xml')
+            .split(',')[0]
+          )
+
+    - task: Maven@4
+      displayName: "Maven versions:set"
+      env:
+        ASDF_JAVA_VERSION: $(ASDF_JAVA_VERSION)
+        NEXUS_DEPS_USR: $(NEXUS-DEPS-USR)
+        NEXUS_DEPS_PSW: $(NEXUS-DEPS-PSW)
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+      inputs:
+        options: >
+          -gs /home/svc_devopscorp/.m2/settings.xml
+          -s $(MAVEN_CUSTOM_SETTINGS)
+          -Dmaven.test.skip=true 
+          -DnewVersion=$(POM_XML_VERSION)-$(RELEASE_TYPE)
+          -DprocessAllModules
+          -DgenerateBackupPoms=false
+          -N versions:update-child-modules
+        mavenPomFile: $(Build.SourcesDirectory)/pom.xml
+        mavenOptions: "-Xmx3072m"
+        mavenVersionOption: 'Path'
+        mavenDirectory: $(ASDF_MAVEN39_PATH)
+        javaHomeOption: "JDKVersion"
+        goals: "versions:set"
+
+    - task: CopyFiles@2
+      displayName: 'Staging Artifacts'
+      inputs:
+        SourceFolder: "$(build.sourcesdirectory)"
+        TargetFolder: "$(Build.ArtifactStagingDirectory)"
+        Contents: |
+          **/pom.xml
+          pom.xml
+        CleanTargetFolder: true
+        OverWrite: true
+        flattenFolders: false
+
+    - task: PublishBuildArtifacts@1
+      displayName: "Push Artifacts"
+      inputs:
+        ArtifactName: bin
+
+    - task: Maven@4
+      displayName: "Push to Azure Artifacts"
+      env:
+        ASDF_JAVA_VERSION: $(ASDF_JAVA_VERSION)
+        NEXUS_DEPS_USR: $(NEXUS-DEPS-USR)
+        NEXUS_DEPS_PSW: $(NEXUS-DEPS-PSW)
+        PUB_CREDENTIAL_USR: $(NEXUS-DEFAULT-USR)
+        PUB_CREDENTIAL_PSW: $(NEXUS-DEFAULT-PSW)
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+      inputs:
+        options: >-
+          -gs /home/svc_devopscorp/.m2/settings.xml
+          -s $(MAVEN_CUSTOM_SETTINGS)
+          -DaltDeploymentRepository="telefonica-vivo-brasil::default::https://pkgs.dev.azure.com/telefonica-vivo-brasil/_packaging/DevOps/maven/v1"
+          -Dmaven.repo.local=$HOME/.m2/repository
+          -Dmaven.process-resources.skip=true
+          -Dmaven.install.skip=true
+          -Dmaven.compile.skip=true
+          -Dmaven.package.skip=true
+          -Dmaven.process-test-resources.skip=true
+          -Dmaven.test-compile.skip=true
+          -Dmaven.test.skip=true
+          -Dmaven.gitcommitid.skip=true
+          -Dskip.installnodenpm=true
+          -Dskip.npm=true
+          -DskipTests
+        mavenPomFile: './pom.xml'
+        mavenOptions: "-Xmx3072m"
+        mavenVersionOption: 'Path'
+        mavenDirectory: $(ASDF_MAVEN39_PATH)
+        javaHomeOption: "JDKVersion"
+        publishJUnitResults: false
+        goals: "deploy"
+    
+
+  - job:
+    dependsOn: artifacts
+    displayName: 'Push to Git (TAG)'
+    steps:
+    - checkout: self
+      persistCredentials: true
+
+    - task: DownloadBuildArtifacts@1
+      displayName: 'Download Artifact'
+      inputs:
+        buildType: 'current'
+        artifactName: 'generated-sources'
+        downloadPath: $(System.ArtifactsDirectory)
+
+    - task: XmlParseFromVivo@4
+      displayName: 'Get pom.xml info'
+      inputs:
+        type: 'file'
+        origin: "pom.xml"
+        jpaths: |
+          var POM_XML_VERSION = .project.version._text
+
+    - task: Bash@3
+      displayName: 'Commit new version'
+      continueOnError: false
+      inputs:
+        targetType: inline
+        script: |- # shell
+
+          git switch -c $(Build.SourceBranch)
+          yes | cp -r -f $(System.ArtifactsDirectory)/generated-sources/* ./
+
+          git add .
+          git commit -m "[skip ci] CodePlay bump version $(POM_XML_VERSION)"
+          git tag $(POM_XML_VERSION) -m "Version has been updated to $(POM_XML_VERSION)"
+          git push origin --tags HEAD:$(Build.SourceBranch)
+
+          echo "##[command] yes | cp -r -f $(System.ArtifactsDirectory)/generated-sources/* ./"
+          echo "##[command] git add ."
+          echo "##[command] git commit -m \"[skip ci] CodePlay bump version $(POM_XML_VERSION)\""
+          echo "##[command] git tag $(POM_XML_VERSION) -m \"Version has been updated to $(POM_XML_VERSION)\""
+          echo "##[command] git push origin --tags HEAD:$(Build.SourceBranch)"

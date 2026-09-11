@@ -1,0 +1,296 @@
+parameters:
+- name: environment
+- name: packageVersion
+- name: artifact
+
+stages:
+- stage: cd_deploy
+  displayName: "CD - Deploy ${{ parameters.environment }}"
+  pool: GeneralPurposeLinuxAgentsCD
+  #GeneralPurposeLinuxAgentsCI
+  ## -> Loads variables from other stages.
+  variables:
+  - group: lib-weblogic # Referência ao grupo de variáveis (library)
+  - name: DEFAULT_WORKDIR_WEBLOGIC_CONFIG
+    value: "$(Pipeline.Workspace)/source_code/.azuredevops/config"
+  - name: WEBLOGIC_MIDDLEWARE_HOME
+    value: 'weblogic/Middleware'
+  - name: WL_HOME
+    value: '$(Pipeline.Workspace)/$(WEBLOGIC_MIDDLEWARE_HOME)/wlserver_10.3'
+  - name: JAVA_HOME
+    value: ''
+
+  jobs:
+
+  - deployment: deploy
+    displayName: 'Deploy'
+    environment:
+      name: deploy-${{ parameters.environment }}
+    continueOnError: true
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+
+          ## -> Skip Download
+          - download: none
+
+          ## -> Checkout the source code.
+          - checkout: self
+            fetchDepth: 1
+
+          - task: XmlParseFromVivo@4
+            displayName: 'Get pom.xml info'
+            inputs:
+              type: 'file'
+              origin: $(Build.SourcesDirectory)/pom.xml
+              jpaths: |
+                var GROUP_ID = .project.groupId._text
+                var ARTIFACT_ID = .project.artifactId._text
+
+          - task: DownloadPackage@1
+            displayName: 'Download Maven Artifact from Azure Artifacts'
+            inputs:
+              packageType: 'maven'
+              feed: 'DevOps'
+              definition: '$(GROUP_ID):$(ARTIFACT_ID)-${{ parameters.artifact }}'
+              version: '${{ parameters.packageVersion }}'
+              downloadPath: '$(Build.ArtifactStagingDirectory)/downloaded-artifact'
+
+          # Faz o Download do Pacote Weblogic
+          - task: UniversalPackages@0
+            displayName: "Download package Weblogic."
+            inputs:
+              command: 'download'
+              downloadDirectory: '$(Pipeline.Workspace)/weblogic'
+              feedsToUse: 'internal'
+              vstsFeed: '3d53bc62-8749-4931-ae46-a443b73bc87a'    # DEVOPS
+              vstsFeedPackage: 'b09cf160-956a-4d5a-9f9c-5aca4f982d92'  # weblogic
+              vstsPackageVersion: '10.3.6-11gr1'
+
+            # Faz o Download do Pacote JDK
+          - task: UniversalPackages@0
+            displayName: "Download package jdk-7u80-linux-x64."
+            inputs:
+              command: 'download'
+              downloadDirectory: '$(Pipeline.Workspace)/jdk'
+              feedsToUse: 'internal'
+              vstsFeed: '3d53bc62-8749-4931-ae46-a443b73bc87a'   # DEVOPS
+              vstsFeedPackage: 'de587d92-b78a-488e-a41e-a198bf8bfe29' # jdk
+              vstsPackageVersion: '1.7.0-7u80.linux-x64'
+
+          # Descompacta o pacote Weblogic
+          - task: Bash@3
+            displayName: "Extract pacote Weblogic"
+            inputs:
+              targetType: 'inline'
+              workingDirectory: $(Pipeline.Workspace)/weblogic
+              script: |       
+                echo "Listando arquivos no diretório de weblogic:"
+                ls -l 
+
+                # Pegando o nome do primeiro arquivo encontrado no diretório
+                FILE_NAME_WEBLOGIC=$(find . -type f -name "*tar.gz" | head -n 1)
+                #echo "##vso[task.setvariable variable=FILE_NAME_WEBLOGIC]$FILE_NAME_WEBLOGIC"
+                echo "Descompactando o pacote Weblogic: $FILE_NAME_WEBLOGIC "
+                tar -xzf $FILE_NAME_WEBLOGIC
+                ls $(Pipeline.Workspace)/weblogic
+
+          # Descompacta o pacote JDK
+          - task: Bash@3
+            displayName: "Extract Java"
+            inputs:
+              targetType: 'inline'
+              workingDirectory: $(Pipeline.Workspace)/jdk
+              script: |       
+                echo "Listando arquivos no diretório de JDK:"
+                ls -l 
+
+                # Pegando o nome do primeiro arquivo encontrado no diretório
+                FILE_NAME_JAVA=$(find . -type f -name "*tar.gz" | head -n 1)
+                #echo "##vso[task.setvariable variable=FILE_NAME_WEBLOGIC]$FILE_NAME_WEBLOGIC"
+                echo "Descompactando o pacote $FILE_NAME_JAVA"
+                tar -xzf $FILE_NAME_JAVA   
+
+          - task: CmdLine@2
+            displayName: list packages and remove unwanted files
+            name: packages
+            condition: succeeded()
+            continueOnError: false
+            inputs:
+              workingDirectory: $(Build.ArtifactStagingDirectory)/downloaded-artifact
+              targetType: inline
+              script: |
+                echo "##[group] Antes da exclusão:"
+                ls -l $(Build.ArtifactStagingDirectory)/downloaded-artifact
+                echo "##[endgroup]"
+                echo "Removendo arquivos que não terminam com .ear, .jar, .ejb ou web"
+                find $(Build.ArtifactStagingDirectory)/downloaded-artifact -type f ! \( \
+                  -name "*.ear" -o \
+                  -name "*.jar" -o \
+                  -name "*.ejb" -o \
+                  -name "*web" \
+                \) -exec rm -f {} +
+
+                echo "##[group] Depois da exclusão:"
+                ls -l $(Build.ArtifactStagingDirectory)/downloaded-artifact
+                echo "##[endgroup]"
+
+          - task: Bash@3
+            displayName: 'Definir nome do artefato como variável'
+            inputs:
+              targetType: 'inline'
+              workingDirectory: $(Build.ArtifactStagingDirectory)/downloaded-artifact
+              script: |
+                ARTIFACT_FILE=$(ls | grep -E '\.ear$|\.jar$|\.ejb$|web$' | head -n 1)
+                echo "Arquivo encontrado: $ARTIFACT_FILE"
+                echo "##vso[task.setvariable variable=ARTIFACT_FILE]$ARTIFACT_FILE"
+
+            # Configura as variaveis que serão utilizadas
+          - task: Bash@3
+            displayName: 'Setar variaveis Java'
+            inputs:
+              targetType: inline
+              script: |
+
+                #Seta a variavel JAVA_HOME
+                export JAVA_HOME="$(Pipeline.Workspace)/jdk/jdk1.7.0_80"
+                export JAVA_VENDOR=Oracle
+                export CLASSPATH=$WL_HOME/server/lib/weblogic.jar:$CLASSPATH
+                export PATH=$JAVA_HOME/bin:$PATH          
+        
+                #Printa as variaveis do Java
+                echo "CLASSPATH: $CLASSPATH"
+                echo "PATH: $PATH"
+                echo "JAVA_HOME: $JAVA_HOME"
+                echo "JAVA_VENDOR: $JAVA_VENDOR"
+        
+                # Print a versão do Java
+                echo "Versão do Java:"
+                java -version
+
+                #Seta a variavel Java Home 
+                echo "##vso[task.setvariable variable=JAVA_HOME]$JAVA_HOME"
+                echo "##vso[task.setvariable variable=JAVA_VENDOR]$JAVA_VENDOR"
+                echo "##vso[task.setvariable variable=CLASSPATH]$CLASSPATH"
+                echo "##vso[task.setvariable variable=PATH]$PATH"
+
+                # Transforma 'preprod' em 'PREPROD' - Parametro environment
+                ENV_UPPER=$(echo '${{ parameters.environment }}' | tr '[:lower:]' '[:upper:]')
+                echo "Ambiente em maiúscula: $ENV_UPPER"
+
+  
+                # Construindo os nomes das variáveis
+                WEBLOGIC_URL="${ENV_UPPER}_WEBLOGIC_URL"
+                WEBLOGIC_USER="${ENV_UPPER}_WEBLOGIC_USER"
+                WEBLOGIC_PASSWORD="${ENV_UPPER}_WEBLOGIC_PASSWORD"
+                WEBLOGIC_CLUSTER="${ENV_UPPER}_WEBLOGIC_CLUSTER"
+
+                # Usando eval para obter os valores
+                eval VALUE_URL=\$$WEBLOGIC_URL
+                eval VALUE_USER=\$$WEBLOGIC_USER
+                eval VALUE_PASS=\$$WEBLOGIC_PASSWORD
+                eval VALUE_CLUSTER=\$$WEBLOGIC_CLUSTER
+
+                # Exportando para as próximas tasks
+                echo "##vso[task.setvariable variable=VAR_WEBLOGIC_URL]$VALUE_URL"
+                echo "##vso[task.setvariable variable=VAR_WEBLOGIC_USER]$VALUE_USER"
+                echo "##vso[task.setvariable variable=VAR_WEBLOGIC_PASSWORD]$VALUE_PASS"
+                echo "##vso[task.setvariable variable=VAR_WEBLOGIC_CLUSTER]$VALUE_CLUSTER"
+
+                # Exibindo valores para debug
+                echo "user: $VALUE_USER"
+                echo "passwd: $VALUE_PASS"
+                echo "cluster: $VALUE_CLUSTER"
+                echo "URL: $VALUE_URL"
+
+          - task: UniversalPackages@0
+            displayName: Download Scripts wslt
+            inputs:
+              command: download
+              downloadDirectory: '$(Build.SourcesDirectory)/downloaded-package'
+              feedsToUse: 'internal'
+              vstsFeed: '3d53bc62-8749-4931-ae46-a443b73bc87a'
+              vstsFeedPackage: 'codeplay-weblogic-scripts-wslt'
+              vstsPackageVersion: '1.0.0'
+
+          - task: Bash@3
+            displayName: 'Executar WLST para pegar versão do pacote'
+            inputs:
+              targetType: 'inline'
+              workingDirectory: $(Build.SourcesDirectory)/downloaded-package
+              script: |
+                echo "#### Variáveis ####"
+                echo "CLASSPATH: $CLASSPATH"
+                echo "PATH: $PATH"
+                echo "JAVA_HOME: $JAVA_HOME"
+                echo "JAVA_VENDOR: $JAVA_VENDOR"
+                java -version || true
+
+                echo "Executando WLST..."
+                timeout "$(TIMEOUT)" "$(WL_HOME)/common/bin/wlst.sh" get_active_package.py \
+                  "$(VAR_WEBLOGIC_USER)" \
+                  "$(VAR_WEBLOGIC_PASSWORD)" \
+                  "$(VAR_WEBLOGIC_URL)" \
+                  "$(PREFIX_APP)"
+
+          - task: Bash@3
+            displayName: "Underploy da aplicação"
+            inputs:
+              workingDirectory: $(Build.SourcesDirectory)/downloaded-package
+              targetType: 'inline'
+              script: |
+                echo "Executando WLST..."
+                timeout "$(TIMEOUT)" "$(WL_HOME)/common/bin/wlst.sh" undeploy_application.py \
+                  "$(VAR_WEBLOGIC_USER)" \
+                  "$(VAR_WEBLOGIC_PASSWORD)" \
+                  "$(VAR_WEBLOGIC_URL)" \
+                  "${{parameters.packageVersion}}" \
+                  "$(VAR_WEBLOGIC_CLUSTER)"
+                
+
+          - task: Bash@3
+            displayName: "Executar WLST para fazer deploy de aplicação WebLogic"
+            inputs:
+              targetType: 'inline'
+              workingDirectory: $(Build.SourcesDirectory)/downloaded-package
+              script: |
+                echo "CLASSPATH: $CLASSPATH"
+                echo "PATH: $PATH"
+                echo "JAVA_HOME: $JAVA_HOME"
+                echo "JAVA_VENDOR: $JAVA_VENDOR" 
+                java -version
+
+                echo "Executando WLST..."
+                timeout "$(TIMEOUT)" "$(WL_HOME)/common/bin/wlst.sh" deploy_application.py \
+                  "$(VAR_WEBLOGIC_USER)" \
+                  "$(VAR_WEBLOGIC_PASSWORD)" \
+                  "$(VAR_WEBLOGIC_URL)" \
+                  "${{parameters.packageVersion}}" \
+                  "$(Build.ArtifactStagingDirectory)/downloaded-artifact/$(ARTIFACT_FILE)" \
+                  "$(VAR_WEBLOGIC_CLUSTER)"
+
+          - task: Bash@3
+            displayName: "Shutdown JVM Weblogic"
+            inputs:
+              targetType: 'inline'
+              workingDirectory: $(Build.SourcesDirectory)/downloaded-package
+              script: |
+                echo "Executando WLST..."
+                timeout "$(TIMEOUT)" "$(WL_HOME)/common/bin/wlst.sh" shutdown_servers.py \
+                  "$(VAR_WEBLOGIC_USER)" \
+                  "$(VAR_WEBLOGIC_PASSWORD)" \
+                  "$(VAR_WEBLOGIC_URL)"
+
+          - task: Bash@3
+            displayName: "Start JVM WebLogic"
+            inputs:
+              targetType: 'inline'
+              workingDirectory: $(Build.SourcesDirectory)/downloaded-package
+              script: |
+                echo "Executando WLST..."
+                timeout "$(TIMEOUT)" "$(WL_HOME)/common/bin/wlst.sh" start_servers.py \
+                  "$(VAR_WEBLOGIC_USER)" \
+                  "$(VAR_WEBLOGIC_PASSWORD)" \
+                  "$(VAR_WEBLOGIC_URL)"
+

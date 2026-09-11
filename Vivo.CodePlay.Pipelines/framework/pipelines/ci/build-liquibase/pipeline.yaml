@@ -1,0 +1,580 @@
+# =====================================================================================================================
+# Pipeline: Build Liquibase Project — Empacotamento e Publicação (CI)
+# =====================================================================================================================
+# PROPÓSITO
+# ---------
+# Produzir o pacote Liquibase (ZIP + meta/manifest.json) de forma padronizada e auditável.
+#
+# MODOS DE EXECUÇÃO
+# ----------------
+# - PR (prValidationOnly=true): valida/gera pacote para verificação (não publica no feed, não commita/tag).
+# - Release (prValidationOnly=false): além da validação, publica ZIP no feed Maven e executa stage VersionCommit.
+#
+# NOTAS DE GOVERNANÇA
+# -------------------
+# - Liquibase em modo OFFLINE na CI (não conecta em banco).
+# - Taxonomia e validações (parent/GAV/manifest) falham cedo para garantir padrão corporativo.
+# - VersionCommit aplica bump/commit/tag diretamente no pom.xml do repositório (workspace do checkout).
+# =====================================================================================================================
+
+parameters:
+  # ===================================================================================================================
+  # Parâmetros de Controle de Execução (PR vs Release)
+  # ===================================================================================================================
+  - name: agentPool
+    type: string
+    default: GeneralPurposeLinuxAgentsCI
+    displayName: 'Pool de agentes para execução'
+
+  - name: prValidationOnly
+    type: boolean
+    default: false
+    displayName: 'Executar apenas validação para PR'
+
+  # ===================================================================================================================
+  # Parâmetros de Runtime (GuardRails / Java)
+  # ===================================================================================================================
+  - name: guardrailsRuntime
+    type: string
+    default: modern
+    values: [modern, legacy]
+    displayName: 'Runtime do GuardRails (profiles run-modern/run-legacy)'
+
+  - name: javaVersion
+    type: string
+    default: 'openjdk-17.0.2'
+    values:
+      - 'openjdk-21.0.2'
+      - 'openjdk-17.0.2'
+      - 'openjdk-11.0.2'
+      - 'adoptopenjdk-8.0.352+8'
+      - 'sapmachine-17.0.10'
+    displayName: 'Versão do Java'
+
+  # ===================================================================================================================
+  # Parâmetros do Projeto (monorepo / módulo)
+  # ===================================================================================================================
+  - name: projectDir
+    type: string
+    default: ''
+    displayName: 'Diretório do projeto Liquibase (ex: build-liquibase)'
+
+  - name: dbConfigFile
+    type: string
+    default: '.azuredevops/db-config.yaml'
+    displayName: 'Caminho do arquivo de configuração de banco (ex: .azuredevops/db-config.yaml)'
+
+  # ===================================================================================================================
+  # Parâmetros de Performance (Cache Maven)
+  # ===================================================================================================================
+  - name: enableCache
+    type: boolean
+    default: true
+    displayName: 'Habilitar cache de dependências Maven'
+
+  - name: mavenDebug
+    type: boolean
+    default: false
+    displayName: 'Habilitar log mais detalhado do Maven para liquibase'
+
+  - name: sqlGateValidate
+    type: boolean
+    default: true
+    displayName: 'Habilitar validação dos scripts inclusive de Rollback'
+  
+# =====================================================================================================================
+# Variáveis Internas do Pipeline
+# =====================================================================================================================
+variables:
+  # ===================================================================================================================
+  # Diretórios de execução
+  # ===================================================================================================================
+  - name: LQ_ROOT_DIR
+    value: '$(Pipeline.Workspace)/liquibase'
+
+  - name: PACKAGE_DIR
+    value: '$(LQ_ROOT_DIR)/package'
+
+  - name: WORKING_ROOT_DIR
+    value: '$(LQ_ROOT_DIR)/work'
+
+  - name: EVIDENCE_CI_PRINT_DIR
+    value: '$(LQ_ROOT_DIR)/evidence/ci-print'
+
+  - name: ARTIFACTS_ROOT_DIR
+    value: '$(LQ_ROOT_DIR)/artifacts'
+
+  - name: ARTIFACTS_DIR_LIQUIBASE
+    value: '$(ARTIFACTS_ROOT_DIR)/liquibase'
+
+  - name: ARTIFACTS_DIR_CI
+    value: '$(ARTIFACTS_ROOT_DIR)/ci'
+
+  - name: PROJECT_DIR
+    value: ''
+
+  - name: POM_FILE_PATH
+    value: ''
+
+  - name: MAVEN_CUSTOM_SETTINGS
+    value: ''
+
+  # ===================================================================================================================
+  # Maven local repository (cacheável)
+  # ===================================================================================================================
+  - name: MAVEN_CACHE_FOLDER
+    value: '$(Pipeline.Workspace)/.m2/repository'
+
+  - name: MAVEN_LOCAL_REPO
+    value: '$(MAVEN_CACHE_FOLDER)'
+
+  - name: MAVEN_REPO_LOCAL_OPTS
+    value: '-Dmaven.repo.local=$(MAVEN_CACHE_FOLDER)'
+
+  - name: MAVEN_DIRECTORY
+    value: '/home/svc_devopscorp/.asdf/installs/maven/3.9.9'
+
+  - name: MAVEN_XMX_ARGS
+    value: '-Xmx3072m'
+
+  # ===================================================================================================================
+  # Defaults do projeto
+  # ===================================================================================================================
+  - name: SETTINGS_REL_PATH
+    value: '.azuredevops/settings.xml'
+
+  - name: CHANGELOG_FILE
+    value: 'db/changelog/changelog.yaml'
+
+  - name: CI_PROFILE
+    value: ''
+
+  - name: RUNTIME_PROFILE
+    value: ''
+
+  - name: RESOLVED_VENDOR
+    value: ''
+
+  - name: OFFLINE_URL
+    value: ''
+
+  # ===================================================================================================================
+  # Variáveis utilizadas por templates de Segurança (Fortify/SCA)
+  # ===================================================================================================================
+  - name: AKV_DEVOPS_NAME
+    value: 'kv-azdevops-shared'
+
+  - name: CACORP_LOCATION
+    value: '$(Agent.HomeDirectory)/../../certs/CACORP.pem'
+
+  - name: FORTIFY_APP_DEFAULT_VERSION
+    value: 'DevSecOps'
+
+# =====================================================================================================================
+# Estágios do Pipeline
+# =====================================================================================================================
+stages:
+  - stage: BuildAndPublish
+    displayName: '[Build] Run Build and Publish'
+    jobs:
+      - job: BuildAndPublish
+        displayName: '[Build] Execute Pipeline'
+        pool:
+          name: ${{ parameters.agentPool }}
+
+        steps:
+          # -------------------------------------------------------------------------------------------------------
+          # Obtém o código-fonte para execução do build.
+          # -------------------------------------------------------------------------------------------------------
+          - checkout: self
+            displayName: '[Checkout] Repository'
+
+          # -------------------------------------------------------------------------------------------------------
+          # Exibe parâmetros da execução quando o modo debug está habilitado.
+          # -------------------------------------------------------------------------------------------------------
+          - task: VivoUtilsFromVivo@1
+            name: DebugShowPipelineParameters
+            displayName: '[Debug] Show Parameters'
+            condition: eq(variables['System.Debug'], 'true')
+            inputs:
+              command: 'show-pipeline-parameters'
+              parameters: '${{ convertToJson(parameters) }}'
+
+          # -------------------------------------------------------------------------------------------------------
+          # Prepara contexto de build e arquivos de configuração Maven.
+          # -------------------------------------------------------------------------------------------------------
+          - task: AzdoTaskLiquibase@2
+            name: DiscoverSetupBuild
+            displayName: '[Setup] Prepare Context'
+            inputs:
+              command: 'discoverSetup'
+              dbConfigFile: '${{ parameters.dbConfigFile }}'
+              mode: 'build'
+              projectDir: '${{ parameters.projectDir }}'
+              workingRootDir: '$(WORKING_ROOT_DIR)'
+              settingsRelPath: '$(SETTINGS_REL_PATH)'
+              guardrailsRuntime: '${{ parameters.guardrailsRuntime }}'
+              javaVersion: '${{ parameters.javaVersion }}'
+              agentPool: '${{ parameters.agentPool }}'
+              prValidationOnly: ${{ parameters.prValidationOnly }}
+              enableCache: ${{ parameters.enableCache }}
+              mavenDebug: ${{ parameters.mavenDebug }}
+              sqlGateValidate: ${{ parameters.sqlGateValidate }}
+              mavenRepoLocal: '$(MAVEN_CACHE_FOLDER)'
+
+          # -------------------------------------------------------------------------------------------------------
+          # Restaura cache de dependências Maven quando habilitado.
+          # -------------------------------------------------------------------------------------------------------
+          - task: Cache@2
+            name: CacheMavenDependencies
+            displayName: '[Cache] Restore Dependencies'
+            condition: and(succeeded(), eq(variables['LQ_CI_ENABLE_CACHE'], 'true'))
+            inputs:
+              key: 'maven-v2 | "$(Agent.OS)" | "$(LQ_CI_GUARDRAILS_RUNTIME)" | "$(POM_FILE_PATH)"'
+              restoreKeys: |
+                maven-v2 | "$(Agent.OS)" | "$(LQ_CI_GUARDRAILS_RUNTIME)"
+                maven-v2 | "$(Agent.OS)"
+                maven-v2
+                maven
+              path: '$(MAVEN_CACHE_FOLDER)'
+
+          # -------------------------------------------------------------------------------------------------------
+          # Resolve a próxima versão para a execução atual.
+          # -------------------------------------------------------------------------------------------------------
+          - task: VersionManagerVivo@8
+            name: VersionNextBuild
+            displayName: '[Version] Next Version'
+            inputs:
+              command: 'nextVersion'
+              branchingStrategy: 'trunkbased'
+              versionFile: '$(POM_FILE_PATH)'
+              bumpMethod: 'patch'
+              method: 'patch'
+
+          # -------------------------------------------------------------------------------------------------------
+          # Resolve metadados do projeto e variáveis derivadas de runtime.
+          # -------------------------------------------------------------------------------------------------------
+          - task: AzdoTaskLiquibase@2
+            name: DiscoverProjectMetadata
+            displayName: '[Discover] Resolve Metadata'
+            inputs:
+              command: 'discover'
+              dbConfigFile: '${{ parameters.dbConfigFile }}'
+              mode: 'build'
+              projectDir: '$(PROJECT_DIR)'
+              workingRootDir: '$(PROJECT_DIR)'
+              settingsRelPath: '$(SETTINGS_REL_PATH)'
+              guardrailsRuntime: '$(LQ_CI_GUARDRAILS_RUNTIME)'
+              validateParent: true
+
+          - task: Bash@3
+            name: DiscoverExportVariables
+            displayName: '[Discover] Export Variables'
+            inputs:
+              targetType: inline
+              script: |
+                set -euo pipefail
+
+                echo "##vso[task.setvariable variable=RESOLVED_VENDOR]$(resolvedVendor)"
+                echo "##vso[task.setvariable variable=RUNTIME_PROFILE]$(runtimeProfile)"
+                echo "##vso[task.setvariable variable=CI_PROFILE]ci-$(changeType)"
+                echo "##vso[task.setvariable variable=OFFLINE_URL]offline:$(resolvedVendor)"
+
+          # -------------------------------------------------------------------------------------------------------
+          # Gera pacote ZIP, manifest e saídas de preview SQL.
+          # -------------------------------------------------------------------------------------------------------
+          - task: AzdoTaskLiquibase@2
+            name: LiquibasePackageBuild
+            displayName: '[Build] Package Bundle (Offline)'
+            inputs:
+              command: 'package'
+              dbConfigFile: '${{ parameters.dbConfigFile }}'
+              projectDir: '$(PROJECT_DIR)'
+              settingsRelPath: '$(SETTINGS_REL_PATH)'
+              javaVersion: '$(LQ_CI_JAVA_VERSION)'
+              guardrailsRuntime: '$(LQ_CI_GUARDRAILS_RUNTIME)'
+              mavenGoals: 'clean package'
+              mavenRepoLocal: '$(MAVEN_CACHE_FOLDER)'
+              validateManifest: true
+              validateZip: true
+              mavenDirectory: '$(MAVEN_DIRECTORY)'
+              mavenXmx: '$(MAVEN_XMX_ARGS)'
+              enableCache: $(LQ_CI_ENABLE_CACHE)
+              mavenDebug: $(LQ_CI_MAVEN_DEBUG)
+            env:
+              AZURE_DEVOPS_PAT: $(System.AccessToken)
+              SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+
+
+          - task: AzdoTaskLiquibase@2
+            name: SqlGateResolveMatrix
+            displayName: '[Gate] Resolve Vendor/Profile Matrix'
+            condition: and(succeeded(), eq(variables['LQ_CI_SQL_GATE_VALIDATE'], 'true'))
+            inputs:
+              command: 'sqlGateResolveMatrix'
+              dbConfigFile: '${{ parameters.dbConfigFile }}'
+              projectDir: '$(PROJECT_DIR)'
+              guardrailsRuntime: '$(LQ_CI_GUARDRAILS_RUNTIME)'
+              sqlGateEnvFile: '$(Pipeline.Workspace)/sql-gate.env'
+
+          - task: DockerCompose@1
+            name: SqlGateDockerUp
+            displayName: '[Gate] Docker Compose Up'
+            condition: and(succeeded(), eq(variables['LQ_CI_SQL_GATE_VALIDATE'], 'true'))
+            inputs:
+              containerregistrytype: 'Azure Container Registry'
+              dockerComposeFile: '$(SQL_GATE_DOCKER_COMPOSE_FILE)'
+              action: 'Run a Docker Compose command'
+              projectName: 'sqlgate$(Build.BuildId)'
+              dockerComposeCommand: '--env-file $(SQL_GATE_ENV_FILE) --profile $(SQL_GATE_COMPOSE_PROFILE) up -d --pull missing'
+
+          - task: AzdoTaskLiquibase@2
+            name: LiquibaseSqlGateValidate
+            displayName: '[Gate] SQL Gate Validate'
+            condition: and(succeeded(), eq(variables['LQ_CI_SQL_GATE_VALIDATE'], 'true'))
+            inputs:
+              command: 'sqlGateValidate'
+              dbConfigFile: '${{ parameters.dbConfigFile }}'
+              projectDir: '$(PROJECT_DIR)'
+              gateFailLevels: 'BLOCKER,ERROR'
+              gateReportFile: 'target/sql-gate-findings.txt'
+              skipRollbackValidation: false
+
+          - task: DockerCompose@1
+            name: SqlGateDockerDown
+            displayName: '[Gate] Docker Compose Down'
+            condition: and(always(), eq(variables['LQ_CI_SQL_GATE_VALIDATE'], 'true'), ne(variables['SQL_GATE_ENV_FILE'], ''), ne(variables['SQL_GATE_COMPOSE_PROFILE'], ''))
+            inputs:
+              containerregistrytype: 'Azure Container Registry'
+              dockerComposeFile: '$(SQL_GATE_DOCKER_COMPOSE_FILE)'
+              action: 'Run a Docker Compose command'
+              projectName: 'sqlgate$(Build.BuildId)'
+              dockerComposeCommand: '--env-file $(SQL_GATE_ENV_FILE) --profile $(SQL_GATE_COMPOSE_PROFILE) down -v'
+
+          # -------------------------------------------------------------------------------------------------------
+          # Coleta e imprime evidências SQL geradas no build.
+          # -------------------------------------------------------------------------------------------------------
+          - task: AzdoTaskLiquibase@2
+            name: LiquibaseEvidenceBuild
+            displayName: '[Evidence] Print Preview SQL'
+            condition: succeeded()
+            inputs:
+              command: 'evidence'
+              dbConfigFile: '${{ parameters.dbConfigFile }}'
+              mode: 'previewSql'
+              workingDirectory: '$(PROJECT_DIR)'
+              outputDir: '$(EVIDENCE_CI_PRINT_DIR)'
+              maxPrintLines: '20000'
+
+          # -------------------------------------------------------------------------------------------------------
+          # Organiza ZIP e outputs de CI no diretório de staging.
+          # -------------------------------------------------------------------------------------------------------
+          - task: Bash@3
+            name: LiquibaseStageOutputs
+            displayName: '[Stage] Stage ZIP and CI Output'
+            condition: succeeded()
+            inputs:
+              targetType: inline
+              script: |
+                set -euo pipefail
+
+                TARGET_DIR="$(PROJECT_DIR)/target"
+                ZIP_FILE="$(zipFilePath)"
+
+                mkdir -p "$(ARTIFACTS_DIR_LIQUIBASE)" "$(ARTIFACTS_DIR_CI)"
+
+                [ -n "$ZIP_FILE" ] || { echo "##[error]zipFilePath não foi retornado pela task package."; exit 1; }
+                [ -f "$ZIP_FILE" ] || { echo "##[error]ZIP não encontrado: $ZIP_FILE"; exit 1; }
+
+                cp "$ZIP_FILE" "$(ARTIFACTS_DIR_LIQUIBASE)/"
+
+                if [ -d "$TARGET_DIR/ci" ]; then
+                  cp -R "$TARGET_DIR/ci/." "$(ARTIFACTS_DIR_CI)/"
+                else
+                  echo "Diretório target/ci não encontrado. Nenhum SQL de CI para staging."
+                fi
+
+                echo "ZIP staged em: $(ARTIFACTS_DIR_LIQUIBASE)"
+                echo "CI staged em:  $(ARTIFACTS_DIR_CI)"
+
+          # -------------------------------------------------------------------------------------------------------
+          # Publica artefatos de build para consumo no stage de segurança (SCA).
+          # -------------------------------------------------------------------------------------------------------
+          - task: PublishPipelineArtifact@1
+            name: PublishBuildArtifactForSecurityAnalysis
+            displayName: '[Publish] Build Artifact for Security Analysis'
+            condition: succeeded()
+            inputs:
+              targetPath: '$(PROJECT_DIR)/target'
+              artifactName: '$(Build.Repository.Name)'
+              publishLocation: 'pipeline'
+
+          # -------------------------------------------------------------------------------------------------------
+          # Publica o bundle no feed Maven para execuções de release.
+          # -------------------------------------------------------------------------------------------------------
+          - task: Maven@4
+            name: LiquibaseReleasePublish
+            displayName: '[Publish] Release ZIP Bundle'
+            condition: and(succeeded(), eq(variables['LQ_CI_PR_VALIDATION_ONLY'], 'false'))
+            inputs:
+              goals: 'clean deploy'
+              mavenPomFile: '$(POM_FILE_PATH)'
+              workingDirectory: '$(PROJECT_DIR)'
+              publishJUnitResults: false
+              mavenVersionOption: 'Path'
+              mavenDirectory: '$(MAVEN_DIRECTORY)'
+              javaHomeOption: 'JDKVersion'
+              mavenOptions: '$(MAVEN_XMX_ARGS)'
+              options: >-
+                -s $(MAVEN_CUSTOM_SETTINGS)
+                $(MAVEN_REPO_LOCAL_OPTS)
+                -P$(RUNTIME_PROFILE),$(CI_PROFILE)
+                -Ddb.vendor=$(RESOLVED_VENDOR)
+                -Dliquibase.changelogFile=$(CHANGELOG_FILE)
+                -Dliquibase.url=$(OFFLINE_URL)
+                -Dmaven.test.skip=true
+            env:
+              ASDF_JAVA_VERSION: $(LQ_CI_JAVA_VERSION)
+              AZURE_DEVOPS_PAT: $(System.AccessToken)
+              SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+
+  # ===================================================================================================================
+  # Stage: SecurityAnalysis - AppSec (Fortify + SCA)
+  # ===================================================================================================================
+  - stage: SecurityAnalysis
+    displayName: '[Security] Analyze Security'
+    dependsOn:
+      - BuildAndPublish
+    condition: succeeded()
+    jobs:
+      # -------------------------------------------------------------------------------------------------------
+      # Resolve feature flags/endpoints de AppSec e publica artifact de endpoints.
+      # -------------------------------------------------------------------------------------------------------
+      - job: AppSecConfigKeys
+        displayName: '[Security] Resolve AppSec Config'
+        pool:
+          name: ${{ parameters.agentPool }}
+        steps:
+          - template: /security/get_appconfig_keys_framework.yml
+            parameters:
+              azureSubscription: DevOpsSharedResources
+              appConfigurationEndpoint: https://appcs-azdevops-shared.azconfig.io
+
+      # -------------------------------------------------------------------------------------------------------
+      # Executa SAST com Fortify quando habilitado via AppSec.
+      # -------------------------------------------------------------------------------------------------------
+      - job: FortifyScan
+        displayName: '[Security] Run Fortify Scan'
+        dependsOn:
+          - AppSecConfigKeys
+        variables:
+          USE_FORTIFY: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.USE_FORTIFY'] ]
+          USE_CONVISO: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.USE_CONVISO'] ]
+          SKIP_SECURITY_GATE: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.SKIP_SECURITY_GATE'] ]
+          FORTIFY_LOCAL_SCANCENTRAL_VERSION: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.FORTIFY_LOCAL_SCANCENTRAL_VERSION'] ]
+        condition: and(succeeded(), eq(variables.USE_FORTIFY, true))
+        pool:
+          name: ${{ parameters.agentPool }}
+        steps:
+          - template: /security/define_appsec_app_version.yml
+          - template: /security/run_fortify_scan.yml
+            parameters:
+              fortifyExclusionRepository: 'FortifyExclusion'
+              enableFortifyExclusions: false
+              appLanguage: 'other'
+              appVersion: "$(FORTIFY_APP_VERSION)"
+
+      # -------------------------------------------------------------------------------------------------------
+      # Executa SCA com Dependency Track quando habilitado via AppSec.
+      # -------------------------------------------------------------------------------------------------------
+      - job: SCAScan
+        displayName: '[Security] Run SCA Scan'
+        dependsOn:
+          - AppSecConfigKeys
+        variables:
+          USE_DEPENDENCY_TRACK: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.USE_DEPENDENCY_TRACK'] ]
+          USE_DT_DOCKER: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.USE_DT_DOCKER'] ]
+          USE_CONVISO: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.USE_CONVISO'] ]
+          SKIP_SECURITY_GATE_SCA: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.SKIP_SECURITY_GATE_SCA'] ]
+        condition: and(succeeded(), eq(variables.USE_DEPENDENCY_TRACK, true))
+        pool:
+          name: ${{ parameters.agentPool }}
+        steps:
+          - template: /security/define_appsec_app_version.yml
+          - template: /security/run_sca_scan.yml
+            parameters:
+              appVersion: "$(FORTIFY_APP_VERSION)"
+              buildArtifactName: '$(Build.Repository.Name)'
+
+  # ===================================================================================================================
+  # Stage: VersionCommit - Commit e Tag da Versão de Release
+  # ===================================================================================================================
+  - stage: VersionCommit
+    displayName: '[Version] Commit Version'
+    dependsOn:
+      - BuildAndPublish
+      - SecurityAnalysis
+    condition: and(succeeded(), eq(dependencies.BuildAndPublish.outputs['BuildAndPublish.DiscoverSetupBuild.LQ_CI_PR_VALIDATION_ONLY'], 'false'))
+    jobs:
+      - job: CommitVersion
+        displayName: '[Version] Commit Release Version'
+        pool:
+          name: ${{ parameters.agentPool }}
+
+        variables:
+          - name: POM_FILE_PATH
+            ${{ if eq(parameters.projectDir, '') }}:
+              value: '$(Build.SourcesDirectory)/pom.xml'
+            ${{ else }}:
+              value: '$(Build.SourcesDirectory)/${{ parameters.projectDir }}/pom.xml'
+
+        steps:
+          # -------------------------------------------------------------------------------------------------------
+          # Obtém o código-fonte com credenciais para commit e tag.
+          # -------------------------------------------------------------------------------------------------------
+          - checkout: self
+            clean: true
+            persistCredentials: true
+            fetchDepth: 0
+
+          # -------------------------------------------------------------------------------------------------------
+          # Resolve a próxima versão para persistência no repositório.
+          # -------------------------------------------------------------------------------------------------------
+          - task: VersionManagerVivo@8
+            name: VersionNextCommit
+            displayName: '[Version] Next Version'
+            inputs:
+              command: 'nextVersion'
+              branchingStrategy: 'trunkbased'
+              versionFile: '$(POM_FILE_PATH)'
+              bumpMethod: 'patch'
+
+          # -------------------------------------------------------------------------------------------------------
+          # Efetiva commit e tag da versão calculada.
+          # -------------------------------------------------------------------------------------------------------
+          - task: VersionManagerVivo@8
+            name: VersionCommitTag
+            displayName: '[Version] Commit and Tag'
+            condition: succeeded()
+            inputs:
+              command: 'commitVersion'
+              version: '$(VersionNextCommit.VERSION)'
+              versionFile: '$(POM_FILE_PATH)'
+              createTag: true
+              pushChanges: true
+          
+          # ==============================================================================
+          # [Versionamento] Publica versão de build no Event Hub para rastreabilidade
+          # ==============================================================================
+          - task: VivoEventHubTools@3
+            continueOnError: true
+            displayName: 'Publish Build Event to Event Hub'
+            inputs:
+              command: build
+              eventHubConnection: EVHCodeProd
+              eventHubName: 'govapp.component.build.event'
+              componentProject: $(System.TeamProject)
+              componentName: $(Build.Repository.Name)
+              componentVersion: $(VersionNextCommit.VERSION)
+              componentBuildId: $(Build.BuildId)
+              componentPipelineUrl: $(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)&view=results

@@ -1,0 +1,78 @@
+parameters:
+  - name: condition
+    default: succeeded()
+  - name: environment
+  - name: nodePool
+  - name: action
+  - name: compartmentId
+
+steps:
+  - task: CmdLine@2
+    name: get_nodes
+    displayName: "Get ${{ parameters.environment }} Nodes"
+    condition: ${{ parameters.condition }}
+    inputs:
+      script: |
+        NODE_POOL_JSON=$(echo '${{ parameters.nodePool }}' | jq '.')
+
+        NODE_POOL_ID=$(echo $NODE_POOL_JSON | jq -r '.id')
+        NODE_POOL_NAME=$(echo $NODE_POOL_JSON | jq -r '.name')
+        NODE_POOL_STATE=$(echo $NODE_POOL_JSON | jq -r '.["lifecycle-state"]')
+
+        NODES=""
+
+        echo "##[debug] ENVIRONMENT ..............................................: ${{ parameters.environment }}"
+        echo "##[debug] ACTION ...................................................: ${{ parameters.action }}" 
+        echo "##[debug] CONDITION ................................................: ${{ parameters.condition }}"
+        echo "##[debug] COMPARTMENT ID ...........................................: ${{ parameters.compartmentId }}"
+        echo "##[debug] NODE POOL ................................................: ${{ parameters.nodePool }}"
+        echo "##[debug] NODE POOL ID .............................................: $NODE_POOL_ID"
+        echo "##[debug] NODE POOL NAME ...........................................: $NODE_POOL_NAME"
+        echo "##[debug] NODE POOL STATE ..........................................: $NODE_POOL_STATE"
+
+        echo "##[command]oci compute instance list --compartment-id ${{ parameters.compartmentId }} --query 'data[?'system-tags'.'orcl-containerengine'.'NodePool' == '$NODE_POOL_ID' && (\"lifecycle-state\" == 'STOPPED' || \"lifecycle-state\" == 'RUNNING')].{ID:id,Name:'display-name',State:'lifecycle-state',Pool:'system-tags'}'"
+        RETURNED_NODES=$(oci compute instance list \
+                --compartment-id ${{ parameters.compartmentId }} \
+                --query "data[?\"system-tags\".\"orcl-containerengine\".\"NodePool\" == '$NODE_POOL_ID' && (\"lifecycle-state\" == 'STOPPED' || \"lifecycle-state\" == 'RUNNING')].{id:id,name:\"display-name\",pool:\"system-tags\".\"orcl-containerengine\".\"NodePool\",state:\"lifecycle-state\"}")
+        RETURNED_NODES_COUNT=$(echo "$RETURNED_NODES" | jq '. | length')
+
+        echo "##[debug] NODES COUNT ..............................................: $RETURNED_NODES_COUNT"
+        echo ""
+
+        if [ "$RETURNED_NODES_COUNT" -eq 0 ]; then
+          echo "##[warning]No nodes found in $EXPECTED_LIFECYCLE_STATE state for node pool $NODE_POOL_NAME"
+        fi
+
+        NODE_INDEX=0
+        MAX_ITERATIONS=$((RETURNED_NODES_COUNT - 1))
+
+        for i in $(seq 0 $MAX_ITERATIONS); do
+          NODE_INDEX=$((NODE_INDEX + 1))
+          NODE_ID=$(echo $RETURNED_NODES | jq -r ".[$i].id")
+          NODE_NAME=$(echo $RETURNED_NODES | jq -r ".[$i].name")
+          NODE_POOL=$(echo $RETURNED_NODES | jq -r ".[$i].pool")
+          NODE_STATE=$(echo $RETURNED_NODES | jq -r ".[$i].state")
+          
+          echo ""
+          echo ">>>>> Node $NODE_INDEX:"
+          echo "🌐 Get Node IP ..."
+          echo "##[command]    oci compute instance list-vnics --instance-id $NODE_ID | jq -r '(.data[]).'private-ip''"
+          NODE_IP=$(oci compute instance list-vnics --instance-id $NODE_ID | jq -r '(.data[])."private-ip"')
+
+          echo ">> Id: $NODE_ID"
+          echo ">> Name: $NODE_NAME"
+          echo ">> Pool: $NODE_POOL"
+          echo ">> IP: $NODE_IP"
+          echo ">> State: $NODE_STATE"
+          
+          if [ -z "$NODES" ]; then
+            NODES="$NODE_ID,$NODE_NAME,$NODE_IP,$NODE_STATE"
+          else
+            NODES="$NODES;$NODE_ID,$NODE_NAME,$NODE_IP,$NODE_STATE"
+          fi
+        done
+
+        echo ""
+        echo "##[section]Nodes selected for action: $NODES"
+
+        echo "##vso[task.setvariable variable=NODES;isOutput=true]$NODES"

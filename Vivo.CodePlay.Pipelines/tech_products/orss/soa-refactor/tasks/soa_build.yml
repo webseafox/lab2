@@ -1,0 +1,69 @@
+steps:
+  - checkout: none
+
+  - task: Docker@2
+    name: DockerLogin
+    displayName: 'Login on Azure Container Registry'
+    inputs:
+      containerRegistry: 'ACR-DEVOPS'
+      command: 'login'
+
+  - task: DownloadSecureFile@1
+    name: DownloadSettings
+    displayName: 'Download SOA settings XML'
+    condition: and(succeeded(), in(variables['PROJECT_TYPE'], 'COMPOSITE'))
+    inputs:
+      secureFile: $(COMPONENT_SETTINGS)
+
+  - task: Bash@3
+    name: BuildSOAComposite
+    displayName: 'Building BPEL Composite'
+    condition: and(succeeded(), in(variables['PROJECT_TYPE'], 'COMPOSITE'))
+    inputs:
+      targetType: 'inline'
+      script: |
+        docker run --rm --entrypoint bash \
+          -v $(Build.SourcesDirectory):/builds \
+          -v $(Agent.TempDirectory):/settings \
+          -w /builds \
+          -e COMPONENT_SETTINGS=$(COMPONENT_SETTINGS) \
+          -e PARTITION=$(PARTITION) \
+          -e PROJECT=$(PROJECT) \
+          -e COMPOSITE_VERSION=$(COMPOSITE_VERSION) \
+          $(DOCKER_IMAGE) \
+          -c "cd /;
+              chmod +x /build.sh;
+              ./build.sh"
+
+        if grep -q 'ERROR' $(Build.SourcesDirectory)/build.log
+        then
+          echo "##vso[task.complete result=Failed;]"
+        else
+          mv $(Build.SourcesDirectory)/soaconfig.jar soaconfig-$(System.PullRequest.PullRequestId).jar
+          mv $(Build.SourcesDirectory)/changes.txt soaconfig-$(System.PullRequest.PullRequestId).txt
+        fi
+
+  - task: Bash@3
+    name: BuildMDS
+    displayName: 'Building MDS'
+    condition: and(succeeded(), in(variables['PROJECT_TYPE'], 'METADATA_STORE'))
+    inputs:
+      targetType: 'inline'
+      script: |
+        mkdir $(Build.SourcesDirectory)/oramds_build_tmp
+        IFS='|'
+        for file in $FILES
+        do
+          cp -Rva --parents $file $(Build.SourcesDirectory)/oramds_build_tmp
+        done
+        cd $(Build.SourcesDirectory)/oramds_build_tmp/$PARTITION/$PROJECT/apps
+        zip -r oramds-$(System.PullRequest.PullRequestId).jar *
+        mv oramds-$(System.PullRequest.PullRequestId).jar $(Build.SourcesDirectory)
+
+        cd $(Build.SourcesDirectory)/oramds_build_tmp/$PARTITION/$PROJECT
+        zip -r oramds-$(System.PullRequest.PullRequestId).zip ./apps
+        mv oramds-$(System.PullRequest.PullRequestId).zip $(Build.SourcesDirectory)
+
+        mv $(Build.SourcesDirectory)/changes.txt $(Build.SourcesDirectory)/oramds-$(System.PullRequest.PullRequestId).txt
+
+        rm -rf $(Build.SourcesDirectory)/oramds_build_tmp

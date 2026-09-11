@@ -1,0 +1,193 @@
+trigger: none
+
+parameters:
+  - name: environment
+    displayName: Selecione a esteira para deploy
+    type: string
+    default: producao
+    values:
+      - producao
+
+variables:
+  SCRIPTS_DIR: /app/prd1bea/.deploy_automatizado/yggdrasil
+  BAMBOO_PLAN_URL: http://svuxpbam4.gvt.net.br:8085/browse/DOMWLSCONF1PRD-CONFIGURADORONLINE
+  servidor: /app/prd1bea/.deploy_automatizado/yggdrasil/svuxpbam4.conf
+  dominios: /app/prd1bea/.deploy_automatizado/dominios
+  dominio: domwlsconf1prd/domwlsconf1prd.dom
+  dominios_teste: /home/prd1bea/devops/melhorias_savvion/testes
+  idade_maxima: "-120"
+  aplicacao: domwlsconf1prd/configuradorOnline.app
+  rollback_revision: ""
+stages:
+  - stage: CD
+    pool: GeneralPurposeLinuxAgentsCD
+    jobs:
+      - job: Setupinicial
+        displayName: Setup Inicial
+        steps:
+          - script: |
+              # Arguments:
+              #   $1 (WORKING_DIR) - The directory where the script will be executed.
+              #   $2 (COMMAND)     - The command to run in the specified directory
+
+              function run_script() {
+                if [ -z "$1" ] || [ -z "$2" ]; then
+                    echo "##[error] Both WORKING_DIR and COMMAND must be provided."
+                    return 1
+                fi
+
+                local WORKING_DIR="$1"
+                local COMMAND="$2"
+                
+                export bamboo_servidor="$(servidor)"
+                export bamboo_dominios="$(dominios)"
+                export bamboo_idade_maxima="$(idade_maxima)"
+                export bamboo_dominio="$(dominio)"
+                export bamboo_aplicacao="$(aplicacao)"
+                export bamboo_dominios_teste="$(dominios_teste)"
+                export bamboo_rollback_revision="$(rollback_revision)"
+
+                echo "##[debug] ENVIRONMENT VARIABLES #########################################"
+                echo "##[debug] bamboo_servidor..............: $bamboo_servidor"
+                echo "##[debug] bamboo_dominios..............: $bamboo_dominios"
+                echo "##[debug] bamboo_idade_maxima..........: $bamboo_idade_maxima"
+                echo "##[debug] bamboo_dominio...............: $bamboo_dominio"
+                echo "##[debug] bamboo_aplicacao.............: $bamboo_aplicacao"
+                echo "##[debug] bamboo_dominios_teste........: $bamboo_dominios_teste"
+                echo "##[debug] bamboo_rollback_revision.....: $bamboo_rollback_revision"
+
+                cd $WORKING_DIR
+                echo "##[debug] Build working directory is: $PWD"
+                echo "Beginning to execute $COMMAND"
+                $COMMAND
+              }
+
+              echo "##[debug] Encoding function with base64:"
+              ENCODED_FUNCTION_RUN_SCRIPT=$(declare -f run_script  | base64 -w 0)
+              echo "##[debug] $ENCODED_FUNCTION_RUN_SCRIPT"
+
+              echo "##[debug] Exporting the serialized function into the variable 'ENCODED_FUNCTION_RUN_SCRIPT'"
+              echo "##vso[task.setvariable variable=ENCODED_FUNCTION_RUN_SCRIPT;isOutput=true]$ENCODED_FUNCTION_RUN_SCRIPT"
+            name: Setupinicial
+      - deployment: Deploy
+        displayName: Deploy
+        environment: deploy-${{ parameters.environment }}
+        dependsOn: Setupinicial
+        variables:
+          ENCODED_FUNCTION_RUN_SCRIPT: $[ dependencies.Setupinicial.outputs['Setupinicial.ENCODED_FUNCTION_RUN_SCRIPT'] ]
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: SSH@0
+                  displayName: Análise pré migração - Acesso ao WebLogic Admin
+                  inputs:
+                    sshEndpoint: bamboo_svuxpbam4
+                    runOptions: inline
+                    inline: |
+                      WORKING_DIR="/app/bamboo/home/xml-data/build-dir/DOMWLSCONF1PRD-CONFIGURADORONLINE-AAWA"
+                      COMMAND="$(SCRIPTS_DIR)/analise.sh --weblogic-admin"
+
+                      echo "##[debug] Running function run_script:"
+                      FUNCTION_RUN_SCRIPT=$(echo "$(ENCODED_FUNCTION_RUN_SCRIPT)" | base64 --decode)                   
+                      eval "$FUNCTION_RUN_SCRIPT"
+
+                      run_script "$WORKING_DIR" "$COMMAND"
+                - task: SSH@0
+                  displayName: Análise pré migração - Acesso ssh
+                  inputs:
+                    sshEndpoint: bamboo_svuxpbam4
+                    runOptions: inline
+                    inline: |
+                      WORKING_DIR="/app/bamboo/home/xml-data/build-dir/DOMWLSCONF1PRD-CONFIGURADORONLINE-AS"
+                      COMMAND="$(SCRIPTS_DIR)/analise.sh --conexao-ssh"
+
+                      echo "##[debug] Running function run_script:"
+                      FUNCTION_RUN_SCRIPT=$(echo "$(ENCODED_FUNCTION_RUN_SCRIPT)" | base64 --decode)                   
+                      eval "$FUNCTION_RUN_SCRIPT"
+
+                      run_script "$WORKING_DIR" "$COMMAND"
+                - task: SSH@0
+                  displayName: Análise do pacote - Verifica data
+                  inputs:
+                    sshEndpoint: bamboo_svuxpbam4
+                    runOptions: inline
+                    inline: |
+                      WORKING_DIR="/app/bamboo/home/xml-data/build-dir/DOMWLSCONF1PRD-CONFIGURADORONLINE-NVDA"
+                      COMMAND="$(SCRIPTS_DIR)/analise.sh --verificar-data"
+
+                      echo "##[debug] Running function run_script:"
+                      FUNCTION_RUN_SCRIPT=$(echo "$(ENCODED_FUNCTION_RUN_SCRIPT)" | base64 --decode)                   
+                      eval "$FUNCTION_RUN_SCRIPT"
+
+                      run_script "$WORKING_DIR" "$COMMAND"
+                - task: SSH@0
+                  displayName: Backup
+                  inputs:
+                    sshEndpoint: bamboo_svuxpbam4
+                    runOptions: inline
+                    inline: |
+                      WORKING_DIR="/app/bamboo/home/xml-data/build-dir/DOMWLSCONF1PRD-CONFIGURADORONLINE-BAC"
+                      COMMAND="$(SCRIPTS_DIR)/deploy_weblogic.sh --backup"
+
+                      echo "##[debug] Running function run_script:"
+                      FUNCTION_RUN_SCRIPT=$(echo "$(ENCODED_FUNCTION_RUN_SCRIPT)" | base64 --decode)                   
+                      eval "$FUNCTION_RUN_SCRIPT"
+
+                      run_script "$WORKING_DIR" "$COMMAND"
+                - task: SSH@0
+                  displayName: Undeploy
+                  inputs:
+                    sshEndpoint: bamboo_svuxpbam4
+                    runOptions: inline
+                    inline: |
+                      WORKING_DIR="/app/bamboo/home/xml-data/build-dir/DOMWLSCONF1PRD-CONFIGURADORONLINE-JOB1"
+                      COMMAND="$(SCRIPTS_DIR)/deploy_weblogic.sh --undeploy"
+
+                      echo "##[debug] Running function run_script:"
+                      FUNCTION_RUN_SCRIPT=$(echo "$(ENCODED_FUNCTION_RUN_SCRIPT)" | base64 --decode)                   
+                      eval "$FUNCTION_RUN_SCRIPT"
+
+                      run_script "$WORKING_DIR" "$COMMAND"
+                - task: SSH@0
+                  displayName: Deploy
+                  inputs:
+                    sshEndpoint: bamboo_svuxpbam4
+                    runOptions: inline
+                    inline: |
+                      WORKING_DIR="/app/bamboo/home/xml-data/build-dir/DOMWLSCONF1PRD-CONFIGURADORONLINE-DEP"
+                      COMMAND="$(SCRIPTS_DIR)/deploy_weblogic.sh --undeploy"
+
+                      echo "##[debug] Running function run_script:"
+                      FUNCTION_RUN_SCRIPT=$(echo "$(ENCODED_FUNCTION_RUN_SCRIPT)" | base64 --decode)                   
+                      eval "$FUNCTION_RUN_SCRIPT"
+
+                      run_script "$WORKING_DIR" "$COMMAND"
+                - task: SSH@0
+                  displayName: Análise pós migração - Aplicação ainda existe?
+                  inputs:
+                    sshEndpoint: bamboo_svuxpbam4
+                    runOptions: inline
+                    inline: |
+                      WORKING_DIR="/app/bamboo/home/xml-data/build-dir/DOMWLSCONF1PRD-CONFIGURADORONLINE-AE1"
+                      COMMAND="$(SCRIPTS_DIR)/analise.sh --aplicacao-existe"
+
+                      echo "##[debug] Running function run_script:"
+                      FUNCTION_RUN_SCRIPT=$(echo "$(ENCODED_FUNCTION_RUN_SCRIPT)" | base64 --decode)                   
+                      eval "$FUNCTION_RUN_SCRIPT"
+
+                      run_script "$WORKING_DIR" "$COMMAND"
+                - task: SSH@0
+                  displayName: Análise pós migração - Revisões para Rollback
+                  inputs:
+                    sshEndpoint: bamboo_svuxpbam4
+                    runOptions: inline
+                    inline: |
+                      WORKING_DIR="/app/bamboo/home/xml-data/build-dir/DOMWLSCONF1PRD-CONFIGURADORONLINE-RPR"
+                      COMMAND="$(SCRIPTS_DIR)/deploy_weblogic.sh --revision-rollback"
+
+                      echo "##[debug] Running function run_script:"
+                      FUNCTION_RUN_SCRIPT=$(echo "$(ENCODED_FUNCTION_RUN_SCRIPT)" | base64 --decode)                   
+                      eval "$FUNCTION_RUN_SCRIPT"
+
+                      run_script "$WORKING_DIR" "$COMMAND"

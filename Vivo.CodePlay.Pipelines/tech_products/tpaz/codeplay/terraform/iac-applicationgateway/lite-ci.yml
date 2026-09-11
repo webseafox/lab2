@@ -1,0 +1,1116 @@
+parameters:
+- name: forceCertificateRenew
+  type: boolean
+- name: sigla 
+  type: string
+- name: network
+  type: string  
+- name: environment
+  displayName: Environment
+  type: string
+  default: dev
+  values:
+  - dev
+  - test
+  - prod
+- name: action
+  displayName: Action
+  type: string
+  default: plan
+  values:
+  - plan
+  - apply
+  - destroy
+  - planDestroy
+
+- name: requiresManualApproval
+  type: boolean
+  default: 'false'
+
+- name: isDestroy
+  type: boolean
+  default: 'false'
+
+stages:
+- stage: security_scan
+  pool: GeneralPurposeLinuxAgentsCI
+  displayName: Security Scan
+  jobs:
+  - job: AppSecConfigKeys
+    displayName: 'Get AppSec Config Keys'
+    steps:
+    - template: /security/get_appconfig_keys_framework.yml
+      parameters:
+        azureSubscription: DevOpsSharedResources
+        appConfigurationEndpoint: https://appcs-azdevops-shared.azconfig.io
+
+  - job: run_fortify
+    displayName: Run Fortify
+    dependsOn: AppSecConfigKeys
+    variables:
+      USE_FORTIFY: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.USE_FORTIFY'] ]
+      USE_CONVISO: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.USE_CONVISO'] ]
+      SKIP_SECURITY_GATE: True
+      FORTIFY_APP_VERSION: $[ dependencies.AppSecConfigKeys.outputs['scan_version_name.FORTIFY_APP_VERSION'] ]
+    condition: and(succeeded(), eq(variables.USE_FORTIFY, 'true'))
+    steps:
+    - template: /security/define_appsec_app_version.yml
+
+    - template: /security/run_fortify_scan.yml
+      parameters:
+        fortifyExclusionRepository: 'FortifyExclusion'
+        enableFortifyExclusions: false
+        appLanguage: 'java'
+        appVersion: "$(FORTIFY_APP_VERSION)" # OBS: A variável FORTIFY_APP_VERSION é definida no template /security/define_appsec_app_version.yml
+        convisoCompany: 1345
+- stage: stage_plan
+  pool:
+    name: GeneralPurposeLinuxAgentsCD
+  displayName: PLAN -> ${{parameters.environment}}
+  dependsOn:
+  - security_scan
+  condition: and(succeeded(), or(eq('${{parameters.action}}','plan'), eq('${{parameters.action}}','apply')))
+  jobs:
+  - job: job_plan
+    displayName: PLAN -> ${{parameters.environment}}
+    steps:
+    - task: 6d15af64-176c-496d-b583-fd2ae21d4df4@1
+      inputs:
+        repository: self
+    - task: Bash@3
+      displayName: About Stage
+      inputs:
+        targetType: inline
+        script: |
+            RED='\033[0;31m'
+            GREEN='\033[0;32m'
+            BLUE='\033[0;34m'
+            YELLOW='\033[1;33m'
+            BG_GREEN='\033[42;1;37m'
+
+            echo ' ================================================================================================================================'
+            echo '|                       __   __  _                  ___            _         ___   _                                             |'
+            echo '|                       \ \ / / (_) __ __  ___     / __|  ___   __| |  ___  | _ \ | |  __ _   _  _                               |'
+            echo '|                        \ V /  | | \ V / / _ \   | (__  / _ \ / _` | / -_) |  _/ | | / _` | | || |                              |'                 
+            echo '|                         \_/   |_|  \_/  \___/    \___| \___/ \__,_| \___| |_|   |_| \__,_|  \_, |                              |'               
+            echo '|                                                                                             |__/                               |'
+            echo ' ================================================================================================================================'
+            echo "                                                                                                      powered by Vivo DevOps Team"
+            echo ""
+
+            printf "
+            =================================================================================================================================
+            ${GREEN}                                                 ${SYSTEM_STAGEDISPLAYNAME} 
+            =================================================================================================================================
+
+              Lembre-se que a esteira apenas reflete o comportamento da sua aplicação e de acordo com as variáveis definidas.
+
+            ${YELLOW} Em caso de dúvidas sobre essa fase do pipeline acesse a documentação: ${BLUE}https://wikicorp.telefonica.com.br/display/AC/Terraform+-+Azure
+
+            =================================================================================================================================
+            "
+    - task: ms-devlabs.custom-terraform-tasks.custom-terraform-installer-task.TerraformInstaller@1
+      displayName: 'Install Terraform 1.4.5'
+      inputs:
+        terraformVersion: 1.4.5
+    - task: AzureKeyVault@2
+      displayName: 'Getting AKV credentials'
+      timeoutInMinutes: 1
+      retryCountOnTaskFailure: 5
+      inputs:
+        azureSubscription: DevOpsSharedResources
+        KeyVaultName: kv-azdevops-shared
+        SecretsFilter: 'NEXUS-DEPS-USR, NEXUS-DEPS-PSW, AZ-DEVOPS-PAT-TOKEN, PHPIPAM-PASSWORD'
+    - task: CmdLine@2
+      displayName: 'Setup git config https'
+      env:
+        GIT_PASS: $(AZ-DEVOPS-PAT-TOKEN)
+        GIT_ASKPASS: "$(Agent.TempDirectory)/git_env_password.sh"
+      inputs:
+        script: |
+          echo "##[debug] GIT_ASKPASS........: ${GIT_ASKPASS}"
+          echo "exec echo \"$GIT_PASS\"" >> "${GIT_ASKPASS}"
+          chmod 777 "${GIT_ASKPASS}"
+          echo "##vso[task.setvariable variable=GIT_ASKPASS]$GIT_ASKPASS"
+        workingDirectory: $(Agent.TempDirectory)
+    - task: ms-devlabs.custom-terraform-tasks.custom-terraform-release-task.TerraformTaskV4@4
+      displayName: 'Terraform INIT - azurerm'
+      inputs:
+        backendServiceArm: SharedResources
+        backendAzureRmResourceGroupName: rg-devops-sharedservices
+        backendAzureRmStorageAccountName: sttfstatedevopsshared
+        backendAzureRmContainerName: terraform-state-${{parameters.environment}}
+        backendAzureRmKey: $(System.TeamProject)/$(Build.Repository.Name)/terraform.tfstate
+        workingDirectory: $(Build.SourcesDirectory)
+      env:
+        TF_LOG: ERROR
+    - task: TerraformTaskV4@4
+      displayName: 'Terraform VALIDATE'
+      inputs:
+        command: validate
+        commandOptions: ''
+        environmentServiceNameAzureRM: sp-terraform-${{parameters.environment}}
+        workingDirectory: $(Build.SourcesDirectory)
+    - task: TerraformTaskV4@4
+      displayName: 'Terraform PLAN'
+      inputs:
+        command: plan
+        commandOptions: --out=tfplan.out -var-file=environments/${{ parameters.environment }}/terraform.tfvars.json
+        environmentServiceNameAzureRM: sp-terraform-${{parameters.environment}}
+        workingDirectory: $(Build.SourcesDirectory)
+      env:
+        AZDO_ORG_SERVICE_URL: https://dev.azure.com/telefonica-vivo-brasil
+        PHPIPAM_APP_ID: platformcode
+        PHPIPAM_ENDPOINT_ADDR: http://10.240.42.97:8000/api
+        PHPIPAM_PASSWORD: $(PHPIPAM-PASSWORD)
+        PHPIPAM_USER_NAME: platformcode
+        TF_VAR_NEXUS_USERNAME: $(NEXUS-DEPS-USR)
+        TF_VAR_NEXUS_PASSWORD: $(NEXUS-DEPS-PSW)
+        TF_VAR_runtime_tags: '{"trilha":"${{parameters.environment}}","repositorio":"$(Build.Repository.Uri)"}'
+        ASDF_HELM_VERSION: 3.11.0
+    - task: CmdLine@2
+      displayName: 'Terraform SHOW - Export to .json'
+      inputs:
+        script: |
+          terraform --version -json
+          echo "##[command] terraform show -json tfplan.out | jq '.' > tfplan.json"
+          terraform show -json tfplan.out | jq '.' > tfplan.json
+        workingDirectory: $(Build.SourcesDirectory)
+    - task: AzureKeyVault@2
+      displayName: 'Getting AKV credentials'
+      timeoutInMinutes: 1
+      retryCountOnTaskFailure: 5
+      inputs:
+        azureSubscription: DevOpsSharedResources
+        KeyVaultName: kv-azdevops-shared
+        SecretsFilter: 'INFRACOST-API-KEY'
+    - task: CmdLine@2
+      name: step_infracost_breakdown
+      displayName: Infracost breakdown
+      env:
+        INFRACOST_API_KEY: $(INFRACOST-API-KEY)
+      inputs:
+        script: |
+          infracost configure set currency BRL
+          infracost breakdown --show-skipped --project-name $BUILD_REPOSITORY_NAME --path tfplan.json
+        workingDirectory: $(Build.SourcesDirectory)
+    - task: CmdLine@2
+      name: step_checkov
+      displayName: Run Checkov
+      env:
+        DIRECTORY: $(Build.SourcesDirectory)
+        BASELINE: $(Build.SourcesDirectory)/.checkov.baseline
+        VAR_FILE: environments/${{ parameters.environment }}/terraform.tfvars.json
+        DOWNLOAD_EXTERNAL_MODULES: "true"
+        OUTPUT_FILE_PATH: "console,$(System.DefaultWorkingDirectory)/TEST-Checkov.xml"
+      inputs:
+        script: |
+          echo "##[debug] DIRECTORY....................: ${DIRECTORY}"
+          echo "##[debug] BASELINE.....................: ${BASELINE}"
+          echo "##[debug] VAR_FILE.....................: ${VAR_FILE}"
+          echo "##[debug] DOWNLOAD_EXTERNAL_MODULES....: ${DOWNLOAD_EXTERNAL_MODULES}"
+          echo "##[debug] OUTPUT_FILE_PATH.............: ${OUTPUT_FILE_PATH}"
+
+          if [ ! -f "${BASELINE}" ]; then
+          BASELINE="${AGENT_TEMPDIRECTORY}/.checkov.baseline"
+          echo "##[debug] Arquivo .checkov.baseline não encontrado. Criando baseline padrão."
+            cat <<EOF > "${BASELINE?}"
+          {
+            "failed_checks": []
+          }
+          EOF
+          fi
+
+          echo "##[command] checkov"
+          checkov --directory ${DIRECTORY} \
+            --baseline ${BASELINE} \
+            --var-file ${VAR_FILE} \
+            --download-external-modules ${DOWNLOAD_EXTERNAL_MODULES} \
+            --skip-path tfplan.json \
+            --skip-path examples \
+            --output cli \
+            --output junitxml \
+            --output-baseline-as-skipped \
+            --soft-fail \
+            --output-file-path ${OUTPUT_FILE_PATH}
+        workingDirectory: $(Build.SourcesDirectory)
+    - task: CmdLine@2
+      name: step_tfsec
+      displayName: Run tfsec
+      env:
+        TFVARS_LOCATION: environments/${{ parameters.environment }}/terraform.tfvars.json
+      inputs:
+        script: |
+          echo "##[command] tfsec --var-file ${TFVARS_LOCATION} --exclude-path examples --exclude-downloaded-modules --format junit --soft-fail --verbose --out ${SYSTEM_DEFAULTWORKINGDIRECTORY}/TEST-tfsec.xml"
+          tfsec \
+            --var-file ${TFVARS_LOCATION} \
+            --exclude-path examples \
+            --exclude-downloaded-modules \
+            --format junit \
+            --soft-fail \
+            --verbose \
+            --out ${SYSTEM_DEFAULTWORKINGDIRECTORY}/TEST-tfsec.xml
+        workingDirectory: $(Build.SourcesDirectory)
+    - task: PublishTestResults@2
+      name: t_publish_test_result
+      displayName: Publish Test Results
+      inputs:
+        mergeTestResults: false
+        searchFolder: $(System.DefaultWorkingDirectory)
+        testResultsFiles: '**/TEST-*.xml'
+        testResultsFormat: JUnit
+        testRunTitle: Test Results
+        failTaskOnFailedTests: true
+        publishRunAttachments: true
+      continueOnError: true
+      condition: succeeded()
+
+    - script: |
+        set -e
+        echo "Verificando se há recursos para destroy"
+
+        # Extrai os tipos de ações do plano Terraform
+        CREATE_COUNT=$(jq '[.resource_changes[] | select(.change.actions[] == "create")] | length' tfplan.json)
+        DESTROY_COUNT=$(jq '[.resource_changes[] | select(.change.actions[] == "delete")] | length' tfplan.json)
+
+        echo "Recursos a adicionar: $CREATE_COUNT"
+        echo "Recursos a destruir: $DESTROY_COUNT"
+
+        # Se houver pelo menos um add e um destroy ao mesmo tempo, barramos a execução
+        if [ "$CREATE_COUNT" -gt 0 ] && [ "$DESTROY_COUNT" -gt 0 ]; then
+          echo "Aviso: O plano detectou que há recursos sendo destruídos e recriados ao mesmo tempo."
+          echo "Definindo variável de controle para aprovação manual..."
+          echo "##vso[task.setvariable variable=requiresManualApproval;isOutput=true]true"  # Define a variável de controle
+        else
+          echo "##vso[task.setvariable variable=requiresManualApproval;isOutput=true]false"
+          echo "Não há conflitos de ADD e DESTROY."
+        fi
+      displayName: 'Verificando se há recursos para destroy'
+      name: setRequiresApproval   
+      workingDirectory: $(Build.SourcesDirectory)
+      #condition: eq('${{ parameters.isDestroy }}', false)
+      condition: and(eq('${{ parameters.isDestroy }}', false), eq('${{ parameters.action }}', 'apply'))
+
+
+   # Aprovação manual somente se a variável requiresManualApproval for verdadeira
+  - job: waitForValidation 
+    displayName: Aprovação Manual para destroy
+    pool: server
+    timeoutInMinutes: 4320
+    dependsOn: job_plan 
+    #condition: and(succeeded(), eq('${{ parameters.isDestroy }}', false))
+    condition: and(succeeded(), eq('${{ parameters.isDestroy }}', false), eq('${{ parameters.action }}', 'apply'))
+    variables:
+      requiresManualApproval: $[ dependencies.job_plan.outputs['setRequiresApproval.requiresManualApproval'] ]
+    steps:
+    - task: ManualValidation@1
+      condition: eq(variables['requiresManualApproval'], 'true') 
+      inputs:
+        instructions: |
+          O plano detectou recursos sendo destruídos e recriados ao mesmo tempo. 
+          Por favor, aprove ou negue a execução dessa mudança.
+          Caso não deseje permitir a destruição e recriação dos recursos, recuse a execução.
+        onTimeout: 'reject'
+
+- stage: stage_plan_destroy
+  pool:
+    name: GeneralPurposeLinuxAgentsCD
+  displayName: PLAN to DESTROY -> ${{parameters.environment}}
+  dependsOn: []
+  condition: and(succeeded(), or(eq('${{parameters.action}}','planDestroy'), eq('${{parameters.action}}','destroy')))
+  jobs:
+  - job: job_plan_destroy
+    displayName: PLAN to DESTROY -> ${{parameters.environment}}
+    steps:
+    - task: 6d15af64-176c-496d-b583-fd2ae21d4df4@1
+      inputs:
+        repository: self
+    - task: Bash@3
+      displayName: About Stage
+      inputs:
+        targetType: inline
+        script: |
+            RED='\033[0;31m'
+            GREEN='\033[0;32m'
+            BLUE='\033[0;34m'
+            YELLOW='\033[1;33m'
+            BG_GREEN='\033[42;1;37m'
+
+            echo ' ================================================================================================================================'
+            echo '|                       __   __  _                  ___            _         ___   _                                             |'
+            echo '|                       \ \ / / (_) __ __  ___     / __|  ___   __| |  ___  | _ \ | |  __ _   _  _                               |'
+            echo '|                        \ V /  | | \ V / / _ \   | (__  / _ \ / _` | / -_) |  _/ | | / _` | | || |                              |'                 
+            echo '|                         \_/   |_|  \_/  \___/    \___| \___/ \__,_| \___| |_|   |_| \__,_|  \_, |                              |'               
+            echo '|                                                                                             |__/                               |'
+            echo ' ================================================================================================================================'
+            echo "                                                                                                      powered by Vivo DevOps Team"
+            echo ""
+
+            printf "
+            =================================================================================================================================
+            ${GREEN}                                                 ${SYSTEM_STAGEDISPLAYNAME} 
+            =================================================================================================================================
+
+              Lembre-se que a esteira apenas reflete o comportamento da sua aplicação e de acordo com as variáveis definidas.
+
+            ${YELLOW} Em caso de dúvidas sobre essa fase do pipeline acesse a documentação: ${BLUE}https://wikicorp.telefonica.com.br/display/AC/Terraform+-+Azure
+
+            =================================================================================================================================
+            "
+    - task: ms-devlabs.custom-terraform-tasks.custom-terraform-installer-task.TerraformInstaller@1
+      displayName: 'Install Terraform 1.4.5'
+      inputs:
+        terraformVersion: 1.4.5
+    - task: AzureKeyVault@2
+      displayName: 'Getting AKV credentials'
+      timeoutInMinutes: 1
+      retryCountOnTaskFailure: 5
+      inputs:
+        azureSubscription: DevOpsSharedResources
+        KeyVaultName: kv-azdevops-shared
+        SecretsFilter: 'NEXUS-DEPS-USR, NEXUS-DEPS-PSW, AZ-DEVOPS-PAT-TOKEN, PHPIPAM-PASSWORD'
+    - task: CmdLine@2
+      displayName: 'Setup git config https'
+      env:
+        GIT_PASS: $(AZ-DEVOPS-PAT-TOKEN)
+        GIT_ASKPASS: "$(Agent.TempDirectory)/git_env_password.sh"
+      inputs:
+        script: |
+          echo "##[debug] GIT_ASKPASS........: ${GIT_ASKPASS}"
+          echo "exec echo \"$GIT_PASS\"" >> "${GIT_ASKPASS}"
+          chmod 777 "${GIT_ASKPASS}"
+          echo "##vso[task.setvariable variable=GIT_ASKPASS]$GIT_ASKPASS"
+        workingDirectory: $(Agent.TempDirectory)
+    - task: ms-devlabs.custom-terraform-tasks.custom-terraform-release-task.TerraformTaskV4@4
+      displayName: 'Terraform INIT - azurerm'
+      inputs:
+        backendServiceArm: SharedResources
+        backendAzureRmResourceGroupName: rg-devops-sharedservices
+        backendAzureRmStorageAccountName: sttfstatedevopsshared
+        backendAzureRmContainerName: terraform-state-${{parameters.environment}}
+        backendAzureRmKey: $(System.TeamProject)/$(Build.Repository.Name)/terraform.tfstate
+        workingDirectory: $(Build.SourcesDirectory)
+      env:
+        TF_LOG: ERROR
+    - task: TerraformTaskV4@4
+      displayName: 'Terraform VALIDATE'
+      inputs:
+        command: validate
+        commandOptions: ''
+        environmentServiceNameAzureRM: sp-terraform-${{parameters.environment}}
+        workingDirectory: $(Build.SourcesDirectory)
+    - task: TerraformTaskV4@4
+      displayName: 'Terraform PLAN - DESTROY'
+      inputs:
+        command: plan
+        commandOptions: --out=tfplan.out -var-file=environments/${{ parameters.environment }}/terraform.tfvars.json -destroy
+        environmentServiceNameAzureRM: sp-terraform-${{parameters.environment}}
+        workingDirectory: $(Build.SourcesDirectory)
+      env:
+        AZDO_ORG_SERVICE_URL: https://dev.azure.com/telefonica-vivo-brasil
+        PHPIPAM_APP_ID: platformcode
+        PHPIPAM_ENDPOINT_ADDR: http://10.240.42.97:8000/api
+        PHPIPAM_PASSWORD: $(PHPIPAM-PASSWORD)
+        PHPIPAM_USER_NAME: platformcode
+        TF_VAR_NEXUS_USERNAME: $(NEXUS-DEPS-USR)
+        TF_VAR_NEXUS_PASSWORD: $(NEXUS-DEPS-PSW)
+        TF_VAR_runtime_tags: '{"trilha":"${{parameters.environment}}","repositorio":"$(Build.Repository.Uri)"}'
+        ASDF_HELM_VERSION: 3.11.0
+    - task: CmdLine@2
+      displayName: 'Terraform SHOW - Export to .json'
+      inputs:
+        script: |
+          terraform --version -json
+          echo "##[command] terraform show -json tfplan.out | jq '.' > tfplan.json"
+          terraform show -json tfplan.out | jq '.' > tfplan.json
+        workingDirectory: $(Build.SourcesDirectory)
+    - task: AzureKeyVault@2
+      displayName: 'Getting AKV credentials'
+      timeoutInMinutes: 1
+      retryCountOnTaskFailure: 5
+      inputs:
+        azureSubscription: DevOpsSharedResources
+        KeyVaultName: kv-azdevops-shared
+        SecretsFilter: 'INFRACOST-API-KEY'
+    - task: CmdLine@2
+      name: step_infracost_breakdown
+      displayName: Infracost breakdown
+      env:
+        INFRACOST_API_KEY: $(INFRACOST-API-KEY)
+      inputs:
+        script: |
+          infracost configure set currency BRL
+          infracost breakdown --show-skipped --project-name $BUILD_REPOSITORY_NAME --path tfplan.json
+        workingDirectory: $(Build.SourcesDirectory)
+    - task: CmdLine@2
+      name: step_checkov
+      displayName: Run Checkov
+      env:
+        DIRECTORY: $(Build.SourcesDirectory)
+        BASELINE: $(Build.SourcesDirectory)/.checkov.baseline
+        VAR_FILE: environments/${{ parameters.environment }}/terraform.tfvars.json
+        DOWNLOAD_EXTERNAL_MODULES: "true"
+        OUTPUT_FILE_PATH: "console,$(System.DefaultWorkingDirectory)/TEST-Checkov.xml"
+      inputs:
+        script: |
+          echo "##[debug] DIRECTORY....................: ${DIRECTORY}"
+          echo "##[debug] BASELINE.....................: ${BASELINE}"
+          echo "##[debug] VAR_FILE.....................: ${VAR_FILE}"
+          echo "##[debug] DOWNLOAD_EXTERNAL_MODULES....: ${DOWNLOAD_EXTERNAL_MODULES}"
+          echo "##[debug] OUTPUT_FILE_PATH.............: ${OUTPUT_FILE_PATH}"
+
+          if [ ! -f "${BASELINE}" ]; then
+          BASELINE="${AGENT_TEMPDIRECTORY}/.checkov.baseline"
+          echo "##[debug] Arquivo .checkov.baseline não encontrado. Criando baseline padrão."
+            cat <<EOF > "${BASELINE?}"
+          {
+            "failed_checks": []
+          }
+          EOF
+          fi
+
+          echo "##[command] checkov"
+          checkov --directory ${DIRECTORY} \
+            --baseline ${BASELINE} \
+            --var-file ${VAR_FILE} \
+            --download-external-modules ${DOWNLOAD_EXTERNAL_MODULES} \
+            --skip-path tfplan.json \
+            --skip-path examples \
+            --output cli \
+            --output junitxml \
+            --output-baseline-as-skipped \
+            --soft-fail \
+            --output-file-path ${OUTPUT_FILE_PATH}
+        workingDirectory: $(Build.SourcesDirectory)
+    - task: CmdLine@2
+      name: step_tfsec
+      displayName: Run tfsec
+      env:
+        TFVARS_LOCATION: environments/${{ parameters.environment }}/terraform.tfvars.json
+      inputs:
+        script: |
+          echo "##[command] tfsec --var-file ${TFVARS_LOCATION} --exclude-path examples --exclude-downloaded-modules --format junit --soft-fail --verbose --out ${SYSTEM_DEFAULTWORKINGDIRECTORY}/TEST-tfsec.xml"
+          tfsec \
+            --var-file ${TFVARS_LOCATION} \
+            --exclude-path examples \
+            --exclude-downloaded-modules \
+            --format junit \
+            --soft-fail \
+            --verbose \
+            --out ${SYSTEM_DEFAULTWORKINGDIRECTORY}/TEST-tfsec.xml
+        workingDirectory: $(Build.SourcesDirectory)
+    - task: PublishTestResults@2
+      name: t_publish_test_result
+      displayName: Publish Test Results
+      inputs:
+        mergeTestResults: false
+        searchFolder: $(System.DefaultWorkingDirectory)
+        testResultsFiles: '**/TEST-*.xml'
+        testResultsFormat: JUnit
+        testRunTitle: Test Results
+        failTaskOnFailedTests: true
+        publishRunAttachments: true
+      continueOnError: true
+      condition: succeeded()
+
+    - script: |
+        set -e
+        echo "Verificando se há recursos para destroy"
+
+        # Extrai os tipos de ações do plano Terraform
+        CREATE_COUNT=$(jq '[.resource_changes[] | select(.change.actions[] == "create")] | length' tfplan.json)
+        DESTROY_COUNT=$(jq '[.resource_changes[] | select(.change.actions[] == "delete")] | length' tfplan.json)
+
+        echo "Recursos a adicionar: $CREATE_COUNT"
+        echo "Recursos a destruir: $DESTROY_COUNT"
+
+        # Se houver pelo menos um add e um destroy ao mesmo tempo, barramos a execução
+        if [ "$CREATE_COUNT" -gt 0 ] && [ "$DESTROY_COUNT" -gt 0 ]; then
+          echo "Aviso: O plano detectou que há recursos sendo destruídos e recriados ao mesmo tempo."
+          echo "Definindo variável de controle para aprovação manual..."
+          echo "##vso[task.setvariable variable=requiresManualApproval;isOutput=true]true"  # Define a variável de controle
+        else
+          echo "##vso[task.setvariable variable=requiresManualApproval;isOutput=true]false"
+          echo "Não há conflitos de ADD e DESTROY."
+        fi
+      displayName: 'Verificando se há recursos para destroy'
+      name: setRequiresApproval   
+      workingDirectory: $(Build.SourcesDirectory)
+      #condition: eq('${{ parameters.isDestroy }}', false)
+      condition: and(eq('${{ parameters.isDestroy }}', false), eq('${{ parameters.action }}', 'apply'))
+
+   # Aprovação manual somente se a variável requiresManualApproval for verdadeira
+  - job: waitForValidation 
+    displayName: Aprovação Manual para destroy
+    pool: server
+    timeoutInMinutes: 4320
+    dependsOn: job_plan_destroy 
+    #condition: and(succeeded(), eq('${{ parameters.isDestroy }}', false))
+    condition: and(succeeded(), eq('${{ parameters.isDestroy }}', false), eq('${{ parameters.action }}', 'apply'))
+    variables:
+      requiresManualApproval: $[ dependencies.job_plan_destroy.outputs['setRequiresApproval.requiresManualApproval'] ]
+    steps:
+    - task: ManualValidation@1
+      condition: eq(variables['requiresManualApproval'], 'true') 
+      inputs:
+        instructions: |
+          O plano detectou recursos sendo destruídos e recriados ao mesmo tempo. 
+          Por favor, aprove ou negue a execução dessa mudança.
+          Caso não deseje permitir a destruição e recriação dos recursos, recuse a execução.
+        onTimeout: 'reject'
+
+- stage: stage_apply
+  pool:
+    name: GeneralPurposeLinuxAgentsCD
+  displayName: APPLY -> ${{parameters.environment}}
+  dependsOn:
+  - stage_plan
+  condition: and(succeeded(), eq('${{parameters.action}}','apply'))
+  jobs:
+  - deployment: job_apply
+    displayName: APPLY -> ${{parameters.environment}}
+    environment:
+      name: terraform-approval-apply-${{parameters.environment}}
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: 6d15af64-176c-496d-b583-fd2ae21d4df4@1
+            inputs:
+              repository: self
+          - task: Bash@3
+            displayName: About Stage
+            inputs:
+              targetType: inline
+              script: |
+                RED='\033[0;31m'
+                GREEN='\033[0;32m'
+                BLUE='\033[0;34m'
+                YELLOW='\033[1;33m'
+                BG_GREEN='\033[42;1;37m'
+
+                echo ' ================================================================================================================================'
+                echo '|                       __   __  _                  ___            _         ___   _                                             |'
+                echo '|                       \ \ / / (_) __ __  ___     / __|  ___   __| |  ___  | _ \ | |  __ _   _  _                               |'
+                echo '|                        \ V /  | | \ V / / _ \   | (__  / _ \ / _` | / -_) |  _/ | | / _` | | || |                              |'                 
+                echo '|                         \_/   |_|  \_/  \___/    \___| \___/ \__,_| \___| |_|   |_| \__,_|  \_, |                              |'               
+                echo '|                                                                                             |__/                               |'
+                echo ' ================================================================================================================================'
+                echo "                                                                                                      powered by Vivo DevOps Team"
+                echo ""
+
+                printf "
+                =================================================================================================================================
+                ${GREEN}                                                 ${SYSTEM_STAGEDISPLAYNAME} 
+                =================================================================================================================================
+
+                  Lembre-se que a esteira apenas reflete o comportamento da sua aplicação e de acordo com as variáveis definidas.
+
+                ${YELLOW} Em caso de dúvidas sobre essa fase do pipeline acesse a documentação: ${BLUE}https://wikicorp.telefonica.com.br/display/AC/Terraform+-+Azure
+
+                =================================================================================================================================
+                "
+          - task: ms-devlabs.custom-terraform-tasks.custom-terraform-installer-task.TerraformInstaller@1
+            displayName: 'Install Terraform 1.4.5'
+            inputs:
+              terraformVersion: 1.4.5 
+          - task: AzureKeyVault@2
+            displayName: 'Getting AKV credentials'
+            timeoutInMinutes: 1
+            retryCountOnTaskFailure: 5
+            inputs:
+              azureSubscription: DevOpsSharedResources
+              KeyVaultName: kv-azdevops-shared
+              SecretsFilter: 'NEXUS-DEPS-USR, NEXUS-DEPS-PSW, AZ-DEVOPS-PAT-TOKEN, PHPIPAM-PASSWORD, JENKINS-PASSWORD-IAC-DEVOPS'
+
+          - task: CmdLine@2
+            displayName: 'Setup git config https'
+            env:
+              GIT_PASS: $(AZ-DEVOPS-PAT-TOKEN)
+              GIT_ASKPASS: "$(Agent.TempDirectory)/git_env_password.sh"
+            inputs:
+              script: |
+                echo "##[debug] GIT_ASKPASS........: ${GIT_ASKPASS}"
+                echo "exec echo \"$GIT_PASS\"" >> "${GIT_ASKPASS}"
+                chmod 777 "${GIT_ASKPASS}"
+                echo "##vso[task.setvariable variable=GIT_ASKPASS]$GIT_ASKPASS"
+              workingDirectory: $(Agent.TempDirectory)  
+          - task: ms-devlabs.custom-terraform-tasks.custom-terraform-release-task.TerraformTaskV4@4
+            displayName: 'Terraform INIT - azurerm'
+            inputs:
+              backendServiceArm: SharedResources
+              backendAzureRmResourceGroupName: rg-devops-sharedservices
+              backendAzureRmStorageAccountName: sttfstatedevopsshared
+              backendAzureRmContainerName: terraform-state-${{parameters.environment}}
+              backendAzureRmKey: $(System.TeamProject)/$(Build.Repository.Name)/terraform.tfstate
+              workingDirectory: $(Build.SourcesDirectory)
+            env:
+              TF_LOG: ERROR
+          - task: AzureCLI@2
+            name: SSLCertificateGeneration
+            displayName: 'Generate/Renew SSL Certificate'
+            condition: and(
+                           eq('${{ parameters.action }}', 'apply'),
+                           eq('${{ parameters.network }}', 'private')
+                          )
+            inputs:
+              azureSubscription: sp-terraform-${{parameters.environment}}
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+          
+                SIGLA="${{parameters.sigla}}"
+                ENVIRONMENT="${{parameters.environment}}"
+                FORCE_RENEW="${{ parameters.forceCertificateRenew }}"
+          
+                KEY_VAULT_NAME="kv-appgw-stfe-br-01-${ENVIRONMENT}"
+                CERT_NAME="cert-${SIGLA}-astfe-${ENVIRONMENT}"
+                CERT_SRV="https://brtlvbgs0492co.redecorp.br/certsrv"
+          
+                BASE_DOMAIN="${SIGLA}-app.redecorp.azr"
+          
+                echo "Environment: ${ENVIRONMENT}"
+                echo "Certificate: ${CERT_NAME}"
+                echo "KeyVault: ${KEY_VAULT_NAME}"
+          
+                echo "##vso[task.setvariable variable=CERT_NAME;isOutput=true]${CERT_NAME}"
+          
+                # =============================
+                # DOMÍNIOS
+                # =============================
+                if [ "$ENVIRONMENT" = "dev" ]; then
+                  SAN_LIST=(
+                    "${SIGLA}-app-dev.redecorp.azr"
+                  )
+                elif [ "$ENVIRONMENT" = "test" ]; then
+                  SAN_LIST=(
+                    "${SIGLA}-app-test.redecorp.azr"
+                    "${SIGLA}-app-est1.redecorp.azr"
+                    "${SIGLA}-app-est2.redecorp.azr"
+                    "${SIGLA}-app-preprod.redecorp.azr"
+                    "${SIGLA}-app-prodlike.redecorp.azr"
+                  )
+          
+                elif [ "$ENVIRONMENT" = "prod" ]; then
+                  SAN_LIST=(
+                    "${BASE_DOMAIN}"
+                  )
+          
+                else
+                  echo "##vso[task.logissue type=error]Environment inválido"
+                  exit 1
+                fi
+          
+                echo "Domains to include in certificate:"
+                for san in "${SAN_LIST[@]}"; do
+                  echo " - ${san}"
+                done
+          
+                # =============================
+                # CHECK CERT
+                # =============================
+                
+                CERT_EXISTS=$(az keyvault certificate show \
+                  --vault-name "${KEY_VAULT_NAME}" \
+                  --name "${CERT_NAME}" \
+                  --query "id" -o tsv 2>/dev/null || echo "")
+          
+                if [ -n "$CERT_EXISTS" ]; then
+                  LATEST_VERSION=$(az keyvault certificate list-versions \
+                    --vault-name "${KEY_VAULT_NAME}" \
+                    --name "${CERT_NAME}" \
+                    --query "[0].version" -o tsv)
+          
+                  EXPIRY=$(az keyvault certificate show \
+                    --vault-name "${KEY_VAULT_NAME}" \
+                    --name "${CERT_NAME}" \
+                    --version "${LATEST_VERSION}" \
+                    --query "attributes.expires" -o tsv)
+          
+                  EXPIRY_EPOCH=$(date -d "${EXPIRY}" +%s || true)
+                  CURRENT_EPOCH=$(date +%s)
+          
+                  if [ -n "${EXPIRY_EPOCH}" ]; then
+                    DAYS_UNTIL_EXPIRY=$(( (EXPIRY_EPOCH - CURRENT_EPOCH) / 86400 ))
+                    echo "Expires in ${DAYS_UNTIL_EXPIRY} days"
+                    if [ "${FORCE_RENEW,,}" = "true" ]; then
+                      echo "Forçando renovação"
+                    else
+                      if [ ${DAYS_UNTIL_EXPIRY} -gt 30 ]; then
+                        echo "Reusing certificate"
+                        exit 0
+                      fi
+                    fi
+                  fi
+                fi
+          
+                # =============================
+                # PURGE
+                # =============================
+                CERT_DELETED=$(az keyvault certificate list-deleted \
+                  --vault-name "${KEY_VAULT_NAME}" \
+                  --query "[?name=='${CERT_NAME}'].name" -o tsv || echo "")
+          
+                if [ -n "$CERT_DELETED" ]; then
+                  az keyvault certificate purge \
+                    --vault-name "${KEY_VAULT_NAME}" \
+                    --name "${CERT_NAME}" || true
+                  sleep 5
+                fi
+          
+                echo "Generating certificate..."
+          
+                openssl genrsa -out certificate.key 2048
+          
+                cat > san.cnf <<EOF
+                [req]
+                default_bits = 2048
+                prompt = no
+                default_md = sha256
+                distinguished_name = dn
+                req_extensions = req_ext
+          
+                [dn]
+                CN = ${SAN_LIST[0]}
+          
+                [req_ext]
+                subjectAltName = @alt_names
+          
+                [alt_names]
+                EOF
+          
+                i=1
+                for san in "${SAN_LIST[@]}"; do
+                  echo "DNS.${i} = ${san}" >> san.cnf
+                  ((i++))
+                done
+          
+                openssl req -new \
+                  -key certificate.key \
+                  -out certificate.csr \
+                  -config san.cnf
+          
+                CSR_CONTENT=$(cat certificate.csr)
+          
+                if [ -z "${SVC_AZ_IAC_DEVOPS}" ] || [ -z "${SVC_AZ_IAC_DEVOPS_PASSWORD}" ]; then
+                  echo "##vso[task.logissue type=error]Credenciais CertSRV ausentes"
+                  exit 1
+                fi
+          
+                set +e
+                curl --ntlm \
+                  --user "REDECORP\\${SVC_AZ_IAC_DEVOPS}:${SVC_AZ_IAC_DEVOPS_PASSWORD}" \
+                  --location "${CERT_SRV}/certfnsh.asp" \
+                  --http1.1 \
+                  --insecure \
+                  --connect-timeout 30 \
+                  --max-time 60 \
+                  --header 'Content-Type: application/x-www-form-urlencoded' \
+                  --data-urlencode 'Mode=newreq' \
+                  --data-urlencode "CertRequest=${CSR_CONTENT}" \
+                  --data-urlencode 'CertAttrib=CertificateTemplate:WebServer' \
+                  --output response.html >/dev/null 2>&1
+                CURL_EXIT_CODE=$?
+                set -e 
+
+                if [ $CURL_EXIT_CODE -ne 0 ]; then
+                  echo "##vso[task.logissue type=error]Failed to submit CSR to CertSRV"
+                  exit 1
+                fi
+                
+                if grep -qi "Certificate Request Denied" response.html; then
+                  echo "##vso[task.logissue type=error]Certificate Request DENIED by CertSRV"
+                  exit 1
+                fi
+                
+                if grep -qi "401\|unauthorized\|invalid credentials\|access.*denied" response.html; then
+                  echo "##vso[task.logissue type=error]CertSRV Authentication Failed (401 Unauthorized)"
+                  exit 1
+                fi
+                
+                if grep -qi "denied\|rejected\|error\|failed\|invalid" response.html; then
+                  echo "##vso[task.logissue type=error]Certificate request denied or failed"
+                  exit 1
+                fi
+                
+                # Extract request ID
+                REQ_ID=$(grep -oP 'ReqID=\K\d+' response.html | head -1 | tr -d '\r\n\t ')
+                
+                if [[ ! "$REQ_ID" =~ ^[0-9]+$ ]]; then
+                  echo "##vso[task.logissue type=error]Failed to extract request ID from CertSRV response"
+                  exit 1
+                fi          
+                
+          
+                curl --ntlm \
+                  --user "REDECORP\\${SVC_AZ_IAC_DEVOPS}:${SVC_AZ_IAC_DEVOPS_PASSWORD}" \
+                  --location "${CERT_SRV}/certnew.cer?ReqID=${REQ_ID}&Enc=b64" \
+                  --http1.1 \
+                  --insecure \
+                  --connect-timeout 30 \
+                  --max-time 60 \
+                  --output certificate.crt >/dev/null 2>&1
+
+                
+                if [ ! -f certificate.crt ]; then
+                  echo "##vso[task.logissue type=error]Certificate download failed"
+                  exit 1
+                fi
+            
+                # Format and validate certificate
+                if grep -q "BEGIN CERTIFICATE" certificate.crt; then
+                  BASE64_CERT=$(sed -n '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/p' certificate.crt | grep -v "BEGIN\|END" | tr -d '\n\r ')
+                  echo "-----BEGIN CERTIFICATE-----" > certificate_formatted.crt
+                  echo "${BASE64_CERT}" | fold -w 64 >> certificate_formatted.crt
+                  echo "-----END CERTIFICATE-----" >> certificate_formatted.crt
+                  mv certificate_formatted.crt certificate.crt
+                fi
+              
+                if ! openssl x509 -in certificate.crt -noout -text &>/dev/null; then
+                  echo "##vso[task.logissue type=error]Invalid certificate format"
+                  exit 1
+                fi
+          
+                openssl pkcs12 -export \
+                  -out certificate.pfx \
+                  -inkey certificate.key \
+                  -in certificate.crt \
+                  -passout pass:
+          
+                az keyvault certificate import \
+                  --vault-name "${KEY_VAULT_NAME}" \
+                  --name "${CERT_NAME}" \
+                  --file certificate.pfx
+          
+                echo "Certificate imported successfully"
+          
+              workingDirectory: $(Build.SourcesDirectory)
+            env:
+              SVC_AZ_IAC_DEVOPS: 'SVC_AZ_IAC_DEVOPS'  
+              SVC_AZ_IAC_DEVOPS_PASSWORD: $(JENKINS-PASSWORD-IAC-DEVOPS)
+          
+          - task: TerraformTaskV4@4
+            displayName: 'Terraform APPLY'
+            inputs:
+              command: apply
+              commandOptions: -var-file=environments/${{ parameters.environment }}/terraform.tfvars.json --auto-approve
+              environmentServiceNameAzureRM: sp-terraform-${{parameters.environment}}
+              workingDirectory: $(Build.SourcesDirectory)
+            env:
+              AZDO_ORG_SERVICE_URL: https://dev.azure.com/telefonica-vivo-brasil
+              PHPIPAM_APP_ID: platformcode
+              PHPIPAM_ENDPOINT_ADDR: http://10.240.42.97:8000/api
+              PHPIPAM_PASSWORD: $(PHPIPAM-PASSWORD)
+              PHPIPAM_USER_NAME: platformcode
+              TF_VAR_NEXUS_USERNAME: $(NEXUS-DEPS-USR)
+              TF_VAR_NEXUS_PASSWORD: $(NEXUS-DEPS-PSW)
+              TF_VAR_runtime_tags: '{"trilha":"${{parameters.environment}}","repositorio":"$(Build.Repository.Uri)"}'
+              ASDF_HELM_VERSION: 3.11.0
+          - task: CmdLine@2
+            displayName: 'Terraform OUTPUT .json'
+            env:
+              OUTPUT_FILE: $(Build.ArtifactStagingDirectory)/outputs.json
+            inputs:
+              script: |
+                terraform --version -json
+
+                echo "##[command] terraform output -json > ${OUTPUT_FILE}"
+                terraform output -json > ${OUTPUT_FILE}
+
+                jq 'if . == {} then error("") else . end | {"outputs": "exported"}' ${OUTPUT_FILE}
+                retVal=$?
+
+                if [ $retVal -ne 0 ]; then
+                  echo "##[debug] File '${OUTPUT_FILE}' is empty, removing it from artifact staging directory."
+                  rm ${OUTPUT_FILE}
+                fi
+              workingDirectory: $(Build.SourcesDirectory)
+          - task: PublishPipelineArtifact@1
+            displayName: Publish Pipeline Artifact
+            condition: ''
+            inputs:
+              targetPath: $(Build.ArtifactStagingDirectory)
+              artifactName: terraform_apply
+              publishLocation: pipeline
+
+- stage: stage_destroy
+  pool:
+    name: GeneralPurposeLinuxAgentsCD
+  displayName: DESTROY -> ${{parameters.environment}}
+  dependsOn:
+  - stage_plan_destroy
+  condition: and(succeeded(), eq('${{parameters.action}}','destroy'))
+  jobs:
+  - deployment: job_destroy
+    displayName: DESTROY -> ${{parameters.environment}}
+    environment:
+      name: terraform-approval-destroy-${{parameters.environment}}
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: 6d15af64-176c-496d-b583-fd2ae21d4df4@1
+            inputs:
+              repository: self
+          - task: Bash@3
+            displayName: About Stage
+            inputs:
+              targetType: inline
+              script: |
+                RED='\033[0;31m'
+                GREEN='\033[0;32m'
+                BLUE='\033[0;34m'
+                YELLOW='\033[1;33m'
+                BG_GREEN='\033[42;1;37m'
+
+                echo ' ================================================================================================================================'
+                echo '|                       __   __  _                  ___            _         ___   _                                             |'
+                echo '|                       \ \ / / (_) __ __  ___     / __|  ___   __| |  ___  | _ \ | |  __ _   _  _                               |'
+                echo '|                        \ V /  | | \ V / / _ \   | (__  / _ \ / _` | / -_) |  _/ | | / _` | | || |                              |'                 
+                echo '|                         \_/   |_|  \_/  \___/    \___| \___/ \__,_| \___| |_|   |_| \__,_|  \_, |                              |'               
+                echo '|                                                                                             |__/                               |'
+                echo ' ================================================================================================================================'
+                echo "                                                                                                      powered by Vivo DevOps Team"
+                echo ""
+
+                printf "
+                =================================================================================================================================
+                ${GREEN}                                                 ${SYSTEM_STAGEDISPLAYNAME} 
+                =================================================================================================================================
+
+                  Lembre-se que a esteira apenas reflete o comportamento da sua aplicação e de acordo com as variáveis definidas.
+
+                ${YELLOW} Em caso de dúvidas sobre essa fase do pipeline acesse a documentação: ${BLUE}https://wikicorp.telefonica.com.br/display/AC/Terraform+-+Azure
+
+                =================================================================================================================================
+                "
+          - task: ms-devlabs.custom-terraform-tasks.custom-terraform-installer-task.TerraformInstaller@1
+            displayName: 'Install Terraform 1.4.5'
+            inputs:
+              terraformVersion: 1.4.5 
+          - task: AzureKeyVault@2
+            displayName: 'Getting AKV credentials'
+            timeoutInMinutes: 1
+            retryCountOnTaskFailure: 5
+            inputs:
+              azureSubscription: DevOpsSharedResources
+              KeyVaultName: kv-azdevops-shared
+              SecretsFilter: 'NEXUS-DEPS-USR, NEXUS-DEPS-PSW, AZ-DEVOPS-PAT-TOKEN, PHPIPAM-PASSWORD'
+          - task: CmdLine@2
+            displayName: 'Setup git config https'
+            env:
+              GIT_PASS: $(AZ-DEVOPS-PAT-TOKEN)
+              GIT_ASKPASS: "$(Agent.TempDirectory)/git_env_password.sh"
+            inputs:
+              script: |
+                echo "##[debug] GIT_ASKPASS........: ${GIT_ASKPASS}"
+                echo "exec echo \"$GIT_PASS\"" >> "${GIT_ASKPASS}"
+                chmod 777 "${GIT_ASKPASS}"
+                echo "##vso[task.setvariable variable=GIT_ASKPASS]$GIT_ASKPASS"
+              workingDirectory: $(Agent.TempDirectory)
+          - task: ms-devlabs.custom-terraform-tasks.custom-terraform-release-task.TerraformTaskV4@4
+            displayName: 'Terraform INIT - azurerm'
+            inputs:
+              backendServiceArm: SharedResources
+              backendAzureRmResourceGroupName: rg-devops-sharedservices
+              backendAzureRmStorageAccountName: sttfstatedevopsshared
+              backendAzureRmContainerName: terraform-state-${{parameters.environment}}
+              backendAzureRmKey: $(System.TeamProject)/$(Build.Repository.Name)/terraform.tfstate
+              workingDirectory: $(Build.SourcesDirectory)
+            env:
+              TF_LOG: $(TF_LOG)
+          - task: CmdLine@2
+            displayName: 'Terraform OUTPUT .json'
+            env:
+              OUTPUT_FILE: $(Build.ArtifactStagingDirectory)/outputs.json
+            inputs:
+              script: |
+                terraform --version -json
+
+                echo "##[command] terraform output -json > ${OUTPUT_FILE}"
+                terraform output -json > ${OUTPUT_FILE}
+
+                jq 'if . == {} then error("") else . end | {"outputs": "exported"}' ${OUTPUT_FILE}
+                retVal=$?
+
+                if [ $retVal -ne 0 ]; then
+                  echo "##[debug] File '${OUTPUT_FILE}' is empty, removing it from artifact staging directory."
+                  rm ${OUTPUT_FILE}
+                fi
+              workingDirectory: $(Build.SourcesDirectory)
+          - task: PublishPipelineArtifact@1
+            displayName: Publish Pipeline Artifact
+            condition: ''
+            inputs:
+              targetPath: $(Build.ArtifactStagingDirectory)
+              artifactName: terraform_destroy
+              publishLocation: pipeline
+     
+          - task: TerraformTaskV4@4
+            displayName: 'Terraform DESTROY'
+            inputs:
+              command: destroy
+              commandOptions: -var-file=environments/${{ parameters.environment }}/terraform.tfvars.json --auto-approve
+              environmentServiceNameAzureRM: sp-terraform-${{parameters.environment}}
+              workingDirectory: $(Build.SourcesDirectory)
+            env:
+              AZDO_ORG_SERVICE_URL: https://dev.azure.com/telefonica-vivo-brasil
+              PHPIPAM_APP_ID: platformcode
+              PHPIPAM_ENDPOINT_ADDR: http://10.240.42.97:8000/api
+              PHPIPAM_PASSWORD: $(PHPIPAM-PASSWORD)
+              PHPIPAM_USER_NAME: platformcode
+              TF_VAR_NEXUS_USERNAME: $(NEXUS-DEPS-USR)
+              TF_VAR_NEXUS_PASSWORD: $(NEXUS-DEPS-PSW)
+              TF_VAR_runtime_tags: '{"trilha":"${{parameters.environment}}","repositorio":"$(Build.Repository.Uri)"}'
+              ASDF_HELM_VERSION: 3.11.0
+          - task: AzureCLI@2
+            name: DeleteSSLCert
+            displayName: 'Delete SSL Certificate'
+            condition: and(
+               eq('${{ parameters.action }}', 'destroy'),
+               eq('${{ parameters.network }}', 'private')
+              )
+            inputs:
+              azureSubscription: sp-terraform-${{parameters.environment}}
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+    
+                SIGLA="${{parameters.sigla}}"
+                ENVIRONMENT="${{parameters.environment}}"
+                KEY_VAULT_NAME="kv-appgw-stfe-br-01-${ENVIRONMENT}"
+                CERT_NAME="cert-${SIGLA}-astfe-${ENVIRONMENT}"
+    
+                echo "Deleting certificate ${CERT_NAME} from ${KEY_VAULT_NAME}..."
+    
+                # Delete certificate
+                az keyvault certificate delete \
+                  --vault-name "${KEY_VAULT_NAME}" \
+                  --name "${CERT_NAME}"
+
+                echo "Waiting for certificate to enter deleted state..."
+                
+                # Espera até aparecer no soft-delete
+                for i in {1..12}; do
+                  if az keyvault certificate show-deleted \
+                    --vault-name "${KEY_VAULT_NAME}" \
+                    --name "${CERT_NAME}" >/dev/null 2>&1; then
+                    echo "Certificate is now in deleted state."
+                    break
+                  fi
+                
+                  echo "Still deleting... attempt $i"
+                  sleep 5
+                done
+                
+                echo "Purging certificate..."
+                  
+    
+                # Purge deleted certificate (optional)
+                az keyvault certificate purge \
+                  --vault-name "${KEY_VAULT_NAME}" \
+                  --name "${CERT_NAME}"
+    
+                echo "Certificate deleted and purged successfully."

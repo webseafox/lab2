@@ -1,0 +1,491 @@
+parameters:
+- name: jira_id
+  displayName: ID da história que deve ser testada
+  type: string
+- name: test_environment
+  displayName: Ambiente onde o teste será executado
+  type: string
+- name: component_test_id
+  displayName: Componente que será testado
+  type: string
+  default: ""
+- name: octane_workspace
+  displayName: Workspace onde estão os testes no Octane
+  type: string
+  default: ""
+- name: docker_image
+  type: string
+  default: selenium
+- name: framework
+  type: string
+  default: JUnit
+- name: octane_environment
+  type: string
+  default: 'PROD'
+- name: dependsOn
+  type: object
+  default: []
+- name: extra_env
+  displayName: Variáveis de ambiente extras para execução dos testes
+  type: object
+  default: {}
+  # IMPORTANTE: valores devem ser referências como $(VAR_NAME) e deve ser feito o uso do variable group do pipeline.
+
+stages:
+- stage: e2e_test_execution_${{ parameters.test_environment }}
+  displayName: "E2E - Test Execution"
+  dependsOn: ${{ parameters.dependsOn }}
+  variables:
+    - name: SCRIPTS_FOLDER
+      value: $(Build.SourcesDirectory)/Vivo.CodePlay.Pipelines/tech_products/rbqa/test-execution-stage/v3/scripts
+    - name: CONTAINER_IMAGE
+      ${{ if eq(parameters.docker_image, 'selenium') }}:
+        value: acrsharedservices01.azurecr.io/base/qa/selenium-junit/oraclient/runtime:1.0.1
+      ${{ elseif eq(parameters.docker_image, 'selenium-xfcb-chrome') }}:
+        value: acrsharedservices01.azurecr.io/base/qa/selenium-xvfb/chrome/runtime:1.0.2
+      ${{ elseif eq(parameters.docker_image, 'selenium-xfcb-edge') }}:
+        value: acrsharedservices01.azurecr.io/base/qa/selenium-xvfb/edge/runtime:1.0.2
+      ${{ elseif eq(parameters.docker_image, 'selenium-xfcb-firefox') }}:
+        value: acrsharedservices01.azurecr.io/base/qa/selenium-xvfb/firefox/runtime:1.0.2
+      ${{ elseif eq(parameters.docker_image, 'uftdeveloper') }}:
+        value: acrsharedservices01.azurecr.io/base/qa/uftdeveloper/chrome/runtime:1.0.2
+      ${{ else }}:
+        value: acrsharedservices01.azurecr.io/base/qa/selenium-junit/oraclient/runtime:1.0.1
+    - template: /tech_products/rbqa/test-execution-stage/v3/variables/variables.yml
+      parameters:
+          octane_environment: ${{ parameters.octane_environment }}
+
+  jobs:
+  - job: rbqa_test_execution_job
+    displayName: "Test Execution"
+    pool:
+      name: $(PRIVATE_AGENT_QA)
+      demands:
+      - Agent.Version -equals 3.232.3
+
+    steps:
+    - checkout: Tests
+      displayName: Checkout Test Repo
+      name: checkout_test_repo
+      persistCredentials: true
+      clean: true
+
+    - checkout: CodePlay
+      displayName: Checkout CodePlay
+      name: checkout_codeplay
+      persistCredentials: true
+      clean: true
+
+     ## Download NEXUS Credentials
+    - task: AzureKeyVault@2
+      displayName: 'Getting AKV Credentials'
+      timeoutInMinutes: 3
+      retryCountOnTaskFailure: 5
+      inputs:
+        azureSubscription: DevOpsSharedResources
+        KeyVaultName: $(AKV_DEVOPS_NAME)
+        SecretsFilter: 'NEXUS-DEPS-USR, NEXUS-DEPS-PSW, NEXUS-DEFAULT-USR, NEXUS-DEFAULT-PSW'
+
+    ## -> Set NEXUS credentials to variables. This allows it to used in other stages, jobs or tasks.
+    ## -> NEXUS_DEPS_USR and NEXUS_DEPS_PSW, use these to download dependencies.
+    ## -> NEXUS_DEFAULT_USR and NEXUS_DEFAULT_PSW, use these to upload artifacts.
+    - task: Bash@3
+      displayName: 'Set Credentials Variables'
+      name: credentials
+      condition: and(
+        succeeded(),
+        ne(variables['NEXUS-DEPS-USR'], ''), ne(variables['NEXUS-DEPS-PSW'], ''),
+        ne(variables['NEXUS-DEFAULT-USR'], ''), ne(variables['NEXUS-DEFAULT-PSW'], ''))
+      continueOnError: false
+      inputs:
+        targetType: 'inline'
+        script: |
+            echo "##[group] Variables to DOWNLOAD dependencies from NEXUS"
+            echo "##[debug] NEXUS-DEPS-USR: $(NEXUS-DEPS-USR). Use as >> NEXUS_DEPS_USR."
+            echo "##vso[task.setvariable variable=NEXUS_DEPS_USR;isOutput=true;isSecret=true]$(NEXUS-DEPS-USR)"
+            echo "##[debug] NEXUS-DEPS-PSW: $(NEXUS-DEPS-PSW). Use as >> NEXUS_DEPS_PSW"
+            echo "##vso[task.setvariable variable=NEXUS_DEPS_PSW;isOutput=true;isSecret=true]$(NEXUS-DEPS-PSW)"
+            echo "##[endgroup]"
+        KeyVaultName: kv-azdevops-shared
+        SecretsFilter: 'NEXUS-DEPS-USR, NEXUS-DEPS-PSW'
+
+    - task: AzdoTaskRbqaOctaneGetStageTestsFromVivo@1
+      inputs:
+        rbqaURL: '$(ALM_SERVER)'
+        rbqaUser: '$(ALM_USER)'
+        rbqaPassword: '$(ALM_PASSWORD)'
+        rbqaSharedSpace: '$(ALM_SHARED_SPACE)'
+        rbqaWorkspace: '${{ parameters.octane_workspace }}'
+        rbqaJiraId: '${{ parameters.jira_id }}'
+      name: get_octane_tests
+      displayName: Get Octane Tests
+
+    - task: Bash@3
+      displayName: 'Set Variables'
+      name: testIDS
+      inputs:
+        targetType: 'inline'
+        script: |
+            echo "##vso[task.setvariable variable=NEXUS_DEPS_USR;]$(credentials.NEXUS_DEPS_USR)"
+            echo "##vso[task.setvariable variable=NEXUS_DEPS_PSW;]$(credentials.NEXUS_DEPS_PSW)"
+            echo "##vso[task.setvariable variable=TEST_IDS;]$(get_octane_tests.testIDs)"
+            echo "##vso[task.setvariable variable=TEST_MATRIX;]$(get_octane_tests.testMatrix)"
+            echo "The variable testmatrix value is: $(TEST_MATRIX)"
+            echo "The variable get_octane_tests.testMatrix value is: $(get_octane_tests.testMatrix)"
+  
+    - task: Bash@3
+      displayName: 'Compose Email Recipients'
+      condition: always()
+      continueOnError: true
+      inputs:
+        targetType: 'inline'
+        script: |
+          set -euo pipefail
+
+          # prefer python3; accept python if it is Python 3
+          if command -v python3 >/dev/null 2>&1; then
+            PYTHON_CMD=python3
+          elif command -v python >/dev/null 2>&1 && python -c 'import sys; sys.exit(0 if sys.version_info[0] >= 3 else 1)'; then
+            PYTHON_CMD=python
+          else
+            echo "##vso[task.logissue type=warning]Python 3 not found on the agent. Falling back to RBQA_NOTIFICATION_EMAILS/BUILD_REQUESTED_FOR_EMAIL."
+            echo "##vso[task.setvariable variable=RECIPIENT_EMAILS;isSecret=true]${RBQA_NOTIFICATION_EMAILS:-${BUILD_REQUESTED_FOR_EMAIL:-}}"
+            exit 0
+          fi
+
+          "$PYTHON_CMD" - <<'PY'
+          import os
+          import sys
+          import json
+          import re
+          from email.utils import parseaddr
+
+          MAX_RECIPIENTS = 100
+          recipients = []
+          seen = set()
+
+          EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+          def normalize_email(raw):
+            if raw is None:
+              return ""
+            s = str(raw).strip()
+            _, addr = parseaddr(s)
+            if not addr:
+              addr = s
+            addr = addr.strip().strip('"').strip("'")
+            return addr
+
+          def is_valid_email_like(addr):
+            return bool(addr) and EMAIL_RE.match(addr)
+
+          def add_recipient(value):
+            if value is None:
+              return
+            if isinstance(value, (list, tuple)):
+              for v in value:
+                add_recipient(v)
+              return
+            for part in re.split(r'[;,]', str(value)):
+              email = normalize_email(part)
+              if not email:
+                continue
+              key = email.lower()
+              if key in seen:
+                continue
+              if not is_valid_email_like(email):
+                continue
+              seen.add(key)
+              recipients.append(email)
+              if len(recipients) >= MAX_RECIPIENTS:
+                print(f"##vso[task.logissue type=warning]Recipient list truncated to {MAX_RECIPIENTS} entries.")
+                return
+
+          def walk_for_emailqa(obj):
+            if isinstance(obj, dict):
+              for k, v in obj.items():
+                if str(k).lower() == "emailqa":
+                  add_recipient(v)
+                else:
+                  walk_for_emailqa(v)
+            elif isinstance(obj, list):
+              for it in obj:
+                walk_for_emailqa(it)
+
+          def parse_test_matrix(raw):
+            raw = (raw or "").strip()
+            if not raw:
+              return
+            try:
+              data = json.loads(raw)
+              walk_for_emailqa(data)
+              return
+            except json.JSONDecodeError as ex:
+              print(f"##vso[task.logissue type=warning]JSON parse failed, trying regex fallback: {ex}")
+            for m in re.finditer(
+                r'emailQA\s*[:=]\s*(.+?)(?=[,}\]\s]|$)',
+                raw,
+                flags=re.IGNORECASE
+            ):
+                raw_val = m.group(1).strip(' \'"<>,;')
+                candidate = parseaddr(raw_val)[1]
+                if candidate and is_valid_email_like(candidate):
+                    add_recipient(candidate)
+
+          try:
+            # requester first (keeps requester early in the list)
+            add_recipient(os.environ.get("BUILD_REQUESTED_FOR_EMAIL", ""))
+            # library recipients
+            lib = os.environ.get("RBQA_NOTIFICATION_EMAILS", "") or ""
+            for item in re.split(r'[;,]', lib):
+              add_recipient(item)
+            # test matrix
+            parse_test_matrix(os.environ.get("TEST_MATRIX", ""))
+          except Exception as e:
+            print(f"##vso[task.logissue type=warning]Compose recipients parsing failed: {e}")
+            fallback = os.environ.get("RBQA_NOTIFICATION_EMAILS") or os.environ.get("BUILD_REQUESTED_FOR_EMAIL") or ""
+            print(f"##vso[task.setvariable variable=RECIPIENT_EMAILS;isSecret=true]{fallback}")
+            sys.exit(0)
+
+          combined = ", ".join(recipients)
+
+          print("##[group] Compose Email Recipients")
+          print("Recipients successfully composed")
+          print(f"Total unique recipients: {len(recipients)}")
+          print("##[endgroup]")
+
+          print(f"##vso[task.setvariable variable=RECIPIENT_EMAILS;isSecret=true]{combined}")
+          PY
+
+      env:
+        RBQA_NOTIFICATION_EMAILS: '$(RBQA_NOTIFICATION_EMAILS)'
+        TEST_MATRIX: '$(TEST_MATRIX)'
+        BUILD_REQUESTED_FOR_EMAIL: '$(Build.RequestedForEmail)'
+
+    - task: Docker@2
+      displayName: 'Auth for Azure Container Registry'
+      inputs:
+        command: 'login'
+        containerRegistry: ACR-DEVOPS
+        timeoutInMinutes: 90
+
+    - task: Bash@3
+      displayName: "Set execute permissions for scripts"
+      inputs:
+        targetType: 'inline'
+        script: |
+            chmod +x $(SCRIPTS_FOLDER)/*
+            echo $(SCRIPTS_FOLDER)
+            ls -lha $(SCRIPTS_FOLDER)
+            sed -i -e 's/\r$//' $(SCRIPTS_FOLDER)/*.sh
+
+    # --- Extra env vars: prepare secure file (only when extra_env is provided) ---
+    - ${{ if gt(length(parameters.extra_env), 0) }}:
+      - task: Bash@3
+        displayName: "Prepare extra env file for Docker"
+        inputs:
+          targetType: 'inline'
+          script: |
+            # Creates a secure temporary file with extra environment variables for the Docker container.
+            # Variables are injected with prefix EXTRA_VAR_ which is stripped here,
+            # so the container receives them with their original names.
+            # Example: EXTRA_VAR_MY_SECRET=val -> container sees MY_SECRET=val
+            env_file=$(mktemp)
+            chmod 600 "$env_file"
+            env | grep -E '^EXTRA_VAR_' | sed 's/^EXTRA_VAR_//' > "$env_file"
+            extra_count=$(wc -l < "$env_file" | tr -d ' ')
+            echo "##[section]Extra env vars loaded: ${extra_count} variable(s)"
+            echo "##vso[task.setvariable variable=EXTRA_ENV_FILE]$env_file"
+        env:
+          ${{ each var in parameters.extra_env }}:
+            EXTRA_VAR_${{ var.key }}: ${{ var.value }}
+
+    - task: Bash@3
+      displayName: "Executing scenario(s)"
+      inputs:
+        targetType: 'targetPath'
+        script: $(SCRIPTS_FOLDER)/docker_test_execution.sh
+      env:
+        SYSTEM_ACCESSTOKEN: '$(System.AccessToken)'
+        NEXUS_DEPS_USR: '$(NEXUS_DEPS_USR)'
+        NEXUS_DEPS_PSW: '$(NEXUS_DEPS_PSW)'
+        DEFAULT_MAX_MEMORY_BUILD: "$DEFAULT_MAX_MEMORY_BUILD"
+        ENVIRONMENT: '${{ parameters.test_environment }}'
+        SCENARIOS: '$(TEST_IDS)'
+        OPTIONALS: 'default-stage'
+        FRAMEWORK: ${{ parameters.framework }}
+        CONTAINER_IMAGE: '$(CONTAINER_IMAGE)'
+        DOCKER_IMAGE: ${{ parameters.docker_image }}
+        SCRIPTS_FOLDER: '$(SCRIPTS_FOLDER)'
+        AGENT_TMP_DIRECTORY: '$(Agent.TempDirectory)'
+        ALM_USER: '$(ALM_USER)'
+        ALM_PASSWORD: '$(ALM_PASSWORD)'
+        PROJECT_ID: ""
+        ENABLE_COLLECT_METRIC: False
+        COMPONENT_ID: ${{ parameters.component_test_id }}
+        ${{ if gt(length(parameters.extra_env), 0) }}:
+          EXTRA_ENV_FILE: $(EXTRA_ENV_FILE)
+
+    # --- Extra env vars: cleanup (only when extra_env is provided) ---
+    - ${{ if gt(length(parameters.extra_env), 0) }}:
+      - task: Bash@3
+        displayName: "Cleanup extra env file"
+        condition: always()
+        inputs:
+          targetType: 'inline'
+          script: |
+            [ -f "$(EXTRA_ENV_FILE)" ] && rm -f "$(EXTRA_ENV_FILE)" || true
+
+    - publish: $(Agent.TempDirectory)
+      displayName: Publish logs
+      artifact: logs_${{ parameters.test_environment }}
+      condition: always()
+
+    - publish: $(Build.SourcesDirectory)/RunResults
+      displayName: Publish RunResults
+      artifact: RunResults_${{ parameters.test_environment }}
+      condition: always()
+
+    - task: AzdoTaskRbqaOctaneSetTestResultsFromVivo@1
+      inputs:
+        rbqaURL: '$(ALM_SERVER)'
+        rbqaUser: $(ALM_USER)
+        rbqaPassword: $(ALM_PASSWORD)
+        rbqaSharedSpace: $(ALM_SHARED_SPACE)
+        rbqaWorkspace: ${{ parameters.octane_workspace }}
+        rbqaSuitesMatrix: $(get_octane_tests.testMatrix)
+        rbqaSuitesEnvironment: ${{ parameters.test_environment }}
+      name: set_octane_tests_results
+      displayName: Set Octane Tests Results
+      condition: always()
+
+    - task: Bash@3
+      displayName: "Checking for failed tests"
+      inputs:
+        targetType: 'targetPath'
+        script: $(SCRIPTS_FOLDER)/check_for_failed_tests.sh
+      env:
+        FAIL_PIPELINE: True
+        BUILD_SOURCESDIRECTORY: $(Build.SourcesDirectory)
+
+    - task: Bash@3
+      displayName: "Generate Failure Report for Email"
+      condition: always()
+      continueOnError: true
+      inputs:
+        targetType: 'inline'
+        script: |
+          REPORT_DIR="$(Agent.TempDirectory)/rbqa_reports"
+          SUMMARY="$REPORT_DIR/failed_scenarios_${{ parameters.test_environment }}.txt"
+          mkdir -p "$REPORT_DIR"
+          COUNT=0
+
+          {
+            echo "RBQA_REPORT_VERSION=1"
+            echo "AMBIENTE=${{ parameters.test_environment }}"
+            echo "PIPELINE=$(Build.DefinitionName)"
+            echo "PROJETO=$(System.TeamProject)"
+            echo "GERADO_EM=$(date '+%Y-%m-%dT%H:%M:%S')"
+            echo ""
+
+            for logfile in "$(Agent.TempDirectory)"/*_FAILED.log; do
+              [ -f "$logfile" ] || continue
+
+              fname=$(basename "$logfile" .log)
+              SCENARIO_NAME=${fname%_FAILED}
+
+              echo "---BEGIN_SCENARIO:${SCENARIO_NAME}---"
+              tail -n 150 "$logfile"
+              echo "---END_SCENARIO:${SCENARIO_NAME}---"
+              echo ""
+
+              COUNT=$((COUNT + 1))
+            done
+
+            if [ "$COUNT" -eq 0 ]; then
+              echo "AVISO=Nenhum log *_FAILED.log foi encontrado em $(Agent.TempDirectory)."
+              echo "AVISO_DETALHE=A pipeline pode ter falhado antes da execução dos testes, por exemplo em checkout, busca de testes no Octane, autenticação, preparação do ambiente ou execução do container."
+            fi
+
+            echo "TOTAL_SCENARIOS_FAILED=$COUNT"
+          } > "$SUMMARY"
+
+          echo "Report generated: $COUNT scenario(s), $(wc -l < \"$SUMMARY\") line(s)"
+          echo "##vso[task.setvariable variable=FAILURE_REPORT_PATH]$SUMMARY"
+
+          # Use AGENT_JOBSTATUS environment variable; fallback to 'Failed' when missing
+          AGENT_JOBSTATUS="${AGENT_JOBSTATUS:-}"
+          if [ -z "$AGENT_JOBSTATUS" ]; then
+            AGENT_JOBSTATUS="Failed"
+          fi
+
+          if [ -f "$SUMMARY" ] && [ "$AGENT_JOBSTATUS" = "Failed" ]; then
+            echo "Job failed (or status unavailable). Failure report will be attached."
+            echo "##vso[task.setvariable variable=EMAIL_ATTACHMENT]$SUMMARY"
+          else
+            echo "Job status is $AGENT_JOBSTATUS. No attachment will be sent."
+            echo "##vso[task.setvariable variable=EMAIL_ATTACHMENT]"
+          fi
+
+    - task: AzdoTaskRbqaNotificationDispatcherFromVivo@1
+      displayName: "Send Teams Notification"
+      condition: always()
+      continueOnError: true
+      inputs:
+        command: 'sendTeams'
+        teamsWebhookUrl: '$(RBQA_TEAMS_WEBHOOK_URL)'
+        teamsRetryCount: '3'
+        jobStatus: '$(Agent.JobStatus)'
+        projectName: '$(System.TeamProject)'
+        pipelineName: '$(Build.DefinitionName)'
+        environment: '${{ parameters.test_environment }}'
+        jiraId: '${{ parameters.jira_id }}'
+        requester: '$(Build.RequestedFor)'
+        startTime: '$(System.PipelineStartTime)'
+        buildUrl: '$(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)'
+        artifactsUrl: '$(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)&view=artifacts'
+        failOnError: false
+
+    - task: AzdoTaskRbqaNotificationDispatcherFromVivo@1
+      displayName: "Send Tests Result Email"
+      condition: always()
+      continueOnError: true
+      inputs:
+        command: 'sendEmail'
+        smtpServer: '$(RBQA_SMTP_SERVER)'
+        smtpPort: '$(RBQA_SMTP_PORT)'
+        emailFrom: 'devops@telefonica.com.br'
+        emailTo: '$(RECIPIENT_EMAILS)'
+        enableEmailNormalization: true
+        normalizeSourceDomain: 'telefonicati.onmicrosoft.com'
+        normalizeTargetDomain: 'telefonica.com'
+        emailSubject: '[RBQA Stage] $(Build.DefinitionName) / ${{ parameters.test_environment }} — $(Agent.JobStatus)'
+        emailBody: |
+          Resultado: $(Agent.JobStatus)<br>
+          Projeto: $(System.TeamProject)<br>
+          Pipeline: $(Build.DefinitionName)<br>
+          Ambiente: ${{ parameters.test_environment }}<br>
+          Jira ID: ${{ parameters.jira_id }}<br>
+          Solicitado por: $(Build.RequestedForEmail)<br>
+          Início: $(System.PipelineStartTime)<br>
+          <a href="$(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)">Ver execução</a> &nbsp;|&nbsp;
+          <a href="$(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)&view=artifacts">Ver logs (artifacts)</a>
+        emailAttachment: '$(EMAIL_ATTACHMENT)'
+        failOnError: false
+
+    - task: DeleteFiles@1
+      displayName: "Clean logs directory"
+      inputs:
+        SourceFolder: '$(Agent.TempDirectory)'
+        Contents: '*.log'
+        removeSourceFolder: false
+      condition: always()
+
+    - task: Bash@3
+      displayName: "Clean build sources directory"
+      inputs:
+        targetType: 'inline'
+        script: |
+            rm -rf $(Build.SourcesDirectory)/RunResults
+        removeSourceFolder: false
+      condition: always()

@@ -1,0 +1,97 @@
+stages:
+- stage: code_analysis
+  displayName: "Sonar Code Analysis"
+  pool:
+    name: $(PRIVATE_AGENT_DEFAULT)
+    # demands: Agent.Version -gtVersion 2.210.1
+  dependsOn:
+    - build_test
+  jobs:
+    - job: "information_analysis"
+      displayName: "Information Analysis Sonar Report"
+      steps:
+        - checkout: none
+        - bash: |
+            echo "##[section]Executar análise do scan realizado durante o Build"
+          displayName: "Job information"
+
+
+    - job: "analysis_sonar_report"
+      displayName: "Analysis Report"
+      steps:
+      - task: AzureKeyVault@2  
+        displayName: "Getting AKV credentials"
+        timeoutInMinutes: 1
+        retryCountOnTaskFailure: 5  
+        inputs:    
+          azureSubscription: DevOpsSharedResources    
+          KeyVaultName: $(AKV_DEVOPS_NAME)
+          SecretsFilter: 'SONARQUBE-TOKEN'
+        condition: eq(variables.SONAR_IS_ENABLED, True)
+      
+      - bash: |
+          ## TOKEN="${SONARQUBE_TOKEN}"
+          TOKEN="$(SONARQUBE_TOKEN_SCC)"
+          
+          PR_BRANCH=""
+
+          if [[ $(Build.Reason) == "PullRequest" ]]; then
+            PR_BRANCH=$(echo "$(System.PullRequest.SourceBranch)" | sed 's/refs\/heads\///g')
+            PR_BRANCH="&branch=$PR_BRANCH"
+            echo "##[section]Tem branch de PR -> $PR_BRANCH"
+          fi
+
+          echo "##[command]Analisando relatório em ${SONARQUBE_URL}/api/qualitygates/project_status?projectKey=br.com.vivo%3Asap-commerce-core-customize$PR_BRANCH"
+          SONAR_PROJECT_STATUS_URL="${SONARQUBE_URL}/api/qualitygates/project_status?projectKey=br.com.vivo%3Asap-commerce-core-customize$PR_BRANCH"
+          echo "##[command]SONAR_PROJECT_STATUS_URL....: ${SONAR_PROJECT_STATUS_URL}"
+          
+          SONAR_ANALYSIS_REPORT=$(curl -k --insecure --max-time $(CURL_HTTP_TIMEOUT) -s -u $TOKEN: "${SONAR_PROJECT_STATUS_URL}")
+          ANALYSIS_STATUS=$(curl --max-time $CURL_HTTP_TIMEOUT  -s -u "${SONARQUBE_TOKEN}:" "${SONAR_PROJECT_STATUS_URL}")
+          ALL_DATA=$(jq '.' <<< $ANALYSIS_STATUS)
+
+          ## SHOW ITEMS FROM RESPONSE SONAR REQUEST
+          while read data; do
+            # echo "PROJECT STATUS" echo "$data" | jq -r .status
+            while read conditions; do
+              
+              # METRIC KEY
+              METRIC_KEY=$(echo "$conditions" | jq -r .metricKey)
+              if [[ $METRIC_KEY == "new_coverage" ]]; then
+              
+                GET_STATUS=$(echo "$conditions" | jq -r .status)
+              
+                if [[ $GET_STATUS == "ERROR" ]]; then
+                  # COMPARATOR
+                  # echo "$conditions" | jq -r .comparator
+                  # # PERIOD INDEX
+                  # echo "$conditions" | jq -r .periodIndex
+                  # ERRORTHRESHOLD
+                  MIN_COVERAGE=$(SONAR_MIN_COVERAGE)
+                  # ACTUAL VALUE
+                  ACTUAL_VALUE=$(echo "$conditions" | jq -r .actualValue)
+                  COVERAGE_STATUS=(awk "BEGIN { print ($ACTUAL_VALUE >= $MIN_COVERAGE) ? 'true' : 'false' }")
+                  SET_MSG="O valor mínimo de cobertura deve ser $MIN_COVERAGE e o valor atual é $ACTUAL_VALUE"
+                  echo "##[section]$BREAK_IF_COVERAGE_ERROR"
+                  if [[ $BREAK_IF_COVERAGE_ERROR == "true" ]]; then
+                    echo "##[error]$SET_MSG"
+                    if [[ $COVERAGE_STATUS == "false" ]]; then
+                      echo "##[section]$SET_MSG"
+                      exit 1;
+                    fi
+                  else
+                    echo "##[section] $SET_MSG"
+                  fi
+                  echo -n "________________________________________________"
+                  echo -e "\n"
+                fi
+              fi
+            done < <(echo "$data" | jq -c '.conditions[]')
+          done < <(echo "$ALL_DATA" | jq -c '.[]')
+
+          PROJECT_STATUS=$(echo $ANALYSIS_STATUS | jq -r '.projectStatus.status')
+          echo "##[command]PROJECT_STATUS.............: ${PROJECT_STATUS}"
+        displayName: 'Core Customize Report'
+        condition: eq(variables.SONAR_IS_ENABLED, True)
+        env:
+          SONARQUBE_TOKEN: $(SONARQUBE-TOKEN)
+          BREAK_IF_COVERAGE_ERROR: $(BREAK_IF_COVERAGE_ERROR)

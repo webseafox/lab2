@@ -1,0 +1,125 @@
+parameters:
+- name: dev_namespace_to_deploy
+  type: string
+  default: ''
+- name: project_name
+  type: string
+- name: enable_devflow_validations
+  type: boolean
+  default: False
+- name: show_pos_validate
+  type: boolean
+  default: False
+- name: environment_code
+  type: string
+- name: database_update_mode
+  type: string
+- name: deploy_strategy
+  type: string
+- name: branch_backend
+  type: string
+  default: ''
+- name: branch_frontend
+  type: string
+  default: ''
+- name: qa_branch
+  type: boolean
+  default: False
+- name: s1_branch
+  type: boolean
+  default: False
+- name: git_strategy
+  type: string
+  default: 'trunkbased'
+- name: save_backup
+  type: boolean
+  default: True
+
+variables:
+- template: /tech_products/ecmc/sap-commerce/provisioners/${{parameters.git_strategy }}/variables/load.yaml
+
+resources:
+  repositories:
+    - repository: FortifyExclusion
+
+      name: DevOps/Vivo.Fortify.Exclusions
+      type: git
+      ref: refs/heads/master
+      endpoint: CorePipelines
+
+    - repository: CorePipelines
+      name: DevOps/Vivo.Core.Pipelines
+      type: git
+      ref: refs/tags/v1
+      endpoint: CorePipelines
+
+    - repository: CorePipelinesScripts
+      name: DevOps/Vivo.Core.Pipelines.Scripts
+      type: git
+      ref: refs/heads/master
+      endpoint: CorePipelines
+
+stages:  
+  - template: stages/init.yaml
+    ${{ if and(eq(variables['Build.Reason'], 'Manual'), ne(parameters.branch_frontend, ''), ne(parameters.branch_backend, '')) }}:
+      parameters:
+        branch_frontend: ${{ parameters.branch_frontend }}
+        branch_backend: ${{ parameters.branch_backend }}
+        environment_code: ${{ parameters.environment_code}}
+
+  - template: stages/build.yaml
+    parameters:
+      project_name: ${{ parameters.project_name }}
+      environment_code: ${{ parameters.environment_code }}
+      deploy_strategy: ${{ parameters.deploy_strategy }}
+      ${{ if and(eq(variables['Build.Reason'], 'Manual'), ne(parameters.branch_frontend, ''), ne(parameters.branch_backend, ''), ne(parameters.database_update_mode, '')) }}:
+        database_update_mode: ${{ parameters.database_update_mode }}
+        branch_frontend: ${{ parameters.branch_frontend }}
+        branch_backend: ${{ parameters.branch_backend }}
+
+  - ${{ if and(ne(variables['Build.Reason'],'PullRequest'), eq(parameters.project_name, 'src-sap-commerce-cloud')) }}:
+    - template: stages/work_items.yaml
+      parameters:
+        project_name: ${{ parameters.project_name }}
+        environment_code: ${{ parameters.environment_code }}
+        database_update_mode: ${{ parameters.database_update_mode }}
+        deploy_strategy: ${{ parameters.deploy_strategy }}
+        branch_frontend: ${{ parameters.branch_frontend }}
+        branch_backend: ${{ parameters.branch_backend }}
+        pipeline_status: 'STARTED'
+        work_item_title_prefix: 'Build'
+
+  - template: stages/deploy.yaml
+    parameters:
+      environment_code: ${{ parameters.environment_code}}
+      project_name: ${{ parameters.project_name }}
+      ${{ if and(eq(variables['Build.Reason'], 'Manual'), ne(parameters.branch_frontend, ''), ne(parameters.branch_backend, ''), ne(parameters.database_update_mode, ''))  }}:
+        branch_frontend: ${{ parameters.branch_frontend }}
+        branch_backend: ${{ parameters.branch_backend }}
+        database_update_mode: ${{ parameters.database_update_mode }}
+        deploy_strategy: ${{ parameters.deploy_strategy }}
+ 
+  - ${{ if or(and(ne(variables['Build.Reason'],'PullRequest'), in(variables['Build.SourceBranch'], 'refs/heads/main', 'refs/heads/master')), startsWith(variables['Build.SourceBranch'], 'refs/heads/')) }}:
+    - template: stages/pos_validate_standards_dev_flow.yaml
+  
+  - ${{ if and(ne(variables['Build.Reason'],'PullRequest'), eq(parameters.project_name, 'src-sap-commerce-cloud')) }}:
+    - template: stages/work_items.yaml
+      parameters:
+        project_name: ${{ parameters.project_name }}
+        environment_code: ${{ parameters.environment_code }}
+        database_update_mode: ${{ parameters.database_update_mode }}
+        deploy_strategy: ${{ parameters.deploy_strategy }}
+        branch_frontend: ${{ parameters.branch_frontend }}
+        branch_backend: ${{ parameters.branch_backend }}
+        pipeline_status: 'DEPLOYED'
+        work_item_title_prefix: 'Deploy'
+   
+  - ${{ if and(in(variables['Build.SourceBranch'], 'refs/heads/s1', 'refs/heads/s2', 'refs/heads/s3', 'refs/heads/s4', 'refs/heads/s5', 'refs/heads/s6'), in(variables['Build.Reason'], 'IndividualCI', 'BatchedCI', 'Manual'), eq(parameters.save_backup, true)) }}:
+    - stage: backup_sap
+      displayName: "Backup SAP"
+      jobs:
+        - template: stages/backup_sap.yaml
+          parameters:
+            environment_code: ${{ parameters.environment_code }}
+            display_name: "Backup ${{ parameters.environment_code }}"
+            work_item_title: "BACKUP SAP Commerce Cloud - ${{ parameters.environment_code }}"

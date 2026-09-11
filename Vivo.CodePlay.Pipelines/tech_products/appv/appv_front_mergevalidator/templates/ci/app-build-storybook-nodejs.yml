@@ -1,0 +1,399 @@
+parameters:
+  - name: AZURE_STORAGE_ACCOUNT_NAME
+    type: string
+  - name: AZURE_STORAGE_ACCOUNT_KEY
+    type: string
+
+stages:
+- stage: ci_storybook
+  displayName: "CI - Build And Deploy Storybook"
+  pool:
+    name: GeneralPurposeLinuxAgentsCI
+  dependsOn:
+  - environment_init
+  - ci_quality_gate
+  - ci_security
+
+  ## -> Loads variables from other stages.
+  variables:
+  - name: NEXUS_DEPS_USR
+    value: $[ stageDependencies.nodejs_environment_init.environment.outputs['credentials.NEXUS_DEPS_USR'] ]
+  - name: NEXUS_DEPS_PSW
+    value: $[ stageDependencies.nodejs_environment_init.environment.outputs['credentials.NEXUS_DEPS_PSW'] ]
+  
+  jobs:      
+  - job: storybook
+    displayName: Build Storybook
+    steps:
+
+    ## -> Clean the pipeline workspace and checkout the code.
+    ## -> 6d15af64-176c-496d-b583-fd2ae21d4df4 is the decorator for checkout.
+    - task: 6d15af64-176c-496d-b583-fd2ae21d4df4@1
+      displayName: Checkout Code
+      name: checkout_code 
+      inputs:
+        repository: self
+        persistCredentials: "true"
+        clean: true
+
+    ## -> Checkout the last commit that was pushed to the repository. 
+    ## -> Set last commit HASH to a variable. 
+    - task: Bash@3
+      displayName: Checkout Last Commit
+      name: checkout_last_commit
+      condition: succeeded()
+      continueOnError: false
+      inputs:
+        targetType: inline
+        script: |
+          echo "##[debug] Checkout last commit from '$(System.PullRequest.SourceBranch)'"
+
+          git config pull.rebase true
+          git fetch -f --depth 1 origin $(System.PullRequest.SourceBranch):$(System.PullRequest.SourceBranch)
+          git checkout -f $(System.PullRequest.SourceBranch)
+          lastCommitHash=$(git rev-parse --short=6 HEAD)
+
+          echo "##[debug] Last commit short hash '$lastCommitHash'"
+          echo "##vso[task.setvariable variable=SHORT_HASH]$lastCommitHash"
+
+    - task: CmdLine@2
+      displayName: Get Current Version
+      name: current_version_other
+      condition: succeeded()
+      continueOnError: false
+      inputs:
+        script: |
+          setVariables(){
+            eval result=$2
+            echo "##vso[task.setvariable variable=$1]$result"
+          }                              
+
+          currentVersion=$(DOCKER_CMD_EXTRACT_PACKAGE_JSON_VERSION)
+          setVariables "CURRENT_VERSION" $currentVersion
+          echo "##[debug] Source CURRENT_VERSION: '$currentVersion'"
+          setVariables "INCREMENT_VERSION" $(echo $currentVersion | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+
+    ## -> Set the new version to a variable. This allows it to be used in other stages, jobs or tasks.
+    - task: Bash@3
+      displayName: 'Set New Version'
+      name: new_version
+      condition: succeeded()
+      continueOnError: false
+      inputs:
+        targetType: inline
+        script: |
+          echo "##[debug] Source CURRENT_VERSION: '$(CURRENT_VERSION)'"
+          if [ '$(System.PullRequest.SourceBranch)' == 'master' ]; then
+            echo "##[debug] Source NEW_VERSION: '$(INCREMENT_VERSION)'"
+            echo "##vso[task.setvariable variable=NEW_VERSION;isOutput=true]$(INCREMENT_VERSION)"
+          else
+            sanitizedBranch=$(echo $(System.PullRequest.SourceBranch) | sed 's#/#-#g')
+            newVersion=$(INCREMENT_VERSION)-$sanitizedBranch
+            echo "##[debug] Source NEW_VERSION: $newVersion"
+            echo "##vso[task.setvariable variable=NEW_VERSION;isOutput=true]$newVersion"
+          fi
+
+
+
+
+    - task: Bash@3
+      displayName: Get Project Name
+      condition: succeeded()
+      continueOnError: false
+      inputs:
+        targetType: inline
+        script: |
+          project="$(echo $(DOCKER_CMD_EXTRACT_PACKAGE_JSON_NAME) | awk -F '/' '{print$NF}')"
+
+          echo "##[debug] Project Name: '$project'"
+
+          echo "##vso[task.setvariable variable=project]$project"
+
+    - task: Docker@2
+      name: login_devops
+      displayName: 'Login to Docker Registry'
+      continueOnError: true
+      inputs:
+        containerRegistry: ACR-DEVOPS
+        displayName: 'Login to Docker Registry'
+        command: 'login'
+
+    
+    # ==================================================================
+    # [Compliance] Verifica se o repositório está em conformidade com as políticas de configuração
+    # ==================================================================
+    - task: VivoDevOpsConfigCompliance@1
+      displayName: 'Check DevOps Config Compliance'
+      inputs:
+        policySets: |
+          image-definition-files 
+
+    - task: Bash@3
+      displayName: Build Version
+      name: build_version
+      condition: and(succeeded(), eq(variables.new_version.NEW_VERSION, ''))
+      continueOnError: false
+      inputs:
+        targetType: inline
+        script: >
+        
+          echo "Project Name: $(project)"
+          
+          BUILDER_IMAGE_NAME="builder/node"
+
+          docker build -t $BUILDER_IMAGE_NAME -f .azuredevops/builder.Dockerfile .
+
+          
+          docker run --rm \
+              --user="$(DOCKER_CMD_USERNAME):$(DOCKER_CMD_GROUP)" \
+              --network host \
+              --log-driver none \
+              -e NPM_CONFIG_USERCONFIG="/tmp/.npmrc" \
+              -e HTTPS_PROXY=$(PROXY_AGENT_HTTPS) \
+              -e PUPPETEER_SKIP_DOWNLOAD=true \
+              -e HTTP_PROXY=$(PROXY_AGENT_HTTP) \
+              -e NO_PROXY=$(PROXY_AGENT_NO_PROXY) \
+              -e TZ="America/Sao_Paulo" \
+              -e SYSTEM_ACCESSTOKEN="$(System.AccessToken)" \
+              -e NEXUS_DEPS_USR="$(NEXUS_DEPS_USR)" \
+              -e NEXUS_DEPS_PSW="$(NEXUS_DEPS_PSW)" \
+              -e VITE_ENVIRONMENT=STAGING \
+              -e VITE_STORYBOOK_PATH="/fb-core/storybooks/$(project)/" \
+              -v $(pwd):/app \
+              -v $(DEFAULT_NPMRC_TEMP_FILE_PATH):/tmp/.npmrc \
+              -w $(DOCKER_WORKDIR) \
+              $BUILDER_IMAGE_NAME sh -c "npm i && npm run build && npm run build:storybook && npm run playroom:build"
+                    
+
+          echo "##[debug] Build with version: $(new_version.NEW_VERSION)"
+
+          echo "##[debug] build command: $(NODEJS_CMD_BUILD)"
+          echo "##[debug] test command: $(NODEJS_CMD_BUILD_TEST)"
+
+    ## -> Copy files for staging area
+    - task: CopyFiles@2
+      name: t_copy_file
+      displayName: 'Copy to Staging Directory'
+      condition: succeeded()
+      continueOnError: false
+      inputs:
+        TargetFolder: '$(Build.ArtifactStagingDirectory)'
+        OverWrite: true
+        CleanTargetFolder: true
+        Contents: |
+          storybook-static/**
+          dist/playroom/**
+          
+    ## -> Set artifact information to variables. This allows it to be used in other stages, jobs or tasks. 
+    - task: CmdLine@2
+      name: artifact_name
+      displayName: 'Get Artifact Name'
+  
+      condition: succeeded()
+      continueOnError: false
+      inputs:
+        targetType: inline
+        script: |
+          setVariables(){
+            eval result=$2
+            echo "##vso[task.setvariable variable=$1;isOutput=true]$result"
+          }
+
+          packageJsonName=$(DOCKER_CMD_EXTRACT_PACKAGE_JSON_NAME)
+          setVariables "PACKAGE_JSON_NAME" $packageJsonName
+          echo "##[debug] package.json Name '$packageJsonName'"
+
+          echo "##[debug] Set Artifact Name + New Version"
+          sanitizedBranch=$(echo $(new_version.NEW_VERSION) | sed 's#/#-#g')
+          artifactName="$(echo $packageJsonName | awk -F '/' '{print$NF}')-$sanitizedBranch"
+          setVariables "ARTIFACT_NAME" $artifactName
+          echo "##[debug] Artifact Name '$artifactName'"
+          echo "##vso[task.setvariable variable=ARTIFACT_NAME;isOutput=true]$artifactName"
+
+    ## -> Compress artifacts into tar. This allows it to use less space and to be used in other stages, jobs or tasks.
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Artifact'
+      condition: succeeded()
+      continueOnError: false
+      inputs:
+        ArtifactName: $(artifact_name.ARTIFACT_NAME)
+        StoreAsTar: true
+
+    ## -> Set artifact information to variables.
+    - task: Bash@3
+      displayName: Artifacts Info
+      inputs:
+        targetType: inline
+        script: |
+          echo "##[debug] Artifact name: '$(artifact_name.ARTIFACT_NAME)'"
+
+          echo "##[debug] Target directory location: '$(pwd "$(System.ArtifactsDirectory)")'"
+          echo "##[debug] Target directory path: '$(System.ArtifactsDirectory)'"
+          echo "##[debug] Target directory content:"
+          ls -lh $(System.ArtifactsDirectory)
+          echo "##[debug] NEW_VERSION: $(new_version.NEW_VERSION)"
+
+    ## -> Publish Artifact to Blob Storage.
+    ## -> Only allowed for the specified branches below. Other branches must skip this task.
+    ## -> Using az cli to push to blob storage.
+
+    - task: Bash@3
+      displayName: 'Upload Storybook to Blob Storage'
+      env:
+        AZURE_STORAGE_ACCOUNT_NAME: ${{ parameters.AZURE_STORAGE_ACCOUNT_NAME }}
+        AZURE_STORAGE_ACCOUNT_KEY: ${{ parameters.AZURE_STORAGE_ACCOUNT_KEY }}
+        BRANCH_SOURCE: $(System.PullRequest.SourceBranch)
+      inputs:
+        targetType: inline
+        script: |
+          echo "##[debug] Target directory path: '$(System.ArtifactsDirectory)/storybook-static'"
+
+          # Definindo o delimitador como hífen
+          IFS='-'
+
+          # Lendo os campos separados
+          read -ra parts <<< "$(Build.Repository.Name)"
+
+          # Acessando as partes separadas
+          src=${parts[0]}
+          project=${parts[1]}
+
+          # Exibindo as partes
+          echo "Parte 1: $src"
+          echo "Parte 2: $project"
+
+          # Pega o nome da branch a partir da variável de ambiente
+          
+          branchSource=$(Build.SourceBranchName)
+          # branchSource="$BRANCH_SOURCE"
+          testing=$(System.PullRequest.SourceBranch)
+          echo "##[debug] Testing branch: $testing"
+          #Remove "refs/heads/" do nome da branch para obter apenas o nome
+          branchSourcePath="${testing#refs/heads/}"
+          
+          echo "##[debug] Branch source: $testing"
+          echo "##[debug] Branch name: $branchSourcePath"
+          
+
+
+          # Remove barras iniciais e finais (se houver)
+          branchSourcePath="${branchSourcePath#/}"
+          branchSourcePath="${branchSourcePath%/}"
+          
+          # Normaliza path removendo barras duplicadas
+          branchSourcePath="${branchSourcePath//\/\//\/}"
+
+          echo "##[debug] branchSourcePath final: $branchSourcePath"
+          echo "##[debug] Storybook destination: fb-core/storybooks/$project/$(Build.SourceBranchName)"
+
+          # Upload Storybook para o path da branch
+          az storage blob upload-batch \
+            --verbose \
+            --account-name $AZURE_STORAGE_ACCOUNT_NAME \
+            --account-key $AZURE_STORAGE_ACCOUNT_KEY \
+            --overwrite \
+            -d "fb-core/storybooks/$project/$branchSourcePath" \
+            -s '$(System.ArtifactsDirectory)/storybook-static'
+
+    - task: Bash@3
+      displayName: 'Upload Playroom to Blob Storage'
+      env:
+        AZURE_STORAGE_ACCOUNT_NAME: ${{ parameters.AZURE_STORAGE_ACCOUNT_NAME }}
+        AZURE_STORAGE_ACCOUNT_KEY: ${{ parameters.AZURE_STORAGE_ACCOUNT_KEY }}
+        BRANCH_SOURCE: $(Build.SourceBranchName)
+      inputs:
+        targetType: inline
+        script: |
+          echo "##[debug] Target directory path: '$(System.ArtifactsDirectory)/dist/playroom'"
+
+          # Definindo o delimitador como hífen
+          IFS='-'
+
+          # Lendo os campos separados
+          read -ra parts <<< "$(Build.Repository.Name)"
+
+          # Acessando as partes separadas
+          src=${parts[0]}
+          project=${parts[1]}
+
+          # Exibindo as partes
+          echo "Parte 1: $src"
+          echo "Parte 2: $project"
+
+          # Pega o nome da branch a partir da variável de ambiente
+          branchSource="$BRANCH_SOURCE"
+          testing=$(System.PullRequest.SourceBranch)
+          echo "##[debug] Testing branch: $testing"
+          #Remove "refs/heads/" do nome da branch para obter apenas o nome
+          branchSourcePath="${testing#refs/heads/}"
+          
+          echo "##[debug] Branch source: $testing"
+          echo "##[debug] Branch name: $branchSourcePath"
+          
+
+          # Remove barras iniciais e finais (se houver)
+          branchSourcePath="${branchSourcePath#/}"
+          branchSourcePath="${branchSourcePath%/}"
+          
+          # Normaliza path removendo barras duplicadas
+          branchSourcePath="${branchSourcePath//\/\//\/}"
+
+          echo "##[debug] branchSourcePath final: $branchSourcePath"
+          echo "##[debug] Playroom destination: fb-core/storybooks/$project/$branchSourcePath/playroom"
+
+          # Upload Playroom para subpasta playroom dentro do path da branch
+          az storage blob upload-batch \
+            --verbose \
+            --account-name $AZURE_STORAGE_ACCOUNT_NAME \
+            --account-key $AZURE_STORAGE_ACCOUNT_KEY \
+            --overwrite \
+            -d "fb-core/storybooks/$project/$branchSourcePath/playroom" \
+            -s '$(System.ArtifactsDirectory)/dist/playroom'
+
+    # -> Show new generated Storybook PR URL
+
+    - task: Bash@3
+      displayName: 'On Success - Storybook Publish Success'
+      condition: succeeded()
+      inputs:
+        targetType: inline
+        script: |
+          # Lendo os campos separados
+          read -ra parts <<< "$(Build.Repository.Name)"
+
+          # Acessando as partes separadas
+          src=${parts[0]}
+          project=${parts[1]}
+
+          # Exibindo as partes
+          echo "Parte 1: $src"
+          echo "Parte 2: $project"
+
+          branchSource="$(System.PullRequest.SourceBranch)"
+          branchSourcePath="${branchSource#refs/heads/}"
+          echo "##======================================================== Storybook e Playroom atualizados ============================================================"
+          echo "## Para acessar o Storybook, clique no link abaixo:"
+          echo "## https://preframeworkbrasilsa.telefonicabigdata.com/fb-core/storybooks/$project/$(Build.SourceBranchName)/index.html"
+          echo "##"
+          echo "## Para acessar o Playroom, clique no link abaixo:"
+          echo "## https://preframeworkbrasilsa.telefonicabigdata.com/fb-core/storybooks/$project/$(Build.SourceBranchName)/playroom/index.html"
+          echo "##========================================================================================================================================"
+
+    - task: Bash@3
+      displayName: 'On Failure - Storybook Publish Failure'
+      condition: failed()
+      inputs:
+        targetType: inline
+        script: |
+          echo "##[error] ================================================================================================================================="
+          echo "##[error]                                                  Falha na publicação"
+          echo "##[error] ================================================================================================================================="
+          echo "##[error] Se está vendo essa mensagem é porque aconteceu algo erro durante a publicação da sua biblioteca."
+          echo "##[error] "
+          echo "##[error] Segue abaixo umas dicas para o Troubleshooting:"
+          echo "##[error] $(ALERT_MESSAGE_ARROW) Consulte o log do estágio de publicação do artefato."
+          echo "##[error] $(ALERT_MESSAGE_ARROW) Verifique se a versão corrente da biblioteca já existe no repositório (sobrescrita não é permitido)."
+          echo "##[error] $(ALERT_MESSAGE_ARROW) Confira se as informações do repositório e credenciais de acesso estão corretas."
+          echo "##[error] "
+          echo "##[error] Caso tenha dúvidas sobre essa fase do pipeline acesse a nossa documentação: $(CORPORATE_WIKI_DOC_URL)"
+          echo "##[error] ================================================================================================================================="

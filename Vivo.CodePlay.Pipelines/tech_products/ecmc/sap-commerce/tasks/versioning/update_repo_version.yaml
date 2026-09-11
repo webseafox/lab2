@@ -1,0 +1,346 @@
+﻿parameters:
+- name: componentNewVersion
+  type: string
+- name: condition
+  type: object
+- name: createGitTag
+  type: boolean
+  default: false
+- name: workingDirectory
+  type: string
+  default: ''
+- name: workingDirectoryCore
+  type: string
+  default: ''
+- name: repoIsCore
+  type: boolean
+  default: false
+- name: commitNewVersion
+  type: boolean
+  default: false
+- name: downloadDistFolder
+  type: boolean
+  default: false
+- name: condition_version_file
+  type: object
+  default: false
+steps:
+## TO UPDATE VERSION IN SUBMODULE ADD TAG
+- ${{ if ne(parameters.repoIsCore, true) }}:
+  - ${{ if ne(parameters.commitNewVersion, true) }}:
+    - template: /tech_products/ecmc/sap-commerce/tasks/artifacts/download_pipeline.yaml
+      parameters:
+        displayName: "Download Version-Info From Artifacts"
+        artifactName: "new-version-info"
+        targetPath: ${{ parameters.workingDirectory }}
+        condition: succeeded()
+
+  - ${{ if eq(parameters.downloadDistFolder, true) }}:
+    - bash: |
+        cd ${{ parameters.workingDirectory }}
+        JS_STORE_FRONT_GIT_CURRENT_SHA=$(jq -r '.git_current_sha' new-version.json)
+        GIT_CURRENT_SHA=$JS_STORE_FRONT_GIT_CURRENT_SHA
+        COMPONENT_NEW_VERSION=$(jq -r  '.new_version' new-version.json)
+        echo "JS_STORE_FRONT CURRENT SHA: .....: $GIT_CURRENT_SHA"
+
+        git fetch origin $(PROJECT_SOURCE_BRANCH)
+        git checkout $(PROJECT_SOURCE_BRANCH)
+        git pull --rebase origin $(PROJECT_SOURCE_BRANCH)
+        git reset --hard $GIT_CURRENT_SHA
+
+        echo "##[section]REMOVENDO DIST FOLDER"
+        rm -rf $(FOLDER_BASE_SRC)/dist
+
+      displayName: "Reset repository to hash"
+      condition: ${{ parameters.condition }}
+
+    - template: /tech_products/ecmc/sap-commerce/tasks/artifacts/download_pipeline.yaml
+      parameters:
+        displayName: "Download Dist Folder From Artifacts"
+        artifactName: "dist_$(System.JobAttempt)"
+        targetPath: $(Build.SourcesDirectory)/$(FOLDER_BASE_SRC)
+        condition: and(succeeded(), eq(variables.GENERATE_DIST_FOLDER, True))
+
+
+    # GIT COMMIT DIST FOLDER/SEND TAG
+    - bash: |
+        cd ${{ parameters.workingDirectory }}
+        JS_STORE_FRONT_GIT_CURRENT_SHA=$(jq -r '.git_current_sha' new-version.json)
+        GIT_CURRENT_SHA=$JS_STORE_FRONT_GIT_CURRENT_SHA
+        COMPONENT_NEW_VERSION=$(jq -r  '.new_version' new-version.json)
+        if [[ "$COMPONENT_NEW_VERSION" == "" ]]; then
+            echo "##[error]Não foi possível recuperar a versão"
+            exit 1
+          fi
+        echo "##[command]COMMIT DIST FOLDER? .................: $COMMIT_DIST_FOLDER"
+        echo "##[command]GENERATE DIST FOLDER? ...............: $GENERATE_DIST_FOLDER"
+        echo "##[command]JS_STORE_FRONT_GIT_CURRENT_SHA ......: $JS_STORE_FRONT_GIT_CURRENT_SHA"
+        echo "##[command]CREATE_GIT_TAG ......................: $CREATE_GIT_TAG"
+        echo "##[command]TAG_REPO ............................: $TAG_REPO"
+
+        rm new-version.json
+        git config --replace-all user.name "Azure DevOps" && git config --replace-all user.email "azuredevops@telefonicati.onmicrosoft.com"
+
+        if [ "$GENERATE_DIST_FOLDER" == "true" ] && [ "$COMMIT_DIST_FOLDER" == "True" ]; then
+          SET_COMMIT_MSG="New dist folder generated"
+          echo "##[command]COMMIT_MSG ......: $SET_COMMIT_MSG"
+
+          git add -f $(FOLDER_BASE_SRC)/dist
+
+          git commit -m "[CI SKIP] $SET_COMMIT_MSG"
+          CMD_RUN="push origin HEAD:$(PROJECT_SOURCE_BRANCH)"
+          echo "##[command]git $CMD_RUN"
+          git $CMD_RUN
+
+          if [ $? -ne 0 ]; then
+            echo "##[error]Dist não enviada"
+            echo "##vso[task.logissue type=error;] Git push failed"
+            echo "##vso[task.complete result=Failed;]"
+            exit 1
+          fi
+
+          echo "##[section]Dist enviada"
+        fi
+
+        if [ "$TAG_REPO" == "true" ] && [ "$CREATE_GIT_TAG" == "True" ]; then
+          git tag $COMPONENT_NEW_VERSION
+          git push origin refs/tags/$COMPONENT_NEW_VERSION
+          if [ $? -ne 0 ]; then
+            echo "##[error]Tag não enviada"
+            echo "##vso[task.logissue type=error;] Git push tag"
+            echo "##vso[task.complete result=Failed;]"
+            exit 1
+          fi
+          echo "##[section]Tag enviada"
+        fi
+
+        GIT_CURRENT_SHA=$(git rev-parse HEAD)
+        echo $GIT_CURRENT_SHA
+        echo "##vso[task.setvariable variable=JS_STORE_FRONT_GIT_CURRENT_SHA;isOutput=true]${GIT_CURRENT_SHA}"
+        echo "##[section]HASH DO PROJETO $SUBMODULE_FRONT_PROJECT_NAME: $GIT_CURRENT_SHA"
+      displayName: "Commit Tag/Send Dist"
+      name: send_tag_dist_to_repository
+      condition: ${{ parameters.condition }}
+      env:
+        COMPONENT_NEW_VERSION: ${{ parameters.componentNewVersion }}
+        COMMIT_NEW_VERSION: ${{ parameters.commitNewVersion }}
+        COMMIT_DIST_FOLDER: ${{ parameters.downloadDistFolder }}
+        CREATE_GIT_TAG: ${{ parameters.createGitTag }}
+
+  # UPDATE VERSION
+  - ${{ if eq(parameters.commitNewVersion, true) }}:
+
+    - template: /tech_products/ecmc/shared/tasks/upgrade_semantic_version_with_python.yaml
+      parameters:
+        taskName: determine_new_version
+        extraEnvironmentVars:
+          FILE_VERSION_PATH: "$(FOLDER_BASE_SRC)/package.json"
+
+    - bash: |
+        echo "##[command]COMMIT NEW VERSION ..............: $COMMIT_NEW_VERSION"
+
+        ORIGINAL_IFS="${IFS}"
+
+        set -e
+
+        if [[ "$COMPONENT_NEW_VERSION" == "" ]]; then
+          echo "##[error]Não foi possível recuperar a versão"
+          exit 1
+        fi
+
+        cd ${{ parameters.workingDirectory }}
+        git config --replace-all user.name "Azure DevOps" && git config --replace-all user.email "azuredevops@telefonicati.onmicrosoft.com"
+
+        git fetch origin $(PROJECT_SOURCE_BRANCH)
+        git checkout $(PROJECT_SOURCE_BRANCH)
+        git pull origin $(PROJECT_SOURCE_BRANCH)
+
+        echo "##[section]Set new version in $(FOLDER_BASE_SRC)/package.json"
+        cp $(FOLDER_BASE_SRC)/package.json ${{ parameters.workingDirectory }}/package.json
+        GIT_CURRENT_SHA=$(git rev-parse HEAD)
+        git reset --hard $GIT_CURRENT_SHA
+        mv ${{ parameters.workingDirectory }}/package.json $(FOLDER_BASE_SRC)
+        NEW_PACKAGE_JSON=$(jq ".version=\"$COMPONENT_NEW_VERSION\""  $(FOLDER_BASE_SRC)/package.json)
+        echo $NEW_PACKAGE_JSON | jq '.' > $(FOLDER_BASE_SRC)/package.json
+
+        if [ "$USE_SEMANTIC_VERSION" == "true" ]; then
+          echo "##vso[task.setvariable variable=SAP_COMMERCE_OPTIONS_VERSION;isOutput=true]${SAP_COMMERCE_OPTIONS_VERSION}"
+
+          if [[ "${ACTUAL_BRANCH}" == "refs/heads/${BRANCH_NAME_TO_USE_SEMANTIC}" ]]; then
+            echo "##[debug]Verificando se ACTUAL_BRANCH ${ACTUAL_BRANCH} é igual ao conteúdo da variável BRANCH_NAME_TO_USE_SEMANTIC ${BRANCH_NAME_TO_USE_SEMANTIC}"
+
+            # Construir nova versão semântica
+            echo "##[section]New semantic version: $NEW_VERSION"
+
+            # Atualizar versao semantica package.json com nova versão
+            NEW_VERSION_FILE_JSON=$(jq ".version=\"$NEW_VERSION\"" $(FOLDER_BASE_SRC)/package.json)
+            echo $NEW_VERSION_FILE_JSON | jq '.' > $(FOLDER_BASE_SRC)/package.json
+            echo "##[section]package.json updated successfully"
+
+            git add -f $(FOLDER_BASE_SRC)/package.json
+            if [ $? -ne 0 ]; then
+              echo "[error]No changes to commit."
+              exit 1
+            fi
+          else
+            # Construir nova versão semântica
+            echo "##[section]New not semantic version: $NEW_VERSION"
+
+            # Atualizar versao não semantica no file .azuredevops/package.json
+            echo "{\"version\": \"$NEW_VERSION\"}" | jq '.' > .azuredevops/package.json
+            echo "##[section].azuredevops/package.json updated successfully"
+
+            git add -f .azuredevops/package.json
+            if [ $? -ne 0 ]; then
+              echo "[error]No changes to commit."
+              exit 1
+            fi
+          fi
+
+        fi
+
+
+        SET_COMMIT_MSG=''
+        SET_COMMIT_MSG="Project version updated to $NEW_VERSION"
+
+        git commit -am "[CI SKIP] $SET_COMMIT_MSG"
+
+        if [ $? -ne 0 ]; then
+          echo "[error]No changes to commit."
+          exit 1
+        fi
+
+        IFS="${ORIGINAL_IFS}"
+        CMD_RUN="push origin HEAD:$(PROJECT_SOURCE_BRANCH)"
+        echo "##[command]git $CMD_RUN"
+        git $CMD_RUN
+
+        if [ $? -ne 0 ]; then
+          echo "[error]No changes to commit."
+          exit 1
+        fi
+
+        if [ $? -ne 0 ]; then
+          echo "##vso[task.logissue type=error;] Git push failed"
+          echo "##vso[task.complete result=Failed;]"
+          exit 1
+        fi
+
+        GIT_CURRENT_SHA_OLD=$(git rev-parse HEAD)
+
+        echo "[debug]GIT_CURRENT_SHA_OLD ........... : $GIT_CURRENT_SHA_OLD"
+        GIT_CURRENT_SHA=$(git log -n 1 --pretty='%H')
+        echo "[debug]GIT_CURRENT_SHA ............... : $GIT_CURRENT_SHA"
+        echo "Meu novo SHA: $GIT_CURRENT_SHA"
+
+        jq -n --arg git_current_sha "$GIT_CURRENT_SHA" --arg new_version "$COMPONENT_NEW_VERSION"  '$ARGS.named' > new-version.json
+
+        echo "##vso[task.setvariable variable=JS_STORE_FRONT_GIT_CURRENT_SHA;isOutput=true]${GIT_CURRENT_SHA}"
+        echo "##[section]HASH DO PROJETO $SUBMODULE_FRONT_PROJECT_NAME: $GIT_CURRENT_SHA"
+        echo "##[section]Version ${COMPONENT_NEW_VERSION}"
+
+      displayName: "Update version"
+      name: update_submodule_front_repository
+      condition: succeeded()
+      env:
+        COMPONENT_NEW_VERSION: ${{ parameters.componentNewVersion }}
+        COMMIT_NEW_VERSION: ${{ parameters.commitNewVersion }}
+        ACTUAL_BRANCH: $(Build.SourceBranch)
+
+    - task: CopyFiles@2
+      displayName: "Copy new-version.json to Staging Directory"
+      inputs:
+        TargetFolder: "$(Build.ArtifactStagingDirectory)"
+        OverWrite: true
+        CleanTargetFolder: true
+        Contents: |
+          ${{ parameters.workingDirectory }}/new-version.json
+
+    - task: PublishPipelineArtifact@1
+      displayName: "Publish new-version.json"
+      inputs:
+        artifactName: "new-version-info"
+        targetPath: "$(Build.ArtifactStagingDirectory)"
+## TO UPDATE SHA IN CORE
+- ${{ if eq(parameters.repoIsCore, true) }}:
+    - template: /tech_products/ecmc/sap-commerce/tasks/artifacts/download_pipeline.yaml
+      parameters:
+        displayName: "Download Version-Info From Artifacts"
+        artifactName: "new-version-info"
+        targetPath: ${{ parameters.workingDirectoryCore }}
+        condition: succeeded()
+
+    - bash: |
+
+        verify_and_stop_if_error() {
+          if [[ $1 != 0 ]]; then
+            exit 1
+          fi
+        }
+        echo "##[section]COMMIT HASH DO PROJETO $SUBMODULE_FRONT_PROJECT_NAME: $(JS_STORE_FRONT_GIT_CURRENT_SHA)"
+        cd ${{ parameters.workingDirectoryCore }}
+        git config --replace-all user.name "Azure DevOps" && git config --replace-all user.email "azuredevops@telefonicati.onmicrosoft.com"
+
+        git fetch origin $(PROJECT_SOURCE_BRANCH)
+        git checkout $(PROJECT_SOURCE_BRANCH)
+        git pull origin $(PROJECT_SOURCE_BRANCH)
+
+        GIT_CURRENT_SHA_AGGREGATOR=$(git rev-parse HEAD)
+        git reset --hard $GIT_CURRENT_SHA_AGGREGATOR
+        echo "##[section]COMMIT HASH DO PROJETO: $GIT_CURRENT_SHA_AGGREGATOR"
+
+        URL_FRONT="$SYSTEM_ACCESS_TOKEN@dev.azure.com/telefonica-vivo-brasil/$(TEAM_PROJECT)/_git/$SUBMODULE_FRONT_PROJECT_NAME"
+        URL_FRONT_WITH_PAT="https://$SYSTEM_ACCESS_TOKEN@dev.azure.com/telefonica-vivo-brasil/$(TEAM_PROJECT)/_git/$SUBMODULE_FRONT_PROJECT_NAME"
+        git submodule set-url $FRONTEND_PROJECT_DIR https://$SYSTEM_ACCESS_TOKEN@dev.azure.com/telefonica-vivo-brasil/$(TEAM_PROJECT)/_git/$SUBMODULE_FRONT_PROJECT_NAME
+        echo "##[section]git submodule set-url $FRONTEND_PROJECT_DIR concluído"
+
+        git submodule sync
+        echo "##[section]git submodule sync concluído"
+
+        git submodule update --init --depth 15 $FRONTEND_PROJECT_DIR
+        echo "##[section]git submodule update concluído"
+
+        git submodule set-branch --branch $(PROJECT_SOURCE_BRANCH) -- $FRONTEND_PROJECT_DIR
+        echo "##[section]git submodule set-branch concluído"
+
+        verify_and_stop_if_error $(echo $?)
+
+        # CD DIRECTORY SUBMODULE
+        cd $FRONTEND_PROJECT_DIR
+        git -c http.https://$URL_FRONT.extraheader="AUTHORIZATION: bearer $SYSTEM_ACCESS_TOKEN" fetch "$URL_FRONT_WITH_PAT"
+        git fetch origin $(PROJECT_SOURCE_BRANCH)
+        git pull origin $(PROJECT_SOURCE_BRANCH)
+        git reset --hard $JS_STORE_FRONT_GIT_CURRENT_SHA
+        verify_and_stop_if_error $(echo $?)
+
+        # CD DIRECTORY MAIN REPOSITORY
+        cd ${{ parameters.workingDirectoryCore }}
+        git submodule set-url $FRONTEND_PROJECT_DIR "../$SUBMODULE_FRONT_PROJECT_NAME"
+        git add -f $FRONTEND_PROJECT_DIR
+
+        git commit -m "[${SAP_COMMERCE_OPTIONS_VERSION}] Update $SUBMODULE_FRONT_PROJECT_NAME $JS_STORE_FRONT_GIT_CURRENT_SHA"
+
+        git remote set-url origin https://$SYSTEM_ACCESS_TOKEN@dev.azure.com/telefonica-vivo-brasil/$(TEAM_PROJECT)/_git/$CORE_PROJECT
+        verify_and_stop_if_error $(echo $?)
+
+        CMD_RUN="push origin HEAD:$(PROJECT_SOURCE_BRANCH)"
+        echo "##[command]git $CMD_RUN"
+        git $CMD_RUN
+
+        if [ $? -ne 0 ]; then
+          echo "##vso[task.logissue type=error;] Git push failed"
+          echo "##vso[task.complete result=Failed;]"
+          exit 1
+        fi
+      displayName: "Send Commit to Repository"
+      name: core_commit
+      condition: ${{ parameters.condition }}
+      env:
+        SUBMODULE_FRONT_PROJECT_NAME: $(FRONTEND_PROJECT)
+        SUBMODULE_BACK_PROJECT_NAME: $(BACKEND_PROJECT)
+        FRONTEND_PROJECT_DIR: $(FRONTEND_PROJECT_DIR)
+        BACKEND_PROJECT_DIR: $(BACKEND_PROJECT_DIR)
+        CORE_PROJECT: $(CORE_PROJECT)
+        CORE_PROJECT_POC: "BACKUP-SRC-SAP-COMMERCE-CLOUD"
+        SYSTEM_ACCESS_TOKEN: $(System.AccessToken)
+        TEAM_PROJECT: $(TEAM_PROJECT)

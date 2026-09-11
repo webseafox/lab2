@@ -1,0 +1,47 @@
+parameters:
+- name: enable_devflow_validations
+  type: boolean
+  default: False
+  
+stages:
+- stage: validate_sonar_branch
+  displayName: "Validate Sonar Branch"
+  pool:
+    name: $(PRIVATE_AGENT_SHARED)
+  dependsOn:
+    - pipeline_init
+    - ${{ if and(eq(variables['Build.Reason'], 'PullRequest'), eq(parameters.enable_devflow_validations, True)) }}:
+      - repo_validations
+  jobs:
+    - job: "validate"
+      displayName: "Validate Sonar Report"
+      steps:
+      - checkout: none
+        persistCredentials: true
+      - bash: |
+          PR_BRANCH=$(echo "$(System.PullRequest.SourceBranch)" | sed 's/refs\/heads\///g')
+          
+          SONAR_PROJECT_STATUS_URL="${SONARQUBE_URL}/api/qualitygates/project_status?projectKey=${SONAR_PROJECT_KEY}&branch=$PR_BRANCH"
+          echo "##[debug]Analisando relatório em : ${SONAR_PROJECT_STATUS_URL}"
+          
+          ANALYSIS_STATUS=$(curl --max-time $CURL_HTTP_TIMEOUT  -s -u "$(SONARQUBE_TOKEN_SCC):" "${SONAR_PROJECT_STATUS_URL}")
+          ALL_DATA=$(jq '.' <<< $ANALYSIS_STATUS)
+
+          # echo "##[debug]Resposta da API: $ALL_DATA"
+
+          ## SHOW ITEMS FROM RESPONSE SONAR REQUEST
+          projectStatus=$(echo "$ALL_DATA" | jq -r .projectStatus.status)
+            
+          if [[ -n $projectStatus && "$projectStatus" != "null" ]]; then
+            echo "##[debug]A branch analisada já está disponível como base no sonar"
+            echo "##vso[task.setvariable variable=SONAR_BRANCH_EXISTS;isoutput=true]True"
+            exit 0
+          fi
+
+          echo "##[debug]A branch analisada ainda não está disponível como base no sonar. Começar a criação."
+          echo "##vso[task.setvariable variable=SONAR_BRANCH_EXISTS;isoutput=true]False"
+        name: set_branch_exists
+        displayName: 'Verify Sonar Branch is Valid'
+        condition: eq(variables.SONAR_IS_ENABLED, True)
+        env:
+          SONARQUBE_TOKEN: $(SONARQUBE-TOKEN)

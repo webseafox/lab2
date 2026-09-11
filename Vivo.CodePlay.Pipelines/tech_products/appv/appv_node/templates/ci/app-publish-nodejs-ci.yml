@@ -1,0 +1,221 @@
+parameters:
+  - name: gatesEnabled
+
+stages:
+- stage: ci_publish
+  displayName: "CI - Publish"
+  pool:
+    name: GeneralPurposeLinuxAgentsCI
+  dependsOn:
+  - environment_init
+  - ci_build
+  - ${{ if eq(parameters.gatesEnabled, True) }}:
+    - gates_environment_init
+    - ci_security
+    - ci_quality_gate
+  condition: succeeded()
+
+  ## -> Loads variables from other stages.
+  variables:  
+  - name: NEXUS_DEPS_USR
+    value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEPS_USR'] ]    
+  - name: NEXUS_DEPS_PSW
+    value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEPS_PSW'] ] 
+  - name: NEXUS_DEFAULT_USR
+    value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEFAULT_USR'] ]    
+  - name: NEXUS_DEFAULT_PSW
+    value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEFAULT_PSW'] ] 
+  - name: NEW_VERSION
+    value: $[ stageDependencies.ci_build.build.outputs['new_version.NEW_VERSION'] ]
+  - name: ARTIFACT_NAME
+    value: $[ stageDependencies.ci_build.build.outputs['artifact_name.ARTIFACT_NAME'] ]
+ 
+  jobs:
+
+  ## -> Using a job of type deployment for publish.
+  - deployment: publish
+    displayName: Publish Library    
+    workspace:
+      clean: all
+    environment:
+      name: $(DEPLOY_ENVIRONMENT_LIB)
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+
+          ## -> Downlood and uncompress the downloaded artifact.
+          ## -> 30f35852-3f7e-4c0c-9a88-e127b4f97211 is the decorator for download artifact.
+          - task: DownloadBuildArtifacts@1
+            displayName: 'Download Build Artifacts'
+            inputs:
+              artifactName: $(ARTIFACT_NAME)
+              cleanDestinationFolder: false
+              extractTars: true
+              parallelizationLimit: 8
+              downloadPath: $(System.ArtifactsDirectory)
+
+          - script: | 
+              cd $(DEFAULT_WORKDIR_ARTIFACTS)/$(ARTIFACT_NAME)
+              unzip -q '$(ARTIFACT_NAME).zip'
+              rm '$(ARTIFACT_NAME).zip'
+            displayName: 'Unzip with symlinks'
+
+          ## -> Set artifact information to variables.
+          - task: Bash@3
+            displayName: Artifacts Info
+            inputs:
+              targetType: inline
+              script: |
+                echo "##[debug] Artifact name: '$(ARTIFACT_NAME)'"
+
+                echo "##[debug] Target directory location: '$(pwd "$(DEFAULT_WORKDIR_ARTIFACTS)/$(ARTIFACT_NAME)")'"
+                echo "##[debug] Target directory path: '$(DEFAULT_WORKDIR_ARTIFACTS)/$(ARTIFACT_NAME)'"
+                echo "##[debug] Target directory content:'"
+                echo "$(ls -lha '$(DEFAULT_WORKDIR_ARTIFACTS)/$(ARTIFACT_NAME)')"
+                echo "##[debug] NEW_VERSION: $(NEW_VERSION)"
+
+          ## -> Publish Artifact to NEXUS.
+          ## -> Only allowed for the specified branches below. Other branches must skip this task.
+          ## -> Using npm to push to nexus. 
+          - task: Bash@3
+            displayName: Publish to Nexus
+            env:
+              HTTPS_PROXY: http://10.240.58.39:3128
+            condition: succeeded()
+            inputs:
+              targetType: inline
+              script: |
+                echo "##[debug]Maven settings.....: $(MAVEN_SETTINGS_LOCATION)."
+                echo "##[debug]Publishing to Repository: $(NEXUS_REPO_LIB_MVN)."
+                echo "##[debug]Default URL: $(NEXUS_REPOSITORY_URL)."
+                echo "##[debug]Deployment Repository: $(NEXUS_REPO_LIB_MVN)::default::$(NEXUS_REPOSITORY_URL)/$(NEXUS_REPO_LIB_MVN)."
+                run_npm_publish() {
+                  echo "##[debug]Publishing to Nexus:"
+                  export HUSKY_SKIP_INSTALL=true
+                  npm pkg delete scripts.prepare
+                  if [ -f .npmrc ]; then
+                    auth_opt="email=vivo.devops.br@telefonica.com\nalways-auth=true"
+                    auth=$(echo -n $(NEXUS_DEFAULT_USR):$(NEXUS_DEFAULT_PSW) | openssl base64)
+                    repos=$(grep -o "registry=.*" .npmrc | cut -d':' -f2 | awk -v auth="$auth" '{print $0 ":_auth="auth""}')
+                    { printf '\n'; echo -e "$repos\n$auth_opt"; } | tee -a >(cat >> .npmrc) > /dev/null
+                    echo "##[debug]Credenciais configuradas."
+                    echo "Credenciais configuradas!"
+                    npm pkg delete scripts.prepare
+                    export HUSKY_SKIP_INSTALL=true
+                    echo "##[debug]Publicando no Nexus..."
+                    output=$(npm publish --no-verify --verbose --access=restricted)
+
+                    if [[ $? -ne 0 ]] ; then
+                      echo '##[error] Error while executing curl command to push artifact to nexus.'
+                      echo '##[error] Check [Lib Publish Failure] job in the pipeline for more information.'
+                      exit 1
+                    fi
+                    
+                  else
+                    echo '##vso[task.logissue type=error] Error while executing npm publish. The file .npmrc was not found.'
+                    exit 1
+                  fi
+                }
+
+                run_npm_publish
+
+              workingDirectory: $(DEFAULT_WORKDIR_ARTIFACTS)/$(ARTIFACT_NAME)
+        on:
+          success:
+            steps:
+            - task: Bash@3
+              displayName: Lib Publish Success
+              name: t_success_message
+              inputs:
+                targetType: inline
+                script: |
+                  echo "##[section]================================================================================================================================="
+                  echo "##[section]                                                 SUCCESS LIB PUBLISH"
+                  echo "##[section]================================================================================================================================="
+                  echo "##[section]Parabéns sua biblioteca foi publicada com sucesso no repositório de artefatos"
+                  echo "##[section]"
+                  echo "##[section]Caso tenha dúvidas sobre essa fase do pipeline acesse a nossa documentação: $(CORPORATE_WIKI_DOC_URL)"
+                  echo "##[section]================================================================================================================================="
+
+            ## -> In case of successs, creates the GIT tag
+            - task: jabbera.git-tag-on-release-task.git-tag-on-release-task.git-tag-on-release-task@9
+              retryCountOnTaskFailure: 3
+              displayName: "Git tag with version"
+              inputs:
+                staticTagName: $(NEW_VERSION)
+              condition: ne(variables.BUMP_VERSION_ENABLED, true)
+              
+          failure:
+            steps:
+            - task: Bash@3
+              displayName: Lib Publish Failure
+              name: t_failure_message
+              inputs:
+                targetType: inline
+                script: |
+                  echo "##[error] ================================================================================================================================="
+                  echo "##[error]                                                  FAILURE LIB PUBLISH"
+                  echo "##[error] ================================================================================================================================="
+                  echo "##[error] Se está vendo essa mensagem é porque aconteceu algo erro durante a publicação da sua biblioteca."
+                  echo "##[error] "
+                  echo "##[error] Segue abaixo umas dicas para o Troubleshooting:"
+                  echo "##[error] $(ALERT_MESSAGE_ARROW) Consulte o log do estágio de publicação do artefato."
+                  echo "##[error] $(ALERT_MESSAGE_ARROW) Verifique se a versão corrente da biblioteca já existe no repositório (sobrescrita não é permitido)."
+                  echo "##[error] $(ALERT_MESSAGE_ARROW) Confira se as informações do repositório e credenciais de acesso estão corretas."
+                  echo "##[error] "
+                  echo "##[error] Caso tenha dúvidas sobre essa fase do pipeline acesse a nossa documentação: $(CORPORATE_WIKI_DOC_URL)"
+                  echo "##[error] ================================================================================================================================="
+
+  - job: push_repo_version_bump
+    displayName: "Push/tag version bump"
+    condition: succeeded()
+    dependsOn:
+    - publish
+    steps:
+
+    ## -> Clean the pipeline workspace and checkout the code.
+    ## -> 6d15af64-176c-496d-b583-fd2ae21d4df4 is the decorator for checkout.
+    - task: 6d15af64-176c-496d-b583-fd2ae21d4df4@1
+      condition: eq(variables.BUMP_VERSION_ENABLED, true)
+      inputs:
+        repository: self
+        persistCredentials: "true"
+        clean: true
+
+    ## -> Checkout the last commit that was pushed to the repository. 
+    - task: Bash@3
+      displayName: Checkout Last Commit
+      name: checkout_last_commit
+      condition: eq(variables.BUMP_VERSION_ENABLED, true)
+      inputs:
+        targetType: inline
+        script: |
+          echo "##[debug] Checkout last commit from '$(Build.SourceBranchName)'"
+
+          git config pull.rebase true
+          git fetch -f --depth 1 origin $(Build.SourceBranchName):$(Build.SourceBranchName)
+          git checkout -f $(Build.SourceBranchName)
+
+    ## -> Bump version in code 
+    - task: Bash@3
+      displayName: Update Source Version
+      condition: eq(variables.BUMP_VERSION_ENABLED, true)
+      inputs:
+        targetType: inline
+        script: |
+
+          echo "##[debug] Pushing NEW_VERSION: $(NEW_VERSION)"
+          jq '.version="$(NEW_VERSION)"' package.json > /tmp/package.json
+          mv /tmp/package.json package.json        
+
+    ## -> Push new version to git
+    - task: Bash@3
+      displayName: 'Commit Updated Version'
+      condition: eq(variables.BUMP_VERSION_ENABLED, true)
+      env:
+        BRANCH_NAME: "$(Build.SourceBranchName)"
+        TAG_REPO: true
+      inputs:
+        targetType: inline
+        script: "TAG_PUSH_PARAM=\"\"\n\necho \"##[debug] TAG_REPO.....: ${TAG_REPO}\"\n\ngit add .\ngit commit -am \"[CI SKIP] Project version has been updated. Released version '${NEW_VERSION}'\" --author=\"$BUILD_REQUESTEDFOR <$BUILD_REQUESTEDFOREMAIL>\"\n\nif [[ \"${TAG_REPO}\" == \"true\" ]]; then\n  TAG_PUSH_PARAM=\"--tags\"\n\n  git tag ${NEW_VERSION}\nfi\n\ngit status\necho \"##[command] git push origin ${TAG_PUSH_PARAM} ${BRANCH_NAME}\"\ngit push origin ${TAG_PUSH_PARAM} ${BRANCH_NAME}\n\nif [ $? -ne 0 ]; then \n  echo \"##vso[task.logissue type=error;] Git push failed. Permission denied\"\n  echo \"##vso[task.complete result=Failed;]\"\n  exit 1\nfi  \n\necho \"Version updated to ${NEW_VERSION}\"\n"

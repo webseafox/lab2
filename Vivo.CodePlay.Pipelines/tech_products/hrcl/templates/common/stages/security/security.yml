@@ -1,0 +1,60 @@
+parameters:
+- name: fortifyExclusionRepository
+  
+stages:
+- stage: security_quality_gate
+  displayName: "Security Gate"
+  dependsOn:
+    - environment_init
+    - prepare
+    - build_package
+  pool: GeneralPurposeLinuxAgentsCI
+  variables:
+    - name: NEXT_VERSION
+      value: $[ stageDependencies.prepare.extract.outputs['extract_version_and_sha.NEXT_VERSION'] ]
+    - template: /tech_products/hrcl/templates/common/initialize/variables_catalog_info.yml
+  jobs:
+  - job: app_config_keys
+    displayName: "Get AppSec Keys"
+    condition: succeeded()
+    steps:
+    - template: /security/get_appconfig_keys.yml
+  
+  - job: fortify_scan
+    dependsOn:
+      - app_config_keys
+    variables:
+      USE_FORTIFY: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_FORTIFY'] ]
+      USE_CONVISO: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_CONVISO'] ]
+      SKIP_SECURITY_GATE: $[ dependencies.app_config_keys.outputs['evaluate_flags.SKIP_SECURITY_GATE'] ]
+    condition: and(succeeded(), eq(variables.USE_FORTIFY, true))
+    displayName: "Fortify Scan"
+    steps:
+    - template: /security/run_fortify_scan.yml
+      parameters:
+        fortifyExclusionRepository: ${{ parameters.fortifyExclusionRepository }}
+
+  - job: sca_scan
+    displayName: "SCA Scan"
+    dependsOn:
+      - app_config_keys
+    condition: and(succeeded(), eq(variables.USE_DEPENDENCY_TRACK, true), eq(variables.USE_DT_DOCKER, false))
+    variables: 
+      USE_DEPENDENCY_TRACK: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_DEPENDENCY_TRACK'] ]
+      USE_DT_DOCKER: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_DT_DOCKER'] ]
+      USE_CONVISO: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_CONVISO'] ]
+      SKIP_SECURITY_GATE_SCA: $[ dependencies.app_config_keys.outputs['evaluate_flags.SKIP_SECURITY_GATE_SCA'] ]
+    steps:
+    - template: /security/run_sca_scan.yml
+
+  - job: checkmarx_scan
+    dependsOn: app_config_keys
+    variables:
+      USE_CHECKMARX: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_CHECKMARX'] ]
+      SKIP_SECURITY_GATE: $[ or(eq(dependencies.app_config_keys.outputs['evaluate_flags.SKIP_SECURITY_GATE'], 'true'), eq(variables.CHECKMARX_IGNORE_SECURITY_GATE, 'true')) ]
+    condition: and(succeeded(), eq(variables.USE_CHECKMARX, 'true'))
+    displayName: "Checkmarx Scan"
+    steps:
+    - template: /tech_products/hrcl/templates/task_groups/security/run_checkmarx_scan.yml
+      parameters:
+        skipSecurityGate: $(SKIP_SECURITY_GATE)

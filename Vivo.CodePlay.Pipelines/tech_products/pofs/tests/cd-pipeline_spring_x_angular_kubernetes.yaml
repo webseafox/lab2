@@ -1,0 +1,194 @@
+
+
+trigger:
+  branches:
+    include:
+      - '*'
+  paths:
+    include:
+      - '*'
+    exclude:
+      - docs/*
+
+parameters:
+- name: environment
+  displayName: Escolha o ambiente para publicar
+  type: string
+  default: dev
+  values:
+  - dev
+  - preprod
+  - prod
+
+resources:
+  repositories:
+  - repository: Deploy
+    name: MIGR-Conv86/deploy.deploy-micro-service-conv86-spring-boot
+    type: git
+    # ref: refs/tags/latest
+    ref: refs/heads/master
+
+#Incluir Variaveis da Library
+variables:
+- name: ASDF_JDK_11
+  value: "openjdk-11.0.2"
+- name: System.debug
+  value: "true"
+
+# - name: DOCKER_REGISTRY
+#   value: vcr-docker.nexus.telefonica.com.br
+#   # value: conv86-docker.nexus.telefonica.com.br # come from https://dev.azure.com/telefonica-vivo-brasil/MIGR-Conv86/_git/package.package-micro-service-conv86-spring-boot?path=/pipeline/properties.yaml&version=GBmaster&line=15&lineEnd=16&lineStartColumn=1&lineEndColumn=1&lineStyle=plain&_a=contents
+
+# - name: DOCKER_SERVICE_CONNECTION
+#   value: "ACR-DEVOPS"
+# - name: DOCKER_REGISTRY_EMAIL
+#   value: "arquiteturati@telefonica.com.br"
+# - name: DOCKER_CMD_USERNAME
+#   value: $(id -u)
+# - name: DOCKER_CMD_GROUP
+#   value: $(id -g)
+# - name: DOCKER_IMAGE_NAME
+#   value: conv86/micro-service-conv86-spring-boot
+
+  # IMAGE_REGISTRY: "conv86-docker.nexus.telefonica.com.br" #"10.129.178.173:5017"
+  # IMAGE_NAME: "conv86/micro-service-conv86-spring-boot"
+
+stages:
+- stage: deploy_kube
+  displayName: Deploy Kubernetes
+  jobs:
+  - job: deploy_on_kube
+    continueOnError: False
+    condition: succeeded()
+    displayName: Deploy on Kubernetes
+    pool: GeneralPurposeLinuxAgentsCD
+    steps:
+    # - task: DownloadBuildArtifacts@1
+    #   displayName: Get new pom.xml
+    #   inputs:
+    #     buildType: 'current'
+    #     downloadPath: '$(System.ArtifactsDirectory)'
+
+    - task: DownloadBuildArtifacts@1
+      inputs:
+        project: '1f3d25d3-7351-492f-b8e7-6254027b96c8'
+        pipeline: '18853'
+        buildVersionToDownload: 'specific'
+        buildId: '210933'
+        buildType: 'specific'
+        itemPattern: |
+          bin/**/*.war
+          bin/**/pom.xml
+        downloadPath: '$(System.ArtifactsDirectory)'
+        cleanDestinationFolder: true
+
+    - checkout: Deploy
+      fetchDepth: 1
+
+    - task: AzureKeyVault@2  
+      displayName: 'Getting AKV credentials'
+      timeoutInMinutes: 1
+      retryCountOnTaskFailure: 5  
+      inputs:    
+        azureSubscription: DevOpsSharedResources    
+        KeyVaultName: kv-azdevops-shared
+        SecretsFilter: >- 
+          DOCKER-REGISTRY-USERNAME, DOCKER-REGISTRY-PASSWORD,
+          HELM-REGISTRY-NEXUS-USERNAME, HELM-REGISTRY-NEXUS-PASSWORD,
+          HELM-REGISTRY-ACR-USERNAME, HELM-REGISTRY-ACR-PASSWORD
+
+    - task: DownloadSecureFile@1
+      name: kubeconfig
+      displayName: 'Download kube-dev'
+      inputs:
+        secureFile: kube-dev
+
+    - task: XmlParseFromVivo@4
+      displayName: Get Main Info
+      name: pom_info
+      inputs:
+        type: 'file'
+        origin: $(System.ArtifactsDirectory)/bin/pom.xml
+        jpaths: |
+          var POM_XML_VERSION = .project.version._text
+          var POM_XML_ARTIFACT_ID = .project.artifactId._text
+          var POM_XML_GROUP_ID = .project.groupId._text
+    
+    - task: YamlParseFromVivo@4
+      displayName: Get Helm/Kube Info
+      name: deploy_helm_kube_info
+      inputs:
+        type: 'file'
+        origin: $(Build.SourcesDirectory)/pipeline/properties.yaml
+        jpaths: |
+          # default
+          var KUBE_NAMESPACE = .kubernetes.namespace.${{parameters.environment}}
+                        
+          # "3.5.3"
+          var HELM_VERSION = helm.VERSION
+          # "conv86-helm"
+          var HELM_CHART_REPOSITORY = helm.CHART_REPOSITORY
+          # "helm-conv86"
+          var HELM_CHART_NAME = helm.CHART_NAME
+          # "1.0.79"
+          var HELM_CHART_VERSION = helm.CHART_VERSION
+          # "micro-service-conv86-spring-boot"
+          var HELM_APPLICATION_NAME = helm.APPLICATION_NAME
+          # "30s"
+          var HELM_WAIT_TIMEOUT = helm.WAIT_TIMEOUT
+
+    - task: YamlParseFromVivo@4
+      displayName: Get Env Info
+      name: deploy_env_info
+      inputs:
+        type: 'file'
+        origin: $(Build.SourcesDirectory)/env/${{parameters.environment}}.yaml
+        jpaths: |          
+          var DOCKER_REGISTRY = .global.imageRegistry
+          var DOCKER_REPOSITORY = .image.repository
+
+    # - bash: |
+    #     source ~/.bashrc
+        
+    #     kubectl get ns \
+    #      --kubeconfig="$(kubeconfig.secureFilePath)"  \
+    #      --insecure-skip-tls-verify  \
+    #      -o json > namespaces.json
+    #   displayName: Fetch Kube Namespaces
+    #   condition: succeeded()
+
+    # - script: cat namespaces.json
+    #   displayName: Debug namespaces.json
+    #   condition: and(succeeded(), eq(variables['System.Debug'], true))
+
+    # - task: JsonParseFromVivo@4
+    #   displayName: Check Namespace
+    #   name: namespace_info
+    #   inputs:
+    #     sourceType: 'file'
+    #     source: namespaces.json
+    #     queries: |
+    #       var HAS_KUBE_NAMESPACE =  $.items[?(@.metadata.name.match(/$(KUBE_NAMESPACE)/i))].metadata.name
+
+    - bash: >-
+        kubectl get secrets conv86-docker \
+         -n $(KUBE_NAMESPACE)\
+         --kubeconfig="$(kubeconfig.secureFilePath)" \
+         --insecure-skip-tls-verify
+      # condition: and(
+      #   eq(variables['HAS_KUBE_NAMESPACE'], variables['KUBE_NAMESPACE']), 
+      #   succeeded())
+      condition: succeeded()
+      displayName: Get Secrets
+
+    - bash: >-
+        kubectl create secret docker-registry $(DOCKER_REGISTRY) \
+          --docker-server=$(DOCKER_REGISTRY) \
+          --docker-username=$(DOCKER-REGISTRY-USERNAME) \
+          --docker-password=$(DOCKER-REGISTRY-PASSWORD) \
+          --docker-email='arquiteturati@telefonica.com.br' \
+          -n $(KUBE_NAMESPACE) \
+          --kubeconfig="$(kubeconfig.secureFilePath)" \
+          --insecure-skip-tls-verify
+      condition: succeeded()
+      displayName: Create docker registry secret [$(DOCKER_REGISTRY)]

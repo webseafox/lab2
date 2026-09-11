@@ -1,0 +1,107 @@
+﻿parameters:
+- name: newVersion
+  type: string
+- name: newGitSha
+  type: string
+- name: workingDirectory
+  type: string
+  default: ''
+- name: workingDirectoryCore
+  type: string
+  default: ''
+- name: repoIsCore
+  type: boolean
+  default: false
+
+
+steps:
+  - bash: |
+      verify_and_stop_if_error() {
+          if [[ $1 != 0 ]]; then
+            exit 1
+          fi
+      }
+      echo "##[command]<<<COMMIT HASH DO PROJETO $SUBMODULE_BACK_PROJECT_NAME: ${{ parameters.newGitSha }}>>>"
+      cd ${{ parameters.workingDirectoryCore }}
+      SOURCE_BRANCH=$(PROJECT_SOURCE_BRANCH)
+      echo "##[command]<<<Atualizando git config>>>"
+      git config --replace-all user.name "Azure DevOps" && git config --replace-all user.email "azuredevops@telefonicati.onmicrosoft.com"
+
+      echo "##[command]<<<Fetch branch origin ${SOURCE_BRANCH}>>>"
+      git fetch origin $SOURCE_BRANCH
+      
+      echo "##[command]<<<Checkout branch ${SOURCE_BRANCH}>>>"
+      git checkout $SOURCE_BRANCH
+      
+      echo "##[command]<<<Pull branch ${SOURCE_BRANCH}>>>"
+      git pull origin ${SOURCE_BRANCH}
+      
+      echo "##[command]<<<Pegando SHA com git rev-parse HEAD>>>"
+      GIT_CURRENT_SHA_AGGREGATOR=$(git rev-parse HEAD)
+
+      echo "##[command]<<<Reset HARD em SHA $GIT_CURRENT_SHA_AGGREGATOR>>>"
+      git reset --hard $GIT_CURRENT_SHA_AGGREGATOR
+      
+      URL_BACK="$SYSTEM_ACCESS_TOKEN@dev.azure.com/telefonica-vivo-brasil/$(TEAM_PROJECT)/_git/$SUBMODULE_BACK_PROJECT_NAME"
+      URL_BACK_WITH_PAT="https://$SYSTEM_ACCESS_TOKEN@dev.azure.com/telefonica-vivo-brasil/$(TEAM_PROJECT)/_git/$SUBMODULE_BACK_PROJECT_NAME"
+      git submodule set-url $BACKEND_PROJECT_DIR https://$SYSTEM_ACCESS_TOKEN@dev.azure.com/telefonica-vivo-brasil/$(TEAM_PROJECT)/_git/$SUBMODULE_BACK_PROJECT_NAME
+      echo "##[command]<<<git submodule set-url $BACKEND_PROJECT_DIR concluído>>>"
+
+      echo "##[command]<<<git submodule sync>>>"
+      git submodule sync
+
+      echo "##[command]<<<git submodule update>>>"
+      git submodule update --init --depth 15 $BACKEND_PROJECT_DIR
+      
+      echo "##[command]<<<git submodule set-branch ${SOURCE_BRANCH} do projeto $BACKEND_PROJECT_DIR>>>"
+      git submodule set-branch --branch $SOURCE_BRANCH -- $BACKEND_PROJECT_DIR
+      
+      verify_and_stop_if_error $(echo $?)
+
+      # CD DIRECTORY SUBMODULE
+      cd $BACKEND_PROJECT_DIR
+
+      echo "##[command]<<<Baixando projeto Backend>>>"
+      git -c http.https://$URL_BACK.extraheader="AUTHORIZATION: bearer $SYSTEM_ACCESS_TOKEN" fetch "$URL_BACK_WITH_PAT"
+      
+      echo "##[command]<<<Fetch na branch origin ${SOURCE_BRANCH}>>>"
+      git fetch origin $SOURCE_BRANCH
+      
+      echo "##[command]<<<Reset HARD no SHA ${{ parameters.newGitSha }}>>>"
+      git reset --hard ${{ parameters.newGitSha }}
+      verify_and_stop_if_error $(echo $?)
+      
+      # CD DIRECTORY MAIN REPOSITORY
+      cd ${{ parameters.workingDirectoryCore }}
+      
+      echo "##[command]<<<Setando submodulo $BACKEND_PROJECT_DIR em ../$SUBMODULE_BACK_PROJECT_NAME>>>"
+      git submodule set-url $BACKEND_PROJECT_DIR "../$SUBMODULE_BACK_PROJECT_NAME"
+
+      echo "##[command]<<<git add -f $BACKEND_PROJECT_DIR>>>"
+      git add -f $BACKEND_PROJECT_DIR
+      
+      echo "##[command]<<<Commit da atualização do submódulo>>>"
+      git commit -m "[${SAP_COMMERCE_OPTIONS_VERSION}] Update $SUBMODULE_BACK_PROJECT_NAME ${{ parameters.newGitSha }}"
+
+      echo "##[command]<<<dev.azure.com/telefonica-vivo-brasil/$(TEAM_PROJECT)/_git/$CORE_PROJECT>>>"
+      git remote set-url origin https://$SYSTEM_ACCESS_TOKEN@dev.azure.com/telefonica-vivo-brasil/$(TEAM_PROJECT)/_git/$CORE_PROJECT
+      verify_and_stop_if_error $(echo $?)
+
+      echo "##[command]<<<Atualizando branch HEAD:${SOURCE_BRANCH}>>>"
+      CMD_RUN="push origin HEAD:${SOURCE_BRANCH}"
+      echo "##[command]git $CMD_RUN"
+      git $CMD_RUN
+      
+      if [ $? -ne 0 ]; then 
+        echo "##vso[task.logissue type=error;] Git push failed"
+        echo "##vso[task.complete result=Failed;]"
+        exit 1
+      fi  
+    displayName: "Send Commit to Repository"
+    name: core_commit
+    env:
+      BACKEND_PROJECT_DIR: $(BACKEND_PROJECT_DIR)
+      SUBMODULE_BACK_PROJECT_NAME: $(BACKEND_PROJECT)
+      CORE_PROJECT: $(CORE_PROJECT)
+      SYSTEM_ACCESS_TOKEN: $(System.AccessToken)
+      TEAM_PROJECT: $(TEAM_PROJECT)

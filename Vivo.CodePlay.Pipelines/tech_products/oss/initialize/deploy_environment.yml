@@ -1,0 +1,816 @@
+parameters:
+- name: environment
+  type: string
+- name: infrastructureType
+  type: string
+- name: packageVersion
+  default: ''
+- name: legacy
+  default: false
+
+stages:
+- stage: deploy_environment_init
+  displayName: "CD - Environment"
+  pool:
+    name: $(AGENT_POOL_CD)
+
+  ${{ if or(eq(parameters.packageVersion, ''), eq(parameters.packageVersion, 'none')) }}:
+    dependsOn:
+    - environment_init
+    - ci_build
+    - ci_publish
+    - ci_package
+
+  condition: and(
+    succeeded(),
+    or(
+      eq(variables['Build.SourceBranchName'],'master'),
+      eq(variables['Build.SourceBranchName'],'main'),
+      eq(variables['Build.SourceBranchName'],'dev'),      
+      startsWith(variables['Build.SourceBranchName'],'hotfix'),
+      and(
+        or(
+          eq('${{ parameters.infrastructureType }}', 'weblogic'),
+          eq(dependencies.environment_init.outputs['environment.multibranch_exclusions.ALLOW_MULTIBRANCH'], 'true')
+        ),
+        or(
+          eq(variables['Build.SourceBranchName'],'prodlike'),
+          eq(variables['Build.SourceBranchName'],'preprod'),
+          eq(variables['Build.SourceBranchName'],'esteira1'),
+          eq(variables['Build.SourceBranchName'],'esteira2')
+        )
+      )
+    ))
+
+  ## -> Loads variables from other stages.
+  variables:
+  - name: PACKAGE_STATUS
+    value: $[ stageDependencies.ci_package.package.outputs['job_status.PACKAGE_STATUS'] ]
+
+  - ${{ if and(ne(parameters.packageVersion, ''), ne(parameters.packageVersion, 'none')) }}:
+    - name: PACKAGE_VERSION
+      value: ${{ parameters.packageVersion }}
+  - ${{ else }}:
+    - name: PACKAGE_VERSION
+      value: $[ stageDependencies.ci_build.build.outputs['new_version.NEW_VERSION'] ]
+
+  - template: /tech_products/oss/initialize/variables_catalog_info.yml
+
+  jobs:
+
+  - job: environment
+    displayName: Environment Validation and Setup
+
+    steps:
+    ## -> Skip downloads
+    - download: none
+
+    ## -> Checkout the source code.
+    - checkout: self
+      displayName: Checkout Source Code
+      name: checkout_source_code
+      clean: true
+      path: sourcecode
+      submodules: recursive
+
+    ## -> Clean the pipeline workspace and checkout the code for HELM CHART.
+    - checkout: OSSDevOpsHelm
+      displayName: Clone Helm Chart
+      name: clone_helm_chart
+      path: helmchart
+      clean: true
+      submodules: true
+      persistCredentials: true
+
+    ## -> Check if previous Gates stages were not failed as there is bug in AzDo that bypasses the condition
+    ## -> and the pipeline continues to the next stage.
+    ## -> This is a workaround to avoid the pipeline to continue if the gates failed.
+    - task: Bash@3
+      displayName: Gates Verification
+      condition: and(succeeded(), eq(variables.PACKAGE_STATUS, 'Failed'))
+      inputs:
+        targetType: inline
+        script: |
+
+          echo "##[debug] PACKAGE_STATUS    : ${PACKAGE_STATUS}"
+
+          echo "##[error] The security checks in the Package Stage have failed."
+          echo "##[error] Please review the scan results and address any identified issues before proceeding."
+
+          exit 1
+
+    ## -> Download HELM Registry Credentials for NEXUS
+    - task: AzureKeyVault@2
+      displayName: 'Getting AKV credentials'
+      condition: and(
+        succeeded(),
+        ne('${{ parameters.infrastructureType }}', 'weblogic'),
+        ne(variables['HELM_REGISTRY_ACR_ENABLED'], 'true'))
+      timeoutInMinutes: 1
+      retryCountOnTaskFailure: 5
+      inputs:
+        azureSubscription: DevOpsSharedResources
+        KeyVaultName: $(AKV_DEVOPS_NAME)
+        SecretsFilter: 'HELM-REGISTRY-NEXUS-USERNAME, HELM-REGISTRY-NEXUS-PASSWORD'
+
+    ## -> Download HELM Registry Credentials for ACR
+    - task: AzureKeyVault@2
+      displayName: 'Getting AKV credentials'
+      condition: and(
+        succeeded(),
+        ne('${{ parameters.infrastructureType }}', 'weblogic'),
+        eq(variables['HELM_REGISTRY_ACR_ENABLED'], 'true'),
+        eq(variables['HELM-REGISTRY-ACR-USERNAME'], ''),
+        eq(variables['HELM-REGISTRY-ACR-PASSWORD'], ''))
+      timeoutInMinutes: 1
+      retryCountOnTaskFailure: 5
+      inputs:
+        azureSubscription: DevOpsSharedResources
+        KeyVaultName: $(AKV_DEVOPS_NAME)
+        SecretsFilter: 'HELM-REGISTRY-ACR-USERNAME, HELM-REGISTRY-ACR-PASSWORD'
+
+    ## -> Download Docker Registry Credentials
+    - task: AzureKeyVault@2
+      displayName: 'Getting AKV credentials'
+      condition: and(
+        succeeded(),
+        ne('${{ parameters.infrastructureType }}', 'weblogic'),
+        eq(variables['DOCKER-REGISTRY-USERNAME'], ''),
+        eq(variables['DOCKER-REGISTRY-PASSWORD'], ''))
+      timeoutInMinutes: 1
+      retryCountOnTaskFailure: 5
+      inputs:
+        azureSubscription: DevOpsSharedResources
+        KeyVaultName: $(AKV_DEVOPS_NAME)
+        SecretsFilter: 'DOCKER-REGISTRY-USERNAME, DOCKER-REGISTRY-PASSWORD'
+
+    ## -> Set HELM and DOCKER credentials to variables. This allows it to used in other stages, jobs or tasks.
+    - task: Bash@3
+      displayName: 'Set Credentials Variables'
+      name: credentials
+      condition: and(
+        succeeded(),
+        ne('${{ parameters.infrastructureType }}', 'weblogic'))
+      continueOnError: false
+      inputs:
+        targetType: 'inline'
+        script: |
+          echo "##[group] Secrets for HELM"
+          echo "##[debug] HELM-REGISTRY-NEXUS-USERNAME: $(HELM-REGISTRY-NEXUS-USERNAME). Use as >> HELM_REGISTRY_NEXUS_USERNAME. "
+          echo "##vso[task.setvariable variable=HELM_REGISTRY_NEXUS_USERNAME;isOutput=true;isSecret=true]$(HELM-REGISTRY-NEXUS-USERNAME)"
+          echo "##[debug] HELM-REGISTRY-NEXUS-PASSWORD: $(HELM-REGISTRY-NEXUS-PASSWORD). Use as >> HELM_REGISTRY_NEXUS_PASSWORD. "
+          echo "##vso[task.setvariable variable=HELM_REGISTRY_NEXUS_PASSWORD;isOutput=true;isSecret=true]$(HELM-REGISTRY-NEXUS-PASSWORD)"
+          echo "##[debug] HELM-REGISTRY-ACR-USERNAME: $(HELM-REGISTRY-ACR-USERNAME). Use as >> HELM_REGISTRY_ACR_USERNAME. "
+          echo "##vso[task.setvariable variable=HELM_REGISTRY_ACR_USERNAME;isOutput=true;isSecret=true]$(HELM-REGISTRY-ACR-USERNAME)"
+          echo "##[debug] HELM-REGISTRY-ACR-PASSWORD: $(HELM-REGISTRY-ACR-PASSWORD). Use as >> HELM_REGISTRY_ACR_PASSWORD. "
+          echo "##vso[task.setvariable variable=HELM_REGISTRY_ACR_PASSWORD;isOutput=true;isSecret=true]$(HELM-REGISTRY-ACR-PASSWORD)"
+          echo "##[endgroup]"
+
+          echo "##[group] Secrets for Docker"
+          echo "##[debug] DOCKER-REGISTRY-USERNAME: $(DOCKER-REGISTRY-USERNAME). Use as >> DOCKER_REGISTRY_USERNAME"
+          echo "##vso[task.setvariable variable=DOCKER_REGISTRY_USERNAME;isOutput=true;isSecret=true]$(DOCKER-REGISTRY-USERNAME)"
+          echo "##[debug] DOCKER-REGISTRY-PASSWORD: $(DOCKER-REGISTRY-PASSWORD). Use as >> DOCKER_REGISTRY_PASSWORD"
+          echo "##vso[task.setvariable variable=DOCKER_REGISTRY_PASSWORD;isOutput=true;isSecret=true]$(DOCKER-REGISTRY-PASSWORD)"
+          echo "##[endgroup]"
+          echo "##[debug] To open and check the information above, click the arrows on the left."
+
+          echo "##[debug] Setting IMAGE_REPOSITORY_SECRET_NAME variable..."
+          dockerSecretName=$(echo $(DOCKER_SERVICE_CONNECTION) | tr A-Z a-z)
+          echo "##[debug] IMAGE_REPOSITORY_SECRET_NAME: $dockerSecretName"
+          echo "##vso[task.setvariable variable=IMAGE_REPOSITORY_SECRET_NAME;]$dockerSecretName"
+
+        KeyVaultName: $(AKV_DEVOPS_NAME)
+        SecretsFilter: 'NEXUS-DEPS-USR, NEXUS-DEPS-PSW, NEXUS-DEFAULT-USR, NEXUS-DEFAULT-PSW'
+
+    ## -> Log in to kubernetes
+    - task: Kubernetes@1
+      displayName: Kubernetes Cluster Login
+      inputs:
+        connectionType: 'Kubernetes Service Connection'
+        kubernetesServiceEndpoint: 'kube-${{ parameters.infrastructureType }}-${{ parameters.environment }}'
+        command: 'login'
+
+    ## -> Locate Istio and Values files
+    - task: Bash@3
+      displayName: 'Locate Istio and Values Files'
+      name: locate_values_file
+      inputs:
+        targetType: inline
+        script: |
+          echo "##[debug] Looking for values.(yml,yaml) file..."
+
+          valuesFile=$(find "$(Pipeline.Workspace)/sourcecode/.azuredevops/config/${{ parameters.environment }}" -name 'values*')
+
+          if [ -z $valuesFile ] ; then
+            echo "##[error] values.(yml,yaml) not found. Aborting..."
+            exit 1;
+          fi
+
+          echo "##[debug] Found values file: $valuesFile"
+          echo "##vso[task.setvariable variable=VALUES_FILE;]$valuesFile"
+
+          echo "##[debug] Looking for istio.json file to enable istio merge task..."
+          istioFile=$(find "$(Pipeline.Workspace)/sourcecode/.azuredevops/config/${{ parameters.environment }}" -maxdepth 1 -type f -name 'istio.json' | head -n1)
+
+          ## -> Setting variable to control istio merge task
+          if [ -n "$istioFile" ]; then
+            echo "##[debug] istio.json file found. Istio merge task will be enabled."
+            echo "##vso[task.setvariable variable=ISTIO_MERGE_ENABLED;]true"
+            echo "##vso[task.setvariable variable=ISTIO_FILE;]$istioFile"
+          else
+            echo "##[debug] No istio.json file found. Istio merge task will be skipped."
+            echo "##vso[task.setvariable variable=ISTIO_MERGE_ENABLED;]false"
+          fi
+
+    ## -> Merge Istio and Values files
+    - task: Bash@3
+      displayName: 'Merge Istio and Values files'
+      condition: and(
+        succeeded(),
+        eq(variables['ISTIO_MERGE_ENABLED'], 'true')
+        )
+      inputs:
+        targetType: inline
+        script: |
+          istioFile="$(ISTIO_FILE)"
+          valuesFile="$(VALUES_FILE)"
+
+          echo "##[group]Contents of istio.json"
+          cat "$istioFile"
+          echo "##[endgroup]"
+
+          echo "##[debug] Quick YAML syntax validation using yq for $valuesFile"
+          echo "##[debug] Validating YAML syntax using library variable DOCKER_CMD_YQ_VALIDATE_VALUES_FILE"
+
+          VALUES_FILE="$valuesFile" eval "${DOCKER_CMD_YQ_VALIDATE_VALUES_FILE}" 2>/dev/null
+
+          if [ $? -ne 0 ]; then
+            echo "##[error] Invalid YAML syntax in $valuesFile"
+            exit 1
+          fi
+
+          echo "##[group]Contents of values file before istio merge"
+          cat $valuesFile
+          echo "##[endgroup]"
+
+          YQ_IMAGE="${YQ_IMAGE}"
+          ISTIO_FILE="$istioFile"
+          VALUES_FILE="$valuesFile"
+          ISTIO_YML="$(pwd)/istio.yml"
+
+          echo "##[debug] Converting istio.json -> istio.yml using variable DOCKER_CMD_YQ_CONVERT_ISTIO_JSON"
+          eval "ISTIO_FILE=\"$ISTIO_FILE\" YQ_IMAGE=\"$YQ_IMAGE\" ${DOCKER_CMD_YQ_CONVERT_ISTIO_JSON}"
+
+          if [ $? -ne 0 ] || [ ! -s istio.yml ]; then
+            echo "##[error] Conversion failed or istio.yml empty. Aborting merge."
+            exit 1
+          fi
+
+          echo "##[debug] Merging values.yml + istio.yml using variable DOCKER_CMD_YQ_MERGE_VALUES_ISTIO"
+          eval "VALUES_FILE=\"$VALUES_FILE\" ISTIO_YML=\"$ISTIO_YML\" YQ_IMAGE=\"$YQ_IMAGE\" ${DOCKER_CMD_YQ_MERGE_VALUES_ISTIO}"
+
+          if [ $? -ne 0 ] || [ ! -s temp.yml ]; then
+            echo "##[error] Merge failed or temp.yml empty. Aborting."
+            exit 1
+          fi
+
+          echo "##[debug] Backing up original values.yml to values.yml.bak"
+          cp "$valuesFile" "${valuesFile}.bak"
+          mv temp.yml "$valuesFile"
+
+          echo "##[debug] Normalizing whitespace (trimming trailing spaces and extra blank lines)"
+          # Remove trailing spaces
+          sed -i 's/[[:space:]]*$//' "$valuesFile"
+
+          ## -> Collapse multiple blank lines into a single blank line
+          awk 'NF{blank=0} !NF{blank++; if(blank>1) next} {print}' "$valuesFile" > values.norm && mv values.norm "$valuesFile"
+
+          ## -> Ensure file ends with single newline
+          printf '\n' >> "$valuesFile"
+
+          echo "##[debug] Validating merged YAML"
+          echo "##[debug] valuesFile absolute path: $valuesFile"
+
+          if [ -d "$valuesFile" ]; then
+            echo "##[error] Path '$valuesFile' is a directory, expected values file. Aborting."
+            mv "${valuesFile}.bak" "$valuesFile" 2>/dev/null || true
+            exit 1
+          fi
+
+          echo "##[debug] Final merged YAML validation using DOCKER_CMD_YQ_VALIDATE_VALUES_FILE"
+          VALUES_FILE="$valuesFile" eval "${DOCKER_CMD_YQ_VALIDATE_VALUES_FILE}" 2>/dev/null
+
+          if [ $? -ne 0 ]; then
+            echo "##[error] Merged file invalid YAML. Restoring backup."
+            mv "${valuesFile}.bak" "$valuesFile" 2>/dev/null || true
+            exit 1
+          fi
+
+          echo "##[group]Content of values.yml after istio merge"
+          cat "$valuesFile" | $YQ_DOCKER eval '.' -P
+          echo "##[endgroup]"
+
+          echo "##[debug] Istio merge and validation completed successfully."
+
+    ## -> Create Helm Chart Package
+    - task: Bash@3
+      displayName: 'Create helm chart package '
+      name: helm_chart_package
+      condition: succeeded()
+      inputs:
+        targetType: inline
+        script: |
+          echo "##[debug] Creating helm package..."
+          helmChart=$(helm package $(Pipeline.Workspace)/helmchart)
+          echo "##[debug] $helmChart"
+
+          helmChartPackage=$(ls | grep -E "\.tgz$" | head -n 1)
+          echo "##[debug] Helm chart package: $helmChartPackage"
+          echo "##vso[task.setvariable variable=HELM_CHART_PACKAGE;]$helmChartPackage"
+
+    ## -> Set Namespace Variable and Check if exists
+    - task: Bash@3
+      displayName: 'Check and Set Namespace Variable'
+      name: set_namespace_variable
+      inputs:
+        targetType: inline
+        script: |
+          echo "##[debug] Set the namespace for environment '${{ parameters.environment }}'..."
+
+          selectedVar=$(echo "K8S_NAMESPACE_${{ parameters.environment }}" |  tr 'a-z' 'A-Z')
+          namespace=${!selectedVar}
+
+          if [ -z "$namespace" ] && [ ! -z "$(K8S_NAMESPACE)" ]; then
+            echo "##[debug] K8S_NAMESPACE_${{ parameters.environment }} variable is not set."
+            echo "##[debug] Setting NAMESPACE by K8S_NAMESPACE variable."
+            namespace=$(K8S_NAMESPACE)
+          fi
+
+          echo "##[debug] Set the namespace: $namespace"
+
+          if [[ -z "$namespace" ]]; then
+            echo "##[error] Unable to identify the deployment environment, contact the pipeline administrator."
+            exit 1;
+          fi
+
+          echo "##[debug] Check if namespace $namespace exists in the cluster..."
+
+          namespaces=$(kubectl get ns -o json --insecure-skip-tls-verify)
+
+          echo "##[group] Namespaces in cluster"
+          echo "##[debug] ${namespaces}"
+          echo "##[endgroup]"
+
+          clusterMatchedNamespace=$(echo $namespaces | jq -c '.items[].metadata | select(.name=="'"$namespace"'")' | jq -r '.name')
+
+          echo "##[debug] Found the Namespace in cluster: $clusterMatchedNamespace"
+
+          if [ "$clusterMatchedNamespace" = "$namespace" ]; then
+            echo "##[debug] Namespace [$namespace] OK."
+          else
+            echo "##[error] Namespace [$namespace] not found."
+            echo "##[error] Please create the namespace in the cluster before proceeding with the deployment."
+            exit 1;
+          fi
+
+          echo "##vso[task.setvariable variable=NAMESPACE;]$namespace"
+
+    ## -> Validate Helm Values with Schema.
+    - task: Bash@3
+      displayName: 'Validate Helm Chart'
+      name: validate_helm_schema
+      condition: succeeded()
+      inputs:
+        targetType: inline
+        workingDirectory: $(Pipeline.Workspace)/helmchart
+        script: |
+          
+          environment="${{ parameters.environment }}"
+          chartDir="$(pwd)"
+          sourceDir="$(Pipeline.Workspace)/sourcecode"
+          schemaFile="values.schema.json"
+
+          echo "##[debug] Environment: $environment"
+          echo "##[debug] Chart directory: $chartDir"
+          echo "##[debug] Source directory: $sourceDir"
+          echo ""
+
+          if [ ! -f "$schemaFile" ]; then
+            echo "##[error]════════════════════════════════════════════════════════════"
+            echo "##[error] ❌ Schema file not found in Helm chart"
+            echo "##[error]════════════════════════════════════════════════════════════"
+            echo "##[error]"
+            echo "##[error] File expected: $chartDir/$schemaFile"
+            echo "##[error]"
+            echo "##[error] Schema validation is REQUIRED for all deployments."
+            echo "##[error] Deployment has been BLOCKED to ensure configuration safety."
+            echo "##[error]"
+            echo "##[error] ℹ️  To fix this issue:"
+            echo "##[error]   1. Add values.schema.json to the Helm chart repository"
+            echo "##[error]   2. Ensure it's in the root directory of the chart"
+            echo "##[error]   3. Re-run the pipeline"
+            echo "##[error]"
+            echo "##[error]════════════════════════════════════════════════════════════"
+            exit 1
+          fi
+
+          echo "##[debug] ✅ Schema file found: $schemaFile"
+
+          ## -> Find values file
+          valuesDir="$sourceDir/.azuredevops/config/$environment"
+
+          echo "##[debug] Searching for values file in: $valuesDir"
+
+          if [ ! -d "$valuesDir" ]; then
+            echo "##[error]════════════════════════════════════════════════════════════"
+            echo "##[error] ❌ Configuration directory not found"
+            echo "##[error]════════════════════════════════════════════════════════════"
+            echo "##[error]"
+            echo "##[error] Expected directory: $valuesDir"
+            echo "##[error]"
+            echo "##[error] Please ensure:"
+            echo "##[error]   - Directory .azuredevops/config/$environment exists"
+            echo "##[error]   - Environment parameter is correct: $environment"
+            echo "##[error]"
+            echo "##[error]════════════════════════════════════════════════════════════"
+            exit 1
+          fi
+
+          VALUES_FILE=$(find "$valuesDir" -maxdepth 1 -type f \( \
+            -name 'values.yml' -o \
+            -name 'values.yaml' -o \
+            -name 'values*.yml' -o \
+            -name 'values*.yaml' -o \
+            -name 'legacy.yml' -o \
+            -name 'legacy.yaml' -o \
+            -name 'legacy*.yml' -o \
+            -name 'legacy*.yaml' \
+          \) -print -quit 2>/dev/null)
+
+          if [ -z "$VALUES_FILE" ] || [ ! -f "$VALUES_FILE" ]; then
+            echo "##[error]════════════════════════════════════════════════════════════"
+            echo "##[error] ❌ Values file not found"
+            echo "##[error]════════════════════════════════════════════════════════════"
+            echo "##[error]"
+            echo "##[error] Searched in: $valuesDir"
+            echo "##[error] Environment: $environment"
+            echo "##[error]"
+            echo "##[error] Expected file names:"
+            echo "##[error]   - values.yml / values.yaml"
+            echo "##[error]   - legacy.yml / legacy.yaml"
+            echo "##[error]"
+            echo "##[error] Directory contents:"
+            ls -la "$valuesDir" 2>/dev/null || echo "##[error] (directory empty or inaccessible)"
+            echo "##[error]"
+            echo "##[error]════════════════════════════════════════════════════════════"
+            exit 1
+          fi
+
+          echo "##[debug] ✅ Values file found: $VALUES_FILE"
+          echo ""
+
+          echo "##[group]📄 Values File Content"
+          echo "File: $VALUES_FILE"
+          echo "─────────────────────────────────────────────────────────────────────"
+          
+          catOutput=$(cat "$VALUES_FILE" 2>&1)
+          CAT_EXIT_CODE=$?
+          
+          if [ $CAT_EXIT_CODE -ne 0 ]; then
+            echo "##[error] Failed to read values file"
+            echo "##[error] Error: $catOutput"
+            echo "##[endgroup]"
+            exit 1
+          fi
+          
+          echo "$catOutput"
+          echo "─────────────────────────────────────────────────────────────────────"
+          echo "##[endgroup]"
+          echo ""
+
+          echo "##[group]📋 Schema File (First 50 lines)"
+          echo "File: $chartDir/$schemaFile"
+          echo "─────────────────────────────────────────────────────────────────────"
+          
+          headOutput=$(head -n 50 "$chartDir/$schemaFile" 2>&1)
+          HEAD_EXIT_CODE=$?
+          
+          if [ $HEAD_EXIT_CODE -ne 0 ]; then
+            echo "##[error] Failed to read schema file"
+            echo "##[error] Error: $headOutput"
+            echo "##[endgroup]"
+            exit 1
+          fi
+          
+          echo "$headOutput"
+          echo "... (truncated for brevity, schema contains more rules)"
+          echo "─────────────────────────────────────────────────────────────────────"
+          echo "##[endgroup]"
+
+          # ========================================
+          # Run Helm Lint with Schema Validation
+          # ========================================
+          echo "##[section]════════════════════════════════════════════════════════════════"
+          echo "##[section] 🔍 Running Helm Lint with Schema Validation"
+          echo "##[section]════════════════════════════════════════════════════════════════"
+          echo ""
+          echo "##[command] helm lint . -f \"$VALUES_FILE\" --strict"
+
+          lintOutput=$(helm lint . -f "$VALUES_FILE" --strict 2>&1)
+          LINT_EXIT_CODE=$?
+
+          echo "##[group]📊 Helm Lint Output"
+          echo "$lintOutput"
+          echo "##[endgroup]"
+          echo ""
+
+          ## -> Handle validation result
+          if [ $LINT_EXIT_CODE -ne 0 ]; then
+            echo "##[error]════════════════════════════════════════════════════════════════"
+            echo "##[error]         ❌ HELM VALUES SCHEMA VALIDATION FAILED                "
+            echo "##[error]════════════════════════════════════════════════════════════════"
+            echo "##[error]"
+            echo "##[error] Environment: $environment"
+            echo "##[error] Values file: $VALUES_FILE"
+            echo "##[error] Schema file: $chartDir/$schemaFile"
+            echo "##[error] Exit code: $LINT_EXIT_CODE"
+            echo "##[error]"
+            echo "##[error] The values file does NOT meet the schema requirements."
+            echo "##[error] Deployment has been BLOCKED to prevent errors in the cluster."
+            echo "##[error]"
+            echo "##[error]────────────────────────────────────────────────────────────────"
+            echo "##[error] 📋 Helm Lint Error Details:"
+            echo "##[error]────────────────────────────────────────────────────────────────"
+            echo "$lintOutput" | sed 's/^/##[error] /'
+            echo "##[error]────────────────────────────────────────────────────────────────"
+            echo "##[error]"
+            echo "##[error]────────────────────────────────────────────────────────────────"
+            echo "##[error] 🔧 Common Issues and Solutions:"
+            echo "##[error]────────────────────────────────────────────────────────────────"
+            echo "##[error]"
+            echo "##[error] 1️⃣  HorizontalPodAutoscaler (HPA) Issues:"
+            echo "##[error]    ❌ minReplicas or maxReplicas less than 1"
+            echo "##[error]    ✅ Solution: Set minReplicas >= 1 and maxReplicas >= 1"
+            echo "##[error]    Example:"
+            echo "##[error]      horizontalpodautoscaler:"
+            echo "##[error]        minReplicas: 2"
+            echo "##[error]        maxReplicas: 10"
+            echo "##[error]"
+            echo "##[error] 2️⃣  CPU Resource Issues:"
+            echo "##[error]    ❌ CPU value without 'm' suffix (e.g., '100' instead of '100m')"
+            echo "##[error]    ✅ Solution: Add 'm' for millicores or use whole numbers"
+            echo "##[error]    Examples:"
+            echo "##[error]      cpu: \"100m\"   # 100 millicores"
+            echo "##[error]      cpu: \"1\"      # 1 core"
+            echo "##[error]      cpu: \"2\"      # 2 cores"
+            echo "##[error]"
+            echo "##[error] 3️⃣  Memory Resource Issues:"
+            echo "##[error]    ❌ Memory value without unit (e.g., '512' instead of '512Mi')"
+            echo "##[error]    ✅ Solution: Add unit suffix (Mi, Gi, etc.)"
+            echo "##[error]    Examples:"
+            echo "##[error]      memory: \"128Mi\"  # 128 Mebibytes"
+            echo "##[error]      memory: \"512Mi\"  # 512 Mebibytes"
+            echo "##[error]      memory: \"1Gi\"    # 1 Gibibyte"
+            echo "##[error]      memory: \"2Gi\"    # 2 Gibibytes"
+            echo "##[error]"
+            echo "##[error] 4️⃣  Service Configuration Issues:"
+            echo "##[error]    ❌ Invalid service type"
+            echo "##[error]    ✅ Solution: Use valid types"
+            echo "##[error]    Valid types: ClusterIP, NodePort, LoadBalancer, ExternalName"
+            echo "##[error]"
+            echo "##[error]    ❌ Invalid port number (must be 1-65535)"
+            echo "##[error]    ✅ Solution: Use valid port range"
+            echo "##[error]    Example: port: 8080"
+            echo "##[error]"
+            echo "##[error] 5️⃣  Image Configuration Issues:"
+            echo "##[error]    ❌ Invalid pullPolicy"
+            echo "##[error]    ✅ Solution: Use valid policies"
+            echo "##[error]    Valid policies: Always, IfNotPresent, Never"
+            echo "##[error]"
+            echo "##[error] 6️⃣  Deployment Name Issues:"
+            echo "##[error]    ❌ Uppercase letters or underscores in deployment name"
+            echo "##[error]    ✅ Solution: Use lowercase letters, numbers, and hyphens only"
+            echo "##[error]    Examples:"
+            echo "##[error]      ✅ my-app"
+            echo "##[error]      ✅ app-1"
+            echo "##[error]      ✅ service-api"
+            echo "##[error]      ❌ My_App"
+            echo "##[error]      ❌ app_1"
+            echo "##[error]"
+            echo "##[error]────────────────────────────────────────────────────────────────"
+            echo "##[error] 📚 Next Steps:"
+            echo "##[error]────────────────────────────────────────────────────────────────"
+            echo "##[error]"
+            echo "##[error] 1. Review the error messages in the 'Helm Lint Output' section above"
+            echo "##[error] 2. Fix the values file: $VALUES_FILE"
+            echo "##[error] 3. Commit and push the corrected values"
+            echo "##[error] 4. Re-run the pipeline"
+            echo "##[error]"
+            echo "##[error]════════════════════════════════════════════════════════════════"
+
+            exit 1
+          fi
+
+          ## -> Validation SUCCESS
+          echo "##[section]════════════════════════════════════════════════════════════════"
+          echo "##[section]         ✅ HELM VALUES SCHEMA VALIDATION PASSED                "
+          echo "##[section]════════════════════════════════════════════════════════════════"
+          echo "##[section]"
+          echo "##[section] Environment: $environment"
+          echo "##[section] Values file: $VALUES_FILE"
+          echo "##[section] Schema file: $chartDir/$schemaFile"
+          echo "##[section]"
+          echo "##[section] ✅ All values meet the schema requirements"
+          echo "##[section] ✅ Configuration validated successfully"
+          echo "##[section] ✅ Safe to proceed with deployment"
+          echo "##[section]"
+          echo "##[section] Proceeding to next stage..."
+          echo "##[section]"
+          echo "##[section]════════════════════════════════════════════════════════════════"
+
+    - task: Bash@3
+      displayName: 'Render Helm Template'
+      inputs:
+        targetType: inline
+        script: |
+          echo "##[debug] Rendering helm template for validation..."
+          helm template "$(APP_NAME)" \
+            "$(HELM_CHART_PACKAGE)" \
+            -f "${VALUES_FILE}" \
+            --namespace "$(NAMESPACE)" \
+            --set "image.repository=${GOV_APP_ACRONYM}/$(APP_NAME)" \
+            --set "image.tag=$(PACKAGE_VERSION)" \
+            --set "imagePullSecrets[0].name=$(IMAGE_REPOSITORY_SECRET_NAME)" \
+            > rendered-template.yaml
+
+          if [ $? -ne 0 ]; then
+            echo "##[error] Helm template rendering failed."
+            exit 1
+          fi
+
+          echo "##[debug] Helm template rendered successfully."
+
+          echo "##[group] Helm Template:"
+          cat rendered-template.yaml
+          echo "##[endgroup]"  
+
+
+    ## -> Helm Diff - Preview Deploy Changes
+    - task: Bash@3
+      displayName: 'Helm Diff - Preview Deploy Changes'
+      continueOnError: true
+      inputs:
+        targetType: 'inline'
+        script: |
+          echo "##[debug] Looking for values.(yml,yaml) file..."
+          valuesFile="${VALUES_FILE}"
+
+          echo "##[debug] Using values file: $valuesFile"
+
+          if ! helm plugin list | grep -q "^diff"; then
+            echo "##[error] helm-diff plugin could not be found."
+            echo "##[error] Contact the Dev Support to install it on agent $(Agent.Name)."
+            exit 0;
+          fi
+
+          echo "##[debug] Performing helm diff to preview changes..."
+          echo "##[debug] Note: Manual changes made directly to the cluster will not be detected."
+          echo "##[debug] Helm diff results:"
+
+          helm diff --color upgrade --detailed-exitcode "${APP_NAME}" \
+            "${HELM_CHART_PACKAGE}" \
+            -f $valuesFile \
+            --namespace "${NAMESPACE}" \
+            --set "image.repository=${GOV_APP_ACRONYM}/${APP_NAME}" \
+            --set "image.tag=${PACKAGE_VERSION}" \
+            --set "imagePullSecrets[0].name=$(IMAGE_REPOSITORY_SECRET_NAME)" 2>/dev/null
+
+          if [ $? -eq 0 ]; then
+            echo "##[warning] No differences found between the current deploy and helm chart on the cluster."
+            echo "##[warning] Check image version and values file is correct."
+          fi
+
+    ## -> Validate Pods Replicas Changes
+    - task: Bash@3
+      displayName: 'Validate Replicas Changes'
+      continueOnError: true
+      inputs:
+        targetType: 'inline'
+        script: |
+          echo "##[debug] Checking for differences in replicas between current deploy and cluster state..."
+
+          kubectl get hpa "${APP_NAME}" -n "${NAMESPACE}" -o yaml > cluster-hpa.yaml 2>/dev/null
+
+          if [ $? -ne 0 ] || [ ! -s cluster-hpa.yaml ]; then
+            echo "##[debug] No HorizontalPodAutoscaler found in cluster for application $APP_NAME."
+            echo "##[debug] Skipping replicas comparison."
+            exit 0;
+          fi
+
+          echo "##[group] HPA from cluster:"
+          cat cluster-hpa.yaml
+          echo "##[endgroup]"
+
+          ## -> Extract replicas information from cluster and rendered template
+          ClusterMinReplicas=$(cat cluster-hpa.yaml | $YQ_DOCKER eval 'select(.kind == "HorizontalPodAutoscaler") | (.spec.minReplicas // 1)' -)
+          ClusterMaxReplicas=$(cat cluster-hpa.yaml | $YQ_DOCKER eval 'select(.kind == "HorizontalPodAutoscaler") | (.spec.maxReplicas // 1)' -)
+          ClusterCurrentReplicas=$(cat cluster-hpa.yaml | $YQ_DOCKER eval 'select(.kind == "HorizontalPodAutoscaler") | (.status.currentReplicas // 0)' -)
+
+          RenderedMinReplicas=$(cat rendered-template.yaml | $YQ_DOCKER eval 'select(.kind == "HorizontalPodAutoscaler") | (.spec.minReplicas // 1)' -)
+          RenderedMaxReplicas=$(cat rendered-template.yaml | $YQ_DOCKER eval 'select(.kind == "HorizontalPodAutoscaler") | (.spec.maxReplicas // 1)' -)
+
+          ## -> Compare and warn if differences found in pods
+          echo "=========================================================================="
+          printf "%-20s %-10s %-10s %-10s\n" "" "Deploy" "Cluster" "Status"
+          echo "=========================================================================="
+
+          ## -> Min Replicas
+          if [ "$RenderedMinReplicas" -ne "$ClusterMinReplicas" ]; then
+            printf "%-20s %-10s %-10s %-10s\n" "minReplicas" "$RenderedMinReplicas" "$ClusterMinReplicas" "⚠️ Changed"
+          else
+            printf "%-20s %-10s %-10s %-10s\n" "minReplicas" "$RenderedMinReplicas" "$ClusterMinReplicas" "✅ MATCH"
+          fi
+
+          ## -> Max Replicas
+          if [ "$RenderedMaxReplicas" -ne "$ClusterMaxReplicas" ]; then
+            printf "%-20s %-10s %-10s %-10s\n" "maxReplicas" "$RenderedMaxReplicas" "$ClusterMaxReplicas" "⚠️ Changed"
+          else
+            printf "%-20s %-10s %-10s %-10s\n" "maxReplicas" "$RenderedMaxReplicas" "$ClusterMaxReplicas" "✅ MATCH"
+          fi
+
+          ## -> Check if current replicas is greater than max replicas
+          if [ "$ClusterCurrentReplicas" -gt "$RenderedMaxReplicas" ]; then
+            printf "%-20s %-10s %-10s %-10s\n" "Running Replicas" "-" "$ClusterCurrentReplicas" "❗ Caution - Exceeds MaxReplicas"
+          else
+            printf "%-20s %-10s %-10s %-10s\n" "Running Replicas" "-" "$ClusterCurrentReplicas" "✅ OK"
+          fi
+          echo "=========================================================================="
+
+          if [ "$ClusterCurrentReplicas" -gt "$RenderedMaxReplicas" ]; then
+            echo "##[warning] ALERT: The deployment will reduce the number of running pods to match the maxReplicas defined in the Helm chart."
+            echo "##[warning] Current running replicas ($ClusterCurrentReplicas) exceed the configured maxReplicas ($RenderedMaxReplicas)."
+            echo "##[warning] This operation will trigger a scale down and may impact application availability if not planned."
+            echo "##[warning] Review your maxReplicas setting in values.yml to avoid unintended service disruption."
+          fi
+
+          environment=${{ parameters.environment }}
+
+          if [ "$environment" = "producao" ] && [ "$ClusterCurrentReplicas" -eq "$RenderedMaxReplicas" ]; then
+            echo "##[warning] PRODUCTION SCALING ALERT: Current replicas match maximum replicas limit."
+            echo "##[warning] This configuration may cause service degradation during high load periods."
+            echo "##[warning] Recommendation: Increase maxReplicas in values.yml before deployment to ensure auto-scaling capability."
+            echo "##vso[task.logissue type=warning] PRODUCTION SCALING ALERT: Current replicas match maximum replicas limit."
+            echo "##vso[task.complete result=SucceededWithIssues;]"
+          fi
+
+    ## -> Wether it is deploy Only, check if Docker image is available in the registry
+    - ${{ if eq(parameters.legacy, false) }}:
+      - task: Bash@3
+        displayName: 'Check Docker Image Availability'
+        condition: and(
+          succeeded(),
+          ne(variables['DISABLE_IMAGE_CHECK'], 'true'))
+        retryCountOnTaskFailure: 5
+        inputs:
+          failOnStderr: true
+          targetType: 'inline'
+          script: |
+            deployVersion="$(PACKAGE_VERSION)"
+            imageURL="$(NEXUS_ENDPOINT_API_REPOSITORY)/search?docker.imageName=${GOV_APP_ACRONYM}/${APP_NAME}&docker.imageTag=$deployVersion"
+
+            echo "##[debug] Image Name : ${GOV_APP_ACRONYM}/${APP_NAME}"
+            echo "##[debug] Image Tag  : $deployVersion"
+
+            echo "##[debug] Checking if the Docker image exists on Nexus..."
+
+            echo "##[group] Image Query Log"
+            response=$(curl -u '$(credentials.DOCKER_REGISTRY_USERNAME):$(credentials.DOCKER_REGISTRY_PASSWORD)' -X GET -s "$imageURL")
+            if [ $? -ne 0 ] || [ -z "$response" ]; then
+              echo "##vso[task.logissue type=error] Failed to fetch Docker image information from Nexus."
+              echo "##[error] Please check the Nexus endpoint or credentials."
+              echo "##vso[task.complete result=Failed;]"
+              exit 1
+            fi
+
+            echo "##[debug] Response: $response"
+            echo "##[endgroup]"
+
+            # Validate the presence of items in the response
+            items=$(echo "$response" | jq -r '.items | length' 2>/dev/null)
+            if [ $? -ne 0 ] || [ -z "$items" ] || [ "$items" -eq 0 ]; then
+              echo "##vso[task.logissue type=error] Docker image not found for ${GOV_APP_ACRONYM}/${APP_NAME}:$deployVersion"
+              echo "##[error] Please check if the specified image and tag/version exists on Nexus, or Nexus availability."
+              echo "##vso[task.complete result=Failed;]"
+              exit 1
+            else
+              echo "##[debug] Docker image found for ${GOV_APP_ACRONYM}/${APP_NAME}:$deployVersion"
+            fi
+
+    ## -> Logout of kubernetes
+    - task: Kubernetes@1
+      displayName: Kubernetes Cluster Logout
+      condition: always()
+      continueOnError: true
+      timeoutInMinutes: 1      
+      inputs:
+        command: 'logout'

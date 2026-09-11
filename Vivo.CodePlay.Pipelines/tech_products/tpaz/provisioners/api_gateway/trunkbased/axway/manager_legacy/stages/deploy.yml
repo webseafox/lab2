@@ -1,0 +1,82 @@
+parameters:
+- name: environment
+  type: object
+- name: dependsOn
+  type: object
+  default: []
+
+stages:
+- stage: stage_deploy_${{ parameters.environment }}
+  pool: $(PRIVATE_AGENT_DEFAULT_DEPLOY)
+  displayName: Deploy-${{ parameters.environment }}
+  dependsOn: ${{ parameters.dependsOn }}
+  jobs:
+  - deployment: job_deploy
+    displayName: Deploy
+    environment: deploy-manager-${{ parameters.environment }}
+    variables:
+      APP_VERSION: $[ coalesce(variables.VERSION_PARAMETER, stageDependencies.stage_build.job_set_version.outputs['set_version.APP_VERSION'], variables.VERSION_FILE) ]
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+          - download: none
+          - script: |
+              CURRENT_VERSION=$(cat VERSION)
+              echo "##vso[task.logissue type=warning;] Version parameter not specified, deploy will be done from the current VERSION: ${CURRENT_VERSION}"
+              echo "##vso[task.setvariable variable=APP_VERSION;]${CURRENT_VERSION}"
+            displayName: 'Set version when not specified'
+            condition: and(eq(variables['Build.Reason'], 'Manual'), eq(variables.isVersionParameterEmpty, true))
+          - template: /tasks/nexus/download_file.yml
+            parameters:
+              repository: $(HELM_REPOSITORY)
+              remoteFileLocation: "$(HELM_CHART_NAME)-$(HELM_CHART_VERSION).tgz"
+              displayName: "Download helm package"
+              localFileLocation: $(Agent.TempDirectory)
+          - task: ExtractFiles@1
+            displayName: Extract helm package
+            inputs:
+              archiveFilePatterns: "$(Agent.TempDirectory)/$(HELM_CHART_NAME)-$(HELM_CHART_VERSION).tgz"
+              destinationFolder: $(Agent.TempDirectory)
+              cleanDestinationFolder: false
+          - script: |
+              echo "##[debug] HELM_RELEASE_NAMESPACE..........: $(HELM_RELEASE_NAMESPACE)"
+              echo "##[debug] HELM_CHART_NAME.................: $(HELM_CHART_NAME)"
+              echo "##[debug] HELM_CHART_VERSION..............: $(HELM_CHART_VERSION)"
+              echo "##[debug] HELM_RELEASE_NAME...............: $(HELM_RELEASE_NAME)"
+              echo "##[debug] APP_VERSION.....................: $(APP_VERSION)"
+              echo "##[debug] HELM_VERSION....................: $(HELM_VERSION)"
+              echo "##[debug] kubernetesServiceConnection.....: k8s-gateway-external-${{ lower(parameters.environment) }}"
+
+              echo "##[group] list files"
+              ls -la
+              echo "##[endgroup]"
+            displayName: Show variables
+            workingDirectory: $(Agent.TempDirectory)
+          - task: HelmDeploy@1
+            displayName: 'Helm list'
+            inputs:
+              connectionType: 'Kubernetes Service Connection'
+              kubernetesServiceConnection: 'k8s-gateway-external-${{ lower(parameters.environment) }}'
+              namespace: $(HELM_RELEASE_NAMESPACE)
+              tillerNamespace: 'kube-system'
+            env:
+              ASDF_HELM_VERSION: $(HELM_VERSION)
+          - task: HelmDeploy@1
+            displayName: 'Helm upgrade'
+            inputs:
+              connectionType: 'Kubernetes Service Connection'
+              kubernetesServiceConnection: 'k8s-gateway-external-${{ lower(parameters.environment) }}'
+              namespace: $(HELM_RELEASE_NAMESPACE)
+              command: upgrade
+              chartName: '$(Agent.TempDirectory)/$(HELM_CHART_NAME)'
+              chartVersion: $(HELM_CHART_VERSION)
+              releaseName: $(HELM_RELEASE_NAME)
+              overrideValues: 'apigw.imageTag=$(APP_VERSION)'
+              valueFile: .azuredevops/env/${{ parameters.environment }}/values.yaml
+              arguments: '--install --debug'
+              tillerNamespace: 'kube-system'
+              waitForExecution: false
+            env:
+              ASDF_HELM_VERSION: $(HELM_VERSION)

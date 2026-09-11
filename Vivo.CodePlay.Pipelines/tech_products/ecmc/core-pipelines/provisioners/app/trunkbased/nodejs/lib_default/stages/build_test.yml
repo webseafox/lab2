@@ -1,0 +1,58 @@
+parameters:
+- name: incrementLevel
+  default: patch
+- name: enableDevflowValidations
+  type: boolean
+  default: False
+
+stages:
+- stage: build_test
+  displayName: "Build & Test"
+  dependsOn:
+  - pipeline_init
+  - ${{ if eq(parameters.enableDevflowValidations, True) }}:
+    - repo_validations
+  pool: "$(PRIVATE_AGENT_DEFAULT)"
+  jobs:
+    - job: bump_version
+      displayName: Bumping Version
+      steps:
+      - template: /tech_products/ecmc/core-pipelines/tasks/nodejs/npm_extract_version.yml
+        parameters:
+          currentVersionVariableOut: LIB_CURRENT_VERSION
+      - template: /tech_products/ecmc/core-pipelines/tasks/versioning/bump_version.yml
+        parameters:
+          currentVersion: $(export_current_version.LIB_CURRENT_VERSION)
+          newVersionVariableOut: LIB_NEW_VERSION
+          incrementLevel: ${{ parameters.incrementLevel }}
+          bumpVersionOnManual: true
+
+    - job: build_app
+      condition: and(succeeded(), eq(variables.flowIsTagging, false))
+      displayName: Build & Test & Coverage
+      dependsOn:
+      - bump_version
+      variables:
+      - name: LIB_NEW_VERSION 
+        value: $[ dependencies.bump_version.outputs['component_bump_version.LIB_NEW_VERSION'] ]
+      steps:
+      - template: /tech_products/ecmc/core-pipelines/tasks/git/checkout_last_commit.yml
+        parameters:
+          branchName: "$(Build.SourceBranchName)"
+      - template: /tech_products/ecmc/core-pipelines/task_groups/build/nodejs_build_test.yml
+      - template: /tech_products/ecmc/core-pipelines/tasks/tests/publish_tests_result.yml
+        parameters:
+          testResultsFilesPattern: "**/junit.xml"
+          searchFolder: "$(Build.SourcesDirectory)"
+          publishRunAttachments: false
+          testRunTitle: "Testes Unitários"
+          condition: always()
+        # - template: /tech_products/ecmc/core-pipelines/task_groups/tests/publish_tests_reports.yml
+        #   parameters:
+        #     coverageFilePattern: "$(COVERAGE_REPORT_SUMMARY_FILE_LOCATION)"
+        #     pathToSources: "$(COVERAGE_REPORT_PATH_TO_SOURCE)"
+        #     additionalCodeCoverageFiles: "$(COVERAGE_REPORT_ADDITIONAL_FILE)"
+      - template: /tech_products/ecmc/core-pipelines/tasks/tests/publish_coverage_report.yml
+        parameters:
+          codeCoverageTool: "Cobertura"
+          reportPath: '$(System.DefaultWorkingDirectory)/**/*-coverage.xml'

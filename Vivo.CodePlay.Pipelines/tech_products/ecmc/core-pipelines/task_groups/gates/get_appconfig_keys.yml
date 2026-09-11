@@ -1,0 +1,116 @@
+parameters:
+- name: appConfigurationEnabled
+  type: boolean
+  default: true
+- name: azureSubscription
+  default: "$(APP_CONFIGURATION_AZURE_SUBSCRIPTION)"
+- name: appConfigurationEndpoint
+  default: "$(APP_CONFIGURATIN_ENDPOINT)"
+
+steps:
+  - bash: |
+      echo "##[debug] APP CONFIG ENABLED.............: ${{ parameters.appConfigurationEnabled }}"
+      echo "##[debug] APP CONFIG SUBSCRIPTION........: ${{ parameters.azureSubscription }}"
+      echo "##[debug] APP CONFIG ENDPOINT............: ${{ parameters.appConfigurationEndpoint }}"
+    displayName: "App Configuration Info"
+
+  - bash: |
+      source ~/.bashrc
+
+      TEAM_PROJECT_NAME="$(System.TeamProject)"
+      TEAM_PROJECT_ID="`echo $(System.TeamProjectId) | tr '-' '_'`"
+
+      KEY_SONAR_BREAK_ENABLED=$(echo "SONAR_ERROR_BREAK_ENABLED_${TEAM_PROJECT_ID}" | awk 'BEGIN { getline; print toupper($0) }')
+      LABEL_GLOBAL="GLOBAL"
+      LABEL_PROJECT="$TEAM_PROJECT_NAME"
+
+      echo "##vso[task.setvariable variable=OUT_LABEL_GLOBAL]$LABEL_GLOBAL"
+      echo "##vso[task.setvariable variable=OUT_LABEL_PROJECT]$LABEL_PROJECT"
+      echo "##vso[task.setvariable variable=OUT_KEY_SONAR_BREAK_ENABLED]$KEY_SONAR_BREAK_ENABLED"
+
+      echo "##[debug] LABEL_GLOBAL........................: $LABEL_GLOBAL"
+      echo "##[debug] LABEL_PROJECT.......................: $LABEL_PROJECT"
+      echo "##[debug] KEY SONAR BREAK _ENABLED............: $KEY_SONAR_BREAK_ENABLED"
+
+    condition: and( succeeded(), ${{ eq(parameters.appConfigurationEnabled, true) }} )
+    displayName: 'Generate app configuration keys'
+
+  - task: AzureAppConfiguration@8
+    displayName: 'Download app configuration keys'
+    condition: and( succeeded(), ${{ eq(parameters.appConfigurationEnabled, true) }} )
+    timeoutInMinutes: 1
+    retryCountOnTaskFailure: 5
+    inputs:
+      azureSubscription: ${{ parameters.azureSubscription }}
+      AppConfigurationEndpoint: ${{ parameters.appConfigurationEndpoint }}
+      Label: '$(OUT_LABEL_GLOBAL),$(OUT_LABEL_PROJECT)'
+    env:
+      HTTPS_PROXY: $(PROXY_AGENT_HTTPS)
+      HTTP_PROXY: $(PROXY_AGENT_HTTP)
+      NO_PROXY: $(PROXY_AGENT_NO_PROXY)
+
+  - bash: |
+      source ~/.bashrc
+
+      get_app_configuration_key() {
+          VAR_NAME="$1";
+          DEFAULT_VALUE="$2"
+          eval VAR_VALUE="\$$VAR_NAME";
+          [ -z "$VAR_VALUE" ] && echo "$DEFAULT_VALUE" || echo "$VAR_VALUE"
+      }
+
+      SONAR_BREAK_ENABLED_VALUE=`get_app_configuration_key $OUT_KEY_SONAR_BREAK_ENABLED "false"`
+
+      echo "##[debug] GLOBAL VARIABLES"
+      echo "##[debug] OUT_KEY_SONAR_BREAK_ENABLED............: $OUT_KEY_SONAR_BREAK_ENABLED"
+      echo "##[debug] SONAR_BREAK_ENABLED_VALUE..............: $SONAR_BREAK_ENABLED_VALUE"
+      echo ""
+
+      cat <<EOF > ${AGENT_TEMPDIRECTORY}/app_config_vars_sonar.json
+      {
+        "items": [
+        {"key": "$OUT_KEY_SONAR_BREAK_ENABLED","value": "$SONAR_BREAK_ENABLED_VALUE","label": "$OUT_LABEL_PROJECT","content_type": null,"tags": {}}
+        ]
+      }
+      EOF
+    condition: and( succeeded(), ${{ eq(parameters.appConfigurationEnabled, true) }} )
+    displayName: 'Validate app configuration keys'
+
+  - task: AzureAppConfigurationPush@7
+    displayName: 'Push app configuration keys'
+    condition: and( succeeded(), ${{ eq(parameters.appConfigurationEnabled, true) }} )
+    inputs:
+      azureSubscription: ${{ parameters.azureSubscription }}
+      AppConfigurationEndpoint: ${{ parameters.appConfigurationEndpoint }}
+      ConfigurationFile: '$(Agent.TempDirectory)/app_config_vars_sonar.json'
+      FileContentProfile: appconfig/kvset
+    env:
+      HTTPS_PROXY: $(PROXY_AGENT_HTTPS)
+      HTTP_PROXY: $(PROXY_AGENT_HTTP)
+      NO_PROXY: $(PROXY_AGENT_NO_PROXY)
+
+  - bash: |
+      source ~/.bashrc
+
+      getvar() {
+        VAR_NAME="$1";
+        eval VAR_VALUE="\$$VAR_NAME";
+        [ -z "$VAR_VALUE" ] && echo "false" || echo "$VAR_VALUE"
+      }
+
+      USE_APPCONFIG="${{ parameters.appConfigurationEnabled }}"
+
+      if [[ "$USE_APPCONFIG" =~ ^(T|t)rue$ ]]; then
+
+        SONAR_BREAK_ENABLED="$(getvar $OUT_KEY_SONAR_BREAK_ENABLED)"
+        if [ "$SONAR_BREAK_ENABLED" != "true" ]; then
+            SONAR_BREAK_ENABLED=false
+        fi
+      fi
+
+      echo "##[debug] SONAR_BREAK_ENABLED...........: $SONAR_BREAK_ENABLED"
+      echo ""
+      echo "##vso[task.setvariable variable=SONAR_BREAK_ENABLED;isOutput=true;]$SONAR_BREAK_ENABLED"
+    condition: succeeded()
+    displayName: 'Evaluate quality gate flags'
+    name: evaluate_flags_sonar

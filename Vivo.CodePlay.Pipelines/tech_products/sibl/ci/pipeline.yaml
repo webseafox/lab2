@@ -1,0 +1,3190 @@
+﻿# ==================================================================
+# Pipeline: SIBL Repository Migration - Exportação e Validação Siebel
+# -----------------------------------------------------
+# Pipeline de Integração Contínua para migração controlada de objetos
+# Siebel (repository .sif / non-repository .xml) com identificação manual,
+# export via SSH remoto, Fortify SAST, SonarQube Quality Gate e suporte
+# a 4 ambientes (esteira1, esteira2, preprod, prodlike).
+# -----------------------------------------------------
+# Capacidades Implementadas:
+# ✅ Validação forte de parâmetros (Jira, objectType, ambiente)
+# ✅ Identificação manual com manifesto JSON estruturado (jq + fallback)
+# ✅ Mapeamento automático IDs → Paths Siebel (dicionário inline)
+# ✅ Export via SSH remoto (siebdev.exe / WfProcMgr)
+# ✅ Fortify SAST obrigatório (compliance)
+# ✅ SonarQube Quality Gate bloqueador (SonarAnalysisFromVivo@2)
+# ✅ Security Gate consolidado (fail-safe: assume FAILED)
+# ✅ Resumo de execução para auditoria (condition: always)
+# -----------------------------------------------------
+# TODOs Futuras Melhorias:
+# - GitOperations: commit/tag automático pós-export
+# - Compile: compilação SRF automática
+# - Import: importação de objetos no ambiente destino
+# - DatabaseMigration: DDL/DML/DCL scripts
+# - Gate de aprovação manual (ManualValidation@1)
+# ==================================================================
+
+parameters:
+  # ==================================================================
+  # Configuração de Ambiente e Rastreabilidade
+  # ==================================================================
+  - name: environment
+    displayName: '🌍 Ambiente de Destino'
+    type: string
+    default: 'preprod'
+    values:
+      - dev1
+      - qa1
+      - qa3
+      - pp
+      - esteira1
+      - esteira2
+      - preprod
+      - prodlike
+
+  - name: jiraProject
+    displayName: '🎫 Código do Projeto Jira (recomendado para rastreabilidade)'
+    type: string
+    default: ''
+
+  # ==================================================================
+  # Configuração de Objetos Siebel
+  # ------------------------------------------------------------------
+  # objectType: Tipo de objeto a filtrar (repository .sif, nonrepository .xml, both)
+  # objectIds: Formato type{subtype=Nome} separado por vírgula (vazio = projeto completo)
+  # projectName: Nome do projeto Siebel (default: nome do repositório Git)
+  # ==================================================================
+  - name: objectType
+    displayName: '📁 Tipo de Objeto Siebel'
+    type: string
+    default: 'both'
+    values:
+      - repository      # Objetos repository (.sif) - Siebel Tools
+      - nonrepository   # Objetos non-repository (.xml) - WfProcMgr
+      - both            # Ambos tipos simultâneamente
+
+  - name: objectIds
+    displayName: '📋 Especificação de Objetos Siebel (type{subtype=Nome})'
+    type: string
+    default: ''
+
+  - name: projectName
+    displayName: '📂 Nome do Projeto Siebel'
+    type: string
+    default: '$(Build.Repository.Name)'
+
+  # ==================================================================
+  # Controle de Fluxo e Capacidades
+  # ==================================================================
+  - name: enableExport
+    displayName: '📤 Habilitar Export de Objetos Siebel'
+    type: boolean
+    default: true
+
+  - name: enableGitOperations
+    displayName: '🔀 Habilitar Operações Git (Commit/Tag)'
+    type: boolean
+    default: true
+
+  - name: enableCompile
+    displayName: '🔨 Habilitar Compilação SRF'
+    type: boolean
+    default: true
+
+  - name: enableImport
+    displayName: '📥 Habilitar Import de Objetos'
+    type: boolean
+    default: true
+
+  # ==================================================================
+  # Configurações de Segurança e Qualidade
+  # ==================================================================
+  - name: sonarServiceConnection
+    type: string
+    default: 'VIVO_SONARQUBE'
+    displayName: 'Service Connection do SonarQube'
+
+  - name: sonarQualityGate
+    type: string
+    default: 'AzureDevOps-Default'
+    displayName: 'Quality Gate do SonarQube'
+
+  - name: sonarScannerMode
+    type: string
+    default: 'cli'
+    displayName: 'Modo do scanner SonarQube'
+    values:
+      - 'cli'
+      - 'dotnet'
+
+  - name: sonarPollingTimeoutSec
+    type: string
+    default: '600'
+    displayName: 'Timeout do Polling SonarQube (segundos)'
+
+  - name: sonarWsTimeoutSec
+    type: string
+    default: '300'
+    displayName: 'Timeout da API SonarQube (segundos)'
+
+  - name: sonarTaskRetryCount
+    type: number
+    default: 2
+    displayName: 'Tentativas automáticas da task SonarQube em falha transitória'
+
+  - name: useAppConfig
+    type: boolean
+    default: true
+    displayName: 'Usar Azure App Configuration para SonarQube'
+
+  - name: enableFortifyExclusions
+    displayName: 'Habilitar exclusões Fortify (checkout repositório)'
+    type: boolean
+    default: false
+  
+  - name: SKIP_SECURITY_GATE
+    displayName: 'Pular Gate de Segurança'
+    type: boolean
+    default: false
+
+  # ==================================================================
+  # Capacidades Futuras (Roadmap)
+  # ==================================================================
+  - name: enableDatabaseMigration
+    displayName: '🗄️ Habilitar Migração de Banco (DDL/DML/DCL)'
+    type: boolean
+    default: false
+
+  # ==================================================================
+  # Diagnóstico e Simulação
+  # ==================================================================
+  - name: debugMode
+    displayName: '🐛 Modo Debug (logs detalhados)'
+    type: boolean
+    default: false
+
+  - name: dryRun
+    displayName: '🧪 Dry Run (simular sem executar)'
+    type: boolean
+    default: true
+
+  # ==================================================================
+  # Publicação no Azure Artifacts
+  # ==================================================================
+  - name: enableArtifactsPublish
+    displayName: '📦 Habilitar publicação no Azure Artifacts'
+    type: boolean
+    default: true
+
+  - name: artifactsFeed
+    displayName: '📚 Feed do Azure Artifacts'
+    type: string
+    default: 'DevOps'
+
+  - name: artifactsPackageName
+    displayName: '📦 Prefixo do pacote no Azure Artifacts (concatenado com environment)'
+    type: string
+    default: 'sibl-exports-'
+
+# ==================================================================
+# Variáveis Internas do Pipeline
+# ==================================================================
+variables:
+  # ==================================================================
+  # Variáveis Globais e Rastreabilidade
+  # ==================================================================
+  - name: SIGLA
+    value: $[ lower(split(variables['System.TeamProject'],' ')[0]) ]
+
+  - name: TIMESTAMP
+    value: $[format('{0:yyyyMMddHHmmss}', pipeline.startTime)]
+
+  - name: ARTIFACTS_ENV_SUFFIX
+    ${{ if eq(parameters.environment, 'dev1') }}:
+      value: 'esteira1'
+    ${{ elseif eq(parameters.environment, 'qa1') }}:
+      value: 'esteira2'
+    ${{ elseif eq(parameters.environment, 'qa3') }}:
+      value: 'preprod'
+    ${{ elseif eq(parameters.environment, 'pp') }}:
+      value: 'preprod'
+    ${{ else }}:
+      value: '${{ parameters.environment }}'
+
+  # Nome do pacote Azure Artifacts: prefixo + ambiente (ex: sibl-exports-esteira1)
+  - name: ARTIFACTS_PACKAGE_NAME
+    value: '${{ parameters.artifactsPackageName }}$(ARTIFACTS_ENV_SUFFIX)'
+
+  - name: Git.UserName
+    value: 'Azure DevOps Pipeline'
+
+  - name: Git.UserEmail
+    value: 'pipeline@telefonicati.onmicrosoft.com'
+
+  # ==================================================================
+  # Normalização de Flags Booleanas (parâmetros → variáveis string)
+  # ==================================================================
+  - name: DEBUG_MODE
+    ${{ if eq(parameters.debugMode, true) }}:
+      value: 'true'
+    ${{ else }}:
+      value: 'false'
+
+  - name: ENABLE_EXPORT
+    ${{ if eq(parameters.enableExport, true) }}:
+      value: 'true'
+    ${{ else }}:
+      value: 'false'
+
+  - name: ENABLE_GIT_OPERATIONS
+    ${{ if eq(parameters.enableGitOperations, true) }}:
+      value: 'true'
+    ${{ else }}:
+      value: 'false'
+
+  - name: DRY_RUN_MODE
+    ${{ if eq(parameters.dryRun, true) }}:
+      value: 'true'
+    ${{ else }}:
+      value: 'false'
+
+  # ==================================================================
+  # AppSec / Azure App Configuration
+  # ------------------------------------------------------------------
+  # ⚠️ Coordenar alterações com AppSec Team
+  # Override via Variable Group ou Azure Key Vault
+  # ==================================================================
+  - name: APP_CONFIGURATION_AZURE_SUBSCRIPTION
+    value: 'DevOpsSharedResources'
+
+  - name: AZURE_APP_CONFIGURATION_ENDPOINT
+    value: 'https://appcs-azdevops-shared.azconfig.io'
+
+  - name: AKV_DEVOPS_NAME
+    value: 'kv-azdevops-shared'
+
+  # Variáveis utilizadas por templates de Segurança (Fortify/SCA)
+  - name: CACORP_LOCATION
+    value: '$(Agent.HomeDirectory)/../../certs/CACORP.pem'
+
+  # ==================================================================
+  # Infraestrutura de Execução (Agent Pools)
+  # ==================================================================
+  - name: CI_AGENT_POOL
+    value: 'GeneralPurposeLinuxAgentsCI'
+  - name: CI_AGENT_POOL_WINDOWS
+    value: 'SiebelAgents'
+
+  # ==================================================================
+  # Variáveis por Ambiente (carregadas por Variable Groups)
+  # ------------------------------------------------------------------
+  # Valores reais são injetados via Variable Groups do Azure DevOps.
+  # Os placeholders OVERRIDE_VIA_VARIABLE_GROUP indicam que o valor
+  # DEVE ser sobrescrito pelo Variable Group correspondente.
+  # ==================================================================
+  - ${{ if eq(parameters.environment, 'esteira1') }}:
+    - name: SIEBEL_SERVER
+      value: 'OVERRIDE_VIA_VARIABLE_GROUP'
+    - name: SIEBEL_SERVER_IP
+      value: 'OVERRIDE_VIA_VARIABLE_GROUP'
+    - name: WINDOWS_SERVER
+      value: 'OVERRIDE_VIA_VARIABLE_GROUP'
+    - name: WINDOWS_SERVER_IP
+      value: 'OVERRIDE_VIA_VARIABLE_GROUP'
+    - name: SIEBEL_EXPORT_DATASOURCE
+      value: 'SIBL_Esteira1_DEV'
+
+  - ${{ if eq(parameters.environment, 'dev1') }}:
+    - name: SIEBEL_SERVER
+      value: 'OVERRIDE_VIA_VARIABLE_GROUP'
+    - name: SIEBEL_SERVER_IP
+      value: 'OVERRIDE_VIA_VARIABLE_GROUP'
+    - name: WINDOWS_SERVER
+      value: 'OVERRIDE_VIA_VARIABLE_GROUP'
+    - name: WINDOWS_SERVER_IP
+      value: 'OVERRIDE_VIA_VARIABLE_GROUP'
+    - name: SIEBEL_EXPORT_DATASOURCE
+      value: 'SIBL_Esteira1_DEV'
+
+  - ${{ if eq(parameters.environment, 'esteira2') }}:
+    - name: SIEBEL_SERVER
+      value: 'OVERRIDE_VIA_VARIABLE_GROUP'
+    - name: SIEBEL_SERVER_IP
+      value: 'OVERRIDE_VIA_VARIABLE_GROUP'
+    - name: WINDOWS_SERVER
+      value: 'OVERRIDE_VIA_VARIABLE_GROUP'
+    - name: WINDOWS_SERVER_IP
+      value: 'OVERRIDE_VIA_VARIABLE_GROUP'
+    - name: SIEBEL_EXPORT_DATASOURCE
+      value: 'SIBL_Esteira2_DEV'
+
+  - ${{ if eq(parameters.environment, 'qa1') }}:
+    - name: SIEBEL_SERVER
+      value: 'OVERRIDE_VIA_VARIABLE_GROUP'
+    - name: SIEBEL_SERVER_IP
+      value: 'OVERRIDE_VIA_VARIABLE_GROUP'
+    - name: WINDOWS_SERVER
+      value: 'OVERRIDE_VIA_VARIABLE_GROUP'
+    - name: WINDOWS_SERVER_IP
+      value: 'OVERRIDE_VIA_VARIABLE_GROUP'
+    - name: SIEBEL_EXPORT_DATASOURCE
+      value: 'SIBL_Esteira2_DEV'
+
+  - ${{ if eq(parameters.environment, 'preprod') }}:
+    - name: SIEBEL_SERVER
+      value: 'OVERRIDE_VIA_VARIABLE_GROUP'
+    - name: SIEBEL_SERVER_IP
+      value: 'OVERRIDE_VIA_VARIABLE_GROUP'
+    - name: WINDOWS_SERVER
+      value: 'OVERRIDE_VIA_VARIABLE_GROUP'
+    - name: WINDOWS_SERVER_IP
+      value: 'OVERRIDE_VIA_VARIABLE_GROUP'
+    - name: SIEBEL_EXPORT_DATASOURCE
+      value: 'SIBL_EsteiraPreProd_DEV'
+
+  - ${{ if eq(parameters.environment, 'qa3') }}:
+    - name: SIEBEL_SERVER
+      value: 'OVERRIDE_VIA_VARIABLE_GROUP'
+    - name: SIEBEL_SERVER_IP
+      value: 'OVERRIDE_VIA_VARIABLE_GROUP'
+    - name: WINDOWS_SERVER
+      value: 'OVERRIDE_VIA_VARIABLE_GROUP'
+    - name: WINDOWS_SERVER_IP
+      value: 'OVERRIDE_VIA_VARIABLE_GROUP'
+    - name: SIEBEL_EXPORT_DATASOURCE
+      value: 'SIBL_EsteiraPreProd_DEV'
+
+  - ${{ if eq(parameters.environment, 'pp') }}:
+    - name: SIEBEL_SERVER
+      value: 'OVERRIDE_VIA_VARIABLE_GROUP'
+    - name: SIEBEL_SERVER_IP
+      value: 'OVERRIDE_VIA_VARIABLE_GROUP'
+    - name: WINDOWS_SERVER
+      value: 'OVERRIDE_VIA_VARIABLE_GROUP'
+    - name: WINDOWS_SERVER_IP
+      value: 'OVERRIDE_VIA_VARIABLE_GROUP'
+    - name: SIEBEL_EXPORT_DATASOURCE
+      value: 'SIBL_EsteiraPreProd_DEV'
+
+  - ${{ if eq(parameters.environment, 'prodlike') }}:
+    - name: SIEBEL_SERVER
+      value: 'OVERRIDE_VIA_VARIABLE_GROUP'
+    - name: SIEBEL_SERVER_IP
+      value: 'OVERRIDE_VIA_VARIABLE_GROUP'
+    - name: WINDOWS_SERVER
+      value: 'OVERRIDE_VIA_VARIABLE_GROUP'
+    - name: WINDOWS_SERVER_IP
+      value: 'OVERRIDE_VIA_VARIABLE_GROUP'
+    - name: SIEBEL_EXPORT_DATASOURCE
+      value: 'SIBL_EsteiraProdLike_DEV'
+    - group: vg-sibl-env-dev-prodlike
+
+  # ==================================================================
+  # Paths e Diretórios de Processamento
+  # ==================================================================
+  - name: EXPORT_PATH
+    value: '$(SIEBEL_EXPORT_PATH)\$(TIMESTAMP)'
+
+  - name: SIF_OUTPUT_PATH
+    value: '$(Pipeline.Workspace)/sif_files'
+
+  - name: XML_OUTPUT_PATH
+    value: '$(Pipeline.Workspace)/xml_files'
+
+  - name: SRF_OUTPUT_PATH
+    value: '$(Pipeline.Workspace)/srf_output'
+
+  # ==================================================================
+  # Configuração Padrão de Export Siebel
+  # ------------------------------------------------------------------
+  # Valores default para export sem Variable Groups.
+  # ⚠️ SIEBEL_EXPORT_PASSWORD DEVE ser sobrescrito via Variable Group / Key Vault
+  # ==================================================================
+  - name: SIEBEL_EXPORT_SERVER
+    value: 'SV2KPREM2'
+
+  - name: SIEBEL_EXPORT_TOOLS_PATH
+    value: 'D:\Siebel\Tools15\BIN'
+
+  - name: SIEBEL_EXPORT_CONFIG_PATH
+    value: '$(Agent.TempDirectory)\$(SIEBEL_EXPORT_BUILD_REF)\tools_DevOps.cfg'
+
+  - name: SIEBEL_EXPORT_USER
+    value: 'CRM_MIGRADOR_SIEBEL8_PROD'
+
+  - name: SIEBEL_EXPORT_REPOSITORY
+    value: 'Siebel Repository'
+
+  - name: SIEBEL_EXPORT_OBJECT_LIST_FILE
+    value: '$(Agent.TempDirectory)\$(SIEBEL_EXPORT_BUILD_REF)\lista_sifs_sieb8.txt'
+
+  - name: SIEBEL_EXPORT_LOG_FILE
+    value: 'D:\Siebellogs\export_log_${{ parameters.environment }}_$(SIEBEL_EXPORT_BUILD_REF).txt'
+
+  - name: SIEBEL_EXPORT_BUILD_REF
+    value: '$(Build.DefinitionName)-$(Build.BuildId)'
+
+  - name: SIEBEL_EXPORT_LOCAL_SIF_DIR
+    value: '$(Pipeline.Workspace)\sif_files'
+
+  # ==================================================================
+  # Configuração Dinâmica de Scan Fortify
+  # ------------------------------------------------------------------
+  # Determina o diretório de scan baseado em enableFortifyExclusions
+  # ==================================================================
+  - ${{ if eq(parameters.enableFortifyExclusions, true) }}:
+    - name: FORTIFY_SCAN_DIRECTORY
+      value: '$(Build.SourcesDirectory)/$(Build.Repository.Name)'
+  - ${{ else }}:
+    - name: FORTIFY_SCAN_DIRECTORY
+      value: '$(Build.SourcesDirectory)'
+
+  # ==================================================================
+  # Configuração DEV6  NonRepository Export (srvrmgr ADMBatchProc)
+  # ------------------------------------------------------------------
+  # Defaults para export inline via SSH DEV6.
+  # Sobrescritos pelo vg-sibl-env-dev6 quando cadastrados no Variable Group.
+  # ==================================================================
+  - name: SIEBEL_SRVRMGR_PATH
+    value: '/app/siebel/siebsrvr/bin/srvrmgr'
+
+  - name: SIEBEL_REMOTE_EXPORT_DIR
+    value: '/app/siebel/exports/adm'
+
+  - name: SIEBEL_SRVRMGR_LANG
+    value: 'PTB'
+
+  - name: SIEBEL_EXPORT_POLL_INTERVAL
+    value: '15'
+
+  - name: SIEBEL_EXPORT_POLL_MAX
+    value: '60'
+
+  # ==================================================================
+  # Variable Groups Compartilhados
+  # ==================================================================
+  - group: vg-sibl-env-global
+  # - group: vg-sibl-env-dev-preprod
+
+# Estágios do Pipeline
+# ==================================================================
+stages:
+  # ==================================================================
+  # Stage 1: Prepare - Inicialização, Validação e Versionamento
+  # Descrição: Valida parâmetros de entrada, prepara diretórios de trabalho
+  #            e gera versão semântica para rastreabilidade do build.
+  # ==================================================================
+  - stage: Prepare
+    displayName: '🚀 Prepare - Inicialização'
+    pool:
+      name: $(CI_AGENT_POOL)
+    jobs:
+      - job: Initialize
+        displayName: 'Inicialização e Validação'
+        steps:
+          # [Observabilidade] Exibe parâmetros para diagnóstico em logs
+          - bash: |
+              echo "--- SIBL CI Pipeline ---"
+              echo "Build: $(Build.BuildId) | Ambiente: ${{ parameters.environment }} | Tipo: ${{ parameters.objectType }} | Export: ${{ parameters.enableExport }}"
+              DEBUG_MODE="$(DEBUG_MODE)"
+              if [[ "${DEBUG_MODE}" == "true" ]]; then
+                echo "[DEBUG] BuildNumber=$(Build.BuildNumber) Timestamp=$(TIMESTAMP) Projeto=${{ parameters.projectName }} Jira=${{ parameters.jiraProject }}"
+                echo "[DEBUG] ObjectIds=${{ parameters.objectIds }}"
+                echo "[DEBUG] Stages: Export=${{ parameters.enableExport }} Git=${{ parameters.enableGitOperations }} Compile=${{ parameters.enableCompile }} Import=${{ parameters.enableImport }} DryRun=${{ parameters.dryRun }}"
+              fi
+            displayName: '📋 Exibir Configuração'
+
+          # [Validação] Valida Jira, objectType, objectIds, ambiente (prod bloqueado)
+          - bash: |
+              set -eo pipefail
+              echo "--- Validação de Parâmetros ---"
+              errors=0
+              warnings=0
+
+              # 1. Projeto Jira
+              jiraProject="${{ parameters.jiraProject }}"
+              if [[ -z "${jiraProject}" ]]; then
+                echo "⚠️  AVISO: Jira não informado (recomendado para rastreabilidade)"
+                warnings=$((warnings + 1))
+              elif ! [[ "${jiraProject}" =~ ^[A-Za-z][A-Za-z0-9_-]{0,15}[0-9]*$ ]]; then
+                echo "🚨 ERRO: Formato inválido Jira: ${jiraProject} (esperado: letra inicial, alfanumérico/hífen/underscore)"
+                errors=$((errors + 1))
+              else
+                echo "✅ Jira: ${jiraProject}"
+              fi
+
+              # 2. Tipo de Objeto
+              objectType="${{ parameters.objectType }}"
+              if ! [[ "${objectType}" =~ ^(repository|nonrepository|both)$ ]]; then
+                echo "🚨 ERRO: objectType inválido: ${objectType} (válidos: repository, nonrepository, both)"
+                errors=$((errors + 1))
+              else
+                echo "✅ objectType: ${objectType}"
+              fi
+
+              # 3. Especificação de Objetos
+              objectIds="${{ parameters.objectIds }}"
+              if [[ -z "${objectIds}" ]]; then
+                echo "⚠️  AVISO: objectIds vazio - será exportado projeto COMPLETO"
+                warnings=$((warnings + 1))
+              else
+                if ! [[ "${objectIds}" =~ ^[a-z]+\{[A-Za-z0-9_\ -]+=[A-Za-z0-9_\ -]+\}(,[a-z]+\{[A-Za-z0-9_\ -]+=[A-Za-z0-9_\ -]+\})*$ ]]; then
+                  echo "🚨 ERRO: Formato inválido objectIds. Esperado: type{subtype=Nome},type{subtype=Nome}"
+                  echo "   Recebido: ${objectIds}"
+                  errors=$((errors + 1))
+                else
+                  specCount=$(echo "${objectIds}" | tr ',' '\n' | wc -l)
+                  echo "✅ objectIds: ${specCount} especificação(ões)"
+                fi
+              fi
+
+              # 4. Ambiente (Bloqueio PROD)
+              environment="${{ parameters.environment }}"
+              if [[ "${environment}" == "prod" ]]; then
+                echo "🚨 ERRO: Ambiente PROD bloqueado nesta pipeline. Use pipeline CD."
+                errors=$((errors + 1))
+              else
+                echo "✅ Ambiente: ${environment}"
+              fi
+
+              # Resumo
+              echo "--- Resultado: ${errors} erro(s), ${warnings} aviso(s) ---"
+              if [[ ${errors} -gt 0 ]]; then
+                echo "🚫 Validação FALHOU. Corrija os erros acima."
+                exit 1
+              fi
+              echo "✅ Validação OK"
+            displayName: '✅ Validar Parâmetros'
+
+          # [Configuração Inicial] Checkout completo com histórico e tags
+          - checkout: self
+            clean: true
+            fetchDepth: 0
+            fetchTags: true
+            displayName: '📥 Checkout do Código'
+
+          # [Versionamento] Versão semântica: última tag + nova versão baseada em Build ID
+          - bash: |
+              set -eo pipefail
+              echo "Gerando informações de versão..."
+
+              # Obter última tag sem falhar quando não existir nenhuma
+              lastTag=$(git tag --sort=-creatordate | head -1)
+              if [[ -z "${lastTag}" ]]; then
+                lastTag='v0.0.0'
+              fi
+              echo "Última tag: ${lastTag}"
+
+              # Gerar nova versão baseada no build
+              newVersion="v$(date +%Y.%m.%d)-$(Build.BuildId)"
+              packageVersion="$(date +%Y).$((10#$(date +%m))).$((10#$(date +%d)))-$(Build.BuildId)"
+              echo "Nova versão: ${newVersion}"
+              echo "Versão do pacote Azure Artifacts: ${packageVersion}"
+
+              # Exportar para próximos stages
+              echo "##vso[task.setvariable variable=LAST_TAG;isOutput=true]${lastTag}"
+              echo "##vso[task.setvariable variable=NEW_VERSION;isOutput=true]${newVersion}"
+              echo "##vso[task.setvariable variable=PACKAGE_VERSION;isOutput=true]${packageVersion}"
+
+              echo "✅ Versão gerada: ${newVersion}"
+            name: versioning
+            displayName: '🏷️ Gerar Versão'
+
+  # ==================================================================
+  # Stage 2: Cadastrar - Identificação Manual de Objetos Siebel
+  # Descrição: Identifica objetos para migração via IDs explícitos,
+  #            gera manifesto JSON estruturado, mapeia IDs para paths
+  #            Siebel e publica artifact para consumo downstream.
+  # ==================================================================
+  - stage: Cadastrar
+    displayName: '🔍 Cadastrar - Objetos Alterados'
+    dependsOn: Prepare
+    condition: succeeded()
+    pool:
+      name: $(CI_AGENT_POOL)
+    jobs:
+      - job: IdentifyObjects
+        displayName: 'Identificar Objetos para Migração'
+        variables:
+          # ⚠️ Referência de output entre STAGES diferentes
+          # Sintaxe: stageDependencies.<StageName>.<JobName>.outputs['<stepName>.<variableName>']
+          NEW_VERSION: $[ stageDependencies.Prepare.Initialize.outputs['versioning.NEW_VERSION'] ]
+        steps:
+          # Cadastrar apenas gera arquivos locais (manifesto JSON) a partir de parametros e variaveis ADO.
+          # Nenhum arquivo do repositorio e lido - checkout desnecessario.
+          - checkout: none
+          # [Observabilidade] Info de contexto da identificacao
+          - bash: |
+              echo '--- Identificacao de Objetos ---'
+              echo "Tipo: ${{ parameters.objectType }}"
+            displayName: '📋 Info Identificação'
+
+          # [Processamento Principal] Gerar manifesto JSON (metadata, execution, config, objects, summary)
+          # Lógica inline — substitui generate_manifest.sh
+          - bash: |
+              set -eo pipefail
+              echo "--- Gerar Manifesto JSON (inline) ---"
+
+              OBJECT_IDS="${{ parameters.objectIds }}"
+              OBJECT_TYPE="${{ parameters.objectType }}"
+              PROJECT_NAME="${{ parameters.projectName }}"
+              ENVIRONMENT="${{ parameters.environment }}"
+              MANIFEST_JSON="$(Pipeline.Workspace)/object_manifest.json"
+              MANIFEST_TXT="$(Pipeline.Workspace)/object_manifest.txt"
+
+              # ── Dicionário inline: type{subtype} → (fileExtension, method, objectType) ──
+              # Convenções Siebel:
+              #   repository  → .sif, SiebelTools
+              #   nonrepository → .xml, ADM
+              resolve_object_meta() {
+                local raw_type="$1" raw_subtype="$2" raw_name="$3"
+                local file_ext method obj_type resolved_type subtype_raw
+                subtype_raw="${raw_subtype}"
+
+                case "${raw_type}" in
+                  repository)
+                    file_ext=".sif"; method="SiebelTools"; resolved_type="repository" ;;
+                  nonrepository)
+                    file_ext=".xml"; method="ADM"; resolved_type="nonrepository" ;;
+                  *)
+                    # Inferir tipo a partir do subtipo (heurística)
+                    case "${raw_subtype,,}" in
+                      *workflow*|*buscomp*|*applet*|*view*|*screen*|*application*|*business_component*|*business_object*|*integration*)
+                        file_ext=".sif"; method="SiebelTools"; resolved_type="repository" ;;
+                      *discount*|*pricing*|*aggr*|*category*|*attribute*)
+                        file_ext=".xml"; method="ADM"; resolved_type="nonrepository" ;;
+                      *)
+                        file_ext=".sif"; method="SiebelTools"; resolved_type="repository" ;;
+                    esac
+                    ;;
+                esac
+
+                # objectType = subtypeRaw com underscores → espaços
+                obj_type=$(echo "${subtype_raw}" | sed 's/_/ /g')
+
+                # Gerar nome de arquivo esperado normalizado
+                local type_token name_token expected_file
+                type_token=$(echo "${obj_type}" | sed 's/[^A-Za-z0-9]/_/g; s/__*/_/g; s/^_//; s/_$//' | tr '[:lower:]' '[:upper:]')
+                name_token=$(echo "${raw_name}" | sed 's/[^A-Za-z0-9]/_/g; s/__*/_/g; s/^_//; s/_$//')
+                expected_file="${type_token}_${name_token}${file_ext}"
+
+                echo "${resolved_type}|${file_ext}|${method}|${obj_type}|${subtype_raw}|${expected_file}"
+              }
+
+              # ── resolve_adm_filter: Lookup table para mapear NonRepository types → ADMBatchProc filter fields ──
+              resolve_adm_filter() {
+                local adm_datatype="$1"  # Ex: "LOV", "NV AggrDiscount", etc
+                local object_name="$2"   # Ex: "NV_ON_OFF", "discount_01", etc
+                 local filter_param filter_value filter_pattern adm_datatype_norm adm_eai_method
+                
+                adm_datatype_norm=$(echo "${adm_datatype}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                
+                 # Lookup table completa: ADMDATATYPE → (ADMFILTER_PARAM, ADMEAIMETHOD)
+                 # Fonte: tabela oficial ADM — exact match para máxima precisão
+                 shopt -s nocasematch
+                 case "${adm_datatype_norm}" in
+                   # ===== EXACT MATCHES (Tabela oficial ADM) =====
+                   "Access Controlled Business Service") filter_param="Name";                  adm_eai_method="upsert" ;;
+                   "Access Controlled Task")             filter_param="Name";                  adm_eai_method="upsert" ;;
+                   "AccessGroup")                        filter_param="Name";                  adm_eai_method="upsert" ;;
+                   "AccntPromo")                         filter_param="Name";                  adm_eai_method="upsert" ;;
+                   "ADM Comm Inbound Group")             filter_param="Name";                  adm_eai_method="upsert" ;;
+                   "ADM Comm Package")                   filter_param="Name";                  adm_eai_method="upsert" ;;
+                   "ADM CommSrv CM Adapter Administration") filter_param="Name";               adm_eai_method="upsert" ;;
+                   "ADM Project")                        filter_param="Name";                  adm_eai_method="synchronize" ;;
+                   "ADM Scheduler Server Keys")          filter_param="Name";                  adm_eai_method="upsert" ;;
+                   "ADM Search Category")                filter_param="Name";                  adm_eai_method="upsert" ;;
+                   "ADM Search Category Available Flds") filter_param="Name";                  adm_eai_method="upsert" ;;
+                   "ADM Search Connector")               filter_param="Name";                  adm_eai_method="upsert" ;;
+                   "ADM Search Definition")              filter_param="Name";                  adm_eai_method="upsert" ;;
+                   "ADM Search Engine")                  filter_param="Name";                  adm_eai_method="upsert" ;;
+                   "ADM Search Parent Category")         filter_param="Name";                  adm_eai_method="upsert" ;;
+                   "ADM Shift Exception")                filter_param="Name";                  adm_eai_method="upsert" ;;
+                   "ADM Shift Schedule")                 filter_param="Name";                  adm_eai_method="upsert" ;;
+                   "AttrAdjustments")                    filter_param="Matrix Name";            adm_eai_method="upsert" ;;
+                   "Audit Trail Admin")                  filter_param="Buscomp";               adm_eai_method="upsert" ;;
+                   "BIP Sample Data Generation")         filter_param="Name";                  adm_eai_method="upsert" ;;
+                   "BIP View Association")               filter_param="Name";                  adm_eai_method="upsert" ;;
+                   "Business Rule")                      filter_param="Name";                  adm_eai_method="upsert" ;;
+                   "Correspondence Template")            filter_param="Name";                  adm_eai_method="upsert" ;;
+                   "CostList")                           filter_param="Name";                  adm_eai_method="upsert" ;;
+                   "DataMapObject")                      filter_param="Name";                  adm_eai_method="synchronize" ;;
+                   "Discount and EC Matrix")             filter_param="Name";                  adm_eai_method="synchronize" ;;
+                   "Discount Matrix: GVT Manual Positional Matrix") filter_param="Name";       adm_eai_method="upsert" ;;
+                   "EAI Data Map")                       filter_param="Name";                  adm_eai_method="synchronize" ;;
+                   "EAI Dispatch Service Rule Set")      filter_param="Name";                  adm_eai_method="upsert" ;;
+                   "EAI Lookup Map")                     filter_param="Type";                  adm_eai_method="synchronize" ;;
+                   "Fund")                               filter_param="Name";                  adm_eai_method="upsert" ;;
+                   "GVT Cities")                         filter_param="City";                  adm_eai_method="synchronize" ;;
+                   "GVT Comm Transitions")               filter_param="GVT Source Story Name"; adm_eai_method="upsert" ;;
+                   "GVT Commitments")                    filter_param="GVT Group Name";        adm_eai_method="synchronize" ;;
+                   "GVT DVM Message")                    filter_param="Message Code";          adm_eai_method="synchronize" ;;
+                   "GVT DVM Rules")                      filter_param="Name";                  adm_eai_method="synchronize" ;;
+                   "GVT EMT Data Type")                  filter_param="Name";                  adm_eai_method="synchronize" ;;
+                   "GVT Main Feature Product")           filter_param="Product Name";          adm_eai_method="upsert" ;;
+                   "GVT Mean Usage Rates")               filter_param="Name";                  adm_eai_method="synchronize" ;;
+                   "GVT Mktg Mapeamentos")               filter_param="Name";                  adm_eai_method="synchronize" ;;
+                   "GVT Placa Matriz")                   filter_param="GVT Credit Rate";       adm_eai_method="synchronize" ;;
+                   "GVT User Profile")                   filter_param="Name";                  adm_eai_method="synchronize" ;;
+                   "GVT Voice Franquia Configuration")   filter_param="Name";                  adm_eai_method="synchronize" ;;
+                   "Internal Division")                  filter_param="Name";                  adm_eai_method="upsert" ;;
+                   "LOV")                                filter_param="Name";                  adm_eai_method="synchronize" ;;
+                   "Message Type")                       filter_param="Name";                  adm_eai_method="upsert" ;;
+                   "Misc")                               filter_param="";                      adm_eai_method="" ;;
+                   "NV AggrDiscount")                    filter_param="Name";                  adm_eai_method="synchronize" ;;
+                   "NV AggrDiscSeq")                     filter_param="Name";                  adm_eai_method="synchronize" ;;
+                   "NV AssignGroup")                     filter_param="Name";                  adm_eai_method="upsert" ;;
+                   "NV AssignRule")                      filter_param="Name";                  adm_eai_method="upsert" ;;
+                   "NV BIP Report Template Registration")      filter_param="Name";            adm_eai_method="upsert" ;;
+                   "NV BIP Report Template Translations Child") filter_param="Name";           adm_eai_method="upsert" ;;
+                   "NV Commitment Constraints")          filter_param="NV Constraint Name";    adm_eai_method="synchronize" ;;
+                   "NV Content Fixup")                   filter_param="Name";                  adm_eai_method="upsert" ;;
+                   "NV ExpLOV")                          filter_param="Name";                  adm_eai_method="upsert" ;;
+                   "NV ExpType")                         filter_param="Name";                  adm_eai_method="upsert" ;;
+                   "NV Flow Control")                    filter_param="NV Destiny View";       adm_eai_method="synchronize" ;;
+                   "NV Handheld Configuration")          filter_param="Application Name";      adm_eai_method="synchronize" ;;
+                   "NV Host Table")                      filter_param="Virtual Name";          adm_eai_method="upsert" ;;
+                   "NV iHelp")                           filter_param="Name";                  adm_eai_method="upsert" ;;
+                   "NV iHelp - Header")                  filter_param="Name";                  adm_eai_method="upsert" ;;
+                   "NV Parent Offer")                    filter_param="Name";                  adm_eai_method="synchronize" ;;
+                   "NV Personalization - Actions")       filter_param="Name";                  adm_eai_method="upsert" ;;
+                   "NV Personalization - Applets")       filter_param="Name";                  adm_eai_method="upsert" ;;
+                   "NV Personalization - Event Defs")    filter_param="Name";                  adm_eai_method="upsert" ;;
+                   "NV Personalization - Events")        filter_param="Action Set Name";       adm_eai_method="upsert" ;;
+                   "NV Personalization - Rules")         filter_param="Name";                  adm_eai_method="upsert" ;;
+                   "NV Portfolio")                       filter_param="Name";                  adm_eai_method="synchronize" ;;
+                   "NV ProdFeature")                     filter_param="Name";                  adm_eai_method="synchronize" ;;
+                   "NV ProdLine")                        filter_param="Name";                  adm_eai_method="synchronize" ;;
+                   "NV Symbolic URL")                    filter_param="Name";                  adm_eai_method="upsert" ;;
+                   "NV Workflow Action Type")            filter_param="Name";                  adm_eai_method="upsert" ;;
+                   "NV Workflow Group")                  filter_param="Name";                  adm_eai_method="upsert" ;;
+                   "NV Workflow Policy")                 filter_param="Name";                  adm_eai_method="synchronize" ;;
+                   "NV Workload Rule")                   filter_param="Name";                  adm_eai_method="upsert" ;;
+                   "Organization")                       filter_param="Name";                  adm_eai_method="upsert" ;;
+                   "PDQ")                                filter_param="Description";           adm_eai_method="upsert" ;;
+                   "Personalization - Views")            filter_param="Name";                  adm_eai_method="upsert" ;;
+                   "Position")                           filter_param="Name";                  adm_eai_method="upsert" ;;
+                   "PriceList")                          filter_param="Name";                  adm_eai_method="synchronize" ;;
+                   "ProductCatalog")                     filter_param="Name";                  adm_eai_method="synchronize" ;;
+                   "ProductData")                        filter_param="Name";                  adm_eai_method="upsert" ;;
+                   "Promotion")                          filter_param="Name";                  adm_eai_method="upsert" ;;
+                   "Proposal Template")                  filter_param="Name";                  adm_eai_method="upsert" ;;
+                   "Responsibility")                     filter_param="Name";                  adm_eai_method="synchronize" ;;
+                   "Runtime Business Service")           filter_param="Name";                  adm_eai_method="upsert" ;;
+                   "SmartScript")                        filter_param="Name";                  adm_eai_method="upsert" ;;
+                   "SSO System")                         filter_param="Name";                  adm_eai_method="upsert" ;;
+                   "StateModel")                         filter_param="Name";                  adm_eai_method="upsert" ;;
+                   "UI Expression")                      filter_param="Name";                  adm_eai_method="synchronize" ;;
+                   "UI Files")                           filter_param="Name";                  adm_eai_method="synchronize" ;;
+                   "UI Object")                          filter_param="Name";                  adm_eai_method="synchronize" ;;
+                   "UIThemeMapping")                     filter_param="Name";                  adm_eai_method="upsert" ;;
+                   "UserList")                           filter_param="User.Login Name";       adm_eai_method="upsert" ;;
+                   "View - Client")                      filter_param="Name";                  adm_eai_method="upsert" ;;
+                   "VolumeDiscount")                     filter_param="Name";                  adm_eai_method="upsert" ;;
+                   "Web Application")                    filter_param="Name";                  adm_eai_method="upsert" ;;
+                   "Web Service - Inbound")              filter_param="Name";                  adm_eai_method="synchronize" ;;
+                   "Web Service - Outbound")             filter_param="Name";                  adm_eai_method="synchronize" ;;
+                   # Default: tipo não mapeado na tabela oficial
+                   *)                                    filter_param="Name";                  adm_eai_method="upsert" ;;
+                 esac
+                 shopt -u nocasematch
+
+                # Construir filtro: [FieldName]='ObjectName'
+                filter_value=$(echo "${object_name}" | sed "s/'/'\"'\"'/g")
+                filter_pattern="[${filter_param}]='${filter_value}'"
+                
+                 echo "${filter_param}|${filter_pattern}|${adm_eai_method}"
+              }
+
+              # ── Parse objectIds: formato type{subtype=Nome},... ──
+              OBJECTS_JSON="[]"
+              REPO_COUNT=0
+              NONREPO_COUNT=0
+              TOTAL_COUNT=0
+
+              if [[ -z "${OBJECT_IDS}" ]]; then
+                echo "objectIds vazio — gerando manifesto de projeto completo"
+                OBJECTS_JSON=$(cat <<'ALLJSON'
+              [{"id":"ALL","type":"both","subtype":"all","subtypeRaw":"all","objectType":"all","name":"ALL","fileExtension":".sif","expectedFile":"ALL.sif","method":"SiebelTools","scope":"complete","version":"v001"}]
+              ALLJSON
+              )
+                TOTAL_COUNT=1
+              else
+                OBJECTS_ARRAY=""
+                IFS=',' read -ra SPECS <<< "${OBJECT_IDS}"
+                for spec in "${SPECS[@]}"; do
+                  spec=$(echo "${spec}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                  [[ -z "${spec}" ]] && continue
+
+                  # Parse type{subtype=Nome} — Agora case-insensitive para type (maiúsculo ou minúsculo)
+                  raw_type=$(echo "${spec}" | sed -n 's/^\([a-zA-Z]*\){.*/\1/p')
+                  inner=$(echo "${spec}" | sed -n 's/^[a-zA-Z]*{\(.*\)}$/\1/p')
+                  raw_subtype=$(echo "${inner}" | cut -d'=' -f1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                  raw_name=$(echo "${inner}" | cut -d'=' -f2- | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+
+                  if [[ -z "${raw_type}" || -z "${raw_subtype}" || -z "${raw_name}" ]]; then
+                    echo "⚠️  Spec ignorada (parse falhou): ${spec}"
+                    continue
+                  fi
+
+                  meta=$(resolve_object_meta "${raw_type}" "${raw_subtype}" "${raw_name}")
+                  IFS='|' read -r resolved_type file_ext method obj_type subtype_raw expected_file <<< "${meta}"
+
+                  obj_id=$(echo "${raw_subtype}_${raw_name}" | sed 's/[^A-Za-z0-9]/_/g; s/__*/_/g; s/^_//; s/_$//')
+
+                  # Resolver admFilterParam e admFilter para objetos nonrepository
+                  adm_filter_param=""
+                  adm_filter_value=""
+                   adm_eai_method=""
+                  if [[ "${resolved_type}" == "nonrepository" ]]; then
+                    adm_meta=$(resolve_adm_filter "${obj_type}" "${raw_name}")
+                     IFS='|' read -r adm_filter_param adm_filter_value adm_eai_method <<< "${adm_meta}"
+                  fi
+
+                  OBJ_LINE=$(printf '{"id":"%s","type":"%s","subtype":"%s","subtypeRaw":"%s","objectType":"%s","name":"%s","fileExtension":"%s","expectedFile":"%s","method":"%s","admFilterParam":"%s","admFilter":"%s","admEaiMethod":"%s","scope":"object","version":"v001"}' \
+                     "${obj_id}" "${resolved_type}" "${raw_subtype}" "${subtype_raw}" "${obj_type}" "${raw_name}" "${file_ext}" "${expected_file}" "${method}" "${adm_filter_param}" "${adm_filter_value}" "${adm_eai_method}")
+
+                  if [[ -n "${OBJECTS_ARRAY}" ]]; then
+                    OBJECTS_ARRAY="${OBJECTS_ARRAY},${OBJ_LINE}"
+                  else
+                    OBJECTS_ARRAY="${OBJ_LINE}"
+                  fi
+
+                  if [[ "${resolved_type}" == "repository" ]]; then
+                    REPO_COUNT=$((REPO_COUNT + 1))
+                  elif [[ "${resolved_type}" == "nonrepository" ]]; then
+                    NONREPO_COUNT=$((NONREPO_COUNT + 1))
+                  fi
+                  TOTAL_COUNT=$((TOTAL_COUNT + 1))
+                done
+                OBJECTS_JSON="[${OBJECTS_ARRAY}]"
+              fi
+
+              # ── Montar JSON completo com jq ──
+              MANIFEST=$(jq -n \
+                --arg ts "${PIPELINE_TIMESTAMP}" \
+                --arg bid "${BUILD_BUILDID}" \
+                --arg bnum "${BUILD_BUILDNUMBER}" \
+                --arg sver "${BUILD_SOURCEVERSION}" \
+                --arg sbr "${BUILD_SOURCEBRANCH}" \
+                --arg otype "${OBJECT_TYPE}" \
+                --arg pname "${PROJECT_NAME}" \
+                --arg env "${ENVIRONMENT}" \
+                --argjson objs "${OBJECTS_JSON}" \
+                --argjson total "${TOTAL_COUNT}" \
+                --argjson repo "${REPO_COUNT}" \
+                --argjson nonrepo "${NONREPO_COUNT}" \
+                '{
+                  metadata: {
+                    pipeline_timestamp: $ts,
+                    build_id: $bid,
+                    build_number: $bnum,
+                    source_version: $sver,
+                    source_branch: $sbr
+                  },
+                  execution: {
+                    object_type: $otype,
+                    project_name: $pname,
+                    environment: $env
+                  },
+                  objects: $objs,
+                  summary: {
+                    total: $total,
+                    repository_count: $repo,
+                    nonrepository_count: $nonrepo
+                  }
+                }')
+
+              echo "${MANIFEST}" > "${MANIFEST_JSON}"
+
+              # Backup TXT com IDs
+              jq -r '.objects[].id' "${MANIFEST_JSON}" > "${MANIFEST_TXT}"
+
+              echo "✅ Manifesto gerado: ${MANIFEST_JSON}"
+              echo "   Objetos: ${TOTAL_COUNT} (repo=${REPO_COUNT}, nonrepo=${NONREPO_COUNT})"
+              jq '.' "${MANIFEST_JSON}"
+            env:
+              PIPELINE_TIMESTAMP: $(TIMESTAMP)
+              BUILD_BUILDID: $(Build.BuildId)
+              BUILD_BUILDNUMBER: $(Build.BuildNumber)
+              BUILD_SOURCEVERSION: $(Build.SourceVersion)
+              BUILD_SOURCEBRANCH: $(Build.SourceBranch)
+            displayName: '📝 Processar Lista Manual e Gerar Manifesto (inline)'
+
+          # [Processamento] Mapear IDs para paths Siebel via dicionário interno
+          # Lógica inline — substitui map_paths.sh
+          - bash: |
+              set -eo pipefail
+              echo "--- Mapear IDs para Paths Siebel (inline) ---"
+
+              MANIFEST_PATH="$(Pipeline.Workspace)/object_manifest.json"
+              if [[ ! -f "$MANIFEST_PATH" ]]; then
+                echo "❌ ERRO: Manifesto não encontrado: $MANIFEST_PATH"
+                exit 1
+              fi
+
+              # ── Dicionário de mapeamento ID → Siebel Path ──
+              # Enriquece cada objeto com siebelPath baseado no tipo/subtipo.
+              # Se o ID não estiver mapeado no dicionário, gera path padrão.
+              ENRICHED=$(jq '
+                def siebel_path:
+                  if .type == "repository" then
+                    if (.subtypeRaw // "" | test("(?i)workflow")) then
+                      "Repository/Workflow Processes"
+                    elif (.subtypeRaw // "" | test("(?i)buscomp|business_component")) then
+                      "Repository/Business Components"
+                    elif (.subtypeRaw // "" | test("(?i)applet")) then
+                      "Repository/Applets"
+                    elif (.subtypeRaw // "" | test("(?i)view")) then
+                      "Repository/Views"
+                    elif (.subtypeRaw // "" | test("(?i)screen")) then
+                      "Repository/Screens"
+                    elif (.subtypeRaw // "" | test("(?i)application")) then
+                      "Repository/Applications"
+                    elif (.subtypeRaw // "" | test("(?i)business_object")) then
+                      "Repository/Business Objects"
+                    elif (.subtypeRaw // "" | test("(?i)integration")) then
+                      "Repository/Integration Objects"
+                    else
+                      "Repository/Other"
+                    end
+                  elif .type == "nonrepository" then
+                    if (.subtypeRaw // "" | test("(?i)discount|pricing")) then
+                      "NonRepository/Pricing"
+                    elif (.subtypeRaw // "" | test("(?i)aggr")) then
+                      "NonRepository/Aggregates"
+                    elif (.subtypeRaw // "" | test("(?i)category")) then
+                      "NonRepository/Categories"
+                    elif (.subtypeRaw // "" | test("(?i)attribute")) then
+                      "NonRepository/Attributes"
+                    else
+                      "NonRepository/Other"
+                    end
+                  else
+                    "Other"
+                  end;
+                .objects |= map(. + {siebelPath: siebel_path})
+              ' "$MANIFEST_PATH")
+
+              echo "${ENRICHED}" > "$MANIFEST_PATH"
+
+              TOTAL=$(jq '.objects | length' "$MANIFEST_PATH")
+              echo "✅ Mapeamento concluído: ${TOTAL} objeto(s) enriquecidos com siebelPath"
+              jq -r '.objects[] | "  • \(.id) → \(.siebelPath // "N/A") [\(.expectedFile // "N/A")]"' "$MANIFEST_PATH"
+            displayName: '📃 Mapear IDs para Paths Siebel (inline)'
+          # [Observabilidade] Contagem por tipo já armazenada no campo summary do manifesto
+          - bash: |
+              set -eo pipefail
+              MANIFEST_PATH="$(Pipeline.Workspace)/object_manifest.json"
+              [[ -f "$MANIFEST_PATH" ]] || { echo "❌ Manifesto não encontrado"; exit 1; }
+
+              REPO_COUNT=$(jq '[.objects[] | select(.type == "repository")] | length' "$MANIFEST_PATH")
+              NONREPO_COUNT=$(jq '[.objects[] | select(.type == "nonrepository")] | length' "$MANIFEST_PATH")
+              TOTAL_COUNT=$(jq '.objects | length' "$MANIFEST_PATH")
+
+              echo "Objetos no manifesto: Repository=${REPO_COUNT} | NonRepository=${NONREPO_COUNT} | Total=${TOTAL_COUNT}"
+            displayName: '📊 Contagem de Objetos por Tipo'
+
+          # [Observabilidade] Sumário do manifesto processado (fonte de verdade pós-parse)
+          - bash: |
+              set -eo pipefail
+              echo "--- Sumário de Objetos (manifesto processado) ---"
+
+              MANIFEST_PATH="$(Pipeline.Workspace)/object_manifest.json"
+              [[ -f "$MANIFEST_PATH" ]] || { echo "❌ Manifesto não encontrado"; exit 1; }
+
+              ENVIRONMENT="${{ parameters.environment }}"
+              OBJECT_TYPE="${{ parameters.objectType }}"
+              echo "Ambiente: ${ENVIRONMENT} | Tipo de escopo: ${OBJECT_TYPE}"
+              echo ""
+
+              TOTAL=$(jq '.objects | length' "$MANIFEST_PATH")
+              if [[ "${TOTAL}" -eq 0 ]]; then
+                echo "Escopo: PROJETO COMPLETO (nenhum objeto individual parseado)"
+              else
+                echo "Objetos parseados com sucesso: ${TOTAL}"
+                jq -r '.objects[] | "  • \(.id) [\(.type)] → \(.objectType)/\(.name) [\(.expectedFile)] admFilter=\(.admFilter)"' "$MANIFEST_PATH"
+              fi
+              echo ""
+              echo "Próximo: Export → Security → QualityGates"
+            displayName: '📊 Sumário de Objetos (manifesto)'
+
+          # [Validação] Garantir integridade do manifesto JSON
+          - bash: |
+              set -eo pipefail
+              echo "--- Validação do Manifesto JSON ---"
+
+              MANIFEST_FILE="$(Pipeline.Workspace)/object_manifest.json"
+              MANIFEST_TXT="$(Pipeline.Workspace)/object_manifest.txt"
+
+              if [[ ! -f "$MANIFEST_FILE" ]]; then
+                echo "❌ ERRO: Arquivo manifesto JSON não encontrado: $MANIFEST_FILE"
+                exit 1
+              fi
+
+              if ! jq empty "$MANIFEST_FILE" 2>/dev/null; then
+                echo "❌ ERRO: Manifesto JSON inválido"
+                exit 1
+              fi
+
+              if ! jq -e '.objects and .metadata' "$MANIFEST_FILE" >/dev/null 2>&1; then
+                echo "❌ ERRO: Manifesto JSON não contém estrutura esperada"
+                exit 1
+              fi
+
+              OBJ_COUNT=$(jq '.objects | length' "$MANIFEST_FILE")
+              echo "✅ Manifesto JSON validado com sucesso"
+              echo "   Total de objetos: $OBJ_COUNT"
+
+              if [[ ! -f "$MANIFEST_TXT" ]]; then
+                echo "⚠️  Arquivo manifesto TXT (backup) não encontrado"
+                echo "   Criando a partir do JSON..."
+                jq -r '.objects[].id' "$MANIFEST_FILE" > "$MANIFEST_TXT"
+              fi
+
+              LINES=$(wc -l < "$MANIFEST_TXT")
+              echo "   Linhas no TXT (backup): $LINES"
+              echo ""
+              echo "✅ Validação do manifesto concluída com sucesso"
+              echo ""
+            displayName: '✅ Validar Manifesto JSON'
+
+          # [Controle de Fluxo] Definir flags de export por tipo para jobs downstream
+          # Lógica inline — substitui process_export_flags.sh
+          - bash: |
+              set -eo pipefail
+              echo "--- Definir Flags de Export (inline) ---"
+
+              MANIFEST_PATH="$(Pipeline.Workspace)/object_manifest.json"
+              OBJECT_TYPE="${{ parameters.objectType }}"
+
+              if [[ ! -f "$MANIFEST_PATH" ]]; then
+                echo "❌ ERRO: Manifesto não encontrado: $MANIFEST_PATH"
+                exit 1
+              fi
+
+              REPO_COUNT=$(jq '[.objects[] | select(.type == "repository")] | length' "$MANIFEST_PATH")
+              NONREPO_COUNT=$(jq '[.objects[] | select(.type == "nonrepository")] | length' "$MANIFEST_PATH")
+              BOTH_COUNT=$(jq '[.objects[] | select(.type == "both" or .scope == "complete")] | length' "$MANIFEST_PATH")
+              TOTAL_COUNT=$(jq '.objects | length' "$MANIFEST_PATH")
+
+              echo "Manifesto: total=${TOTAL_COUNT} repo=${REPO_COUNT} nonrepo=${NONREPO_COUNT} both=${BOTH_COUNT}"
+              echo "Parâmetro objectType: ${OBJECT_TYPE}"
+
+              # Determinar flags de export
+              HAS_REPO="false"
+              HAS_NONREPO="false"
+
+              case "${OBJECT_TYPE}" in
+                repository)
+                  if [[ ${REPO_COUNT} -gt 0 || ${BOTH_COUNT} -gt 0 ]]; then
+                    HAS_REPO="true"
+                  fi
+                  ;;
+                nonrepository)
+                  if [[ ${NONREPO_COUNT} -gt 0 || ${BOTH_COUNT} -gt 0 ]]; then
+                    HAS_NONREPO="true"
+                  fi
+                  ;;
+                both)
+                  if [[ ${REPO_COUNT} -gt 0 || ${BOTH_COUNT} -gt 0 ]]; then
+                    HAS_REPO="true"
+                  fi
+                  if [[ ${NONREPO_COUNT} -gt 0 || ${BOTH_COUNT} -gt 0 ]]; then
+                    HAS_NONREPO="true"
+                  fi
+                  ;;
+              esac
+
+              echo "##vso[task.setvariable variable=HAS_REPO_EXPORT;isOutput=true]${HAS_REPO}"
+              echo "##vso[task.setvariable variable=HAS_NONREPO_EXPORT;isOutput=true]${HAS_NONREPO}"
+              echo "##vso[task.setvariable variable=REPO_COUNT;isOutput=true]${REPO_COUNT}"
+              echo "##vso[task.setvariable variable=NONREPO_COUNT;isOutput=true]${NONREPO_COUNT}"
+
+              echo "✅ Flags definidos: HAS_REPO_EXPORT=${HAS_REPO} | HAS_NONREPO_EXPORT=${HAS_NONREPO}"
+            name: exportObjectCounts
+            displayName: '🎯 Definir Flags de Execução de Export (inline)'
+
+          # [Publicação] Publicar manifesto JSON como artifact
+          - task: PublishPipelineArtifact@1
+            inputs:
+              targetPath: '$(Pipeline.Workspace)/object_manifest.json'
+              artifactName: 'object-manifest'
+            displayName: '📤 Publicar Manifesto JSON'
+            condition: always()
+
+          # [Finalização] Placeholder: Gate de Aprovação/Review (futuro - ManualValidation@1)
+          - bash: |
+              echo "✅ Identificação concluída. Manifesto em: $(Pipeline.Workspace)/object_manifest.json"
+            displayName: '✅ Identification Concluída - Pronto para Export'
+
+          # [Limpeza] Limpar arquivos de artifact local ao final do job
+          - task: DeleteFiles@1
+            displayName: '🧹 Limpar arquivos de artifact (Cadastrar)'
+            condition: always()
+            env:
+              NODE_SKIP_PLATFORM_CHECK: '1'
+            inputs:
+              SourceFolder: '$(Pipeline.Workspace)'
+              Contents: |
+                object_manifest.json
+                object_manifest.txt
+              removeSourceFolder: false
+
+  # ==================================================================
+  # Stage 3: Export - Exportação de Objetos em Execução Local
+  # Descrição: Executa no próprio agente Windows para
+  #            exportar objetos repository (.sif) via siebdev.exe e
+  #            non-repository (.xml) via WfProcMgr.
+  # ==================================================================
+  - ${{ if eq(parameters.enableExport, true) }}:
+    - stage: Export
+      displayName: '📤 Export - Objetos Siebel'
+      dependsOn: Cadastrar
+      condition: succeeded()
+      jobs:
+        # ------------------------------------------------------------------
+        # Job: ExportRepository - Export de objetos .sif via siebdev.exe
+        # ⚠️ Execução local no próprio agente Windows (sem SSH)
+        # ------------------------------------------------------------------
+        - job: ExportRepository
+          displayName: 'Export Repository (.sif)'
+          pool:
+            name: $(CI_AGENT_POOL_WINDOWS)
+          condition: and(or(eq('${{ parameters.objectType }}', 'repository'), eq('${{ parameters.objectType }}', 'both')), eq(stageDependencies.Cadastrar.IdentifyObjects.outputs['exportObjectCounts.HAS_REPO_EXPORT'], 'true'))
+          steps:
+            # Nenhum arquivo do repositorio e lido - checkout desnecessario.
+            - checkout: none
+            # [Preparação] Download do manifesto gerado na identificação
+            - task: DownloadPipelineArtifact@2
+              inputs:
+                artifactName: 'object-manifest'
+                targetPath: '$(Pipeline.Workspace)'
+              displayName: 'Download Manifesto'
+
+            # [Preparação] Download do Secure File no próprio job de export
+            - task: DownloadSecureFile@1
+              name: downloadSiebelSecureConfigExport
+              displayName: '🔐 Download Secure File tools_DevOps.cfg (Export)'
+              inputs:
+                secureFile: 'tools_DevOps.cfg'
+              env:
+                NODE_SKIP_PLATFORM_CHECK: '1'
+
+            # [Processamento Principal] Filtra objetos repository do manifesto para export via siebdev.exe
+            - powershell: |
+                Write-Host "Export Repository (.sif)"
+                Write-Host ""
+                Write-Host "Ambiente: ${{ parameters.environment }}"
+                Write-Host "Projeto: ${{ parameters.projectName }}"
+                Write-Host ""
+
+                $manifestPath = "$(Pipeline.Workspace)/object_manifest.json"
+                if (-not (Test-Path $manifestPath)) {
+                  Write-Error "Manifesto não encontrado: $manifestPath"
+                  exit 1
+                }
+
+                $manifest = Get-Content -Path $manifestPath -Raw | ConvertFrom-Json
+                $objects = @($manifest.objects)
+
+                function Resolve-ObjectType {
+                  param($Object)
+
+                  if ($Object.id -eq 'ALL' -or $Object.scope -eq 'complete') {
+                    return 'both'
+                  }
+
+                  if ($Object.type -eq 'repository' -or $Object.type -eq 'nonrepository') {
+                    return $Object.type
+                  }
+
+                  if ($Object.fileExtension -eq '.sif') {
+                    return 'repository'
+                  }
+
+                  if ($Object.fileExtension -eq '.xml') {
+                    return 'nonrepository'
+                  }
+
+                  if ($Object.type -eq 'both') {
+                    if ($Object.method -eq 'ADM' -or $Object.fileExtension -eq '.xml') {
+                      return 'nonrepository'
+                    }
+                    return 'repository'
+                  }
+
+                  return 'repository'
+                }
+
+                $repositoryObjects = @()
+                foreach ($obj in $objects) {
+                  $resolvedType = Resolve-ObjectType -Object $obj
+                  if ($resolvedType -eq 'repository' -or $resolvedType -eq 'both') {
+                    $repositoryObjects += [PSCustomObject]@{
+                      id = $obj.id
+                      resolvedType = $resolvedType
+                      expectedFile = $obj.expectedFile
+                      fileExtension = $obj.fileExtension
+                    }
+                  }
+                }
+
+                Write-Host "Objetos para ExportRepository: $($repositoryObjects.Count)"
+                if ($repositoryObjects.Count -eq 0) {
+                  Write-Host "⚠️ Nenhum objeto repository encontrado no manifesto"
+                } else {
+                  foreach ($item in $repositoryObjects) {
+                    $fileHint = if ($item.expectedFile) { $item.expectedFile } elseif ($item.fileExtension) { "$($item.id)$($item.fileExtension)" } else { $item.id }
+                    Write-Host "  • $($item.id) [$($item.resolvedType)] -> $fileHint"
+                  }
+                }
+
+                Write-Host ""
+                Write-Host "Awaiting Siebel Tools integration"
+              displayName: 'Export Repository'
+
+            # [Execução Local] Navega para diretórios do Siebel Tools e prepara execução
+            - powershell: |
+                Write-Host "--- Export Repository - Local Execution ---"
+
+                $buildRef = "$(SIEBEL_EXPORT_BUILD_REF)"
+                if ([string]::IsNullOrWhiteSpace($buildRef)) {
+                  Write-Error "Variável SIEBEL_EXPORT_BUILD_REF não definida"
+                  exit 1
+                }
+
+                $agentTempDir = "$(Agent.TempDirectory)"
+                $tempBuildDir = Join-Path $agentTempDir $buildRef
+                $executionDir = $tempBuildDir
+                $secureFileFromJob = "$(downloadSiebelSecureConfigExport.secureFilePath)"
+                $configTargetPath = $secureFileFromJob
+
+                Write-Host "AgentTempDir: $agentTempDir"
+                Write-Host "Diretório temporário do build: $tempBuildDir"
+                Write-Host "Diretório de execução: $executionDir"
+
+                if (-not (Test-Path $tempBuildDir)) {
+                  New-Item -ItemType Directory -Path $tempBuildDir -Force | Out-Null
+                  Write-Host "Diretório temporário criado: $tempBuildDir"
+                }
+
+                if (Test-Path $configTargetPath) {
+                  Write-Host "Secure File disponível em: $configTargetPath"
+                  Write-Host "##vso[task.setvariable variable=SIEBEL_EXPORT_CONFIG_PATH]$configTargetPath"
+                }
+                else {
+                  Write-Error "Secure File não encontrado no job: $configTargetPath"
+                  exit 1
+                }
+
+                if (-not (Test-Path $executionDir)) {
+                  New-Item -ItemType Directory -Path $executionDir -Force | Out-Null
+                  Write-Host "Diretório criado: $executionDir"
+                }
+
+                Set-Location $executionDir
+                Write-Host "Diretório atual: $(Get-Location)"
+
+                if (Test-Path "*.sif") {
+                  Remove-Item "*.sif" -Force
+                  Write-Host "Arquivos .sif antigos removidos"
+                }
+                else {
+                  Write-Host "Nenhum .sif anterior encontrado para limpeza"
+                }
+
+                Write-Host "Ferramenta Siebel: $(SIEBEL_EXPORT_TOOLS_PATH)\siebdev.exe"
+                Write-Host "Config Siebel: $configTargetPath"
+                Write-Host "Manifesto Siebel: $(SIEBEL_EXPORT_OBJECT_LIST_FILE)"
+                Write-Host "Log Siebel: $(SIEBEL_EXPORT_LOG_FILE)"
+                Write-Host "✅ Ambiente local preparado para executar comandos de export"
+              displayName: '📤 Export Repository - Siebel Tools (Local Execution)'
+
+            # [Execução Real] Construir arquivo lista_sifs_sieb8.txt e executar siebdev.exe
+            - powershell: |
+                Write-Host "--- Executar Export Repository com siebdev.exe ---"
+                Write-Host ""
+
+                $manifestPath = "$(Pipeline.Workspace)/object_manifest.json"
+                $manifest = Get-Content -Path $manifestPath -Raw | ConvertFrom-Json
+                $objects = @($manifest.objects)
+
+                # Filtrar apenas objetos repository
+                $repositoryObjects = @($objects | Where-Object { $_.type -eq 'repository' -or $_.fileExtension -eq '.sif' })
+
+                if ($repositoryObjects.Count -eq 0) {
+                  Write-Host "⚠️ Nenhum objeto repository encontrado. Nada para exportar."
+                  exit 0
+                }
+
+                Write-Host "Objetos a exportar: $($repositoryObjects.Count)"
+                Write-Host ""
+
+                # Construir arquivo lista_sifs_sieb8.txt no formato esperado
+                # Formato: ObjectType,"ObjectName: *",FILENAME.sif
+                $listContent = @()
+
+                foreach ($obj in $repositoryObjects) {
+                  $objectType = $obj.objectType
+                  if ([string]::IsNullOrWhiteSpace($objectType)) {
+                    $objectType = if ($obj.subtypeRaw) { $obj.subtypeRaw } else { $obj.subtype -replace '_', ' ' }
+                  }
+
+                  $objectName = $obj.name
+                  $typeLabel = ([string]$objectType).Trim()
+                  $isWorkflow = $typeLabel -match '^(?i)workflow[\s_]*process$'
+                  $nameForList = if ($isWorkflow) { "${objectName}: *" } else { $objectName }
+
+                  # Nome de arquivo sem espaços para evitar falhas de parsing no siebdev.
+                  # Ex.: Workflow Process + NV Create Custom Label WF -> WORKFLOW_PROCESS_NV_Create_Custom_Label_WF.sif
+                  $typeToken = (($typeLabel -replace '[^A-Za-z0-9]+', '_').Trim('_')).ToUpperInvariant()
+                  $objectToken = (($objectName -replace '[^A-Za-z0-9]+', '_').Trim('_'))
+                  $fileName = "${typeToken}_${objectToken}.sif"
+
+                  # Construir linha com aspas duplas para o nome com versão
+                  $line = "$typeLabel,`"$nameForList`",$($fileName -replace '\.sif$', '.sif')"
+                  $listContent += $line
+
+                  Write-Host "  • $objectType | $objectName → $fileName"
+                }
+
+                # Criar diretório do arquivo lista se necessário
+                $listDir = Split-Path -Parent "$(SIEBEL_EXPORT_OBJECT_LIST_FILE)"
+                if (-not (Test-Path $listDir)) {
+                  New-Item -ItemType Directory -Path $listDir -Force | Out-Null
+                }
+
+                # Salvar arquivo lista
+                $listContent | Set-Content -Path "$(SIEBEL_EXPORT_OBJECT_LIST_FILE)" -Encoding ASCII
+                Write-Host ""
+                Write-Host "✅ Arquivo lista criado: $(SIEBEL_EXPORT_OBJECT_LIST_FILE)"
+                Write-Host "   Linhas: $($listContent.Count)"
+                Write-Host ""
+
+                # Exibir conteúdo do arquivo lista para validação
+                Write-Host "Conteúdo do arquivo lista:"
+                Get-Content -Path "$(SIEBEL_EXPORT_OBJECT_LIST_FILE)" | ForEach-Object { Write-Host "  $_" }
+                Write-Host ""
+
+                Write-Host "Configuração de Execução:"
+                Write-Host "  Ferramenta: $(SIEBEL_EXPORT_TOOLS_PATH)\siebdev.exe"
+                Write-Host "  Config: $(SIEBEL_EXPORT_CONFIG_PATH)"
+                Write-Host "  DataSource: $(SIEBEL_EXPORT_DATASOURCE)"
+                Write-Host "  User: $(SIEBEL_EXPORT_USER)"
+                Write-Host "  Repository: $(SIEBEL_EXPORT_REPOSITORY)"
+                Write-Host "  Lista: $(SIEBEL_EXPORT_OBJECT_LIST_FILE)"
+                Write-Host "  Log: $(SIEBEL_EXPORT_LOG_FILE)"
+                Write-Host "  Dry Run: $(DRY_RUN_MODE)"
+                Write-Host ""
+
+                # DRY RUN: pipeline flag ou fallback quando ferramentas não disponíveis
+                if ("$(DRY_RUN_MODE)" -eq "true" -or -not (Test-Path "$(SIEBEL_EXPORT_TOOLS_PATH)\siebdev.exe") -or [string]::IsNullOrWhiteSpace("$(SIEBEL_EXPORT_PASSWORD)")) {
+                  if (-not (Test-Path "$(SIEBEL_EXPORT_TOOLS_PATH)\siebdev.exe")) {
+                    Write-Host "⚠️  AVISO: siebdev.exe não encontrado em: $(SIEBEL_EXPORT_TOOLS_PATH)\siebdev.exe"
+                    Write-Host "   Continuando com execução simulada para validação de pipeline"
+                  }
+                  if ([string]::IsNullOrWhiteSpace("$(SIEBEL_EXPORT_PASSWORD)")) {
+                    Write-Host "⚠️  AVISO: SIEBEL_EXPORT_PASSWORD não definida"
+                    Write-Host "   Este valor deve ser setado via Variable Group ou Key Vault"
+                    Write-Host "   Continuando com execução simulada"
+                  }
+                  Write-Host "🧪 Modo DRY RUN ativado - simulando execução"
+                  Write-Host "Comando que seria executado:"
+                  Write-Host "  & `"$(SIEBEL_EXPORT_TOOLS_PATH)\siebdev.exe`" /c `"$(SIEBEL_EXPORT_CONFIG_PATH)`" /d $(SIEBEL_EXPORT_DATASOURCE) /u $(SIEBEL_EXPORT_USER) /p *** /tl PTB /batchexport `"$(SIEBEL_EXPORT_REPOSITORY)`" `"$(SIEBEL_EXPORT_OBJECT_LIST_FILE)`" `"$(SIEBEL_EXPORT_LOG_FILE)`""
+                  Write-Host ""
+                  Write-Host "Simulando criação de arquivos .sif..."
+
+                  # Simulação: criar arquivos .sif de exemplo
+                  $outputDir = Split-Path -Parent "$(SIEBEL_EXPORT_OBJECT_LIST_FILE)"
+                  $simulatedMarkerPath = Join-Path $outputDir '_SIMULATED_EXPORT.txt'
+                  foreach ($obj in $repositoryObjects) {
+                    $objectType = $obj.objectType
+                    if ([string]::IsNullOrWhiteSpace($objectType)) {
+                      $objectType = if ($obj.subtypeRaw) { $obj.subtypeRaw } else { $obj.subtype -replace '_', ' ' }
+                    }
+                    $objectName = $obj.name
+                    $typeToken = (($objectType -replace '[^A-Za-z0-9]+', '_').Trim('_')).ToUpperInvariant()
+                    $objectToken = (($objectName -replace '[^A-Za-z0-9]+', '_').Trim('_'))
+                    $fileName = "${typeToken}_${objectToken}.sif"
+                    $filePath = Join-Path $outputDir $fileName
+                    "<!-- Simulated Siebel Export: $($obj.name) -->" | Set-Content -Path $filePath -Encoding UTF8
+                    Write-Host "  ✓ Criado (simulado): $fileName"
+                  }
+
+                  @(
+                    "SIMULATED=true"
+                    "BUILD_ID=$(Build.BuildId)"
+                    "BUILD_REF=$(SIEBEL_EXPORT_BUILD_REF)"
+                  ) | Set-Content -Path $simulatedMarkerPath -Encoding ASCII
+                  Write-Host "  ✓ Marcador de simulação: $simulatedMarkerPath"
+
+                  Write-Host ""
+                  Write-Host "✅ Execução simulada concluída com sucesso"
+                }
+                else {
+                  Write-Host "🚀 Executando siebdev.exe..."
+                  Write-Host ""
+
+                  try {
+                    if (-not (Test-Path "$(SIEBEL_EXPORT_CONFIG_PATH)")) {
+                      Write-Error "Arquivo de configuração não encontrado: $(SIEBEL_EXPORT_CONFIG_PATH)"
+                      exit 1
+                    }
+
+                    if (-not (Test-Path "$(SIEBEL_EXPORT_OBJECT_LIST_FILE)")) {
+                      Write-Error "Arquivo lista_sifs não encontrado: $(SIEBEL_EXPORT_OBJECT_LIST_FILE)"
+                      exit 1
+                    }
+
+                    $logDir = Split-Path -Parent "$(SIEBEL_EXPORT_LOG_FILE)"
+                    if (-not [string]::IsNullOrWhiteSpace($logDir) -and -not (Test-Path $logDir)) {
+                      New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+                    }
+
+                    $arguments = @(
+                      '/c', "$(SIEBEL_EXPORT_CONFIG_PATH)",
+                      '/d', "$(SIEBEL_EXPORT_DATASOURCE)",
+                      '/u', "$(SIEBEL_EXPORT_USER)",
+                      '/p', "$(SIEBEL_EXPORT_PASSWORD)",
+                      '/tl', 'PTB',
+                      '/batchexport', "$(SIEBEL_EXPORT_REPOSITORY)", "$(SIEBEL_EXPORT_OBJECT_LIST_FILE)", "$(SIEBEL_EXPORT_LOG_FILE)"
+                    )
+
+                    $quotedArgs = @($arguments | ForEach-Object {
+                      if ($_ -match '\s') { "`"$_`"" } else { "$_" }
+                    })
+                    $command = "`"$(SIEBEL_EXPORT_TOOLS_PATH)\siebdev.exe`" " + ($quotedArgs -join ' ')
+
+                    Write-Host "Comando executado:"
+                    Write-Host "  $command"
+                    $startTime = Get-Date
+                    $exitCode = -1
+                    $workDir = Split-Path -Parent "$(SIEBEL_EXPORT_OBJECT_LIST_FILE)"
+                    Write-Host "Diretório de trabalho do processo: $workDir"
+
+                    Push-Location $workDir
+                    try {
+                      # Execucao direta (igual ao teste manual no host), sem Start-Process/redirect.
+                      & "$(SIEBEL_EXPORT_TOOLS_PATH)\siebdev.exe" '/c' "$(SIEBEL_EXPORT_CONFIG_PATH)" '/d' "$(SIEBEL_EXPORT_DATASOURCE)" '/u' "$(SIEBEL_EXPORT_USER)" '/p' "$(SIEBEL_EXPORT_PASSWORD)" '/tl' 'PTB' '/batchexport' "$(SIEBEL_EXPORT_REPOSITORY)" "$(SIEBEL_EXPORT_OBJECT_LIST_FILE)" "$(SIEBEL_EXPORT_LOG_FILE)"
+                      $exitCode = $LASTEXITCODE
+                    }
+                    finally {
+                      Pop-Location
+                    }
+
+                    $durationSec = [Math]::Round(((Get-Date) - $startTime).TotalSeconds, 2)
+                    Write-Host "ExitCode capturado do siebdev.exe: $exitCode"
+                    Write-Host "Duração da execução (s): $durationSec"
+
+                    # O siebdev pode retornar antes de finalizar escrita do log.
+                    # Aguarda ate o STATUS final aparecer no export_log.
+                    $timeoutSec = 600
+                    $pollSec = 10
+                    $deadline = (Get-Date).AddSeconds($timeoutSec)
+                    $logValidationOk = $false
+                    $lastProgressLog = Get-Date
+                    while ((Get-Date) -lt $deadline -and -not $logValidationOk) {
+                      if (Test-Path "$(SIEBEL_EXPORT_LOG_FILE)") {
+                        $logContent = Get-Content -Path "$(SIEBEL_EXPORT_LOG_FILE)" -Raw -ErrorAction SilentlyContinue
+                        if (-not [string]::IsNullOrWhiteSpace($logContent)) {
+                          $hasExportSuccessful = $logContent -match '(?im)^STATUS:\s*Export\s+Successful\s*$'
+                          $statusMatch = [regex]::Match($logContent, '(?im)^STATUS:\s*Total:\s*(\d+)\s*,\s*Successful\s+Exports:\s*(\d+)\s*,\s*Failed\s+Exports:\s*(\d+)\s*$')
+
+                          if ($statusMatch.Success) {
+                            $totalExports = [int]$statusMatch.Groups[1].Value
+                            $successfulExports = [int]$statusMatch.Groups[2].Value
+                            $failedExports = [int]$statusMatch.Groups[3].Value
+
+                            Write-Host "Resumo parcial export_log: Total=$totalExports | Successful=$successfulExports | Failed=$failedExports"
+
+                            if ($hasExportSuccessful -and $failedExports -eq 0 -and $totalExports -eq $successfulExports) {
+                              $logValidationOk = $true
+                              break
+                            }
+                          }
+                        }
+                      }
+
+                      if (((Get-Date) - $lastProgressLog).TotalSeconds -ge 30) {
+                        Write-Host "[AGUARDANDO] export_log final ainda nao pronto: $(SIEBEL_EXPORT_LOG_FILE)"
+                        $lastProgressLog = Get-Date
+                      }
+
+                      Start-Sleep -Seconds $pollSec
+                    }
+
+                    if (Test-Path "$(SIEBEL_EXPORT_LOG_FILE)") {
+                      Write-Host "Siebel Export Log final:"
+                      Get-Content -Path "$(SIEBEL_EXPORT_LOG_FILE)" -ErrorAction SilentlyContinue | Write-Host
+                    }
+
+                    $exitCodeText = if ($null -eq $exitCode -or [string]::IsNullOrWhiteSpace("$exitCode")) { '<empty>' } else { "$exitCode" }
+
+                    if ($logValidationOk) {
+                      Write-Host "✅ siebdev.exe validado com sucesso via export_log (ExitCode=$exitCodeText)"
+                    }
+                    else {
+                      Write-Error "siebdev.exe falhou na validação final (ExitCode=$exitCodeText, LogValidation=$logValidationOk, LogPath=$(SIEBEL_EXPORT_LOG_FILE))"
+                      exit 1
+                    }
+                  }
+                  catch {
+                    Write-Host ""
+                    Write-Host "--- Diagnóstico adicional (catch) ---"
+                    if (Test-Path "$(SIEBEL_EXPORT_LOG_FILE)") {
+                      Write-Host "Siebel Export Log final:"
+                      Get-Content -Path "$(SIEBEL_EXPORT_LOG_FILE)" -ErrorAction SilentlyContinue | Write-Host
+                    }
+                    Write-Error "Erro ao executar siebdev.exe: $($_.Exception.Message)"
+                    exit 1
+                  }
+                }
+
+                Write-Host ""
+                Write-Host "✅ Export Repository concluído"
+              displayName: '🚀 Executar Export Repository com siebdev.exe'
+
+            # [Persistência entre Jobs] Coleta local dos .sif exportados para artifact intermediário
+            - powershell: |
+                Write-Host "--- Preparar Artifact Intermediário de Export Repository ---"
+                Write-Host ""
+
+                $buildRef = "$(SIEBEL_EXPORT_BUILD_REF)"
+                $bundlePath = "$(Pipeline.Workspace)\repository-export-raw"
+                $agentTempDir = "$(Agent.TempDirectory)"
+                $localExportPath = Join-Path $agentTempDir $buildRef
+
+                if (Test-Path $bundlePath) {
+                  Remove-Item -Path (Join-Path $bundlePath '*') -Recurse -Force -ErrorAction SilentlyContinue
+                }
+                else {
+                  New-Item -ItemType Directory -Path $bundlePath -Force | Out-Null
+                }
+
+                function Test-IsNormalizedFileName {
+                  param([string]$FileName)
+                  return ($FileName -match '_' -and $FileName -notmatch ' ')
+                }
+
+                $sifFiles = @()
+                if (Test-Path $localExportPath) {
+                  $sifFiles = @(Get-ChildItem -Path $localExportPath -Filter "*.sif" -Recurse -File -ErrorAction SilentlyContinue |
+                    Where-Object { Test-IsNormalizedFileName -FileName $_.Name })
+                }
+
+                Write-Host "Fonte local esperada: $localExportPath"
+                Write-Host "Arquivos .sif normalizados encontrados para empacotar: $($sifFiles.Count)"
+
+                foreach ($file in $sifFiles) {
+                  Copy-Item -Path $file.FullName -Destination $bundlePath -Force
+                  Write-Host "  • Copiado: $($file.Name)"
+                }
+
+                $simulatedMarkerPath = Join-Path $localExportPath '_SIMULATED_EXPORT.txt'
+                if (Test-Path $simulatedMarkerPath) {
+                  Copy-Item -Path $simulatedMarkerPath -Destination (Join-Path $bundlePath '_SIMULATED_EXPORT.txt') -Force
+                  Write-Host "  • Marcador de simulação copiado para o bundle"
+                }
+
+                $finalCount = @(Get-ChildItem -Path $bundlePath -Filter "*.sif" -File -ErrorAction SilentlyContinue).Count
+                Write-Host "Total no bundle intermediário: $finalCount"
+                Write-Host "Bundle path: $bundlePath"
+                Write-Host ""
+              displayName: '📦 Preparar Artifact Intermediário (Repository)'
+
+            # [Persistência entre Jobs] Publicar .sif exportados para consumo em PushArtifactsAndGit
+            - task: PublishPipelineArtifact@1
+              inputs:
+                targetPath: '$(Pipeline.Workspace)\repository-export-raw'
+                artifactName: 'repository-export-raw'
+              displayName: '📤 Publicar Artifact Intermediário (Repository)'
+              condition: always()
+
+            # [Limpeza] Limpar arquivos temporários e de artifact ao final do job
+            - task: DeleteFiles@1
+              displayName: '🧹 Limpar arquivos de artifact (ExportRepository)'
+              condition: always()
+              env:
+                NODE_SKIP_PLATFORM_CHECK: '1'
+              inputs:
+                SourceFolder: '$(Pipeline.Workspace)'
+                Contents: |
+                  object_manifest.json
+                  repository-export-raw/**
+                removeSourceFolder: false
+
+            - task: DeleteFiles@1
+              displayName: '🧹 Limpar temporários Siebel (ExportRepository)'
+              condition: always()
+              env:
+                NODE_SKIP_PLATFORM_CHECK: '1'
+              inputs:
+                SourceFolder: '$(Agent.TempDirectory)\$(SIEBEL_EXPORT_BUILD_REF)'
+                Contents: '**/*'
+                removeSourceFolder: false
+
+        # ------------------------------------------------------------------
+        # Job: ExportNonRepository - Export de objetos .xml via ADMBatchProc/srvrmgr
+        # ⚠️ Execução via SSH (DEV6) com lógica inline: sem SVN, sem scripts externos
+        # Substitui: artefatos_ctl.sh --baixar-artefatos --xml
+        #            migracao_ctl.sh  --export --xml
+        # ------------------------------------------------------------------
+        - job: ExportNonRepository
+          displayName: 'Export NonRepository (.xml)'
+          pool:
+            name: $(CI_AGENT_POOL)
+          condition: and(or(eq('${{ parameters.objectType }}', 'nonrepository'), eq('${{ parameters.objectType }}', 'both')), eq(stageDependencies.Cadastrar.IdentifyObjects.outputs['exportObjectCounts.HAS_NONREPO_EXPORT'], 'true'))
+          variables:
+            # Mapear parâmetro booleano dryRun para variável de string consumível no bash
+            DRY_RUN_PARAM: ${{ parameters.dryRun }}
+          steps:
+            # Nenhum arquivo do repositorio e lido - checkout desnecessario.
+            - checkout: none
+            # [Preparação] Download do manifesto gerado na identificação
+            - task: DownloadPipelineArtifact@2
+              inputs:
+                artifactName: 'object-manifest'
+                targetPath: '$(Pipeline.Workspace)'
+              displayName: 'Download Manifesto'
+
+            # [Processamento Principal] Export de objetos nonrepository (.xml)
+            - powershell: |
+                Write-Host "Export NonRepository (.xml)"
+                Write-Host ""
+                Write-Host "Método: ADMBatchProc via srvrmgr"
+                Write-Host ""
+
+                Write-Host "Fonte de dados: artifact object-manifest (object_manifest.json)"
+
+                $manifestPath = "$(Pipeline.Workspace)/object_manifest.json"
+                if (-not (Test-Path $manifestPath)) {
+                  Write-Error "Manifesto não encontrado: $manifestPath"
+                  exit 1
+                }
+
+                $manifest = Get-Content -Path $manifestPath -Raw | ConvertFrom-Json
+                $objects = @($manifest.objects)
+
+                # Fonte oficial: objetos nonrepository vindos do manifesto publicado no stage Cadastrar.
+                $nonRepoObjects = @($objects | Where-Object { $_.type -eq 'nonrepository' })
+                $nonRepoXmlList = @($nonRepoObjects | ForEach-Object {
+                  if (-not [string]::IsNullOrWhiteSpace($_.expectedFile)) {
+                    [string]$_.expectedFile
+                  }
+                  elseif (-not [string]::IsNullOrWhiteSpace($_.name)) {
+                    "$($_.name).xml"
+                  }
+                  else {
+                    "$($_.id).xml"
+                  }
+                })
+                $nonRepoXmlListString = ($nonRepoXmlList -join ',')
+
+                Write-Host "Objetos para ExportNonRepository: $($nonRepoObjects.Count)"
+                Write-Host "XML list (string): $nonRepoXmlListString"
+                Write-Host "##vso[task.setvariable variable=NONREPO_XML_LIST]$nonRepoXmlListString"
+                Write-Host "##vso[task.setvariable variable=NONREPO_OBJECT_COUNT]$($nonRepoObjects.Count)"
+
+                if ($nonRepoObjects.Count -eq 0) {
+                  Write-Host "⚠️ Nenhum objeto nonrepository encontrado no manifesto"
+                  Write-Host "##vso[task.setvariable variable=NONREPO_OBJECTS_JSON][]"
+                } else {
+                  foreach ($item in $nonRepoObjects) {
+                    $fileHint = if ($item.expectedFile) { $item.expectedFile } elseif ($item.fileExtension) { "$($item.id)$($item.fileExtension)" } else { "$($item.id).xml" }
+                    Write-Host "  • $($item.id) [nonrepository] -> $fileHint"
+                  }
+
+                  # Gerar NONREPO_OBJECTS_JSON (single-line) para consumo pelo bash remoto
+                  # Campos: admDataType, admFilter (formatado do manifesto), admMethod, admPrefix e expectedFile
+                  # IMPORTANTE: usa $_.admFilter do manifesto (já calculado por resolve_adm_filter no Cadastrar)
+                  #             em vez de reconstruir do zero a partir do raw name.
+                  # fonte de verdade para admDataType: stage Cadastrar (IdentifyObjects/object_manifest.json)
+
+                  $jsonObjects = $nonRepoObjects | ForEach-Object {
+                    $admType = if (-not [string]::IsNullOrWhiteSpace($_.objectType)) {
+                      [string]$_.objectType
+                    } elseif (-not [string]::IsNullOrWhiteSpace($_.subtypeRaw)) {
+                      [string]$_.subtypeRaw
+                    } else {
+                      ([string]$_.subtype) -replace '_', ' '
+                    }
+                    $admType = $admType.Trim()
+
+                    $admMethod = if (-not [string]::IsNullOrWhiteSpace($_.admEaiMethod)) {
+                      [string]$_.admEaiMethod
+                    } else {
+                      'synchronize'
+                    }
+                    switch ($admMethod.Trim().ToLowerInvariant()) {
+                      'upsert' { $admMethod = 'Upsert'; break }
+                      'synchronize' { $admMethod = 'Synchronize'; break }
+                      default { $admMethod = 'Synchronize' }
+                    }
+
+                    # Raw name do objeto (separado do filtro formatado)
+                    $name = if (-not [string]::IsNullOrWhiteSpace($_.name)) {
+                      [string]$_.name
+                    } else {
+                      [string]$_.id
+                    }
+
+                    # admFilter: usa valor pré-calculado pelo Cadastrar (formato "[Field]='Value'")
+                    # Fallback defensivo apenas para manifests legados sem o campo admFilter.
+                    # IMPORTANTE: Fazer Trim() para remover espaços extras do JSON
+                    $admFilter = if (-not [string]::IsNullOrWhiteSpace($_.admFilter)) {
+                      [string]$_.admFilter.Trim()                           # "[Name]='NV_ON_OFF'" ou "[Type]='EAI_MAP'"
+                    } elseif (-not [string]::IsNullOrWhiteSpace($_.admFilterParam) -and -not [string]::IsNullOrWhiteSpace($name)) {
+                      "[$([string]$_.admFilterParam)]='$name'"       # reconstrói a partir dos campos separados
+                    } else {
+                      "[Name]='$name'"                               # último recurso
+                    }
+
+                    $expectedFile = if (-not [string]::IsNullOrWhiteSpace($_.expectedFile)) {
+                      [string]$_.expectedFile
+                    } else {
+                      "$name.xml"
+                    }
+                    $admPrefix = [System.IO.Path]::GetFileNameWithoutExtension($expectedFile)
+                    [ordered]@{
+                      id           = [string]$_.id
+                      name         = $name
+                      siebelPath   = [string]$_.siebelPath       # preserva para logging no DEV6
+                      admDataType  = $admType
+                      admFilter    = $admFilter                   # filtro formatado pronto para ADMBatchProc
+                      admMethod    = $admMethod
+                      admPrefix    = $admPrefix
+                      expectedFile = $expectedFile
+                    }
+                  }
+                  $nonRepoObjectsJson = @($jsonObjects) | ConvertTo-Json -Compress -Depth 10 -AsArray
+                  Write-Host "NONREPO_OBJECTS_JSON: $nonRepoObjectsJson"
+                  Write-Host "##vso[task.setvariable variable=NONREPO_OBJECTS_JSON]$nonRepoObjectsJson"
+                }
+              displayName: '📄 Resolver Lista NonRepository via Manifesto'
+
+            # [Conectividade + Execução] Export NonRepository — lógica inline via SSH DEV6
+            # Substitui: artefatos_ctl.sh --baixar-artefatos --xml (sem SVN)
+            #            migracao_ctl.sh --export --xml (srvrmgr ADMBatchProc inline)
+            - bash: |
+                set -eo pipefail
+
+                fail() { echo "##[error]$1"; exit 1; }
+                warn() { echo "##[warning]$1"; }
+                is_ado_placeholder() {
+                  local value="$1"
+                  [[ "${value}" == '$('* ]]
+                }
+                resolve_ado_var() {
+                  local primary_name="$1"
+                  local fallback_name="$2"
+                  local logical_name="$3"
+                  local primary_value="${!primary_name:-}"
+                  local fallback_value="${!fallback_name:-}"
+
+                  if [[ -n "${primary_value}" ]] && ! is_ado_placeholder "${primary_value}"; then
+                    printf '%s' "${primary_value}"
+                    return 0
+                  fi
+
+                  if [[ -n "${fallback_value}" ]] && ! is_ado_placeholder "${fallback_value}"; then
+                    warn "Usando fallback ${fallback_name} para ${logical_name}."
+                    printf '%s' "${fallback_value}"
+                    return 0
+                  fi
+
+                  fail "Variavel ADO obrigatoria ausente/nao expandida para ${logical_name}. Defina '${primary_name}' (preferencial) ou '${fallback_name}' no Variable Group vinculado ao pipeline."
+                }
+                require_var() {
+                  local var_name="$1"
+                  local var_value="${!var_name}"
+                  [[ -n "${var_value}" ]] || fail "Variavel obrigatoria ausente: ${var_name}"
+                  [[ "${var_value}" != '$('* ]] || fail "Variavel ADO nao expandida: ${var_name}='${var_value}'"
+                }
+                b64_no_wrap() {
+                  if base64 --help 2>&1 | grep -q -- '-w'; then
+                    base64 -w0
+                  else
+                    base64 | tr -d '\n'
+                  fi
+                }
+
+                # ─────────────────────────────────────────────────────────────────────
+                # SEÇÃO A: Variáveis locais (do env:)
+                # ─────────────────────────────────────────────────────────────────────
+                SSH_HOST="${SIEBEL_SERVER_IP}"
+                SSH_USER="$(resolve_ado_var SIEBEL_SERVER_USER SSH_USER 'usuario SSH')"
+                SSH_PASS="$(resolve_ado_var SIEBEL_SERVER_PASS SSH_PASS 'senha SSH')"
+                DRY_RUN="${DRY_RUN}"
+                OBJECTS_JSON="${NONREPO_OBJECTS_JSON}"
+                LOCAL_XML_DIR="${XML_OUTPUT_PATH}"
+                SRVRMGR_BIN="${SIEBEL_SRVRMGR_PATH}"
+                REMOTE_BASE_DIR="${SIEBEL_REMOTE_EXPORT_DIR}"
+                SRVRMGR_LANG="${SIEBEL_SRVRMGR_LANG}"
+                POLL_INTERVAL="${SIEBEL_EXPORT_POLL_INTERVAL}"
+                POLL_MAX="${SIEBEL_EXPORT_POLL_MAX}"
+
+                SIEBEL_USER="${SIEBEL_EXPORT_USER}"
+                SIEBEL_GW="${SIEBEL_GATEWAY}"
+                SIEBEL_ENT="${SIEBEL_ENTERPRISE}"
+                SIEBEL_APP_SERVER="${SIEBEL_APPSERVER}"
+
+                PYTHON_BIN="python3"
+                if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
+                  PYTHON_BIN="python"
+                fi
+
+                # ─────────────────────────────────────────────────────────────────────
+                # SEÇÃO B: Validações de pré-requisito
+                # ─────────────────────────────────────────────────────────────────────
+                require_var SSH_HOST
+                require_var SSH_USER
+                require_var SSH_PASS
+                require_var SIEBEL_USER
+                require_var SIEBEL_EXPORT_PASSWORD
+                require_var SIEBEL_GW
+                require_var SIEBEL_ENT
+                require_var LOCAL_XML_DIR
+                require_var SRVRMGR_BIN
+                require_var REMOTE_BASE_DIR
+                require_var SIEBEL_APP_SERVER
+
+                command -v sshpass >/dev/null 2>&1 || fail "sshpass nao instalado no agente Linux"
+                command -v ssh >/dev/null 2>&1 || fail "ssh nao instalado no agente Linux"
+                command -v scp >/dev/null 2>&1 || fail "scp nao instalado no agente Linux"
+                command -v tar >/dev/null 2>&1 || fail "tar nao instalado no agente Linux"
+                command -v base64 >/dev/null 2>&1 || fail "base64 nao disponivel no agente Linux"
+                command -v "${PYTHON_BIN}" >/dev/null 2>&1 || fail "python3/python nao disponivel no agente Linux"
+
+                echo "Diagnostico inicial: host=${SSH_HOST} srvrmgr=${SRVRMGR_BIN} remote_base=${REMOTE_BASE_DIR} dry_run=${DRY_RUN}"
+
+                # ─────────────────────────────────────────────────────────────────────
+                # SEÇÃO C: Early exits — sem objetos ou dry-run
+                # ─────────────────────────────────────────────────────────────────────
+                if [[ "${OBJECTS_JSON}" == "[]" || -z "${OBJECTS_JSON}" ]]; then
+                  echo "Nenhum objeto nonrepository no manifesto. Nada para exportar."
+                  exit 0
+                fi
+
+                if [[ "${DRY_RUN}" == "true" ]]; then
+                  echo "##[section]DRY RUN — Export NonRepository (srvrmgr ADMBatchProc inline)"
+                  echo "Objetos que seriam exportados:"
+                  echo "${OBJECTS_JSON}" | "${PYTHON_BIN}" -c "
+                import json, sys
+                data = json.load(sys.stdin)
+                objs = data if isinstance(data, list) else [data]
+                for o in objs:
+                    print(\"  • {0} | {1} -> {2} (prefix={3})\".format(o['admDataType'], o['admFilter'], o['expectedFile'], o['admPrefix']))
+                print('Total: {0} objeto(s)'.format(len(objs)))
+                "
+                  echo ""
+                  echo "DRY RUN: nenhuma conexao SSH foi realizada."
+                  exit 0
+                fi
+
+                # ─────────────────────────────────────────────────────────────────────
+                # SEÇÃO D: Preparar parâmetros para transmissão SSH
+                # ─────────────────────────────────────────────────────────────────────
+                EXPORT_TS=$(date +%Y%m%d_%H%M%S)_${BUILD_BUILDID:-local}
+                REMOTE_EXPORT_DIR="${REMOTE_BASE_DIR}/export_${EXPORT_TS}"
+                REMOTE_TGZ_PATH="/tmp/siebel_xml_export_${EXPORT_TS}.tar.gz"
+                LOCAL_TGZ_PATH="${AGENT_TEMPDIRECTORY:-/tmp}/siebel_xml_export_${EXPORT_TS}.tar.gz"
+
+                # Base64-encode para transmissão segura (evita metacaracteres shell)
+                OBJECTS_JSON_B64=$(printf '%s' "${OBJECTS_JSON}" | b64_no_wrap)
+                SIEBEL_PASS_B64=$(printf '%s' "${SIEBEL_EXPORT_PASSWORD}" | b64_no_wrap)
+
+                echo "##[section]Iniciando Export NonRepository via SSH"
+                echo "Target: ${SSH_USER}@${SSH_HOST}"
+                echo "Export dir remoto: ${REMOTE_EXPORT_DIR}"
+                echo "Objetos:"
+                echo "${OBJECTS_JSON}" | "${PYTHON_BIN}" -c "
+                import json, sys
+                data = json.load(sys.stdin)
+                objs = data if isinstance(data, list) else [data]
+                for o in objs:
+                  print(\"  • {0} | {1} -> {2}\".format(o['admDataType'], o['admFilter'], o['expectedFile']))
+                "
+
+                # ─────────────────────────────────────────────────────────────────────
+                # SEÇÃO E: Validar conectividade SSH
+                # ─────────────────────────────────────────────────────────────────────
+                echo "Testando conectividade SSH..."
+                SSHPASS="${SSH_PASS}" sshpass -e ssh \
+                  -o StrictHostKeyChecking=no \
+                  -o ConnectTimeout=15 \
+                  "${SSH_USER}@${SSH_HOST}" \
+                  "echo DEV6_SSH_OK"
+
+                # ─────────────────────────────────────────────────────────────────────
+                # SEÇÃO F: Executar bloco remoto via SSH — lógica inline
+                # Heredoc single-quoted: sem expansão local; env VAR=... passa valores
+                # Substitui completamente artefatos_ctl.sh e migracao_ctl.sh
+                # ─────────────────────────────────────────────────────────────────────
+                SSHPASS="${SSH_PASS}" sshpass -e ssh \
+                  -o StrictHostKeyChecking=no \
+                  -o ConnectTimeout=30 \
+                  -o ServerAliveInterval=30 \
+                  -o ServerAliveCountMax=10 \
+                  "${SSH_USER}@${SSH_HOST}" \
+                  "env \
+                    OBJECTS_JSON_B64='${OBJECTS_JSON_B64}' \
+                    SIEBEL_USER='${SIEBEL_USER}' \
+                    SIEBEL_PASS_B64='${SIEBEL_PASS_B64}' \
+                    SIEBEL_GW='${SIEBEL_GW}' \
+                    SIEBEL_ENT='${SIEBEL_ENT}' \
+                    SIEBEL_LANG='${SRVRMGR_LANG}' \
+                    SRVRMGR='${SRVRMGR_BIN}' \
+                    EXPORT_DIR='${REMOTE_EXPORT_DIR}' \
+                    REMOTE_TGZ='${REMOTE_TGZ_PATH}' \
+                    POLL_INTERVAL='${POLL_INTERVAL}' \
+                    POLL_MAX='${POLL_MAX}' \
+                    SIEBEL_APPSERVER='${SIEBEL_APP_SERVER}' \
+                    bash -s" <<'REMOTE_SCRIPT'
+                # ============================================================
+                # BLOCO REMOTO — executa em bash no DEV6
+                # Substitui: artefatos_ctl.sh --baixar-artefatos --xml
+                #            migracao_ctl.sh  --export --xml
+                # Sem SVN, sem dependência de scripts externos
+                # ============================================================
+                set -euo pipefail
+                
+                # R1: Decodificar entradas
+                OBJECTS_JSON=$(printf '%s' "${OBJECTS_JSON_B64}" | base64 -d)
+                SIEBEL_PASS=$(printf '%s' "${SIEBEL_PASS_B64}" | base64 -d)
+                
+                PYTHON_BIN="python3"
+                command -v python3 >/dev/null 2>&1 || PYTHON_BIN="python"
+                SRVRMGR_WITH_ENV='source /app/siebel/siebsrvr/siebenv.sh && ${SRVRMGR}'
+                
+                echo "=== Export NonRepository Siebel (inline) — DEV6 ==="
+                echo "Export dir: ${EXPORT_DIR}"
+                echo "srvrmgr: ${SRVRMGR}"
+                echo ""
+                
+                # R2: Passo 1 — Preparar diretório de export limpo (sem SVN)
+                # Substitui: artefatos_ctl.sh --baixar-artefatos --xml
+                echo "--- Passo 1: Preparar diretório de export ---"
+                if [[ -d "${EXPORT_DIR}" ]]; then
+                  echo "Diretório existia de run anterior (retry), limpando..."
+                  rm -rf "${EXPORT_DIR}"
+                fi
+                mkdir -p "${EXPORT_DIR}"
+                chmod 750 "${EXPORT_DIR}"
+                echo "Diretório criado: ${EXPORT_DIR}"
+                
+                # R3: Passo 2 — Parsear objetos com python3
+                echo ""
+                echo "--- Passo 2: Parsear NONREPO_OBJECTS_JSON ---"
+
+                OBJECTS_TSV=$(mktemp /tmp/siebel_nonrepo_objects_XXXXXX.tsv)
+                printf '%s' "${OBJECTS_JSON}" | "${PYTHON_BIN}" -c "
+                import json, sys
+                for obj in json.load(sys.stdin):
+                    print('\t'.join([
+                        obj['expectedFile'],
+                        obj['admPrefix'],
+                        obj['admDataType'],
+                        obj['admFilter'],
+                        obj['admMethod'],
+                        obj['name'],
+                    ]))
+                " > "${OBJECTS_TSV}"
+
+                OBJ_COUNT=$(wc -l < "${OBJECTS_TSV}" | tr -d ' ')
+                [[ "${OBJ_COUNT}" -gt 0 ]] || { echo "##[error]Nenhum objeto valido em NONREPO_OBJECTS_JSON apos parse"; exit 1; }
+                echo "Objetos a exportar: ${OBJ_COUNT}"
+                nl -ba "${OBJECTS_TSV}" | sed 's/^/  /'
+
+                # R4: Passo 3 — Gerar arquivo de input do srvrmgr
+                echo ""
+                echo "--- Passo 3: Gerar arquivo de input do srvrmgr ---"
+                [[ -x "${SRVRMGR}" ]] || { echo "##[error]srvrmgr nao encontrado: ${SRVRMGR}"; exit 1; }
+
+                SRVRMGR_INPUT=$(mktemp /tmp/srvrmgr_input_XXXXXX.inp)
+                while IFS=$'\t' read -r EXPECTED_FILE ADM_PREFIX ADM_DATATYPE ADM_FILTER ADM_METHOD OBJECT_NAME; do
+                  DATATYPE_NORM=$(printf '%s' "${ADM_DATATYPE}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+
+                  METHOD_NORM="${ADM_METHOD}"
+                  if [[ -z "${METHOD_NORM}" || "${METHOD_NORM}" =~ ^([Ee]xport)$ ]]; then
+                    METHOD_NORM="Synchronize"
+                  fi
+
+                  # admFilter deve chegar pré-formatado do manifesto: "[Field]='Value'"
+                  # O Cadastrar já calculou o campo correto via resolve_adm_filter().
+                  # O bloco abaixo é um guard defensivo para manifests legados; não é o caminho normal.
+                  FILTER_NORM="${ADM_FILTER}"
+                  if [[ "${FILTER_NORM}" =~ ^\[.*\] ]] || [[ "${FILTER_NORM}" == *"="* ]]; then
+                    :  # filtro correto recebido do manifesto
+                  else
+                    echo "##[warning]admFilter sem formato esperado para '${OBJECT_NAME}' (valor: '${FILTER_NORM}'). Usando fallback [Name]. Verifique o manifesto gerado no Cadastrar."
+                    FILTER_ESCAPED=${FILTER_NORM//\'/\'\"\'\"\'}
+                    FILTER_NORM="[Name]='${FILTER_ESCAPED}'"
+                  fi
+
+                  printf "start task for comp ADMBatchProc server %s with admpath=%s,admdatatype=\\\"%s\\\",admfilter=\\\"%s\\\",admeaimethod=%s,admprefix=%s\n" \
+                    "${SIEBEL_APPSERVER}" \
+                    "${EXPORT_DIR}" "${DATATYPE_NORM}" "${FILTER_NORM}" "${METHOD_NORM}" "${ADM_PREFIX}" >> "${SRVRMGR_INPUT}"
+                done < "${OBJECTS_TSV}"
+                printf 'quit\n' >> "${SRVRMGR_INPUT}"
+                echo "Arquivo de input gerado: ${SRVRMGR_INPUT}"
+                sed 's/^/  /' "${SRVRMGR_INPUT}"
+                
+                # R5: Passo 4 — Executar srvrmgr com /i e /l
+                echo ""
+                echo "--- Passo 4: Executar srvrmgr (ADMBatchProc) ---"
+                SRVRMGR_LOG=$(mktemp /tmp/srvrmgr_output_XXXXXX.log)
+                bash -lc "${SRVRMGR_WITH_ENV} /g \"${SIEBEL_GW}\" /e \"${SIEBEL_ENT}\" /u \"${SIEBEL_USER}\" /p \"${SIEBEL_PASS}\" /i \"${SRVRMGR_INPUT}\" /l \"${SIEBEL_LANG}\" /o \"${SRVRMGR_LOG}\"" \
+                  2>&1 | tee "${SRVRMGR_LOG}"
+                rm -f "${SRVRMGR_INPUT}"
+                echo "Sessao srvrmgr inicial encerrada"
+                
+                if grep -qi "Could not connect\|Connection failed\|authentication failed" "${SRVRMGR_LOG}"; then
+                  echo "##[error]Falha na conexao ao srvrmgr. Verificar credenciais e gateway."
+                  exit 1
+                fi
+
+                
+                  # ─────────────────────────────────────────────────────────────────────
+                  # PASSO 4.5: Extrair e Validar TASK_IDs (ADMBatchProc)
+                  # Critério primário de sucesso: presença de XMLs em ${EXPORT_DIR}.
+                  # Log em /app/siebel/logs é suplementar — ausência de log NÃO indica falha.
+                  # ─────────────────────────────────────────────────────────────────────
+                  echo ""
+                  echo "--- Passo 4.5: Extrair e Validar TASK_IDs (ADMBatchProc) ---"
+
+                  # V0: Análise do diretório de exportação (critério primário)
+                  echo "Analisando diretório de exportação: ${EXPORT_DIR}"
+                  XML_COUNT_TOTAL=$(find "${EXPORT_DIR}" -maxdepth 1 -name '*.xml' -size +0c 2>/dev/null | wc -l | tr -d ' ')
+                  if [[ "${XML_COUNT_TOTAL}" -gt 0 ]]; then
+                    echo "✓ Diretório de exportação contém ${XML_COUNT_TOTAL} arquivo(s) XML — export em andamento ou concluído."
+                    find "${EXPORT_DIR}" -maxdepth 1 -name '*.xml' -size +0c 2>/dev/null | sort | sed 's/^/  /'
+                  else
+                    echo "  Diretório de exportação ainda sem arquivos XML: ${EXPORT_DIR}"
+                    ls -la "${EXPORT_DIR}" 2>/dev/null | head -10 || echo "  (diretório não acessível ou vazio)"
+                  fi
+
+                  # Extrair TK_TASKID das tasks iniciadas nesta sessao (observabilidade).
+                  echo ""
+                  echo "Analisando log do srvrmgr: ${SRVRMGR_LOG}"
+                  TASK_DIAG_HINT="diagnostico_task=nao_coletado"
+                  TASK_ERROR_IDS=""
+                  TASK_NOLOG_IDS=""
+                  TASK_UNKNOWN_IDS=""
+                  TASK_SUCCESS_IDS=""
+                  STARTED_TASK_IDS=$(grep -E '^[a-zA-Z][a-zA-Z0-9]*[[:space:]]+ADMBatchProc[[:space:]]+[0-9]+' "${SRVRMGR_LOG}" \
+                    | awk '{print $3}' | grep -E '^[0-9]+$' | sort -u || true)
+
+                  if [[ -z "${STARTED_TASK_IDS}" ]]; then
+                    echo "##[warning]Nao foi possivel extrair TK_TASKID do output do srvrmgr. Continuando sem validacao de TASK."
+                    TASK_DIAG_HINT="diagnostico_task=tk_taskid_nao_extraido_do_srvrmgr"
+                  else
+                    echo "Tasks iniciadas (TK_TASKID): $(echo ${STARTED_TASK_IDS} | tr '\n' ' ')"
+                    echo ""
+
+                    TASK_REPORT=$(mktemp /tmp/siebel_task_report_XXXXXX.txt)
+                    echo "TASK_ID | ADMBatchProc_LOG | LOG_STATUS | XML_GERADO" > "${TASK_REPORT}"
+
+                    TASK_VALIDATION_OK=true
+                    for TASK_ID in ${STARTED_TASK_IDS}; do
+                      echo "  Task ID ${TASK_ID}:"
+
+                      # V1: Verificar XMLs no EXPORT_DIR (critério primário de sucesso)
+                      XML_COUNT=$(find "${EXPORT_DIR}" -maxdepth 1 -name '*.xml' -size +0c 2>/dev/null | wc -l | tr -d ' ')
+                      if [[ "${XML_COUNT}" -gt 0 ]]; then
+                        XML_GEN="OK (${XML_COUNT} arquivo(s))"
+                        echo "    ✓ Arquivos XML: ${XML_COUNT} arquivo(s) em ${EXPORT_DIR}"
+                      else
+                        XML_GEN="ZERO"
+                        echo "    ⏳ Ainda sem arquivos XML em ${EXPORT_DIR} — aguardando polling"
+                      fi
+
+                      # V2: Buscar log do ADMBatchProc (suplementar — ausência é normal quando export OK)
+                      ADMLOG=$(find /app/siebel/logs -maxdepth 1 -name "ADMBatchProc_*_${TASK_ID}_*.log*" 2>/dev/null | head -1)
+                      if [[ -z "${ADMLOG}" ]]; then
+                        LOG_STATUS="SEM_LOG"
+                        ADMLOG_NAME="-"
+                        echo "    ℹ️  Log ADMBatchProc não encontrado em /app/siebel/logs — normal quando export bem-sucedido"
+                      else
+                        ADMLOG_NAME=$(basename "${ADMLOG}")
+                        echo "    ✓ Log encontrado: ${ADMLOG_NAME}"
+                        # V3: Inspecionar log apenas quando presente — erros explícitos bloqueiam
+                        if grep -qi "error\|failed\|fatal" "${ADMLOG}" 2>/dev/null; then
+                          LOG_STATUS="ERROR"
+                          echo "    ✗ Log indica ERRO — marcando task como falha"
+                          TASK_VALIDATION_OK=false
+                        elif grep -qi "completed successfully\|task started\|siebel batch processing" "${ADMLOG}" 2>/dev/null; then
+                          LOG_STATUS="SUCCESS"
+                          echo "    ✓ Log indica SUCESSO"
+                        else
+                          LOG_STATUS="UNKNOWN"
+                          echo "    ? Log sem padrão claro de sucesso/erro"
+                        fi
+                      fi
+
+                      case "${LOG_STATUS}" in
+                        ERROR) TASK_ERROR_IDS+="${TASK_ID} " ;;
+                        SEM_LOG) TASK_NOLOG_IDS+="${TASK_ID} " ;;
+                        UNKNOWN) TASK_UNKNOWN_IDS+="${TASK_ID} " ;;
+                        SUCCESS) TASK_SUCCESS_IDS+="${TASK_ID} " ;;
+                      esac
+
+                      echo "${TASK_ID} | ${ADMLOG_NAME} | ${LOG_STATUS} | ${XML_GEN}" >> "${TASK_REPORT}"
+                    done
+
+                    TASK_DIAG_HINT="diagnostico_task=tasks_iniciadas[$(echo ${STARTED_TASK_IDS} | tr '\n' ' ')] erro[$(echo ${TASK_ERROR_IDS:-nenhuma})] sem_log[$(echo ${TASK_NOLOG_IDS:-nenhuma})] unknown[$(echo ${TASK_UNKNOWN_IDS:-nenhuma})] success[$(echo ${TASK_SUCCESS_IDS:-nenhuma})]"
+
+                    echo ""
+                    echo "--- Resumo de Validacao de TASK_IDs ---"
+                    cat "${TASK_REPORT}" | column -t -s'|' | sed 's/^/  /'
+                    rm -f "${TASK_REPORT}"
+
+                    if [[ "${TASK_VALIDATION_OK}" != "true" ]]; then
+                      echo "##[🚨 error]Log do ADMBatchProc indicou erro em alguma task. Encerrando para evitar timeout mascarando a causa raiz."
+                      echo "Causa raiz detectada: ${TASK_DIAG_HINT}"
+                      ls -la "${EXPORT_DIR}/" || true
+                      rm -f "${OBJECTS_TSV}" "${SRVRMGR_LOG}" 2>/dev/null || true
+                      exit 1
+                    fi
+                  fi
+                # R6: Passo 5 — Polling por arquivos esperados + observabilidade do ADMBatchProc
+                echo ""
+                echo "--- Passo 5: Polling ADMBatchProc ate conclusao ---"
+                echo "Config: max ${POLL_MAX} polls x ${POLL_INTERVAL}s"
+                
+                POLL_COUNT=0
+                ALL_DONE=false
+                MISSING_DETAILS=""
+                while [[ ${POLL_COUNT} -lt ${POLL_MAX} ]]; do
+                  MISSING_COUNT=0
+                  MISSING_DETAILS=""
+                  while IFS=$'\t' read -r EXPECTED_FILE ADM_PREFIX ADM_DATATYPE ADM_FILTER ADM_METHOD OBJECT_NAME; do
+                    # ADMBatchProc trunca o prefixo a 50 chars no nome do arquivo gerado.
+                    # Exemplo: admprefix=NV_AGGRDISCOUNT_Descontos_Nenhum_SVA_Bundle_Vivo_Completo (>50)
+                    #          arquivo: NV_AGGRDISCOUNT_Descontos_Nenhum_SVA_Bundle_Vivo_C_<taskid>_NV_AggrDiscount.xml
+                    PREFIX_TRUNC=$(printf '%s' "${ADM_PREFIX}" | cut -c1-50)
+                    FOUND=$(find "${EXPORT_DIR}" -maxdepth 1 -name "${PREFIX_TRUNC}*.xml" ! -name "*_des.xml" -size +0c 2>/dev/null | sort | head -1)
+                    if [[ -z "${FOUND}" ]]; then
+                      MISSING_COUNT=$(( MISSING_COUNT + 1 ))
+                      MISSING_DETAILS+=$'\n'
+                      MISSING_DETAILS+="  - esperado=${EXPECTED_FILE} | padrao=${PREFIX_TRUNC}*.xml | objeto=${OBJECT_NAME} | motivo=nenhum XML encontrado para o prefixo esperado dentro do tempo de polling | ${TASK_DIAG_HINT}"
+                    fi
+                  done < "${OBJECTS_TSV}"
+
+                  if [[ ${MISSING_COUNT} -eq 0 ]]; then
+                    echo "Todos os arquivos esperados foram gerados. Export concluido."
+                    ALL_DONE=true
+                    break
+                  fi
+
+                  POLL_COUNT=$(( POLL_COUNT + 1 ))
+                  sleep "${POLL_INTERVAL}"
+                  echo "Poll ${POLL_COUNT}/${POLL_MAX}... faltando ${MISSING_COUNT} arquivo(s):${MISSING_DETAILS}"
+                done
+
+                if [[ "${ALL_DONE}" != "true" ]]; then
+                  MISSING_PERCENT=$(( (MISSING_COUNT * 100) / OBJ_COUNT ))
+                  echo "##[error]Timeout de polling atingido. Nem todos os arquivos XML foram gerados em ${EXPORT_DIR}."
+                  echo "Faltantes no timeout (${MISSING_COUNT}/${OBJ_COUNT} = ${MISSING_PERCENT}%):${MISSING_DETAILS}"
+                  echo "Listagem final de ${EXPORT_DIR}:"
+                  ls -lah "${EXPORT_DIR}/" || true
+                  exit 1
+                fi
+                
+                # R7: Passo 6 — Verificar arquivos gerados
+                echo ""
+                echo "--- Passo 6: Verificar arquivos exportados ---"
+                EXPORTED_COUNT=0
+                MISSING_FILES=()
+                MISSING_REASONS=()
+                while IFS=$'\t' read -r EXPECTED_FILE ADM_PREFIX ADM_DATATYPE ADM_FILTER ADM_METHOD OBJECT_NAME; do
+                  # ADMBatchProc trunca o prefixo a 50 chars — usar os primeiros 50 para localizar o arquivo.
+                  PREFIX_TRUNC=$(printf '%s' "${ADM_PREFIX}" | cut -c1-50)
+                  FOUND_FILE=$(find "${EXPORT_DIR}" -maxdepth 1 -name "${PREFIX_TRUNC}*.xml" ! -name "*_des.xml" -size +0c 2>/dev/null | sort | head -1)
+                  if [[ -n "${FOUND_FILE}" ]]; then
+                    TARGET_FILE="${EXPORT_DIR}/${EXPECTED_FILE}"
+                    FOUND_BASENAME=$(basename "${FOUND_FILE}")
+
+                    if [[ "${FOUND_BASENAME}" != "${EXPECTED_FILE}" ]]; then
+                      mv -f "${FOUND_FILE}" "${TARGET_FILE}"
+                      FOUND_FILE="${TARGET_FILE}"
+                      echo "  RENOMEADO: ${FOUND_BASENAME} -> ${EXPECTED_FILE}"
+                    fi
+
+                    FILE_SZ=$(du -h "${FOUND_FILE}" | cut -f1)
+                    echo "  OK: $(basename "${FOUND_FILE}") [esperado: ${EXPECTED_FILE}] (${FILE_SZ})"
+                    EXPORTED_COUNT=$(( EXPORTED_COUNT + 1 ))
+                  else
+                    echo "  AUSENTE: ${EXPECTED_FILE} (prefixo_trunc: ${PREFIX_TRUNC}*.xml)"
+                    MISSING_FILES+=("${EXPECTED_FILE}")
+                    MISSING_REASONS+=("  - objeto=${OBJECT_NAME} | esperado=${EXPECTED_FILE} | padrao=${PREFIX_TRUNC}*.xml | motivo=arquivo nao foi gerado pelo ADMBatchProc (timeout/falha no componente/log) | ${TASK_DIAG_HINT}")
+                  fi
+                done < "${OBJECTS_TSV}"
+                echo "Resultado: ${EXPORTED_COUNT}/${OBJ_COUNT} exportados"
+                if [[ ${#MISSING_FILES[@]} -gt 0 ]]; then
+                  MISSING_PERCENT=$(( (${#MISSING_FILES[@]} * 100) / OBJ_COUNT ))
+                  echo "##[error]${#MISSING_FILES[@]} arquivo(s) ausente(s) (${MISSING_PERCENT}%): ${MISSING_FILES[*]}"
+                  echo "Detalhe dos objetos com falha:"
+                  printf '%s\n' "${MISSING_REASONS[@]}"
+                  ls -la "${EXPORT_DIR}/" || true
+                  exit 1
+                fi
+
+                # Limpeza de arquivos auxiliares de descrição gerados pelo ADMBatchProc
+                DES_COUNT=$(find "${EXPORT_DIR}" -maxdepth 1 -name "*_des.xml" -type f 2>/dev/null | wc -l | tr -d ' ')
+                if [[ "${DES_COUNT}" != "0" ]]; then
+                  echo "Removendo ${DES_COUNT} arquivo(s) auxiliar(es) *_des.xml"
+                  find "${EXPORT_DIR}" -maxdepth 1 -name "*_des.xml" -type f -delete 2>/dev/null || true
+                fi
+                
+                # R8: Passo 7 — Empacotar para transferência
+                echo ""
+                echo "--- Passo 7: Empacotar tar.gz ---"
+                cd "${EXPORT_DIR}"
+                tar -czf "${REMOTE_TGZ}" .
+                TGZ_SZ=$(du -h "${REMOTE_TGZ}" | cut -f1)
+                echo "Pacote: ${REMOTE_TGZ} (${TGZ_SZ})"
+                tar -tzf "${REMOTE_TGZ}" | sed 's/^/  /'
+                rm -f "${OBJECTS_TSV}"
+                rm -f "${SRVRMGR_LOG}"
+                echo ""
+                echo "=== Export remoto concluido: ${REMOTE_TGZ} ==="
+                REMOTE_SCRIPT
+
+                # ─────────────────────────────────────────────────────────────────────
+                # SEÇÃO G: Download do tar.gz para o agente
+                # ─────────────────────────────────────────────────────────────────────
+                echo ""
+                echo "--- Download do pacote exportado ---"
+                mkdir -p "$(dirname "${LOCAL_TGZ_PATH}")"
+                SSHPASS="${SSH_PASS}" sshpass -e scp \
+                  -o StrictHostKeyChecking=no \
+                  -o ConnectTimeout=60 \
+                  "${SSH_USER}@${SSH_HOST}:${REMOTE_TGZ_PATH}" \
+                  "${LOCAL_TGZ_PATH}"
+                echo "Download concluido: $(du -h "${LOCAL_TGZ_PATH}" | cut -f1)"
+
+                # ─────────────────────────────────────────────────────────────────────
+                # SEÇÃO H: Extrair XMLs no XML_OUTPUT_PATH local
+                # ─────────────────────────────────────────────────────────────────────
+                echo ""
+                echo "--- Extraindo XMLs para ${LOCAL_XML_DIR} ---"
+                mkdir -p "${LOCAL_XML_DIR}"
+                tar -xzf "${LOCAL_TGZ_PATH}" -C "${LOCAL_XML_DIR}"
+                echo "Arquivos extraidos:"
+                ls -lah "${LOCAL_XML_DIR}/"
+                rm -f "${LOCAL_TGZ_PATH}"
+
+                # ─────────────────────────────────────────────────────────────────────
+                # SEÇÃO I: Limpeza remota (tar.gz + diretório de export)
+                # ─────────────────────────────────────────────────────────────────────
+                echo ""
+                echo "--- Limpeza remota do pacote e diretório de export ---"
+                if ! SSHPASS="${SSH_PASS}" sshpass -e ssh \
+                  -o StrictHostKeyChecking=no \
+                  -o ConnectTimeout=15 \
+                  "${SSH_USER}@${SSH_HOST}" \
+                  "rm -f '${REMOTE_TGZ_PATH}' && rm -rf '${REMOTE_EXPORT_DIR}' && echo 'Pacote e diretório remoto removidos.'"; then
+                  echo "##[warning]Falha na limpeza remota (${REMOTE_TGZ_PATH} / ${REMOTE_EXPORT_DIR}). O export ja foi baixado para o agente."
+                fi
+
+                echo ""
+                echo "##[section]Export NonRepository concluido. XMLs em: ${LOCAL_XML_DIR}"
+              displayName: '🚀 Export NonRepository: srvrmgr ADMBatchProc inline (sem SVN)'
+              env:
+                SIEBEL_SERVER_IP:       $(SIEBEL_SERVER_IP)
+                SIEBEL_SERVER_USER:     $(SIEBEL_SERVER_USER)
+                SIEBEL_SERVER_PASS:     $(SIEBEL_SERVER_PASS)
+                SSH_USER:               $(SSH_USER)
+                SSH_PASS:               $(SSH_PASS)
+                SIEBEL_EXPORT_USER:          $(SIEBEL_EXPORT_USER)
+                SIEBEL_EXPORT_PASSWORD:      $(SIEBEL_EXPORT_PASSWORD)
+                SIEBEL_GATEWAY:              $(SIEBEL_GATEWAY)
+                SIEBEL_ENTERPRISE:           $(SIEBEL_ENTERPRISE)
+                SIEBEL_SRVRMGR_PATH:         $(SIEBEL_SRVRMGR_PATH)
+                SIEBEL_REMOTE_EXPORT_DIR:    $(SIEBEL_REMOTE_EXPORT_DIR)
+                SIEBEL_SRVRMGR_LANG:         $(SIEBEL_SRVRMGR_LANG)
+                SIEBEL_EXPORT_POLL_INTERVAL: $(SIEBEL_EXPORT_POLL_INTERVAL)
+                SIEBEL_EXPORT_POLL_MAX:      $(SIEBEL_EXPORT_POLL_MAX)
+                SIEBEL_APPSERVER:            $(SIEBEL_APPSERVER)
+                NONREPO_OBJECTS_JSON:        $(NONREPO_OBJECTS_JSON)
+                XML_OUTPUT_PATH:             $(XML_OUTPUT_PATH)
+                DRY_RUN:                     $(DRY_RUN_PARAM)
+                BUILD_BUILDID:               $(Build.BuildId)
+
+            # [Observabilidade] Resumo após execução SSH
+            - powershell: |
+                Write-Host "--- Resumo Export NonRepository ---"
+                $xmlOutputPath = "$(XML_OUTPUT_PATH)"
+                if (Test-Path $xmlOutputPath) {
+                  $xmlFiles = @(Get-ChildItem -Path $xmlOutputPath -Filter "*.xml" -File -ErrorAction SilentlyContinue)
+                  Write-Host "Arquivos .xml extraídos em: $xmlOutputPath"
+                  Write-Host "Total: $($xmlFiles.Count)"
+                  foreach ($f in $xmlFiles) { Write-Host "  • $($f.Name) ($([Math]::Round($f.Length/1KB,1)) KB)" }
+                } else {
+                  Write-Host "Diretório XML_OUTPUT_PATH não encontrado: $xmlOutputPath"
+                }
+              displayName: '📋 Resumo Export NonRepository'
+
+            # [Publicação] Publicar arquivos .xml como artifact (quando houver)
+            - task: PublishPipelineArtifact@1
+              inputs:
+                targetPath: '$(XML_OUTPUT_PATH)'
+                artifactName: 'exported-xml-files'
+              displayName: '📤 Publicar Artefato: XML Files'
+              condition: and(always(), ne(variables['NONREPO_OBJECT_COUNT'], '0'))
+
+            # [Limpeza] Limpar arquivos temporários e de artifact ao final do job
+            - task: DeleteFiles@1
+              displayName: '🧹 Limpar arquivos de artifact (ExportNonRepository)'
+              condition: always()
+              env:
+                NODE_SKIP_PLATFORM_CHECK: '1'
+              inputs:
+                SourceFolder: '$(Pipeline.Workspace)'
+                Contents: |
+                  object_manifest.json
+                  exported-xml-files/**
+                removeSourceFolder: false
+
+        # ------------------------------------------------------------------
+        # Job: ValidateExportsAndGit - Validação de exportações e preparação para Git
+        # Responsabilidades:
+        #   1. Download dos artefatos publicados por cada job de export
+        #   2. Validação e consolidação dos arquivos exportados
+        #   3. Preparação e commit no Git por categoria de objeto (futuro)
+        # ------------------------------------------------------------------
+        - job: ValidateExportsAndGit
+          displayName: '✅ Validação de Exportações e Preparação para Git'
+          pool:
+            name: $(CI_AGENT_POOL)
+          dependsOn:
+            - ExportRepository
+            - ExportNonRepository
+          variables:
+            HAS_REPO_EXPORT: $[ stageDependencies.Cadastrar.IdentifyObjects.outputs['exportObjectCounts.HAS_REPO_EXPORT'] ]
+            HAS_NONREPO_EXPORT: $[ stageDependencies.Cadastrar.IdentifyObjects.outputs['exportObjectCounts.HAS_NONREPO_EXPORT'] ]
+          condition: and(in(dependencies.ExportRepository.result, 'Succeeded', 'SucceededWithIssues', 'Skipped'), in(dependencies.ExportNonRepository.result, 'Succeeded', 'SucceededWithIssues', 'Skipped'))
+          steps:
+            - checkout: self
+              clean: true
+              fetchDepth: 0
+              fetchTags: true
+              persistCredentials: true
+              displayName: '📥 Checkout para Git Operations'
+            # [GitConfig] Configurar identidade Git local no repositório
+            - bash: |
+                set -eo pipefail
+                echo "--- Configurar identidade Git local ---"
+
+                SOURCES_ROOT="$(Build.SourcesDirectory)"
+                REPO_NAME="$(Build.Repository.Name)"
+                REPO_ROOT="${SOURCES_ROOT}"
+                NESTED_REPO_PATH="${SOURCES_ROOT}/${REPO_NAME}"
+
+                if [ -d "${NESTED_REPO_PATH}" ]; then
+                  REPO_ROOT="${NESTED_REPO_PATH}"
+                fi
+
+                if [ ! -d "${REPO_ROOT}" ]; then
+                  echo "##[error]Repositório não encontrado para configuração Git: ${REPO_ROOT}"
+                  exit 1
+                fi
+
+                cd "${REPO_ROOT}"
+
+                if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+                  echo "##[error]Diretório atual não é um repositório Git: ${REPO_ROOT}"
+                  exit 1
+                fi
+
+                git config user.name "$(Git.UserName)"
+                git config user.email "$(Git.UserEmail)"
+
+                GIT_USER_NAME=$(git config user.name || true)
+                GIT_USER_EMAIL=$(git config user.email || true)
+
+                if [ -z "${GIT_USER_NAME}" ] || [ -z "${GIT_USER_EMAIL}" ]; then
+                  echo "##[error]Falha ao configurar identidade Git local no repositório"
+                  exit 1
+                fi
+
+                echo "Identidade Git local configurada com sucesso"
+                git config --list --local | grep -E '^user\.(name|email)=' || true
+              displayName: '🔐 Configurar identidade Git (local)'
+
+            # [Preparação] Baixar manifesto de objetos (SEMPRE necessário para organização)
+            - task: DownloadPipelineArtifact@2
+              inputs:
+                artifactName: 'object-manifest'
+                targetPath: '$(Pipeline.Workspace)'
+              displayName: '📥 Download Manifesto de Objetos'
+
+            # [Preparação] Baixar artifact intermediário de repository somente quando houve export repository
+            - task: DownloadPipelineArtifact@2
+              inputs:
+                artifactName: 'repository-export-raw'
+                targetPath: '$(Pipeline.Workspace)/repository-export-raw'
+              displayName: '📥 Download Artifact Intermediário (Repository)'
+              condition: and(always(), eq(variables['HAS_REPO_EXPORT'], 'true'))
+
+            # [Preparação] Baixar artifact intermediário de XML somente quando houve export nonrepository
+            - task: DownloadPipelineArtifact@2
+              inputs:
+                artifactName: 'exported-xml-files'
+                targetPath: '$(Pipeline.Workspace)/exported-xml-files'
+              displayName: '📥 Download Artifact Intermediário (XML)'
+              condition: and(always(), eq(variables['HAS_NONREPO_EXPORT'], 'true'))
+
+            # [Validação] Coletar e validar arquivos .sif e .xml exportados
+            - bash: |
+                set -eo pipefail
+                echo "--- Coletar e Validar Arquivos Exportados ---"
+                echo ""
+
+                AGENT_TEMP_DIR="$(Agent.TempDirectory)"
+                BUILD_REF="$(SIEBEL_EXPORT_BUILD_REF)"
+                BASE_PATH="${AGENT_TEMP_DIR}/${BUILD_REF}"
+                SIF_OUTPUT_PATH="$(SIF_OUTPUT_PATH)"
+                XML_OUTPUT_PATH="$(XML_OUTPUT_PATH)"
+                DOWNLOADED_REPO_PATH="$(Pipeline.Workspace)/repository-export-raw"
+                DOWNLOADED_XML_PATH="$(Pipeline.Workspace)/exported-xml-files"
+
+                echo "Base Path (origem de export): ${BASE_PATH}"
+                echo "SIF Output Path (destino): ${SIF_OUTPUT_PATH}"
+                echo "XML Output Path (destino): ${XML_OUTPUT_PATH}"
+                echo ""
+
+                # Limpar diretórios de output (evita duplicatas de builds anteriores)
+                for path in "${SIF_OUTPUT_PATH}" "${XML_OUTPUT_PATH}"; do
+                  if [ -d "${path}" ]; then
+                    rm -rf "${path}"/*
+                  else
+                    mkdir -p "${path}"
+                  fi
+                done
+
+                # Função para validar se arquivo está normalizado (contém underscore, sem espaços)
+                is_normalized_filename() {
+                  local filename="$1"
+                  [[ "${filename}" == *_* && "${filename}" != *" "* ]]
+                }
+
+                # Procurar arquivos normalizados apenas no caminho correto de export
+                SIF_FILES=()
+                XML_FILES=()
+
+                # SIF: fonte principal deve ser o artifact intermediário do ExportRepository
+                if [ -d "${DOWNLOADED_REPO_PATH}" ]; then
+                  echo "📁 Procurando arquivos .sif em artifact: ${DOWNLOADED_REPO_PATH}"
+                  while IFS= read -r file; do
+                    if is_normalized_filename "$(basename "${file}")"; then
+                      SIF_FILES+=("${file}")
+                    fi
+                  done < <(find "${DOWNLOADED_REPO_PATH}" -maxdepth 1 -name '*.sif' -type f 2>/dev/null || true)
+                else
+                  echo "⚠️  Artifact repository-export-raw não encontrado: ${DOWNLOADED_REPO_PATH}"
+                fi
+
+                # Fallback para SIF: caminho local de export
+                if [ ${#SIF_FILES[@]} -eq 0 ] && [ -d "${BASE_PATH}" ]; then
+                  echo "📁 Fallback para origem local de export: ${BASE_PATH}"
+                  while IFS= read -r file; do
+                    if is_normalized_filename "$(basename "${file}")"; then
+                      SIF_FILES+=("${file}")
+                    fi
+                  done < <(find "${BASE_PATH}" -maxdepth 1 -name '*.sif' -type f 2>/dev/null || true)
+                fi
+
+                # XML: fonte principal deve ser o artifact intermediário do ExportNonRepository
+                if [ -d "${DOWNLOADED_XML_PATH}" ]; then
+                  echo "📁 Procurando arquivos .xml em artifact: ${DOWNLOADED_XML_PATH}"
+                  while IFS= read -r file; do
+                    if is_normalized_filename "$(basename "${file}")"; then
+                      XML_FILES+=("${file}")
+                    fi
+                  done < <(find "${DOWNLOADED_XML_PATH}" -maxdepth 1 -name '*.xml' -type f 2>/dev/null || true)
+                elif [ -d "${BASE_PATH}" ]; then
+                  echo "📁 Fallback para XML na origem local de export: ${BASE_PATH}"
+                  while IFS= read -r file; do
+                    if is_normalized_filename "$(basename "${file}")"; then
+                      XML_FILES+=("${file}")
+                    fi
+                  done < <(find "${BASE_PATH}" -maxdepth 1 -name '*.xml' -type f 2>/dev/null || true)
+                fi
+
+                IS_SIMULATED="false"
+                if [ -f "${DOWNLOADED_REPO_PATH}/_SIMULATED_EXPORT.txt" ]; then
+                  IS_SIMULATED="true"
+                else
+                  for file in "${SIF_FILES[@]}"; do
+                    if head -1 "${file}" 2>/dev/null | grep -q '^<!-- Simulated Siebel Export:'; then
+                      IS_SIMULATED="true"
+                      break
+                    fi
+                  done
+                fi
+
+                echo "##vso[task.setvariable variable=EXPORT_CONTENT_SIMULATED]${IS_SIMULATED}"
+                if [ "${IS_SIMULATED}" = "true" ]; then
+                  echo "⚠️ Conteúdo simulado detectado no export (.sif). GitOps será bloqueado neste run."
+                fi
+
+                echo ""
+                echo "Encontrados ${#SIF_FILES[@]} arquivos .sif normalizados"
+                echo "Encontrados ${#XML_FILES[@]} arquivos .xml normalizados"
+                echo ""
+
+                # Contadores para rastreamento preciso
+                COPIED_SIF_COUNT=0
+                COPIED_XML_COUNT=0
+
+                # Copiar apenas arquivos normalizados para .sif
+                if [ ${#SIF_FILES[@]} -gt 0 ]; then
+                  echo "Arquivos .sif normalizados para Git:"
+                  for file in "${SIF_FILES[@]}"; do
+                    FILE_SIZE=$(stat --format=%s "${file}" 2>/dev/null || echo 0)
+                    echo "  • $(basename "${file}") (${FILE_SIZE} bytes)"
+                    cp "${file}" "${SIF_OUTPUT_PATH}/"
+                    ((++COPIED_SIF_COUNT))
+                  done
+                else
+                  echo "⚠️  Nenhum arquivo .sif normalizado encontrado"
+                fi
+
+                # Copiar apenas arquivos normalizados para .xml (se houver)
+                if [ ${#XML_FILES[@]} -gt 0 ]; then
+                  echo ""
+                  echo "Arquivos .xml normalizados para Git:"
+                  for file in "${XML_FILES[@]}"; do
+                    FILE_SIZE=$(stat --format=%s "${file}" 2>/dev/null || echo 0)
+                    echo "  • $(basename "${file}") (${FILE_SIZE} bytes)"
+                    cp "${file}" "${XML_OUTPUT_PATH}/"
+                    ((++COPIED_XML_COUNT))
+                  done
+                fi
+
+                echo ""
+                echo "Resumo de Coleta:"
+                echo "  • ${COPIED_SIF_COUNT} arquivos .sif copiados para: ${SIF_OUTPUT_PATH}"
+                if [ ${COPIED_XML_COUNT} -gt 0 ]; then
+                  echo "  • ${COPIED_XML_COUNT} arquivos .xml copiados para: ${XML_OUTPUT_PATH}"
+                fi
+
+                echo ""
+              displayName: '📦 Coletar e Validar Arquivos Exportados'
+
+            # [Informação] Resumo de artefatos publicados
+            - bash: |
+                echo "--- Resumo de Artefatos Publicados ---"
+                echo ""
+                echo "✅ Artefato SIF (publicado no job ExportRepository): repository-export-raw"
+                echo "   Localização: $(Pipeline.Workspace)/repository-export-raw"
+                echo ""
+                echo "✅ Artefato XML (publicado no job ExportNonRepository): exported-xml-files"
+                echo "   Localização: $(XML_OUTPUT_PATH)"
+                echo ""
+                echo "Próximas etapas:"
+                echo "  1. Security Analysis (Fortify SAST)"
+                echo "  2. Quality Gates (SonarQube)"
+                echo "  3. Export completado com sucesso"
+                echo ""
+              displayName: '📋 Resumo de Artefatos'
+
+            # [GitOps] Preparação de contexto e validação de pré-requisitos
+            - bash: |
+                set -eo pipefail
+                echo "--- Git Operations: Preparação ---"
+
+                GIT_ENABLED="$(ENABLE_GIT_OPERATIONS)"
+                DRY_RUN="$(DRY_RUN_MODE)"
+                SOURCES_ROOT="$(Build.SourcesDirectory)"
+                REPO_NAME="$(Build.Repository.Name)"
+                REPO_ROOT="${SOURCES_ROOT}"
+                NESTED_REPO_PATH="${SOURCES_ROOT}/${REPO_NAME}"
+
+                echo "Parâmetro enableGitOperations: ${GIT_ENABLED}"
+                echo "Parâmetro dryRun: ${DRY_RUN}"
+
+                if [ -d "${NESTED_REPO_PATH}" ]; then
+                  REPO_ROOT="${NESTED_REPO_PATH}"
+                fi
+
+                if [ "${GIT_ENABLED}" != "true" ]; then
+                  echo "⏭️ Git Operations desabilitado por parâmetro."
+                  echo "##vso[task.setvariable variable=GITOPS_ENABLED]false"
+                  echo "##vso[task.setvariable variable=GITOPS_DISABLED_REASON]parameter-disabled"
+                  exit 0
+                fi
+
+                HAS_SIMULATED_CONTENT=$(echo "$(EXPORT_CONTENT_SIMULATED)" | tr '[:upper:]' '[:lower:]')
+                if [ "${HAS_SIMULATED_CONTENT}" = "true" ]; then
+                  echo "⏭️ Git Operations bloqueado: export contém arquivos simulados (dry-run/fallback)."
+                  echo "##vso[task.setvariable variable=GITOPS_ENABLED]false"
+                  echo "##vso[task.setvariable variable=GITOPS_DISABLED_REASON]simulated-export"
+                  exit 0
+                fi
+
+                if [ ! -d "${REPO_ROOT}" ]; then
+                  echo "##[error]Repositório não encontrado: ${REPO_ROOT}"
+                  exit 1
+                fi
+
+                cd "${REPO_ROOT}"
+                if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+                  echo "##[error]Diretório atual não é um repositório Git: ${REPO_ROOT}"
+                  exit 1
+                fi
+
+                RELEASE_VERSION="v$(date +'%Y.%m')"
+                RELEASE_TAG="${RELEASE_VERSION}-export-$(date +'%Y%m%d')-$(Build.BuildId)"
+
+                echo "Repo Root: ${REPO_ROOT}"
+                echo "Dry Run: ${DRY_RUN}"
+                echo "Release Tag alvo: ${RELEASE_TAG}"
+
+                echo "##vso[task.setvariable variable=GITOPS_ENABLED]true"
+                echo "##vso[task.setvariable variable=GITOPS_DISABLED_REASON]none"
+                echo "##vso[task.setvariable variable=GITOPS_DRYRUN]${DRY_RUN}"
+                echo "##vso[task.setvariable variable=GITOPS_REPO_ROOT]${REPO_ROOT}"
+                echo "##vso[task.setvariable variable=SIEBEL_RELEASE_VERSION]${RELEASE_VERSION}"
+                echo "##vso[task.setvariable variable=SIEBEL_RELEASE_TAG]${RELEASE_TAG}"
+              displayName: '🔧 Git: Preparar Contexto'
+
+            # [GitOps] Organizar artefatos exportados na estrutura final
+            - bash: |
+                set -eo pipefail
+                echo "--- Git Operations: Organizar Estrutura ---"
+
+                if [ "$(GITOPS_ENABLED)" != "true" ]; then
+                  echo "⏭️ Etapa ignorada: Git Operations desabilitado. Motivo=$(GITOPS_DISABLED_REASON)"
+                  exit 0
+                fi
+
+                REPO_ROOT="$(GITOPS_REPO_ROOT)"
+                if [ -z "${REPO_ROOT}" ]; then
+                  REPO_ROOT="$(Build.SourcesDirectory)"
+                fi
+                MANIFEST_PATH="$(Pipeline.Workspace)/object_manifest.json"
+                SIF_SOURCE="$(SIF_OUTPUT_PATH)"
+                XML_SOURCE="$(XML_OUTPUT_PATH)"
+
+                if [ ! -f "${MANIFEST_PATH}" ]; then
+                  echo "##[error]Manifesto não encontrado: ${MANIFEST_PATH}"
+                  exit 1
+                fi
+
+                # Função para converter nome para token seguro
+                convert_to_safe_token() {
+                  local text="$1"
+                  [[ -z "${text}" ]] && echo "unknown" && return
+                  echo "${text}" | sed 's/[^A-Za-z0-9]/_/g; s/__*/_/g; s/^_//; s/_$//'
+                }
+
+                # Função para encontrar arquivo de origem
+                resolve_source_file() {
+                  local source_dir="$1" expected_file="$2" object_name="$3" extension="$4"
+                  
+                  if [ -z "${source_dir}" ] || [ ! -d "${source_dir}" ]; then
+                    return 1
+                  fi
+                  
+                  if [ -n "${expected_file}" ] && [ -f "${source_dir}/${expected_file}" ]; then
+                    echo "${source_dir}/${expected_file}"
+                    return 0
+                  fi
+                  
+                  local candidates=()
+                  mapfile -t candidates < <(find "${source_dir}" -maxdepth 1 -name "*${extension}" -type f 2>/dev/null || true)
+                  if [ ${#candidates[@]} -eq 0 ]; then
+                    return 1
+                  fi
+                  
+                  local normalized_name
+                  normalized_name=$(convert_to_safe_token "${object_name}")
+                  
+                  for file in "${candidates[@]}"; do
+                    local base_name
+                    base_name=$(basename "${file}" "${extension}")
+                    local normalized_file
+                    normalized_file=$(convert_to_safe_token "${base_name}")
+                    
+                    if [[ "${normalized_file}" == *"${normalized_name}"* ]]; then
+                      echo "${file}"
+                      return 0
+                    fi
+                  done
+                  
+                  echo "${candidates[0]}"
+                  return 0
+                }
+
+                # Função para montar nome de arquivo normalizado
+                build_normalized_filename() {
+                  local obj_type="$1" obj_name="$2" extension="$3" fallback_name="$4"
+                  
+                  local safe_type
+                  safe_type=$(convert_to_safe_token "${obj_type}" | tr '[:lower:]' '[:upper:]')
+                  local safe_name
+                  safe_name=$(convert_to_safe_token "${obj_name}")
+                  
+                  if [ -n "${safe_type}" ] && [ -n "${safe_name}" ]; then
+                    echo "${safe_type}_${safe_name}${extension}"
+                    return
+                  fi
+                  
+                  if [ -n "${fallback_name}" ]; then
+                    local fallback_base
+                    fallback_base=$(basename "${fallback_name}" | sed 's/\.[^.]*$//')
+                    local fallback_ext
+                    fallback_ext=$(echo "${fallback_name}" | grep -o '\.[^.]*$' || echo "${extension}")
+                    echo "$(convert_to_safe_token "${fallback_base}")${fallback_ext}"
+                    return
+                  fi
+                  
+                  echo "$(convert_to_safe_token "${obj_name}")${extension}"
+                }
+
+                # Ler manifesto com jq
+                REPO_BASE="${REPO_ROOT}/Repository"
+                NONREPO_BASE="${REPO_ROOT}/NonRepository"
+
+                mkdir -p "${REPO_BASE}" "${NONREPO_BASE}"
+
+                REPO_COPIED=0
+                NONREPO_COPIED=0
+
+                while IFS='|' read -r OBJ_TYPE OBJ_FILE_EXT OBJ_EXPECTED OBJ_OBJECT_TYPE OBJ_NAME; do
+                  
+                  CATEGORY="repository"
+                  if [ "${OBJ_TYPE}" = "nonrepository" ] || [ "${OBJ_FILE_EXT}" = ".xml" ]; then
+                    CATEGORY="nonrepository"
+                  fi
+                  
+                  if [ "${CATEGORY}" = "nonrepository" ]; then
+                    SOURCE_DIR="${XML_SOURCE}"
+                    EXTENSION=".xml"
+                  else
+                    SOURCE_DIR="${SIF_SOURCE}"
+                    EXTENSION=".sif"
+                  fi
+                  
+                  if [ "${CATEGORY}" = "nonrepository" ]; then
+                    TARGET_ROOT="${NONREPO_BASE}"
+                  else
+                    TARGET_ROOT="${REPO_BASE}"
+                  fi
+                  mkdir -p "${TARGET_ROOT}"
+                  
+                  SOURCE_FILE=$(resolve_source_file "${SOURCE_DIR}" "${OBJ_EXPECTED}" "${OBJ_NAME}" "${EXTENSION}" 2>/dev/null || echo "")
+                  if [ -z "${SOURCE_FILE}" ]; then
+                    echo "⚠️ Arquivo não localizado para objeto: ${OBJ_NAME} (${CATEGORY})"
+                    continue
+                  fi
+                  
+                  NORMALIZED_FILENAME=$(build_normalized_filename "${OBJ_OBJECT_TYPE}" "${OBJ_NAME}" "${EXTENSION}")
+                  DESTINATION_PATH="${TARGET_ROOT}/${NORMALIZED_FILENAME}"
+                  cp "${SOURCE_FILE}" "${DESTINATION_PATH}"
+                  
+                  if [ "${CATEGORY}" = "nonrepository" ]; then
+                    ((++NONREPO_COPIED))
+                  else
+                    ((++REPO_COPIED))
+                  fi
+                  echo "  • Copiado (${CATEGORY}): ${OBJ_NAME} -> ${DESTINATION_PATH}"
+                done < <(jq -r '.objects[] | select(.id != "ALL" and .scope != "complete") | "\(.type)|\(.fileExtension)|\(.expectedFile)|\(.objectType // .subtypeRaw // .subtype)|\(.name // .id)"' "${MANIFEST_PATH}")
+
+                echo "✅ Estrutura Git preparada"
+                echo "  • Repository files: ${REPO_COPIED}"
+                echo "  • NonRepository files: ${NONREPO_COPIED}"
+                echo "##vso[task.setvariable variable=GITOPS_REPO_COPIED]${REPO_COPIED}"
+                echo "##vso[task.setvariable variable=GITOPS_NONREPO_COPIED]${NONREPO_COPIED}"
+              displayName: '📁 Git: Organizar Estrutura'
+
+            # [GitOps] Commit por categoria e criação de tag de release
+            - bash: |
+                set -eo pipefail
+                echo "--- Git Operations: Commit e Tag ---"
+
+                if [ "$(GITOPS_ENABLED)" != "true" ]; then
+                  echo "⏭️ Etapa ignorada: Git Operations desabilitado. Motivo=$(GITOPS_DISABLED_REASON)"
+                  exit 0
+                fi
+
+                REPO_ROOT="$(GITOPS_REPO_ROOT)"
+                if [ -z "${REPO_ROOT}" ]; then
+                  REPO_ROOT="$(Build.SourcesDirectory)"
+                fi
+                DRY_RUN="$(GITOPS_DRYRUN)"
+                RELEASE_TAG="$(SIEBEL_RELEASE_TAG)"
+                SOURCE_BRANCH="$(Build.SourceBranch)"
+                COPIED_REPO_COUNT="$(GITOPS_REPO_COPIED)"
+                COPIED_NONREPO_COUNT="$(GITOPS_NONREPO_COPIED)"
+
+                if ! [[ "${COPIED_REPO_COUNT}" =~ ^[0-9]+$ ]]; then
+                  COPIED_REPO_COUNT=0
+                fi
+                if ! [[ "${COPIED_NONREPO_COUNT}" =~ ^[0-9]+$ ]]; then
+                  COPIED_NONREPO_COUNT=0
+                fi
+
+                cd "${REPO_ROOT}"
+                GIT_USER_NAME=$(git config user.name || true)
+                GIT_USER_EMAIL=$(git config user.email || true)
+                if [ -z "${GIT_USER_NAME}" ] || [ -z "${GIT_USER_EMAIL}" ]; then
+                  echo "##[error]Identidade Git não configurada no repositório. Configure user.name e user.email antes de commit/tag."
+                  exit 1
+                fi
+
+                # Prefixo do commit: jiraProject quando informado, senão fallback descritivo
+                JIRA_PROJECT="${{ parameters.jiraProject }}"
+                COMMIT_PREFIX="${JIRA_PROJECT:-SIBL}"
+
+                # Adicionar ambas categorias ao stage
+                git add -- 'Repository' 'NonRepository' 2>/dev/null || true
+
+                # Verificar se há mudanças no stage
+                STAGED_FILES=$(git diff --cached --name-only 2>/dev/null)
+                
+                if [ -z "${STAGED_FILES}" ]; then
+                  echo "ℹ️ Nenhuma alteração encontrada para commit."
+                else
+                  # Montar mensagem detectando categorias por staged files e por sinais da etapa de organização
+                  REPO_STAGED_COUNT=$(printf '%s\n' "${STAGED_FILES}" | awk -F'/' 'tolower($1)=="repository" { c++ } END { print c+0 }')
+                  NONREPO_STAGED_COUNT=$(printf '%s\n' "${STAGED_FILES}" | awk -F'/' 'tolower($1)=="nonrepository" { c++ } END { print c+0 }')
+
+                  REPO_SIGNAL_COUNT="${REPO_STAGED_COUNT}"
+                  NONREPO_SIGNAL_COUNT="${NONREPO_STAGED_COUNT}"
+
+                  if [ "${REPO_SIGNAL_COUNT}" -eq 0 ] && [ "${COPIED_REPO_COUNT}" -gt 0 ]; then
+                    REPO_SIGNAL_COUNT="${COPIED_REPO_COUNT}"
+                  fi
+                  if [ "${NONREPO_SIGNAL_COUNT}" -eq 0 ] && [ "${COPIED_NONREPO_COUNT}" -gt 0 ]; then
+                    NONREPO_SIGNAL_COUNT="${COPIED_NONREPO_COUNT}"
+                  fi
+
+                  echo "Diagnóstico de categorias:"
+                  echo "  • staged Repository: ${REPO_STAGED_COUNT}"
+                  echo "  • staged NonRepository: ${NONREPO_STAGED_COUNT}"
+                  echo "  • copied Repository: ${COPIED_REPO_COUNT}"
+                  echo "  • copied NonRepository: ${COPIED_NONREPO_COUNT}"
+                  echo "  • signal Repository: ${REPO_SIGNAL_COUNT}"
+                  echo "  • signal NonRepository: ${NONREPO_SIGNAL_COUNT}"
+
+                  CHANGED_PARTS=""
+                  if [ "${REPO_SIGNAL_COUNT}" -gt 0 ]; then
+                    CHANGED_PARTS="Repository Objects"
+                  fi
+                  if [ "${NONREPO_SIGNAL_COUNT}" -gt 0 ]; then
+                    if [ -n "${CHANGED_PARTS}" ]; then
+                      CHANGED_PARTS="${CHANGED_PARTS} | NonRepository Objects"
+                    else
+                      CHANGED_PARTS="NonRepository Objects"
+                    fi
+                  fi
+                  if [ -z "${CHANGED_PARTS}" ]; then
+                    CHANGED_PARTS="Updated Objects"
+                  fi
+
+                  COMMIT_MSG="${COMMIT_PREFIX}: ${CHANGED_PARTS} | $(Build.BuildId)"
+                  echo "📝 Commit único preparado:"
+                  echo "   Mensagem: ${COMMIT_MSG}"
+                  echo ""
+
+                  if [ "${DRY_RUN}" = "true" ]; then
+                    echo "🧪 DRY RUN: git commit -m \"${COMMIT_MSG}\""
+                  else
+                    git commit -m "${COMMIT_MSG}"
+                    if [ $? -ne 0 ]; then
+                      echo "##[error]Falha ao criar commit: ${COMMIT_MSG}"
+                      exit 1
+                    fi
+                    echo "✅ Commit realizado com sucesso"
+                  fi
+                fi
+
+                if git tag --list | grep -q "^${RELEASE_TAG}$"; then
+                  echo "##[error]Tag já existe: ${RELEASE_TAG}"
+                  exit 1
+                fi
+
+                if [ "${DRY_RUN}" = "true" ]; then
+                  echo "🧪 DRY RUN: git tag ${RELEASE_TAG}"
+                else
+                  git tag "${RELEASE_TAG}"
+                  if [ $? -ne 0 ]; then
+                    echo "##[error]Falha ao criar tag: ${RELEASE_TAG}"
+                    exit 1
+                  fi
+                fi
+
+                if [ "${DRY_RUN}" = "true" ]; then
+                  echo "🧪 DRY RUN: push remoto ignorado"
+                  exit 0
+                fi
+
+                if [[ ! "${SOURCE_BRANCH}" =~ ^refs/heads/ ]]; then
+                  echo "##[error]Branch de origem inválida para push: ${SOURCE_BRANCH}"
+                  exit 1
+                fi
+
+                BRANCH_NAME="${SOURCE_BRANCH#refs/heads/}"
+                git push origin "HEAD:${BRANCH_NAME}"
+                if [ $? -ne 0 ]; then
+                  echo "##[error]Falha no push da branch: ${BRANCH_NAME}"
+                  exit 1
+                fi
+
+                git push origin "${RELEASE_TAG}"
+                if [ $? -ne 0 ]; then
+                  echo "##[error]Falha no push da tag: ${RELEASE_TAG}"
+                  exit 1
+                fi
+
+                echo "✅ Git Operations concluído com sucesso"
+              displayName: '🏷️ Git: Commit e Release Tag'
+
+            # [Limpeza] Limpar downloads e diretórios de artifact ao final do job
+            - task: DeleteFiles@1
+              displayName: '🧹 Limpar arquivos de artifact (ValidateExportsAndGit)'
+              condition: always()
+              env:
+                NODE_SKIP_PLATFORM_CHECK: '1'
+              inputs:
+                SourceFolder: '$(Pipeline.Workspace)'
+                Contents: |
+                  repository-export-raw/**
+                  exported-xml-files/**
+                  sif_files/**
+                  xml_files/**
+                  object_manifest.json
+                removeSourceFolder: false
+
+  # ==================================================================
+  # Stage 4: SecurityAnalysis - Fortify SAST Obrigatório (Compliance)
+  # Descrição: Obtém flags AppSec via Azure App Configuration e executa
+  #            análise estática de segurança com Fortify SAST.
+  # ==================================================================
+  - stage: SecurityAnalysis
+    displayName: 'Security Analysis'
+    dependsOn: Prepare
+    condition: succeeded()
+    jobs:
+      - job: AppSecConfigKeys
+        displayName: 'Get AppSec Config Keys'
+        pool:
+          name: $(CI_AGENT_POOL)
+        steps:
+          # [Configuração] Flags AppSec via Azure App Configuration
+          - template: /security/get_appconfig_keys_framework.yml
+
+      - job: FortifyScan
+        displayName: 'Fortify Scan'
+        dependsOn:
+          - AppSecConfigKeys
+        variables:
+          USE_FORTIFY: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.USE_FORTIFY'] ]
+          USE_CONVISO: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.USE_CONVISO'] ]
+          SKIP_SECURITY_GATE: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.SKIP_SECURITY_GATE'] ]
+          FORTIFY_LOCAL_SCANCENTRAL_VERSION: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.FORTIFY_LOCAL_SCANCENTRAL_VERSION'] ]
+        condition: and(succeeded(), eq(variables.USE_FORTIFY, 'true'))
+        pool:
+          name: $(CI_AGENT_POOL)
+        steps:
+          # [Execução de Scan] Análise Estática de Segurança com Fortify SAST
+          - template: /security/run_fortify_scan.yml
+            parameters:
+              fortifyExclusionRepository: 'FortifyExclusion'
+              enableFortifyExclusions: ${{ parameters.enableFortifyExclusions }}
+              appLanguage: 'other'
+              appVersion: '$(FORTIFY_APP_VERSION)' # Variável definida pelo template /security/define_appsec_app_version.yml
+
+  # ==================================================================
+  # Stage 5: QualityGates - Análise de Qualidade SonarQube
+  # Descrição: Executa análise completa SonarQube com quality gate
+  #            bloqueador via SonarAnalysisFromVivo@2. Task customizada
+  #            Vivo para análise de qualidade com integração AppConfig.
+  # ==================================================================
+  - stage: QualityGates
+    displayName: '📊 Quality Gates - SonarQube'
+    dependsOn: Prepare
+    condition: succeeded()
+    pool:
+      name: $(CI_AGENT_POOL)
+    jobs:
+      - job: SonarQubeScan
+        displayName: 'SonarQube Quality Analysis'
+        variables:
+          # ⚠️ Referência de output entre STAGES diferentes
+          # Sintaxe: stageDependencies.<StageName>.<JobName>.outputs['<stepName>.<variableName>']
+          NEW_VERSION: $[ stageDependencies.Prepare.Initialize.outputs['versioning.NEW_VERSION'] ]
+        steps:
+          # [Observabilidade] Info do scan SonarQube
+          - bash: |
+              echo "--- SonarQube Quality Gate Analysis ---"
+              echo "Projeto: $(SIGLA)-$(Build.Repository.Name)"
+              echo "Versão: $(NEW_VERSION)"
+              echo "Quality Gate: ${{ parameters.sonarQualityGate }}"
+              echo "Timeout: ${{ parameters.sonarPollingTimeoutSec }}s"
+              echo "Timeout API: ${{ parameters.sonarWsTimeoutSec }}s"
+              echo "Retry task: ${{ parameters.sonarTaskRetryCount }}"
+              echo ""
+            displayName: '📊 Info SonarQube'
+
+          # [Execução de Scan] SonarQube com quality gate bloqueador
+          # Task: SonarAnalysisFromVivo@2 (Custom Task Vivo)
+          # Propósito: Análise de qualidade de código com SonarQube
+          # Capacidades:
+          #   • Scan de código-fonte em múltiplas linguagens (js, vbs, sql, xml)
+          #   • Quality Gate bloqueador (fail-safe)
+          #   • Integração Azure App Configuration para credenciais
+          #   • Polling automático de resultados com timeout configurável
+          #   • Exclusões automáticas (build artifacts, logs, bibliotecas externas)
+          # Documentação: https://dvps.redecorp.azr/portal/codeplay/framework/
+          - task: SonarAnalysisFromVivo@2
+            displayName: '🔍 SonarQube Full Analysis & Quality Gate'
+            timeoutInMinutes: 30
+            retryCountOnTaskFailure: ${{ parameters.sonarTaskRetryCount }}
+            inputs:
+              # ==================================================================
+              # Configuração Básica da Task
+              # ==================================================================
+              command: 'analysis'              # Tipo de comando (analysis/publish)
+              SonarQube: ${{ parameters.sonarServiceConnection }}  # Service Connection
+              scannerMode: ${{ parameters.sonarScannerMode }}      # Modo: cli, dotnet, msbuild
+
+              # ==================================================================
+              # Identidade do Projeto no SonarQube
+              # ==================================================================
+              cliProjectKey: '$(SIGLA)-$(Build.Repository.Name)'   # Chave única no SonarQube
+              cliProjectName: 'Siebel Repository - $(Build.Repository.Name)'  # Nome legível
+              cliProjectVersion: '$(NEW_VERSION)'                  # Versão semântica
+
+              # ==================================================================
+              # Quality Gate e Validação de Qualidade
+              # ==================================================================
+              qualityGate: ${{ parameters.sonarQualityGate }}       # Quality Gate a validar
+              acronym: $(SIGLA)                                    # Acrônimo do projeto
+
+              # ==================================================================
+              # Configuração de Relatório e Polling
+              # ==================================================================
+              reportPath: '$(Agent.TempDirectory)/sonar/$(Build.BuildId)/report-task.txt'  # Caminho do relatório
+              pollingTimeoutSec: ${{ parameters.sonarPollingTimeoutSec }}  # Timeout polling (segundos)
+
+              # ==================================================================
+              # Integração Azure App Configuration (Padrão Vivo)
+              # ==================================================================
+              useAppConfig: ${{ parameters.useAppConfig }}         # Usar Azure App Configuration
+              azureSubscription: DevOpsSharedResources             # Subscription Azure
+              appConfigurationEndpoint: 'https://appcs-azdevops-shared.azconfig.io'  # Endpoint AppConfig
+
+              # ==================================================================
+              # Propriedades Avançadas SonarQube
+              # ==================================================================
+              extraProperties: |
+                # Configuração Básica
+                sonar.sources=.
+                sonar.projectBaseDir=$(Build.SourcesDirectory)
+                sonar.scanner.metadataFilePath=$(Agent.TempDirectory)/sonar/$(Build.BuildId)/report-task.txt
+
+                # Quality Gate e Polling
+                sonar.qualitygate.wait=false
+                sonar.qualitygate.timeout=${{ parameters.sonarPollingTimeoutSec }}
+
+                # Linguagens Suportadas (Siebel)
+                sonar.language=js,vbs,sql,xml
+
+                # Timeouts e Conectividade
+                sonar.ws.timeout=${{ parameters.sonarWsTimeoutSec }}
+                sonar.scm.disabled=false
+
+                # Exclusões Automáticas (Artifacts, Logs, Bibliotecas, Migrações)
+                sonar.exclusions=**/*.log,**/*.tmp,**/target/**,**/bin/**,**/obj/**,**/.git/**,**/.svn/**,**/.azuredevops/**,**/node_modules/**,**/dist/**,**/build/**,**/backup/**,**/temp/**,**/logs/**,**/*.bak,**/*.old,**/*.class,**/*.jar,**/*.war,**/*.ear,**/*.zip,**/*.tar,**/*.gz,**/*.rar,**/*.7z,**/*.css,**/OtherObjects/WorkspaceProject/**,**/OtherObjects/Misc/*.ear,**/OtherObjects/Misc/*.tar,**/OtherObjects/Misc/*.zip,**/migraContas/**,**/migracao_massiva/**,**/migracao_ondemand/**
+
+                # Exclusão de Extensões de Arquivo (Binários, Compactados)
+                sonar.text.excluded.file.suffixes=.ear,.zip,.tar,.gz,.rar,.7z,.exe,.dll,.bin,.dat,.so,.dylib
+
+                # Exclusão de Duplicação de Código (CPD)
+                sonar.cpd.exclusions=**/OtherObjects/**,**/NonRepository/DISCOUNT_*.xml,**/NonRepository/AGGRDISCOUNT_*.xml
+
+  - stage: publish
+    displayName: 'Publish Artifacts'
+    dependsOn:
+      - Prepare
+      - Cadastrar
+      - Export
+      - SecurityAnalysis
+      - QualityGates
+    condition: and(succeeded(), eq('${{ parameters.enableArtifactsPublish }}', 'true'))
+    pool:
+      name: $(CI_AGENT_POOL)
+    jobs:
+      - job: PublishExports
+        displayName: 'Publish Exported Artifacts'
+        variables:
+          VERSION_TAG: $[ stageDependencies.Prepare.Initialize.outputs['versioning.NEW_VERSION'] ]
+          PACKAGE_VERSION: $[ stageDependencies.Prepare.Initialize.outputs['versioning.PACKAGE_VERSION'] ]
+          HAS_REPO_EXPORT: $[ stageDependencies.Cadastrar.IdentifyObjects.outputs['exportObjectCounts.HAS_REPO_EXPORT'] ]
+          HAS_NONREPO_EXPORT: $[ stageDependencies.Cadastrar.IdentifyObjects.outputs['exportObjectCounts.HAS_NONREPO_EXPORT'] ]
+        steps:
+          # Nenhum arquivo do repositório é lido - checkout desnecessário.
+          - checkout: none
+
+          - task: DownloadPipelineArtifact@2
+            inputs:
+              artifactName: 'repository-export-raw'
+              targetPath: '$(Pipeline.Workspace)/repository-export-raw'
+            displayName: '📥 Download Artifact Intermediário (Repository)'
+            condition: and(always(), eq(variables['HAS_REPO_EXPORT'], 'true'))
+
+          - task: DownloadPipelineArtifact@2
+            inputs:
+              artifactName: 'exported-xml-files'
+              targetPath: '$(Pipeline.Workspace)/exported-xml-files'
+            displayName: '📥 Download Artifact Intermediário (XML)'
+            condition: and(always(), eq(variables['HAS_NONREPO_EXPORT'], 'true'))
+
+          # Publicar artefatos exportados para stages subsequentes
+          - bash: |
+              mkdir -p $(Build.ArtifactStagingDirectory)/combined-artifacts/repository-export-raw
+              mkdir -p $(Build.ArtifactStagingDirectory)/combined-artifacts/exported-xml-files
+              cp -r $(Pipeline.Workspace)/repository-export-raw/* $(Build.ArtifactStagingDirectory)/combined-artifacts/repository-export-raw/ 2>/dev/null || true
+              cp -r $(Pipeline.Workspace)/exported-xml-files/* $(Build.ArtifactStagingDirectory)/combined-artifacts/exported-xml-files/ 2>/dev/null || true
+            displayName: 'Consolidate Artifacts'
+
+          - bash: |
+              set -eo pipefail
+
+              repo_count=0
+              xml_count=0
+
+              if [ -d "$(Build.ArtifactStagingDirectory)/combined-artifacts/repository-export-raw" ]; then
+                repo_count=$(find "$(Build.ArtifactStagingDirectory)/combined-artifacts/repository-export-raw" -maxdepth 1 -name '*.sif' -type f | wc -l | tr -d ' ')
+              fi
+
+              if [ -d "$(Build.ArtifactStagingDirectory)/combined-artifacts/exported-xml-files" ]; then
+                xml_count=$(find "$(Build.ArtifactStagingDirectory)/combined-artifacts/exported-xml-files" -maxdepth 1 -name '*.xml' -type f | wc -l | tr -d ' ')
+              fi
+
+              echo "Arquivos para publicação: repository (.sif)=${repo_count} | nonrepository (.xml)=${xml_count}"
+              echo "Conteúdo final consolidado:"
+              find "$(Build.ArtifactStagingDirectory)/combined-artifacts" -maxdepth 3 -type f | sed 's/^/  • /' || true
+
+              if [ "${repo_count}" -eq 0 ] && [ "${xml_count}" -eq 0 ]; then
+                echo "##[error]Nenhum arquivo exportado foi encontrado para publicar no Azure Artifacts. Verifique os jobs ExportRepository/ExportNonRepository e o download dos artifacts no stage publish."
+                exit 1
+              fi
+            displayName: '✅ Validar Conteúdo Consolidado'
+
+          - task: UniversalPackages@0
+            displayName: 'Publish Universal Package'
+            inputs:
+              command: 'publish'
+              publishDirectory: '$(Build.ArtifactStagingDirectory)/combined-artifacts'
+              feedsToUsePublish: 'internal'
+              vstsFeedPublish: '${{ parameters.artifactsFeed }}'
+              vstsFeedPackagePublish: '$(ARTIFACTS_PACKAGE_NAME)'
+              versionOption: 'custom'
+              versionPublish: '$(PACKAGE_VERSION)'
+              packagePublishDescription: 'SIBL export package $(VERSION_TAG)'

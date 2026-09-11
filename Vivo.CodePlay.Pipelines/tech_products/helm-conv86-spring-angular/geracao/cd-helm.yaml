@@ -1,0 +1,160 @@
+
+
+trigger: none
+
+#Incluir Variaveis da Library
+variables:
+- name: ASDF_JDK_11
+  value: "openjdk-11.0.2"
+- name: System.debug
+  value: "true"
+
+stages:
+- stage: deploy_helm_chart
+  displayName: Deploy Helm Chart
+  jobs:
+  - job: deploy_helm_chart
+    continueOnError: False
+    condition: succeeded()
+    displayName: Deploy Helm Chart
+    pool: GeneralPurposeLinuxAgentsCD
+    steps:
+
+    - checkout: self
+      fetchDepth: 1
+      persistCredentials: true
+
+    - task: AzureKeyVault@2  
+      displayName: 'Getting AKV credentials'
+      timeoutInMinutes: 1
+      retryCountOnTaskFailure: 5  
+      inputs:    
+        azureSubscription: DevOpsSharedResources    
+        KeyVaultName: kv-azdevops-shared
+        SecretsFilter: >- 
+          HELM-REGISTRY-NEXUS-USERNAME, HELM-REGISTRY-NEXUS-PASSWORD,
+          NEXUS-DEFAULT-USR, NEXUS-DEFAULT-PSW
+    
+    - task: YamlParseFromVivo@4
+      displayName: Get Helm/Kube Info
+      name: deploy_helm_kube_info
+      inputs:
+        type: 'file'
+        origin: $(Build.SourcesDirectory)/pipeline/properties.yaml
+        jpaths: |
+          var HELM_NEXUS_REPOSITORY_URL = .helm['nexus-repository-url']
+          # "http://10.129.178.173:8082/repository/conv86-helm"
+          var HELM_NEXUS_REPOSITORY = .helm.nexus-repository
+          # "geracao-helm"
+
+    - task: YamlParseFromVivo@4
+      displayName: Get Helm Chart Info
+      name: deploy_helm_chart_info
+      inputs:
+        type: 'file'
+        origin: $(Build.SourcesDirectory)/Chart.yaml
+        jpaths: |
+          var CHART_VERSION = .version
+          var CHART_NAME = .name
+
+    - script: |
+        # ref: https://reemus.dev/tldr/git-tag-versioning-script
+
+        # Get version type from first argument passed to script
+        # VERSION_TYPE="${1-}"
+        
+        VERSION_TYPE="patch"
+        VERSION_NEXT=""
+        
+        if [ "$VERSION_TYPE" = "patch" ]; then
+          # Increment patch version
+          VERSION_NEXT="$(echo "$CHART_VERSION" | awk -F. '{$NF++; print $1"."$2"."$NF}')"
+        elif [ "$VERSION_TYPE" = "minor" ]; then
+          # Increment minor version
+          VERSION_NEXT="$(echo "$CHART_VERSION" | awk -F. '{$2++; $3=0; print $1"."$2"."$3}')"
+        elif [ "$VERSION_TYPE" = "major" ]; then
+          # Increment major version
+          VERSION_NEXT="$(echo "$CHART_VERSION" | awk -F. '{$1++; $2=0; $3=0; print $1"."$2"."$3}')"
+        else
+          # Print error for unknown versioning type
+          printf "\nError: invalid VERSION_TYPE arg passed, must be 'patch', 'minor' or 'major'\n\n"
+          # Exit with error code
+          exit 1
+        fi
+        echo "##vso[task.setvariable variable=VERSION_NEXT]$VERSION_NEXT"
+
+      displayName: Bump Version
+
+    - task: RegexReplace@4
+      inputs:
+        sourceType: 'file'
+        source: 'Chart.yaml'
+        destType: 'file'
+        dest: 'Chart.yaml'
+        regex: '/^(version {0,}: {0,})[^ \n]+/gm'
+        substitution: '$1$(VERSION_NEXT)'
+
+    - script: cat Chart.yaml
+      displayName: Show new Chart.yaml
+
+    - task: Bash@3
+      displayName: Commit new version
+      name: commit_new_version
+      continueOnError: false
+      inputs:
+        targetType: inline
+        script: |-
+          
+          git stash save Chart.yaml
+          git clean -fdX
+          
+          export TAG="$(VERSION_NEXT)"
+
+          echo "##[command] git checkout ${BUILD_SOURCEBRANCHNAME} --"
+          git fetch
+          git checkout ${BUILD_SOURCEBRANCHNAME} --
+          git pull --rebase origin ${BUILD_SOURCEBRANCHNAME}
+          git stash pop
+
+          echo "##[command] git commit"
+          git add Chart.yaml
+          git commit -m "[skip ci] CodePlay bump version ${TAG}"
+
+          echo "##[command]git tag ${TAG}"
+          git tag ${TAG} -m "Version has been updated to ${TAG}"
+
+          echo "##[command] git push origin ${BUILD_SOURCEBRANCHNAME}"
+          git push origin --tags ${BUILD_SOURCEBRANCHNAME}
+
+    - script: helm package .
+      displayName: 'Helm Package'
+      condition: succeeded()
+
+    - task: CopyFiles@2
+      name: t_copy_file
+      displayName: 'Staging Artifacts'
+      condition: succeeded()
+      continueOnError: false
+      inputs:
+        SourceFolder: '$(build.sourcesdirectory)'
+        TargetFolder: '$(Build.ArtifactStagingDirectory)'
+        Contents: |
+          *.tgz
+          Chart.yaml
+        CleanTargetFolder: true
+        OverWrite: true
+        flattenFolders: false
+
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Artifacts'
+      condition: succeeded()
+      continueOnError: false
+      inputs:
+        ArtifactName: bin
+
+    - task: NexusUploadHelmFromVivo@5
+      displayName: Helm push
+      inputs:
+        nexusEndpoint: "Nexus Asis"
+        repository: conv86-helm
+        asset: "*.tgz"

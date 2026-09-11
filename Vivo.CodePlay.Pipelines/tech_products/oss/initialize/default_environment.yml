@@ -1,0 +1,283 @@
+parameters:
+- name: packageVersion
+  default: ''
+
+stages:
+- stage: environment_init
+  displayName: "Setup Environment"
+  pool:
+    name: $(AGENT_POOL_CI)
+
+  variables:
+    - template: variables_java.yml
+    - template: variables_gradle.yml
+
+  jobs:
+
+  - job: environment
+    displayName: Set up environment
+    steps:
+
+      ## -> Pipeline display and info
+    - task: Bash@3
+      displayName: 'About Pipeline'
+      inputs:
+        targetType: inline
+        script: |
+          ##[debug] Setting CORPORATE_WIKI_DOC_URL variable
+          echo "##vso[task.setvariable variable=CORPORATE_WIKI_DOC_URL;isOutput=true]https://wikicorp.telefonica.com.br/x/YzrcJg"
+          
+          YELLOW='\033[1;33m'
+          RESET='\033[0m'
+  
+          echo "  #    ______ ______ ______ ______ ______ ______ ______ ______ ______ ______"
+          echo "  #   |______|______|______|______|______|______|______|______|______|______|"
+          echo "  #     |  __ \   \ \    / / __ \             / __ \ / ____/ ____|"
+          echo "  #     | |  | | __\ \  / / |  | |_ __  ___  | |  | | (___| (___"
+          echo "  #     | |  | |/ _ \ \/ /| |  | | '_ \/ __| | |  | |\___ \\___ \\"
+          echo "  #     | |__| |  __/\  / | |__| | |_) \__ \ | |__| |____) |___) |"
+          echo "  #     |_____/ \___| \/   \____/| .__/|___/  \____/|_____/_____/"
+          echo "  #                              | |"
+          echo "  #     ______ ______ ______ ____|_|______ ______ ______ ______ ______ ______"
+          echo "  #    |______|______|______|______|______|______|______|______|______|______|"
+          echo "                       powered by DevOps OSS Team "
+          echo ""
+          
+          printf " =======================================================\n"
+          printf " ${YELLOW}For more information, access the documentation:\n"
+          printf " for java: $(JAVA_WIKI_DOC_URL)\n"
+          printf " for gradle: $(GRADLE_WIKI_DOC_URL)\n"
+          printf " ${RESET}========================================================\n"
+
+    ## -> Validate parameters
+    - task: Bash@3
+      displayName: Validate Parameters
+      name: validate_parameters
+      condition: succeeded()
+      continueOnError: false
+      inputs:
+        targetType: inline
+        script: |
+
+          packageVersion="${{ parameters.packageVersion }}"
+
+          if [[ "$packageVersion" =~ ^[[:space:]]+ || "$packageVersion" =~ [[:space:]]+$ ]]; then
+            echo "##[error] Parameter packageVersion contain spaces. Please check and rerun."
+            exit 1
+          else
+            echo "##[debug] Parameters are OK."
+          fi
+
+    ## -> Clean the pipeline workspace and checkout the code.
+    - checkout: self
+      displayName: Checkout Code
+      name: checkout_code
+      submodules: true
+      persistCredentials: true
+      path: source_code
+
+    ## -> Initialize Catalog-Info
+    - template: /tech_products/oss/initialize/catalog-info_environment.yml
+      parameters:
+        workingDirectory: $(Agent.BuildDirectory)/source_code
+
+    ## -> Get Artifact information
+    - task: Bash@3
+      displayName: Get Source Data
+      name: source_data
+      inputs:
+        workingDirectory: $(Agent.BuildDirectory)/source_code
+        targetType: inline
+        script: |
+          echo "##[group] Project File Structure"
+          echo "$(ls -lah)"
+          echo "$(tree)"
+          echo "##[endgroup]"
+
+          project_by_type_is() {
+            projectType="$1"
+
+            case "$projectType" in
+              maven)
+                [ -f "pom.xml" ]
+                ;;
+              nodejs)
+                [ -f "package.json" ]
+                ;;
+              gradle)
+                [ -f "pipeline/properties.yaml" ]
+                ;;
+            esac
+          }
+
+          if project_by_type_is maven; then
+            echo "##[debug] Extracting the Group ID from pom.xml."
+            groupId=$(DOCKER_CMD_EXTRACT_GROUP_ID)
+            echo "##[debug] Set Variable GROUP_ID    : $groupId"
+            
+            modules=$(DOCKER_CMD_EXTRACT_POM_XML_MODULES)
+            artifactModules=$(echo $modules | tr -d '[]' | tr -d '""' | tr -d ' ' | tr ',' ' ')
+            modulesArray=($artifactModules)
+
+            ## -> If multi-module change directory to the last module to colect the Artifact ID.
+            if [ ${#modulesArray[@]} -gt 0 ]; then
+              echo "##[debug] This is a multi-module project. Using last module Artifact ID."
+
+              echo "##vso[task.setvariable variable=ARTIFACT_MODULES;isOutput=true]$artifactModules"
+
+              echo "##[group] Set variable ARTIFACT_MODULES:"
+              echo $artifactModules
+              echo "##[endgroup]"
+
+              echo "##[group] Project Modules"
+              for module in "${modulesArray[@]}"; do
+                echo "Module: $module"
+              done
+              echo "##[endgroup]"
+
+              lastModule=${modulesArray[-1]}
+              echo "##[debug] Last Module is $lastModule."
+
+              cd $lastModule
+            fi
+
+            echo "##[debug] Extracting the Artifact ID from pom.xml"
+            artifactID=$(DOCKER_CMD_EXTRACT_ARTIFACT_ID)
+
+          elif project_by_type_is nodejs; then
+            echo "##[debug] Extracting the Artifact ID from package.json."
+
+            packageJsonName=$(DOCKER_CMD_EXTRACT_PACKAGE_JSON_NAME)
+            artifactID=$(echo $packageJsonName | awk -F '/' '{print$NF}')
+
+          elif project_by_type_is gradle; then
+            echo "##[debug] Extracting the Gradle Artifact ID and Group ID from /pipeline/properties.yaml"
+
+            groupId=$(GRADLE_PIPELINE_PROPERTIES_GROUP_ID)
+            echo "##[debug] Set Variable GROUP_ID    : $groupId"
+
+            artifactID=$(GRADLE_PIPELINE_PROPERTIES_ARTIFACT_ID)
+
+          else
+            echo "##[error] Neither pom.xml, package.json, nor /pipeline/properties.yaml were found."
+            echo "##[error] Unable to determine the Artifact ID. Please ensure one of these files is present and try again."
+            exit 1
+          fi
+
+          echo "##[debug] Set Variable ARTIFACT_ID : $artifactID"
+
+          echo "##vso[task.setvariable variable=GROUP_ID;isOutput=true]$groupId"
+          echo "##vso[task.setvariable variable=ARTIFACT_ID;isOutput=true]$artifactID"
+
+    ## -> Download NEXUS Credentials
+    - task: AzureKeyVault@2
+      displayName: 'Getting AKV Credentials'
+      timeoutInMinutes: 1
+      retryCountOnTaskFailure: 5
+      inputs:
+        workingDirectory: $(Agent.BuildDirectory)/source_code
+        azureSubscription: DevOpsSharedResources
+        KeyVaultName: $(AKV_DEVOPS_NAME)
+        SecretsFilter: 'NEXUS-DEPS-USR, NEXUS-DEPS-PSW, NEXUS-DEFAULT-USR, NEXUS-DEFAULT-PSW'
+
+    ## -> Set NEXUS credentials to variables. This allows it to used in other stages, jobs or tasks.
+    ## -> NEXUS_DEPS_USR and NEXUS_DEPS_PSW, use these to download dependencies.
+    ## -> NEXUS_DEFAULT_USR and NEXUS_DEFAULT_PSW, use these to upload artifacts.
+    - task: Bash@3
+      displayName: 'Set Credentials Variables'
+      name: credentials
+      condition: and(
+        succeeded(),
+        ne(variables['NEXUS-DEPS-USR'], ''), ne(variables['NEXUS-DEPS-PSW'], ''),
+        ne(variables['NEXUS-DEFAULT-USR'], ''), ne(variables['NEXUS-DEFAULT-PSW'], ''))
+      continueOnError: false
+      inputs:
+        workingDirectory: $(Agent.BuildDirectory)/source_code
+        targetType: 'inline'
+        script: |
+          echo "##[group] Variables to DOWNLOAD dependencies from NEXUS"
+          echo "##[debug] NEXUS-DEPS-USR: $(NEXUS-DEPS-USR). Use as >> NEXUS_DEPS_USR."
+          echo "##vso[task.setvariable variable=NEXUS_DEPS_USR;isOutput=true;isSecret=true]$(NEXUS-DEPS-USR)"
+          echo "##[debug] NEXUS-DEPS-PSW: $(NEXUS-DEPS-PSW). Use as >> NEXUS_DEPS_PSW"
+          echo "##vso[task.setvariable variable=NEXUS_DEPS_PSW;isOutput=true;isSecret=true]$(NEXUS-DEPS-PSW)"
+          echo "##[endgroup]"
+
+          echo "##[group] Variables to PUBLISH artifacts to NEXUS"
+          echo "##[debug] NEXUS-DEFAULT-USR: $(NEXUS-DEFAULT-USR). Use as >> NEXUS_DEFAULT_USR"
+          echo "##vso[task.setvariable variable=NEXUS_DEFAULT_USR;isOutput=true;isSecret=true]$(NEXUS-DEFAULT-USR)"
+          echo "##[debug] NEXUS-DEFAULT-PSW: $(NEXUS-DEFAULT-PSW). Use as >> NEXUS_DEFAULT_PSW"
+          echo "##vso[task.setvariable variable=NEXUS_DEFAULT_PSW;isOutput=true;isSecret=true]$(NEXUS-DEFAULT-PSW)"
+          echo "##[endgroup]"
+          echo "##[debug] To open and check the information above, click the arrows on the left."
+
+        KeyVaultName: $(AKV_DEVOPS_NAME)
+        SecretsFilter: 'NEXUS-DEPS-USR, NEXUS-DEPS-PSW, NEXUS-DEFAULT-USR, NEXUS-DEFAULT-PSW'
+
+    ## -> Clean the pipeline workspace and checkout the code.
+    - checkout: OSSDevOpsExclusions
+      displayName: Checkout OSS Exclusions
+      name: checkout_oss_exclusions
+      clean: true
+      submodules: true
+      persistCredentials: true
+      path: oss_exclusions
+
+    ## -> Initialize OSS Exclusions
+    - task: Bash@3
+      displayName: Check OSS Multibranch Exclusions
+      name: multibranch_exclusions
+      condition: succeeded()
+      continueOnError: false
+      inputs:
+        workingDirectory: $(Agent.BuildDirectory)/oss_exclusions
+        targetType: inline
+        script: |
+
+          echo "##[debug] Checking if multibranch is allowed for the project OR the requestor ..."
+
+          echo "##[section] Checking if multibranch is allowed for project $(Build.Repository.Name)"
+          ## -> Initialize the output variable
+          allowMultibranch=false
+
+          ## -> Checking if the file $(MULTIBRANCH_EXCLUSIONS_FILE) exists
+          if [ -f "$(MULTIBRANCH_EXCLUSIONS_FILE)" ]; then
+            echo "##[debug] Found $(MULTIBRANCH_EXCLUSIONS_FILE) in $(pwd)"
+
+            ## -> Checking if the $(MULTIBRANCH_EXCLUSIONS_FILE) contains the $(Build.Repository.Name)
+            if grep -q "$(Build.Repository.Name)" "$(MULTIBRANCH_EXCLUSIONS_FILE)"; then
+              echo "##[debug] Found $(Build.Repository.Name) in $(MULTIBRANCH_EXCLUSIONS_FILE) !"
+              allowMultibranch=true
+            else
+              echo "##[debug] $(Build.Repository.Name) not found in $(MULTIBRANCH_EXCLUSIONS_FILE)"
+            fi
+          else
+            echo "##[warning] $(MULTIBRANCH_EXCLUSIONS_FILE) not found"
+          fi
+
+          echo "##[section] Checking if multibranch is allowed for the requestor $(Build.RequestedFor)"
+          ## -> Checking if file $(USERS_EXCLUSIONS_FILE) exists
+          if [ -f "$(USERS_EXCLUSIONS_FILE)" ]; then
+            echo "##[debug] Found $(USERS_EXCLUSIONS_FILE) in $(pwd)"
+
+            ## -> Checking if the $(USERS_EXCLUSIONS_FILE) contains the user $(Build.RequestedFor)
+            if grep -q "$(Build.RequestedFor)" "$(USERS_EXCLUSIONS_FILE)"; then
+              echo "##[debug] Found $(Build.RequestedFor) in $(USERS_EXCLUSIONS_FILE) !"
+              allowMultibranch=true
+            else
+              echo "##[debug] $(Build.RequestedFor) not found in $(USERS_EXCLUSIONS_FILE)"
+            fi
+          else
+            echo "##[warning] $(MULTIBRANCH_EXCLUSIONS_FILE) not found"
+          fi
+          
+          echo "##[debug] Set variable ALLOW_MULTIBRANCH: $allowMultibranch"
+          echo "##vso[task.setvariable variable=ALLOW_MULTIBRANCH;isOutput=true]$allowMultibranch"
+
+    - task: Bash@3
+      displayName: Tag Pipeline with Package Version
+      condition: ne('${{ parameters.packageVersion }}', '')
+      inputs:
+        targetType: inline
+        script: |
+          echo "##[debug] Adding pipeline tag with package version: ${{ parameters.packageVersion }}"
+          echo "##vso[build.addbuildtag]version=${{ parameters.packageVersion }}"

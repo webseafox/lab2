@@ -1,0 +1,798 @@
+﻿stages:
+  - ${{ if and(eq(parameters.branch_frontend, ''), eq(parameters.branch_backend, '')) }}:
+    - stage: renew_credentials
+      dependsOn:
+      - pipeline_init
+      displayName: 'SAP Credentials'
+      pool:
+        name: $(PRIVATE_AGENT_DEFAULT)
+      jobs:
+      - job: renew_sap_tu_token
+        displayName: "Validate or Recreate SAP Credentials"
+        workspace:
+          clean: all
+        steps:
+        - template: /tech_products/ecmc/sap-commerce/tasks/security/validate_renew_sap_tu_token.yaml
+
+  - stage: build
+    dependsOn:
+      - pipeline_init
+      - ${{ if and(eq(parameters.branch_frontend, ''), eq(parameters.branch_backend, '')) }}:
+        - renew_credentials
+    displayName: 'Build'
+    pool:
+      name: $(PRIVATE_AGENT_DEFAULT)
+    jobs:
+      - job: start_build
+        workspace:
+          clean: all
+        displayName: 'Start Build'
+        variables:
+          - name: NEW_VERSION
+            value: $[ stageDependencies.pipeline_init.first_steps.outputs['set_build_version.NEW_VERSION'] ]
+          - name: IS_DEV_BRANCH
+            value: $[ stageDependencies.pipeline_init.first_steps.outputs['set_build_version.IS_DEV_BRANCH'] ]
+        steps:
+          - checkout: none
+            displayName: Skip Clone Aggregator
+            condition: ne(variables.IS_DEV_BRANCH, True)
+          - ${{ if and(eq(variables['Build.Reason'], 'Manual'), or(and(ne(parameters.branch_frontend, ''), ne(parameters.branch_backend, '')), ne(parameters.database_update_mode, ''))) }}:
+            - checkout: BackSapCommerce
+              clean: true
+              displayName: Cloning Backend
+              persistCredentials: true
+              fetchDepth: 1
+              fetchTags: false
+              condition: eq(variables.IS_DEV_BRANCH, True)
+            - checkout: FrontSapCommerce
+              clean: true
+              displayName: Cloning Frontend
+              persistCredentials: true
+              fetchDepth: 1
+              fetchTags: false
+              condition: eq(variables.IS_DEV_BRANCH, True)
+
+            - checkout: CloudSapCommerce
+              clean: true
+              submodules: false
+              persistCredentials: true
+              fetchDepth: 1
+              fetchTags: false
+              displayName: Cloning Aggregator
+              condition: eq(variables.IS_DEV_BRANCH, True)
+
+            - bash: |
+                verify_and_stop_if_error() {
+                  if [[ $1 != 0 ]]; then
+                    exit 1
+                  fi
+                }
+
+                set -e
+                TEAM_PROJECT=$(echo "$(System.TeamProject)" | sed 's/ /%20/g')
+                cd $(Build.SourcesDirectory)/$(Build.Repository.Name)
+                git config --local http.postBuffer 524288000
+                git checkout -b $NEW_VERSION
+                GIT_CURRENT_AGGREGATOR=$(git log -n 1 --pretty='%H')
+
+                git reset --hard $GIT_CURRENT_AGGREGATOR
+
+                URL_FRONT_WITH_PAT="https://$(SYSTEM_ACCESSTOKEN_JKSECOM)@dev.azure.com/telefonica-vivo-brasil/$TEAM_PROJECT/_git/$FRONTEND_PROJECT"
+                URL_FRONT="$(SYSTEM_ACCESSTOKEN_JKSECOM)@dev.azure.com/telefonica-vivo-brasil/$TEAM_PROJECT/_git/$FRONTEND_PROJECT"
+                URL_BACKEND_WITH_PAT="https://$(SYSTEM_ACCESSTOKEN_JKSECOM)@dev.azure.com/telefonica-vivo-brasil/$TEAM_PROJECT/_git/$BACKEND_PROJECT"
+                URL_BACKEND="$(SYSTEM_ACCESSTOKEN_JKSECOM)@dev.azure.com/telefonica-vivo-brasil/$TEAM_PROJECT/_git/$BACKEND_PROJECT"
+
+                cd $(Build.SourcesDirectory)/$FRONTEND_PROJECT
+                git config --local http.postBuffer 524288000
+                git fetch --no-tags origin ${{ parameters.branch_frontend }}:${{ parameters.branch_frontend }}
+                verify_and_stop_if_error $(echo $?)
+
+                git checkout ${{ parameters.branch_frontend }}
+                verify_and_stop_if_error $(echo $?)
+                echo "##[section]Checkout to ${{ parameters.branch_frontend }} ok"
+
+                git pull --no-tags origin ${{ parameters.branch_frontend }}
+                verify_and_stop_if_error $(echo $?)
+                echo "##[section]Pull ${{ parameters.branch_frontend }} ok"
+
+                GIT_CURRENT_FRONT=$(git log -n 1 --pretty='%H')
+                verify_and_stop_if_error $(echo $?)
+
+                cd $(Build.SourcesDirectory)/$BACKEND_PROJECT
+                git config --local http.postBuffer 524288000
+                git fetch --no-tags origin ${{ parameters.branch_backend }}:${{ parameters.branch_backend }}
+                verify_and_stop_if_error $(echo $?)
+
+                git checkout ${{ parameters.branch_backend }}
+                verify_and_stop_if_error $(echo $?)
+                echo "##[section]Checkout to ${{ parameters.branch_backend }} ok"
+
+                git pull --no-tags origin ${{ parameters.branch_backend }}
+                verify_and_stop_if_error $(echo $?)
+                echo "##[section]Pull ${{ parameters.branch_backend }} ok"
+
+                GIT_CURRENT_BACK=$(git log -n 1 --pretty='%H')
+                verify_and_stop_if_error $(echo $?)
+
+                echo "##[section]SHA AGGREGATOR $GIT_CURRENT_AGGREGATOR"
+                echo "##[section]SHA FRONT $GIT_CURRENT_FRONT"
+                echo "##[section]SHA BACK $GIT_CURRENT_BACK"
+
+                cd $(Build.SourcesDirectory)/$(Build.Repository.Name)
+
+                git submodule set-branch -b ${{ parameters.branch_backend }} $BACKEND_PROJECT_DIR
+                git submodule set-branch -b ${{ parameters.branch_frontend }} $FRONTEND_PROJECT_DIR
+
+                git submodule set-url $FRONTEND_PROJECT_DIR https://$(SYSTEM_ACCESSTOKEN_JKSECOM)@dev.azure.com/telefonica-vivo-brasil/$TEAM_PROJECT/_git/$FRONTEND_PROJECT
+                verify_and_stop_if_error $(echo $?)
+                echo "##[command]Config submodule frontend"ecmc/sap-commerce/provisioners/gitflow/src-sap-commerce-cloud/stages/build.yaml
+
+                echo "##[section]Start sync submodule frontend"
+                git submodule sync $FRONTEND_PROJECT_DIR
+                verify_and_stop_if_error $(echo $?)
+
+                git submodule set-url $BACKEND_PROJECT_DIR https://$(SYSTEM_ACCESSTOKEN_JKSECOM)@dev.azure.com/telefonica-vivo-brasil/$TEAM_PROJECT/_git/$BACKEND_PROJECT
+                verify_and_stop_if_error $(echo $?)
+
+                echo "##[section]Start sync submodule backend"
+                git submodule sync $BACKEND_PROJECT_DIR
+                verify_and_stop_if_error $(echo $?)
+
+                echo "##[section]Start update submodules"
+                git submodule update --init --recursive $BACKEND_PROJECT_DIR $FRONTEND_PROJECT_DIR
+                verify_and_stop_if_error $(echo $?)
+                echo "##[command]Submodules update ok"
+
+                #CD FRONTEND_PROJECT_DIR
+                cd $(Build.SourcesDirectory)/$(Build.Repository.Name)/$FRONTEND_PROJECT_DIR
+                git config --local http.postBuffer 524288000
+
+                echo "##[section]Cd to $FRONTEND_PROJECT_DIR"
+
+                git -c http.https://$URL_FRONT.extraheader="AUTHORIZATION: bearer $(SYSTEM_ACCESSTOKEN_JKSECOM)" fetch --no-tags "$URL_FRONT_WITH_PAT"
+                git fetch --no-tags origin ${{ parameters.branch_frontend }}:${{ parameters.branch_frontend }}
+                git checkout ${{ parameters.branch_frontend }}
+                git reset --hard $GIT_CURRENT_FRONT
+                verify_and_stop_if_error $(echo $?)
+
+                #CD BACKEND
+                cd $(Build.SourcesDirectory)/$(Build.Repository.Name)/$BACKEND_PROJECT_DIR
+                git config --local http.postBuffer 524288000
+
+                echo "##[section]Cd to $BACKEND_PROJECT_DIR"
+
+                git -c http.https://$URL_BACKEND.extraheader="AUTHORIZATION: bearer $(SYSTEM_ACCESSTOKEN_JKSECOM)" fetch --no-tags "$URL_BACKEND_WITH_PAT"
+                git fetch --no-tags origin ${{ parameters.branch_backend }}:${{ parameters.branch_backend }}
+                git checkout ${{ parameters.branch_backend }}
+                git reset --hard $GIT_CURRENT_BACK
+                verify_and_stop_if_error $(echo $?)
+
+                cd $(Build.SourcesDirectory)/$(Build.Repository.Name)
+                echo -n 'NONE' > CCV2_DATABASE
+                echo -n $NEW_VERSION > VERSION
+                git submodule set-url $FRONTEND_PROJECT_DIR "../$FRONTEND_PROJECT"
+                git submodule set-url $BACKEND_PROJECT_DIR "../$BACKEND_PROJECT"
+                git config -f .gitmodules submodule.${FRONTEND_PROJECT_DIR}.shallow true
+                git config -f .gitmodules submodule.${BACKEND_PROJECT_DIR}.shallow true
+
+                git config --replace-all user.name "Azure DevOps" && git config --replace-all user.email "azuredevops@telefonicati.onmicrosoft.com"
+                git add -f VERSION CCV2_DATABASE .gitmodules $FRONTEND_PROJECT_DIR $BACKEND_PROJECT_DIR
+                git commit -m "[Azure DevOps] Add CCV2_DATABASE and update submodules for temp branch with version $NEW_VERSION"
+                git remote set-url origin https://$(SYSTEM_ACCESSTOKEN_JKSECOM)@dev.azure.com/telefonica-vivo-brasil/$TEAM_PROJECT/_git/$CORE_PROJECT
+                verify_and_stop_if_error $(echo $?)
+
+                CMD_RUN="push origin HEAD:$NEW_VERSION"
+                echo "##[command]git $CMD_RUN"
+                git $CMD_RUN
+
+                if [ $? -ne 0 ]; then
+                  echo "##vso[task.logissue type=error;] Git push failed"
+                  echo "##vso[task.complete result=Failed;]"
+                  exit 1
+                fi
+              env:
+                FRONTEND_PROJECT: $(FRONTEND_PROJECT)
+                BACKEND_PROJECT: $(BACKEND_PROJECT)
+                CORE_PROJECT: $(CORE_PROJECT)
+                SYSTEM_ACCESSTOKEN_JKSECOM: $(SYSTEM_ACCESSTOKEN_JKSECOM)
+                FRONTEND_PROJECT_DIR: $(FRONTEND_PROJECT_DIR)
+                BACKEND_PROJECT_DIR: $(BACKEND_PROJECT_DIR)
+                TEAM_PROJECT: $(TEAM_PROJECT)
+              condition: eq(variables.IS_DEV_BRANCH, True)
+              displayName: Create temp branch $(NEW_VERSION)
+
+          - template: /tech_products/ecmc/sap-commerce/tasks/security/get_sap_tu_token.yaml
+            parameters:
+              displayName: 'Get SAP TU token (verify build)'
+              exportAsOutput: true
+              stepName: 'get_sap_tu_token'
+
+          - bash: |
+              ACCESS_TOKEN="${SAP_TU_ACCESS_TOKEN}"
+              if [ -z "$ACCESS_TOKEN" ] || [ "$ACCESS_TOKEN" == "null" ]; then
+                echo "##[error]Access token do Technical User indisponível"
+                exit 1
+              fi
+
+              echo "##[section]Verificando existência do build"
+              BUILD_NAME=$NEW_VERSION
+              echo "##[section]NEW_VERSION/BUILD $BUILD_NAME"
+
+              CURL_HTTP_TIMEOUT=${CURL_HTTP_TIMEOUT:-30}
+              SAP_API_RESPONSE_FILE=${SAP_API_RESPONSE_FILE:-sap-api-response.json}
+
+              API_URL_BUILDS=$(echo "$API_URL_BUILDS" | sed "s/<SUBSCRIPTION_CODE>/$SUBSCRIPTION_CODE/")
+
+              echo "##[command]Requisição para $API_URL_BUILDS"
+              echo "##[command]Verificando se já existe um build pendente para $BUILD_NAME"
+
+              HTTP_CODE_RESPONSE=$(curl --max-time $CURL_HTTP_TIMEOUT -o $SAP_API_RESPONSE_FILE  -w "%{http_code}" -s -H "x-approuter-authorization: Bearer ${ACCESS_TOKEN}" -H "Accept: application/json" --compressed "$API_URL_BUILDS")
+
+              echo "##[command]HTTP Response Code: $HTTP_CODE_RESPONSE"
+
+              if [[ "$HTTP_CODE_RESPONSE" == "200" ]];then
+                RESPONSE_BODY=$(cat $SAP_API_RESPONSE_FILE && rm $SAP_API_RESPONSE_FILE)
+                echo "##[section]Resposta da requisição $RESPONSE_BODY"
+                GET_BUILD_VALUE=$(echo $RESPONSE_BODY | jq '.value' | jq -r "map(select(.name==\"$BUILD_NAME\"))[0]")
+
+                # Build criado anteriormente?
+                if [[ "$GET_BUILD_VALUE" != "" && "$GET_BUILD_VALUE" != "null" ]];then
+                  BUILD_STATUS=$(echo $GET_BUILD_VALUE | jq -r '.status')
+                  BUILD_CODE=$(echo $GET_BUILD_VALUE | jq -r '.code')
+                  BUILD_DEPLOY_STATUS=$(echo $GET_BUILD_VALUE | jq -r '.deployed')
+                  BUILD_START=$(echo $GET_BUILD_VALUE | jq -r '.buildStartTimestamp')
+                  BUILD_END=$(echo $GET_BUILD_VALUE | jq -r '.buildEndTimestamp')
+
+                  echo "##[command]Build name: $BUILD_NAME"
+                  echo "##[command]Build code: $BUILD_CODE"
+                  echo "##[command]Build status: $BUILD_STATUS"
+                  echo "##[command]Build deploy status: $BUILD_DEPLOY_STATUS"
+
+                  if [[ "$BUILD_STATUS" == "SUCCESS" ]]; then
+                    echo "##[section]O build $BUILD_NAME existe. Caso a pipeline não seja interrompida, o deploy será iniciado nos estágios a seguir"
+                    echo "##vso[task.setvariable variable=BUILD_CODE;isOutput=true]$BUILD_CODE"
+                    echo "##vso[task.setvariable variable=BUILD_NAME;isOutput=true]$BUILD_NAME"
+                    echo "##vso[task.setvariable variable=BUILD_CODE_EXISTS;isOutput=true]TRUE"
+                    exit 0
+                  fi
+
+                  if [ "$BUILD_STATUS" == "BUILDING" ] || [ "$BUILD_STATUS" == "UNKNOWN" ]; then
+                    echo "##[section]Já existe um build em execução $BUILD_NAME"
+                    echo "##vso[task.setvariable variable=BUILD_CODE;isOutput=true]$BUILD_CODE"
+                    exit 0
+                  fi
+                else
+                  echo "##[section]O build para a versão $BUILD_NAME ainda não existe"
+                  echo "##vso[task.setvariable variable=BUILD_NAME;isOutput=true]$BUILD_NAME"
+                  echo "##vso[task.setvariable variable=BUILD_CODE_EXISTS;isOutput=true]FALSE"
+                  exit 0
+                fi
+              else
+                echo "##[error]Erro na requisição. HTTP Code: $HTTP_CODE_RESPONSE"
+                if [ -f "$SAP_API_RESPONSE_FILE" ]; then
+                  echo "##[section]Response body: $(cat $SAP_API_RESPONSE_FILE)"
+                  rm -f $SAP_API_RESPONSE_FILE
+                fi
+                echo "##vso[task.setvariable variable=BUILD_HTTP_ERROR]TRUE"
+                echo "##vso[task.setvariable variable=BUILD_ERROR_NUMBER_OR_MESSAGE]$HTTP_CODE_RESPONSE"
+                if [[ "$HTTP_CODE_RESPONSE" == "401" ]];then
+                  echo "##vso[task.setvariable variable=ALERT_DEVOPS_TEAM]TRUE"
+                  echo "##vso[task.setvariable variable=ALERT_DEVOPS_MESSAGE]<strong>Atenção time. Houve um erro na pipeline da SAP (erro 401).<br>Confirme se as credenciais do Technical User (SAP_TU_CLIENT_ID/SECRET) estão válidas no grupo de variáveis lojaonline-sap-commerce-cloud (Azure DevOps &gt; Pipelines &gt; Library).</strong>"
+
+                fi
+              fi
+
+              echo "##[section]Não foi possível validar se o build já existe"
+              exit 1
+            displayName: 'Verify if build exists'
+            name: get_builds
+            condition: succeeded()
+            env:
+              SAP_TU_ACCESS_TOKEN: $(SAP_TU_ACCESS_TOKEN)
+              SAP_TU_TOKEN_EXPIRATION: $(SAP_TU_TOKEN_EXPIRATION)
+
+          - template: /tech_products/ecmc/sap-commerce/tasks/messages/create_work_item.yaml
+            parameters:
+              project_name: ${{ parameters.project_name }}
+              environment_code: ${{ parameters.environment_code }}
+              database_update_mode: ${{ parameters.database_update_mode }}
+              deploy_strategy: ${{ parameters.deploy_strategy }}
+              branch_frontend: ${{ parameters.branch_frontend }}
+              branch_backend: ${{ parameters.branch_backend }}
+              pipeline_status: 'HTTP_ERROR'
+              work_item_title: 'Build Error - Sap Commerce cloud - E-commerce B2C'
+              area_path: 'ECMC - Ecomm Cloud B2C\\Build-SAPCLOUD'
+              iteration_path: 'ECMC - Ecomm Cloud B2C'
+              description_details: $(BUILD_ERROR_NUMBER_OR_MESSAGE)
+              condition: and(eq(variables.BUILD_HTTP_ERROR, 'TRUE'), eq(variables.CREATE_WORK_ITEM, 'true'))
+
+          - template: /tech_products/ecmc/sap-commerce/tasks/messages/create_work_item.yaml
+            parameters:
+              project_name: ${{ parameters.project_name }}
+              environment_code: ${{ parameters.environment_code }}
+              database_update_mode: ${{ parameters.database_update_mode }}
+              deploy_strategy: ${{ parameters.deploy_strategy }}
+              branch_frontend: ${{ parameters.branch_frontend }}
+              branch_backend: ${{ parameters.branch_backend }}
+              pipeline_status: 'HTTP_ERROR'
+              work_item_title: 'Erro TOKEN Sap Commerce cloud - E-commerce B2C'
+              area_path: 'ECMC - Ecomm Cloud B2C\\DevOps'
+              iteration_path: 'ECMC - Ecomm Cloud B2C'
+              display_name: 'Alert DevOps on fail'
+              description_details: $(ALERT_DEVOPS_MESSAGE)
+              condition: and(eq(variables.ALERT_DEVOPS_TEAM, 'TRUE'), eq(variables.CREATE_WORK_ITEM, 'true'))
+
+      - job: create_build
+        workspace:
+          clean: all
+        dependsOn:
+          - start_build
+        variables:
+          - name: NEW_VERSION
+            value: $[ stageDependencies.pipeline_init.first_steps.outputs['set_build_version.NEW_VERSION'] ]
+          - name: IS_DEV_BRANCH
+            value: $[ stageDependencies.pipeline_init.first_steps.outputs['set_build_version.IS_DEV_BRANCH'] ]
+          - name: BUILD_CODE
+            value: $[ dependencies.start_build.outputs['get_builds.BUILD_CODE'] ]
+          - name: BUILD_NAME
+            value: $[ dependencies.start_build.outputs['get_builds.BUILD_NAME'] ]
+          - name: BUILD_CODE_EXISTS
+            value: $[ dependencies.start_build.outputs['get_builds.BUILD_CODE_EXISTS'] ]
+          - name: SAP_TU_ACCESS_TOKEN
+            value: $[ dependencies.start_build.outputs['get_sap_tu_token.SAP_TU_ACCESS_TOKEN'] ]
+          - name: SAP_TU_TOKEN_EXPIRATION
+            value: $[ dependencies.start_build.outputs['get_sap_tu_token.SAP_TU_TOKEN_EXPIRATION'] ]
+        displayName: 'Create Build'
+        steps:
+          - checkout: none
+          - bash: |
+              echo "##[section]Repassando token do job anterior"
+              echo "##vso[task.setvariable variable=SAP_TU_ACCESS_TOKEN;issecret=true;isOutput=true]${SAP_TU_ACCESS_TOKEN}"
+              echo "##vso[task.setvariable variable=SAP_TU_TOKEN_EXPIRATION;isOutput=true]${SAP_TU_TOKEN_EXPIRATION}"
+            displayName: 'Re-export token'
+            name: 'get_sap_tu_token'
+            env:
+              SAP_TU_ACCESS_TOKEN: $(SAP_TU_ACCESS_TOKEN)
+              SAP_TU_TOKEN_EXPIRATION: $(SAP_TU_TOKEN_EXPIRATION)
+          - bash: |
+              if [ "$IS_DEV_BRANCH" == "True" ]; then
+                SOURCE_BRANCH=$NEW_VERSION
+              else
+                SOURCE_BRANCH=$(PROJECT_SOURCE_BRANCH)
+              fi
+
+              ACCESS_TOKEN="${SAP_TU_ACCESS_TOKEN}"
+              if [ -z "$ACCESS_TOKEN" ] || [ "$ACCESS_TOKEN" == "null" ]; then
+                echo "##[error]Access token do Technical User indisponível"
+                echo "##vso[task.setvariable variable=BUILD_HTTP_ERROR]TRUE"
+                echo "##vso[task.setvariable variable=BUILD_ERROR_NUMBER_OR_MESSAGE]TOKEN_GENERATION_FAILED"
+                exit 1
+              fi
+
+              echo "##vso[task.setvariable variable=BUILD_CODE_EXISTS;isOutput=true]$BUILD_CODE_EXISTS"
+
+              CURL_HTTP_TIMEOUT=${CURL_HTTP_TIMEOUT:-30}
+              SAP_API_RESPONSE_FILE=${SAP_API_RESPONSE_FILE:-sap-api-response.json}
+
+              if [[ "$BUILD_CODE_EXISTS" != "FALSE" ]];then
+                echo "##[command]Utilizando build code $BUILD_CODE_EXISTS"
+                echo "##vso[task.setvariable variable=BUILD_CODE;isOutput=true]$BUILD_CODE"
+                echo "##[section]Build que será utilizado para deploy $BUILD_NAME (code $BUILD_CODE)"
+                exit 0
+              else
+                echo "##[command]Create build"
+                API_URL_BUILDS=$(echo "$API_URL_BUILDS" | sed "s/<SUBSCRIPTION_CODE>/$SUBSCRIPTION_CODE/")
+                echo "##[command]Requisição para $API_URL_BUILDS"
+                BODY="{\"branch\": \"$SOURCE_BRANCH\",\"name\": \"$BUILD_NAME\"}"
+
+                for i in 1 2 3
+                do
+                  echo "##[section]Tentativa $i de 3"
+                  HTTP_CODE_RESPONSE=$(curl --max-time $CURL_HTTP_TIMEOUT  -o $SAP_API_RESPONSE_FILE -w "%{http_code}" -X POST -s -H "x-approuter-authorization: Bearer ${ACCESS_TOKEN}" -H "Content-Type: application/json" -H "Accept: application/json" --compressed "$API_URL_BUILDS" --data "$BODY")
+
+                  echo "##[command]HTTP Response Code: $HTTP_CODE_RESPONSE"
+
+                  if [[ "$HTTP_CODE_RESPONSE" == "201" ]];then
+                    RESPONSE_BODY=$(cat $SAP_API_RESPONSE_FILE && rm $SAP_API_RESPONSE_FILE)
+                    echo "##[section]Resposta da requisição $RESPONSE_BODY"
+                    BUILD_CODE=$(echo $RESPONSE_BODY | jq -r '.code')
+                    echo "##vso[task.setvariable variable=BUILD_CODE;isOutput=true]$BUILD_CODE"
+                    echo "##[section]Build criado $BUILD_NAME (code $BUILD_CODE)"
+                    exit 0
+                  else
+                    echo "##[error]Erro na requisição. HTTP Code: $HTTP_CODE_RESPONSE"
+                    if [ -f "$SAP_API_RESPONSE_FILE" ]; then
+                      echo "##[section]Response body: $(cat $SAP_API_RESPONSE_FILE)"
+                      rm -f $SAP_API_RESPONSE_FILE
+                    fi
+                    if [ $i == 3 ]; then
+                      echo "##vso[task.setvariable variable=BUILD_HTTP_ERROR]TRUE"
+                      echo "##vso[task.setvariable variable=BUILD_ERROR_NUMBER_OR_MESSAGE]$HTTP_CODE_RESPONSE"
+                    fi
+                  fi
+                done
+              fi
+
+              echo "##[error]Não foi possível criar o build"
+              exit 1
+            displayName: 'Send data to create build'
+            name: send_data_to_build_job_step
+            condition: succeeded()
+            env:
+              SAP_TU_ACCESS_TOKEN: $(SAP_TU_ACCESS_TOKEN)
+              SAP_TU_TOKEN_EXPIRATION: $(SAP_TU_TOKEN_EXPIRATION)
+
+          - template: /tech_products/ecmc/sap-commerce/tasks/messages/create_work_item.yaml
+            parameters:
+              project_name: ${{ parameters.project_name }}
+              environment_code: ${{ parameters.environment_code }}
+              database_update_mode: ${{ parameters.database_update_mode }}
+              deploy_strategy: ${{ parameters.deploy_strategy }}
+              branch_frontend: ${{ parameters.branch_frontend }}
+              branch_backend: ${{ parameters.branch_backend }}
+              pipeline_status: 'HTTP_ERROR'
+              work_item_title: 'Build Sap Commerce cloud - E-commerce B2C'
+              area_path: 'ECMC - Ecomm Cloud B2C\\Build-SAPCLOUD'
+              iteration_path: 'ECMC - Ecomm Cloud B2C'
+              description_details: $(BUILD_ERROR_NUMBER_OR_MESSAGE)
+              condition: and(eq(variables.BUILD_HTTP_ERROR, 'TRUE'), eq(variables.CREATE_WORK_ITEM, 'true'))
+
+      - job: wait_build
+        timeoutInMinutes: 90
+        workspace:
+          clean: all
+        displayName: 'Wait/Watch build'
+        dependsOn:
+          - create_build
+        variables:
+          - name: BUILD_CODE
+            value: $[ dependencies.create_build.outputs['send_data_to_build_job_step.BUILD_CODE'] ]
+          - name: BUILD_CODE_EXISTS
+            value: $[ dependencies.start_build.outputs['get_builds.BUILD_CODE_EXISTS'] ]
+          - name: NEW_VERSION
+            value: $[ stageDependencies.pipeline_init.first_steps.outputs['set_build_version.NEW_VERSION'] ]
+          - name: IS_DEV_BRANCH
+            value: $[ stageDependencies.pipeline_init.first_steps.outputs['set_build_version.IS_DEV_BRANCH'] ]
+          - name: SAP_TU_ACCESS_TOKEN
+            value: $[ dependencies.create_build.outputs['get_sap_tu_token.SAP_TU_ACCESS_TOKEN'] ]
+          - name: SAP_TU_TOKEN_EXPIRATION
+            value: $[ dependencies.create_build.outputs['get_sap_tu_token.SAP_TU_TOKEN_EXPIRATION'] ]
+        steps:
+          - checkout: none
+            displayName: No checkout Cloud Repository
+          - bash: |
+              function progress_bar {
+                percent_total=${2}
+                echo "##vso[task.setprogress value=$percent_total;]Progress"
+                let _progress=(${2}*100/100)
+                let _done=(${_progress}*5)/10
+                let _left=50-$_done
+                _fill=$(printf "%${_done}s")
+                _empty=$(printf "%${_left}s")
+
+                printf "\r##[command]Status:$1 - Progresso : [${_fill// /#}${_empty// /-}] ${_progress}%%"
+                echo -e "\n"
+              }
+              ACCESS_TOKEN="${SAP_TU_ACCESS_TOKEN}"
+              TOKEN_EXPIRATION="${SAP_TU_TOKEN_EXPIRATION:-0}"
+              TOKEN_REFRESH_BUFFER=120
+
+              function renew_access_token {
+                echo "##[section]Renovando access token (client credentials)"
+                TOKEN_PAYLOAD="grant_type=client_credentials&client_id=${SAP_TU_CLIENT_ID}&client_secret=${SAP_TU_CLIENT_SECRET}&resource=${SAP_TU_RESOURCE}"
+                SAP_TOKEN_RESPONSE=$(curl -s -X POST "$SAP_TU_TOKEN_ENDPOINT" \
+                  -H "Content-Type: application/x-www-form-urlencoded" \
+                  -d "$TOKEN_PAYLOAD")
+
+                ACCESS_TOKEN=$(echo "$SAP_TOKEN_RESPONSE" | jq -r '.access_token // empty')
+                EXPIRES_IN=$(echo "$SAP_TOKEN_RESPONSE" | jq -r '.expires_in // empty')
+
+                if [ -z "$ACCESS_TOKEN" ] || [ "$ACCESS_TOKEN" == "null" ]; then
+                  echo "##[error]Falha ao renovar access token do Technical User"
+                  echo "##[debug]Resposta bruta do endpoint: $SAP_TOKEN_RESPONSE"
+                  echo "##vso[task.setvariable variable=BUILD_HTTP_ERROR]TRUE"
+                  echo "##vso[task.setvariable variable=SAP_ERROR_TYPE]HTTP_ERROR"
+                  echo "##vso[task.setvariable variable=BUILD_ERROR_NUMBER_OR_MESSAGE]TOKEN_GENERATION_FAILED"
+                  exit 1
+                fi
+
+                if [ -z "$EXPIRES_IN" ] || [ "$EXPIRES_IN" == "null" ]; then
+                  EXPIRES_IN=3600
+                fi
+
+                NOW_TS=$(date +%s)
+                TOKEN_EXPIRATION=$((NOW_TS + EXPIRES_IN - TOKEN_REFRESH_BUFFER))
+                if [ $TOKEN_EXPIRATION -le $NOW_TS ]; then
+                  TOKEN_EXPIRATION=$((NOW_TS + EXPIRES_IN))
+                fi
+
+                echo "##[section]Token renovado com sucesso (valor oculto)"
+                echo "##vso[task.setvariable variable=SAP_TU_ACCESS_TOKEN;issecret=true]$ACCESS_TOKEN"
+                echo "##vso[task.setvariable variable=SAP_TU_TOKEN_EXPIRATION]$TOKEN_EXPIRATION"
+              }
+
+              if [ -z "$ACCESS_TOKEN" ] || [ "$ACCESS_TOKEN" == "null" ]; then
+                renew_access_token
+              fi
+
+              function ensure_token {
+                local now_ts=$(date +%s)
+                if [ -z "$TOKEN_EXPIRATION" ] || [ $now_ts -ge $TOKEN_EXPIRATION ]; then
+                  renew_access_token
+                fi
+              }
+
+              ensure_token
+              echo "##[section]Access token reutilizado (valor oculto)"
+              echo "##[section]Aguardando término do build ($BUILD_CODE)"
+
+              API_URL_BUILD_PROGRESS=$(echo "$API_URL_BUILD_PROGRESS" | sed "s/<SUBSCRIPTION_CODE>/$SUBSCRIPTION_CODE/")
+              API_URL_BUILD_PROGRESS=$(echo "$API_URL_BUILD_PROGRESS" | sed "s/<BUILD_CODE>/$BUILD_CODE/")
+              echo "##[command]Requisição para $API_URL_BUILD_PROGRESS"
+
+              COUNT_FAILS=0
+              LAST_PERCENT=0
+
+
+              while (true)
+              do
+                ensure_token
+                HTTP_CODE_RESPONSE=$(curl --max-time $CURL_HTTP_TIMEOUT  -o $SAP_API_RESPONSE_FILE  -s  -w "%{http_code}"  -H "x-approuter-authorization: Bearer ${ACCESS_TOKEN}" -H "Accept: application/json" --compressed "$API_URL_BUILD_PROGRESS")
+
+                if [[ "$HTTP_CODE_RESPONSE" != "200" ]];then
+                  ((COUNT_FAILS++))
+                  if [[ $COUNT_FAILS == 10 ]]; then
+                    echo "##[error]Não foi possível retornar os dados do build"
+                    echo "##vso[task.setvariable variable=BUILD_HTTP_ERROR]TRUE"
+                    echo "##vso[task.setvariable variable=SAP_ERROR_TYPE]HTTP_ERROR"
+                    echo "##vso[task.setvariable variable=BUILD_ERROR_NUMBER_OR_MESSAGE]$HTTP_CODE_RESPONSE"
+                    exit 1
+                  fi
+                  echo -e "##[warning]Não foi possível retornar os dados do build (tentativa $COUNT_FAILS). Será realizada uma nova tentativa em alguns instantes\n"
+                  sleep 180
+                  continue
+                fi
+
+                if [[ "$HTTP_CODE_RESPONSE" == "200" ]];then
+                  RESPONSE_BODY=$(cat $SAP_API_RESPONSE_FILE && rm $SAP_API_RESPONSE_FILE)
+
+                  BUILD_STATUS=$(echo $RESPONSE_BODY | jq -r '.buildStatus')
+                  BUILD_PERCENTAGE=$(echo $RESPONSE_BODY | jq -r '.percentage')
+
+
+                  if [[ "$BUILD_STATUS" == "UNKNOWN" ]];then
+                    echo -e "##[section]Status ainda não definido, aguarde ...\n"
+                    LAST_PERCENT=$BUILD_PERCENTAGE
+                    sleep 180
+                  fi
+
+                  if [[ "$BUILD_STATUS" == "SUCCESS" ]];then
+                    progress_bar $BUILD_STATUS $BUILD_PERCENTAGE
+                    # echo -e "##[command]Status: $BUILD_STATUS - $BUILD_PERCENTAGE% completo\n"
+
+                    echo "##vso[task.setvariable variable=BUILD_SUCCESS]TRUE"
+                    echo "##vso[task.setvariable variable=BUILD_SUCCESS_TYPE]BUILD_COMPLETED"
+                    MESSAGE="O build criado possui o código $BUILD_CODE"
+                    echo "##vso[task.setvariable variable=BUILD_SUCCESS_MESSAGE]$MESSAGE"
+                    break
+                  fi
+
+                  if [[ "$BUILD_STATUS" == "BUILDING" ]];then
+                    if [ "$BUILD_PERCENTAGE" == "100" ]; then
+                      sleep 60
+                      continue
+                    fi
+
+                    if [ "$LAST_PERCENT" != "$BUILD_PERCENTAGE" ]; then
+                      # echo -e "##[command]Status: $BUILD_STATUS" - $BUILD_PERCENTAGE% completo\n"
+                      progress_bar $BUILD_STATUS $BUILD_PERCENTAGE
+                    fi
+                  fi
+
+                  if [[ "$BUILD_STATUS" == "FAIL" ]];then
+                    BUILD_ERROR_MESSAGE=$(echo $RESPONSE_BODY | jq -r '.errorMessage')
+                    echo "##[error]$BUILD_ERROR_MESSAGE"
+                    echo "##[error]$BUILD_STATUS"
+                    echo "##[error]O build não foi concluído"
+                    echo "##vso[task.setvariable variable=SAP_ERROR]TRUE"
+                    echo "##vso[task.setvariable variable=SAP_ERROR_TYPE]SAP_ERROR"
+                    echo "##vso[task.setvariable variable=BUILD_ERROR_NUMBER_OR_MESSAGE]O build não foi concluído"
+                    exit 1
+                  fi
+
+                  LAST_PERCENT=$BUILD_PERCENTAGE
+                  sleep 180
+                fi
+                sleep 180
+              done
+            displayName: 'Waiting/Watching build'
+            name: progress_of_build_job
+            condition: and(succeeded(), ne(variables.BUILD_CODE_EXISTS, 'TRUE'))
+            env:
+              SUBSCRIPTION_CODE: $(SUBSCRIPTION_CODE)
+              API_URL_BUILD_PROGRESS: $(API_URL_BUILD_PROGRESS)
+              SAP_TU_CLIENT_ID: $(SAP_TU_CLIENT_ID)
+              SAP_TU_CLIENT_SECRET: $(SAP_TU_CLIENT_SECRET)
+              SAP_TU_TOKEN_ENDPOINT: $(SAP_TU_TOKEN_ENDPOINT)
+              SAP_TU_RESOURCE: $(SAP_TU_RESOURCE)
+              SAP_TU_ACCESS_TOKEN: $(SAP_TU_ACCESS_TOKEN)
+              SAP_TU_TOKEN_EXPIRATION: $(SAP_TU_TOKEN_EXPIRATION)
+
+          - template: /tech_products/ecmc/sap-commerce/tasks/messages/create_work_item.yaml
+            parameters:
+              project_name: ${{ parameters.project_name }}
+              environment_code: ${{ parameters.environment_code }}
+              database_update_mode: ${{ parameters.database_update_mode }}
+              deploy_strategy: ${{ parameters.deploy_strategy }}
+              branch_frontend: ${{ parameters.branch_frontend }}
+              branch_backend: ${{ parameters.branch_backend }}
+              pipeline_status: '$(SAP_ERROR_TYPE)'
+              work_item_title: 'Build Error - Sap Commerce cloud - E-commerce B2C'
+              area_path: 'ECMC - Ecomm Cloud B2C\\Build-SAPCLOUD'
+              iteration_path: 'ECMC - Ecomm Cloud B2C'
+              display_name: 'Create work item (http/SAP error)'
+              description_details: $(BUILD_ERROR_NUMBER_OR_MESSAGE)
+              condition: and( or(eq(variables.BUILD_HTTP_ERROR, 'TRUE'), eq(variables.SAP_ERROR, 'TRUE')), eq(variables.CREATE_WORK_ITEM, 'true'))
+
+          #CRIA WORK ITEM PÓS BUILD COM SUCESSO
+          - template: /tech_products/ecmc/sap-commerce/tasks/messages/create_work_item.yaml
+            parameters:
+              project_name: ${{ parameters.project_name }}
+              environment_code: ${{ parameters.environment_code }}
+              database_update_mode: ${{ parameters.database_update_mode }}
+              deploy_strategy: ${{ parameters.deploy_strategy }}
+              branch_frontend: ${{ parameters.branch_frontend }}
+              branch_backend: ${{ parameters.branch_backend }}
+              pipeline_status: "$(BUILD_SUCCESS_TYPE)"
+              work_item_title: 'Build Success - Sap Commerce cloud - E-commerce B2C'
+              area_path: 'ECMC - Ecomm Cloud B2C\\Build-SAPCLOUD'
+              iteration_path: 'ECMC - Ecomm Cloud B2C'
+              display_name: 'Create work item (Build Success)'
+              description_details: "$(BUILD_SUCCESS_MESSAGE)"
+              condition: and(eq(variables.BUILD_SUCCESS, 'TRUE'), eq(variables.CREATE_WORK_ITEM, 'true'))
+
+          - bash: |
+              ACCESS_TOKEN="${SAP_TU_ACCESS_TOKEN}"
+              TOKEN_EXPIRATION="${SAP_TU_TOKEN_EXPIRATION:-0}"
+              TOKEN_REFRESH_BUFFER=120
+
+              function renew_access_token {
+                echo "##[section]Renovando access token (client credentials)"
+                TOKEN_PAYLOAD="grant_type=client_credentials&client_id=${SAP_TU_CLIENT_ID}&client_secret=${SAP_TU_CLIENT_SECRET}&resource=${SAP_TU_RESOURCE}"
+                SAP_TOKEN_RESPONSE=$(curl -s -X POST "$SAP_TU_TOKEN_ENDPOINT" \
+                  -H "Content-Type: application/x-www-form-urlencoded" \
+                  -d "$TOKEN_PAYLOAD")
+
+                ACCESS_TOKEN=$(echo "$SAP_TOKEN_RESPONSE" | jq -r '.access_token // empty')
+                EXPIRES_IN=$(echo "$SAP_TOKEN_RESPONSE" | jq -r '.expires_in // empty')
+
+                if [ -z "$ACCESS_TOKEN" ] || [ "$ACCESS_TOKEN" == "null" ]; then
+                  echo "##[error]Falha ao renovar access token do Technical User"
+                  echo "##[debug]Resposta bruta do endpoint: $SAP_TOKEN_RESPONSE"
+                  exit 1
+                fi
+
+                if [ -z "$EXPIRES_IN" ] || [ "$EXPIRES_IN" == "null" ]; then
+                  EXPIRES_IN=3600
+                fi
+
+                NOW_TS=$(date +%s)
+                TOKEN_EXPIRATION=$((NOW_TS + EXPIRES_IN - TOKEN_REFRESH_BUFFER))
+                if [ $TOKEN_EXPIRATION -le $NOW_TS ]; then
+                  TOKEN_EXPIRATION=$((NOW_TS + EXPIRES_IN))
+                fi
+
+                echo "##[section]Token renovado com sucesso (valor oculto)"
+                echo "##vso[task.setvariable variable=SAP_TU_ACCESS_TOKEN;issecret=true]$ACCESS_TOKEN"
+                echo "##vso[task.setvariable variable=SAP_TU_TOKEN_EXPIRATION]$TOKEN_EXPIRATION"
+              }
+
+              if [ -z "$ACCESS_TOKEN" ] || [ "$ACCESS_TOKEN" == "null" ]; then
+                renew_access_token
+              fi
+
+              function ensure_token {
+                local now_ts=$(date +%s)
+                if [ -z "$TOKEN_EXPIRATION" ] || [ $now_ts -ge $TOKEN_EXPIRATION ]; then
+                  renew_access_token
+                fi
+              }
+
+              ensure_token
+              echo "##[section]Access token reutilizado (valor oculto)"
+
+              API_URL_BUILD_LOGS=$(echo "$API_URL_BUILDS" | sed "s/<SUBSCRIPTION_CODE>/$SUBSCRIPTION_CODE/")
+              API_URL_BUILD_LOGS="$API_URL_BUILD_LOGS/$BUILD_CODE/logs"
+
+              echo "##[command]Requisição para $API_URL_BUILD_LOGS"
+
+              for i in 1 2 3
+              do
+                ensure_token
+                HTTP_CODE_RESPONSE=$(curl --max-time $CURL_HTTP_TIMEOUT  --output $(Build.SourcesDirectory)/build-logs.zip  -s  -w "%{http_code}"  -H "x-approuter-authorization: Bearer ${ACCESS_TOKEN}" -H "Accept: application/octet-stream" "$API_URL_BUILD_LOGS")
+                echo "##[command]HTTP_CODE_RESPONSE .....: $HTTP_CODE_RESPONSE"
+                if [[ "$HTTP_CODE_RESPONSE" != "200" ]];then
+                  echo -e "##[warning]Não foi possível retornar o arquivo de log do build (tentativa $i). Será realizada uma nova tentativa em alguns instantes, aguarde ...\n"
+                  sleep 60
+                else
+                  break
+                fi
+              done
+
+              unzip $(Build.SourcesDirectory)/build-logs.zip
+              echo "##[command].............................. LOGS .............................."
+              cat "$(Build.SourcesDirectory)/releaselog-$BUILD_CODE.txt"
+
+              ERROR_MESSAGE=$(sed -n 's/.*sterr: fatal: \(.*$\).*/\1/gp' $(Build.SourcesDirectory)/releaselog-$BUILD_CODE.txt)
+              if [ "$ERROR_MESSAGE" != "" ];then
+                echo "##[error]$ERROR_MESSAGE"
+                echo "##vso[task.setvariable variable=BUILD_ERROR_MESSAGE]$ERROR_MESSAGE"
+                echo "##vso[task.setvariable variable=BUILD_ERROR]TRUE"
+              fi
+
+              ERROR_MESSAGE=$(sed -n 's/.*Exception in thread.*\:\(.*\:\?\).*,\s*reason.*/\1/gp' $(Build.SourcesDirectory)/releaselog-$BUILD_CODE.txt)
+
+              if [ "$ERROR_MESSAGE" != "" ];then
+                echo "##[error]$ERROR_MESSAGE"
+                echo "##vso[task.setvariable variable=BUILD_ERROR_MESSAGE]<pre><code><br><div>$ERROR_MESSAGE</div></code></pre>"
+                echo "##vso[task.setvariable variable=BUILD_ERROR]TRUE"
+              fi
+
+            displayName: 'Download build log'
+            name: download_build_job
+            condition: and(always(), ne(variables.BUILD_CODE_EXISTS, 'TRUE'))
+            env:
+              SAP_TU_CLIENT_ID: $(SAP_TU_CLIENT_ID)
+              SAP_TU_CLIENT_SECRET: $(SAP_TU_CLIENT_SECRET)
+              SAP_TU_TOKEN_ENDPOINT: $(SAP_TU_TOKEN_ENDPOINT)
+              SAP_TU_RESOURCE: $(SAP_TU_RESOURCE)
+              SAP_TU_ACCESS_TOKEN: $(SAP_TU_ACCESS_TOKEN)
+              SAP_TU_TOKEN_EXPIRATION: $(SAP_TU_TOKEN_EXPIRATION)
+
+          - template: /tech_products/ecmc/sap-commerce/tasks/messages/create_work_item.yaml
+            parameters:
+              project_name: ${{ parameters.project_name }}
+              environment_code: ${{ parameters.environment_code }}
+              database_update_mode: ${{ parameters.database_update_mode }}
+              deploy_strategy: ${{ parameters.deploy_strategy }}
+              branch_frontend: ${{ parameters.branch_frontend }}
+              branch_backend: ${{ parameters.branch_backend }}
+              pipeline_status: 'SAP_ERROR'
+              work_item_title: 'Build Error - Sap Commerce cloud - E-commerce B2C'
+              area_path: 'ECMC - Ecomm Cloud B2C\\Build-SAPCLOUD'
+              iteration_path: 'ECMC - Ecomm Cloud B2C'
+              display_name: 'Create work item (Build Error)'
+              description_details: $(BUILD_ERROR_MESSAGE)
+              condition: and(eq(variables.BUILD_ERROR, 'TRUE'), eq(variables.CREATE_WORK_ITEM, 'true'))
+
+          - task: CopyFiles@2
+            displayName: "Copy build logs"
+            inputs:
+              TargetFolder: "$(Build.ArtifactStagingDirectory)"
+              OverWrite: true
+              CleanTargetFolder: true
+              Contents: |
+                $(Build.SourcesDirectory)/build-logs.zip
+            condition: and(always(), eq(variables.PUBLISH_BUILD_ERROR_LOG, true))
+
+          - task: PublishPipelineArtifact@1
+            displayName: "Publish build logs artifact"
+            inputs:
+              artifactName: "build-logs"
+              targetPath: "$(Build.ArtifactStagingDirectory)"
+            condition: and(always(), eq(variables.PUBLISH_BUILD_ERROR_LOG, true))
+
+          # REMOVE TEMP BRANCH
+          - ${{ if and(eq(variables['Build.Reason'], 'Manual'), or(and(ne(parameters.branch_frontend, ''), ne(parameters.branch_backend, '')), ne(parameters.database_update_mode, ''))) }}:
+              - checkout: CloudSapCommerce
+                persistCredentials: true
+                displayName: Cloning Cloud Repository
+                condition: and(always(), eq(variables.IS_DEV_BRANCH, True))
+              - bash: |
+                  cd $(Build.SourcesDirectory)/$(Build.Repository.Name)
+                  git config --replace-all user.name "Azure DevOps" && git config --replace-all user.email "azuredevops@telefonicati.onmicrosoft.com"
+                  git branch $NEW_VERSION
+                  git branch -d $NEW_VERSION
+                  git push -d origin $NEW_VERSION
+                displayName: Remove temp branch $(NEW_VERSION)
+                condition: and(always(), eq(variables.IS_DEV_BRANCH, True))

@@ -1,0 +1,94 @@
+parameters:
+  - name: project
+    type: string
+  - name: environment
+    type: string
+  - name: dryRun
+    type: boolean
+  - name: deploymentList
+    type: object
+  - name: pipelinePrefix
+    type: string
+  - name: skipReleaseCreation
+    type: boolean
+  - name: skipReleaseUpdate
+    type: boolean
+  - name: releaseEnabledFlag
+    type: string
+  - name: organization
+    type: string
+
+stages:
+  - stage: deploy
+    displayName: "Mass Deployment"
+    dependsOn: approval
+    jobs:
+      - ${{ each deployment in parameters.deploymentList }}:
+          - job: deploy_${{ replace(replace(deployment.key, '-', '_'), '.', '_') }}
+            displayName: "${{ deployment.key }} (v${{ deployment.value }})"
+            variables:
+              pipelineName: ${{ parameters.pipelinePrefix }}${{ deployment.key }}
+              version: ${{ deployment.value }}
+            steps:
+              - task: Bash@3
+                name: trigger
+                displayName: "Trigger Pipeline"
+                env:
+                  PIPELINE_NAME: $(pipelineName)
+                  VERSION: $(version)
+                  PROJECT: ${{ parameters.project }}
+                  ENVIRONMENT: ${{ parameters.environment }}
+                  DRY_RUN: ${{ parameters.dryRun }}
+                  SKIP_RELEASE_CREATION: ${{ parameters.skipReleaseCreation }}
+                  SKIP_RELEASE_UPDATE: ${{ parameters.skipReleaseUpdate }}
+                  RELEASE_ENABLED_FLAG: ${{ parameters.releaseEnabledFlag }}
+                  ORGANIZATION: ${{ parameters.organization }}
+                inputs:
+                  targetType: inline
+                  script: |
+                    set -e
+
+                    url_encode() { echo "$1" | sed 's/ /%20/g'; }
+                    PROJECT_ENCODED=$(url_encode "$PROJECT")
+
+                    echo "##[section]Pipeline: $PIPELINE_NAME"
+                    echo "  Version: $VERSION"
+                    echo "  Environment: $ENVIRONMENT"
+
+                    if [ "$DRY_RUN" == "True" ]; then
+                      echo ""
+                      echo "##[warning]DRY RUN - Would execute:"
+                      echo "  az pipelines run --org \"$ORGANIZATION\" --name \"$PIPELINE_NAME\" --project \"$PROJECT\" \\"
+                      echo "    --folder-path \"microfrontends-spa\" \\"
+                      echo "    --parameters qa_environment=\"$ENVIRONMENT\" MANUAL_BUNDLE_VERSION=\"$VERSION\" \\"
+                      echo "    skipReleaseCreation=\"$SKIP_RELEASE_CREATION\" skipReleaseUpdate=\"$SKIP_RELEASE_UPDATE\" \\"
+                      echo "    RELEASE_ENABLED_FLAG=\"$RELEASE_ENABLED_FLAG\""
+                      echo "##vso[task.setvariable variable=result;isOutput=true]DRY_RUN|$PIPELINE_NAME|$VERSION|N/A|N/A"
+                    else
+                      RESPONSE=$(az pipelines run \
+                        --org "$ORGANIZATION" \
+                        --name "$PIPELINE_NAME" \
+                        --project "$PROJECT" \
+                        --folder-path "microfrontends-spa" \
+                        --parameters qa_environment="$ENVIRONMENT" MANUAL_BUNDLE_VERSION="$VERSION" \
+                          skipReleaseCreation="$SKIP_RELEASE_CREATION" skipReleaseUpdate="$SKIP_RELEASE_UPDATE" \
+                          RELEASE_ENABLED_FLAG="$RELEASE_ENABLED_FLAG" \
+                        --output json 2>&1) || {
+                          echo "##[warning]Failed to trigger pipeline: $PIPELINE_NAME"
+                          echo ""
+                          echo "##[section]Error Details:"
+                          echo "$RESPONSE"
+                          echo "##vso[task.setvariable variable=result;isOutput=true]FAILED|$PIPELINE_NAME|$VERSION|N/A|N/A"
+                          echo "##vso[task.complete result=SucceededWithIssues;]Trigger failed"
+                          exit 0
+                        }
+                      
+                      RUN_ID=$(echo "$RESPONSE" | jq -r '.id')
+                      RUN_URL="${ORGANIZATION}${PROJECT_ENCODED}/_build/results?buildId=$RUN_ID"
+                      
+                      echo ""
+                      echo "##[section]Triggered successfully"
+                      echo "  Run ID: $RUN_ID"
+                      echo "  URL: $RUN_URL"
+                      echo "##vso[task.setvariable variable=result;isOutput=true]SUCCESS|$PIPELINE_NAME|$VERSION|$RUN_ID|$RUN_URL"
+                    fi

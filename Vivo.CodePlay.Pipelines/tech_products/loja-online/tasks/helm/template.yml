@@ -1,0 +1,160 @@
+﻿parameters:
+- name: environment
+- name: workDir
+- name: k8sKubeconfig
+- name: helmReleaseNamePrefix
+- name: helmReleaseName
+- name: helmReleaseNamespace
+- name: helmRepoName
+- name: helmChartName
+- name: helmChartVersion
+- name: helmTimeout
+- name: helmHistoryMax
+- name: helmImageRepository
+- name: helmImageTag
+- name: helmOciResgitryEnabled
+- name: helmOciRegistryUrl
+- name: helmOciChartBaseUrl
+- name: helmImagePullSecret
+- name: helmOciUsername
+- name: helmOciPassword
+- name: argocd_enabled
+  type: boolean
+  default: 'false'
+
+steps:
+  - ${{ if eq(parameters.argocd_enabled, 'true') }}:
+    - checkout: ArgoCD
+      persistCredentials: true
+      fetchDepth: 1
+    - checkout: ArgoCD-Production
+      persistCredentials: true
+      fetchDepth: 1
+    - checkout: self
+      persistCredentials: true
+      fetchDepth: 1
+
+  - template: /tech_products/loja-online/tasks/helm/registry_login.yml
+
+  - bash: |
+      function git_commands {
+          git config --global --replace-all user.name "Azure DevOps"
+          git config --global --replace-all user.email "azuredevops@telefonicati.onmicrosoft.com"
+          git fetch
+          git checkout master
+          git reset --hard origin/master
+      }
+
+      source ~/.bashrc
+
+      echo "##[debug] HELM_REPO_NAME..............: ${HELM_REPO_NAME}"
+      echo "##[debug] HELM_CHART_NAME.............: ${HELM_CHART_NAME}"
+      echo "##[debug] HELM_CHART_VERSION..........: ${HELM_CHART_VERSION}"
+      echo "##[debug] HELM_RELEASE_NAME_PREFIX....: ${HELM_RELEASE_NAME_PREFIX}"
+      echo "##[debug] HELM_RELEASE_NAME...........: ${HELM_RELEASE_NAME}"
+      echo "##[debug] HELM_RELEASE_NAMESPACE......: ${HELM_RELEASE_NAMESPACE}"
+      echo "##[debug] HELM_TIMEOUT................: ${HELM_TIMEOUT}"
+      echo "##[debug] HELM_IMAGE_REPOSITORY.......: ${HELM_IMAGE_REPOSITORY}"
+      echo "##[debug] HELM_IMAGE_TAG..............: ${HELM_IMAGE_TAG}"
+      echo "##[debug] HELM_IMAGE_PULL_SECRET......: ${HELM_IMAGE_PULL_SECRET}"
+      echo "##[debug] HELM_HISTORY_MAX............: ${HELM_HISTORY_MAX}"
+      echo "##[debug] ENVIRONMENT_CONFIG..........: ${ENVIRONMENT_CONFIG}"
+      echo "##[debug] K8S_KUBE_CONFIG.............: ${K8S_KUBE_CONFIG}"
+      echo "##[debug] DEPLOY_ARGO_CD............: ${argocd_enabled}"
+
+      if [ "${HELM_RELEASE_NAMESPACE}" == "producao" ] || [ "${HELM_RELEASE_NAMESPACE}" == "production" ] || [ "${HELM_RELEASE_NAMESPACE}" == "ms" ] || [ "${HELM_RELEASE_NAMESPACE}" == "prod" ]; then
+          cd $(Build.SourcesDirectory)/$(Build.Repository.Name)
+          mkdir "${HELM_RELEASE_NAMESPACE}"
+
+          helm template "${HELM_RELEASE_NAME_PREFIX}${HELM_RELEASE_NAME}" \
+              "${HELM_REPO_NAME}/${HELM_CHART_NAME}" --version "${HELM_CHART_VERSION}" \
+              -f "./env/prd.yaml" \
+              --kubeconfig "${K8S_KUBE_CONFIG}" \
+              --namespace "${HELM_RELEASE_NAMESPACE}" \
+              --set "nameOverride=${HELM_RELEASE_NAME_PREFIX}${HELM_RELEASE_NAME}" \
+              --set "fullnameOverride=${HELM_RELEASE_NAME_PREFIX}${HELM_RELEASE_NAME}" \
+              --set "containerName=${HELM_RELEASE_NAME_PREFIX}${HELM_RELEASE_NAME}" \
+              --set "image.repository=${HELM_IMAGE_REPOSITORY}" \
+              --set "image.tag=${HELM_IMAGE_TAG}" \
+              --set "imagePullSecrets[0].name=${HELM_IMAGE_PULL_SECRET}" \
+              > "${HELM_RELEASE_NAMESPACE}/${HELM_RELEASE_NAME_PREFIX}${HELM_RELEASE_NAME}.yaml"
+
+          cd ../argocd-production/
+          git_commands
+          cp -f $(Build.SourcesDirectory)/$(Build.Repository.Name)/${HELM_RELEASE_NAMESPACE}/${HELM_RELEASE_NAME_PREFIX}${HELM_RELEASE_NAME}.yaml ${HELM_RELEASE_NAMESPACE}/
+          git add ${HELM_RELEASE_NAMESPACE}/
+          git commit -m "Nova versão do ${HELM_RELEASE_NAME_PREFIX}${HELM_RELEASE_NAME} no namespace ${HELM_RELEASE_NAMESPACE} "
+          git push origin master
+          cd $(Build.SourcesDirectory)/$(Build.Repository.Name)
+
+      elif [ "${ARGOCD_ALLNAMESPACES_HML}" == "true" ]; then
+          namespaces=(${ARGOCD_NAMESPACES})
+          
+          for namespace in "${namespaces[@]}"; do
+              cd $(Build.SourcesDirectory)/$(Build.Repository.Name)
+              mkdir "${namespace}"
+
+              helm template "${HELM_RELEASE_NAME_PREFIX}${HELM_RELEASE_NAME}" \
+                  "${HELM_REPO_NAME}/${HELM_CHART_NAME}" --version "${HELM_CHART_VERSION}" \
+                  -f "./env/hml.yaml" \
+                  --kubeconfig "${K8S_KUBE_CONFIG}" \
+                  --namespace "${namespace}" \
+                  --set "nameOverride=${HELM_RELEASE_NAME_PREFIX}${HELM_RELEASE_NAME}" \
+                  --set "fullnameOverride=${HELM_RELEASE_NAME_PREFIX}${HELM_RELEASE_NAME}" \
+                  --set "containerName=${HELM_RELEASE_NAME_PREFIX}${HELM_RELEASE_NAME}" \
+                  --set "image.repository=${HELM_IMAGE_REPOSITORY}" \
+                  --set "image.tag=${HELM_IMAGE_TAG}" \
+                  --set "imagePullSecrets[0].name=${HELM_IMAGE_PULL_SECRET}" \
+                  > "${namespace}/${HELM_RELEASE_NAME_PREFIX}${HELM_RELEASE_NAME}.yaml"
+
+              cd ../argocd/
+              git_commands
+              cp $(Build.SourcesDirectory)/$(Build.Repository.Name)/${namespace}/${HELM_RELEASE_NAME_PREFIX}${HELM_RELEASE_NAME}.yaml ${namespace}
+              git add -f ${namespace}/
+              git commit -m "Nova versão do ${HELM_RELEASE_NAME_PREFIX}${HELM_RELEASE_NAME} no namespace ${namespace}"
+              git push origin master
+              cd $(Build.SourcesDirectory)/$(Build.Repository.Name) 
+          done
+      else
+          cd $(Build.SourcesDirectory)/$(Build.Repository.Name)
+          mkdir "${HELM_RELEASE_NAMESPACE}"
+
+          helm template "${HELM_RELEASE_NAME_PREFIX}${HELM_RELEASE_NAME}" \
+              "${HELM_REPO_NAME}/${HELM_CHART_NAME}" --version "${HELM_CHART_VERSION}" \
+              -f "./env/hml.yaml" \
+              --kubeconfig "${K8S_KUBE_CONFIG}" \
+              --namespace "${HELM_RELEASE_NAMESPACE}" \
+              --set "nameOverride=${HELM_RELEASE_NAME_PREFIX}${HELM_RELEASE_NAME}" \
+              --set "fullnameOverride=${HELM_RELEASE_NAME_PREFIX}${HELM_RELEASE_NAME}" \
+              --set "containerName=${HELM_RELEASE_NAME_PREFIX}${HELM_RELEASE_NAME}" \
+              --set "image.repository=${HELM_IMAGE_REPOSITORY}" \
+              --set "image.tag=${HELM_IMAGE_TAG}" \
+              --set "imagePullSecrets[0].name=${HELM_IMAGE_PULL_SECRET}" \
+              > "${HELM_RELEASE_NAMESPACE}/${HELM_RELEASE_NAME_PREFIX}${HELM_RELEASE_NAME}.yaml"
+
+          cat "${HELM_RELEASE_NAMESPACE}/${HELM_RELEASE_NAME_PREFIX}${HELM_RELEASE_NAME}.yaml"
+          cd ../argocd/
+          git_commands
+          cp -f $(Build.SourcesDirectory)/$(Build.Repository.Name)/${HELM_RELEASE_NAMESPACE}/${HELM_RELEASE_NAME_PREFIX}${HELM_RELEASE_NAME}.yaml ${HELM_RELEASE_NAMESPACE}/
+          git add ${HELM_RELEASE_NAMESPACE}/
+          git commit -m "Nova versão do ${HELM_RELEASE_NAME_PREFIX}${HELM_RELEASE_NAME} no namespace ${HELM_RELEASE_NAMESPACE} "
+          git push origin master
+      fi
+    displayName: "Deploy application via helm repository with argocd"
+    workingDirectory: "${{parameters.workDir}}"
+    condition: and( succeeded(), not(eq(variables['HELM_REGISTRY_ACR_ENABLED'],'true')), ne('${{ parameters.argocd_enabled }}', 'false'))
+    env:
+      HELM_REPO_NAME: ${{ parameters.helmRepoName }}
+      HELM_CHART_NAME: ${{ parameters.helmChartName }}
+      HELM_CHART_VERSION: ${{ parameters.helmChartVersion }}
+      HELM_RELEASE_NAME_PREFIX: ${{ parameters.helmReleaseNamePrefix }}
+      HELM_RELEASE_NAME: ${{ parameters.helmReleaseName }}
+      HELM_RELEASE_NAMESPACE: ${{ parameters.helmReleaseNamespace }}
+      HELM_TIMEOUT: ${{ parameters.helmTimeout }}
+      HELM_IMAGE_REPOSITORY: ${{ parameters.helmImageRepository }}
+      HELM_IMAGE_TAG: ${{ parameters.helmImageTag }}
+      HELM_IMAGE_PULL_SECRET: ${{ parameters.helmImagePullSecret }}
+      HELM_HISTORY_MAX: ${{ parameters.helmHistoryMax }}
+      ENVIRONMENT_CONFIG: ${{ parameters.environment }}
+      K8S_KUBE_CONFIG: ${{ parameters.k8sKubeconfig }}
+      argocd_enabled: ${{ parameters.argocd_enabled }}

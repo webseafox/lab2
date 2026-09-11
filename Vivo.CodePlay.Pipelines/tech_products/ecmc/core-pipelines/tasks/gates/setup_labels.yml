@@ -1,0 +1,54 @@
+parameters:
+- name: projectKey
+  default: $(SONAR_PROJECT_KEY)
+
+steps:
+- bash: |
+    URL="$(SONARQUBE_URL)"
+    TOKEN="${SONARQUBE_TOKEN}"
+    PROJECT_KEY="${{parameters.projectKey}}"
+    GOV_APP_ACRONYM=$(echo ${GOV_APP_ACRONYM} | tr '[:upper:]' '[:lower:]')
+
+    if [[ "$(SONAR_SELF_HOSTED)" == "true" ]]; then
+      TOKEN="${SONARQUBE_TOKEN_SELF_HOSTED}"
+    fi
+    echo "##[debug]PROJECT_KEY....................$PROJECT_KEY"
+    echo "##[debug]GOV_APP_ACRONYM................$GOV_APP_ACRONYM"
+
+    check_tag_exists() {
+        local t="$1"
+        shift
+        local array=("$@")
+        for item in "${array[@]}"; do
+            if [[ "$item" == "$t" ]]; then
+                return 0
+            fi
+        done
+        return 1
+    }
+
+    TAG_LIST=$(curl -s -u "$TOKEN:" "$URL/api/components/search_projects?ps=500&filter=query%20%3D%20${PROJECT_KEY}" | jq -r --arg project_key "${PROJECT_KEY}" '.components[] | select(.key=="${PROJECT_KEY}") | .tags[]')
+    readarray -t TAG_LIST_ARR <<<"$TAG_LIST"
+
+    if check_tag_exists "${GOV_APP_ACRONYM}" "${TAG_LIST_ARR[@]}"; then
+        echo "##[section]Tag ${GOV_APP_ACRONYM} is already applied to the project $PROJECT_KEY!"
+    else
+        echo "##[section]Tag is missing!"
+        echo "##[section]Applying tag ($GOV_APP_ACRONYM) to $PROJECT_KEY..."
+        TAG_CREATION_STATUS=$(curl -s -u "$TOKEN:" -d "project=${PROJECT_KEY}&tags=${GOV_APP_ACRONYM}" -X POST -o ./.tmp.sonar.out -w "%{http_code}" "$URL/api/project_tags/set")
+
+        if [ "$TAG_CREATION_STATUS" -eq 204 ]; then
+            echo "##[section]Tag has been applied!"
+        else
+            echo "##[section]Error trying to apply the tag to the project ($PROJECT_KEY). Message: ($(cat ./.tmp.sonar.out | jq '.errors[0].msg'))"
+        fi
+    fi
+    rm -rf ./.tmp.sonar.out
+  displayName: 'Setup Acronym to SonarQube Project'
+  env:
+    SONARQUBE_TOKEN_TAG: $(SONARQUBE-TOKEN-TAG)
+    GOV_APP_ACRONYM: $(GOV_APP_ACRONYM)
+    SONARQUBE_TOKEN: $(SONARQUBE-TOKEN)
+    SONARQUBE_QUALITYGATE_TIMEOUT: $(SONARQUBE_QUALITYGATE_TIMEOUT)
+    SONARQUBE_TOKEN_SELF_HOSTED: $(SONARQUBE_TOKEN_SELF_HOSTED)
+    SONARQUBE_TOKEN_TAG_SELF_HOSTED: $(SONARQUBE_TOKEN_TAG_SELF_HOSTED)

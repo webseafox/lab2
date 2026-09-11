@@ -1,0 +1,275 @@
+parameters:
+  - name: convisoAssetName
+    type: string
+  - name: companyId
+    type: string
+    default: "430"
+  - name: graphqlUrl
+    type: string
+    default: "https://api.convisoappsec.com/graphql"
+  - name: scanType
+    type: string
+    default: "ALL" # Aceita: 'SCA' ou 'SAST'
+
+steps:
+  # ═══════════════════════════════════════════════════════════════════════════
+  # BLOCO 1 — Riscos Aceitos 
+  # ═══════════════════════════════════════════════════════════════════════════
+  - bash: |
+      COMPANY_ID="${{ parameters.companyId }}"
+      GRAPHQL_URL="${{ parameters.graphqlUrl }}"
+      ASSET_NAME="${{ parameters.convisoAssetName }}"
+      ASSET_ID="$(CONVISO_ASSET_ID)"
+      SCAN_TYPE="${{ parameters.scanType }}"
+
+      call_conviso_api() {
+        curl -s --retry 3 --retry-delay 2 --max-time 15 \
+          -X POST \
+          -H "x-api-key: $ENV_API_KEY" \
+          -H "Content-Type: application/json" \
+          -d "$1" \
+          "$GRAPHQL_URL"
+      }
+
+      # ─────────────────────────────────────────────────────────────────────────
+      # ETAPA 1 — Resolução do Asset ID 
+      # ─────────────────────────────────────────────────────────────────────────
+      if [ -z "$ASSET_ID" ] || [ "$ASSET_ID" == "\$(CONVISO_ASSET_ID)" ]; then
+        echo "Buscando Asset via API..."
+        ASSET_PAYLOAD=$(jq -n --arg name "$ASSET_NAME" --arg cid "$COMPANY_ID" \
+          '{query: "{ assets(companyId: \"\($cid)\", page: 1, limit: 50, search: { name: \"\($name)\" }) { collection { id name } } }"}')
+        ASSET_RESP=$(call_conviso_api "$ASSET_PAYLOAD")
+
+        if echo "$ASSET_RESP" | grep -q '"errors"'; then
+          echo "##vso[task.logissue type=warning]⚠️ Conviso Risks: Falha ao buscar Asset '$ASSET_NAME'."
+          echo "DEBUG: $ASSET_RESP"
+          exit 0
+        fi
+
+        ASSET_ID=$(echo "$ASSET_RESP" | jq -r --arg name "$ASSET_NAME" \
+          '[.data.assets.collection[]? | select(.name == $name) | .id][0] // empty')
+      fi
+
+      if [ -z "$ASSET_ID" ] || [ "$ASSET_ID" == "null" ]; then
+        echo "##vso[task.logissue type=warning]⚠️ Conviso Risks: Asset '$ASSET_NAME' não localizado. Verifique se o Conviso Sync foi executado."
+        exit 0
+      fi
+
+      echo "Asset localizado — Nome: $ASSET_NAME | ID: $ASSET_ID"
+
+      # Exporta ASSET_ID para o bloco 2 (Check Risk Parameters)
+      echo "##vso[task.setvariable variable=CONVISO_ASSET_ID_RESOLVED]$ASSET_ID"
+
+      # ─────────────────────────────────────────────────────────────────────────
+      # ETAPA 2 — Busca de issues SEM filtro de status na API
+      # ─────────────────────────────────────────────────────────────────────────
+      RISK_PAYLOAD=$(jq -n --arg cid "$COMPANY_ID" --arg aid "$ASSET_ID" \
+        '{query: "{ issues(companyId: \"\($cid)\", pagination: { page: 1, perPage: 100 }, filters: { assetIds: [\"\($aid)\"] }) { collection { id title severity status __typename } } }"}')
+
+      RISK_RESP=$(call_conviso_api "$RISK_PAYLOAD")
+
+      if echo "$RISK_RESP" | grep -q '"errors"'; then
+        echo "##vso[task.logissue type=warning]⚠️ Conviso Risks: Falha ao consultar issues do Asset ID $ASSET_ID."
+        echo "DEBUG: $RISK_RESP"
+        exit 0
+      fi
+
+      ALL_ISSUES=$(echo "$RISK_RESP" | jq -c '.data.issues.collection // []')
+
+      # ─────────────────────────────────────────────────────────────────────────
+      # DEBUG — Loga os tipos (__typename) distintos encontrados no Asset.
+      # Útil para conferir rapidamente no log se o campo __typename está vindo
+      # preenchido e quais valores a API está retornando (ex: SastFinding,
+      # ScaFinding, IacFinding...). Não falha o step, é só informativo.
+      # ─────────────────────────────────────────────────────────────────────────
+      echo "DEBUG __typename encontrados neste Asset: $(echo "$ALL_ISSUES" | jq -c '[.[].__typename] | unique')"
+
+      # ─────────────────────────────────────────────────────────────────────────
+      # ETAPA 3 — Filtragem de Riscos Aceitos com Separação SCA/SAST
+      # Usa o meta-campo GraphQL __typename (SastFinding / ScaFinding / etc.),
+      # que é o identificador oficial do tipo de finding no schema da Conviso
+      # (IssueInterface implementada por SastFinding, ScaFinding, IacFinding,
+      # ContainerFinding, DastFinding, SecretFinding, MastFinding...).
+      # Caso __typename venha vazio/null (ex: schema diferente do esperado),
+      # cai para o fallback por regex no título como segunda tentativa.
+      # ─────────────────────────────────────────────────────────────────────────
+      if [ "$SCAN_TYPE" == "SCA" ]; then
+        ACCEPTED=$(echo "$ALL_ISSUES" | jq -c '[.[] | select(
+          (.status | ascii_upcase == "RISK_ACCEPTED") and
+          (
+            (.__typename // "" | ascii_upcase) as $t |
+            if $t != "" then
+              ($t == "SCAFINDING" or $t == "DEPENDENCYFINDING")
+            else
+              (.title | test("CVE-|GHSA-|BDSA-"; "i"))
+            end
+          )
+        )]')
+      elif [ "$SCAN_TYPE" == "SAST" ]; then
+        ACCEPTED=$(echo "$ALL_ISSUES" | jq -c '[.[] | select(
+          (.status | ascii_upcase == "RISK_ACCEPTED") and
+          (
+            (.__typename // "" | ascii_upcase) as $t |
+            if $t != "" then
+              ($t == "SASTFINDING" or $t == "SOURCECODEVULNERABILITY")
+            else
+              (.title | test("CVE-|GHSA-|BDSA-"; "i") | not)
+            end
+          )
+        )]')
+      else
+        ACCEPTED=$(echo "$ALL_ISSUES" | jq -c '[.[] | select(.status | ascii_upcase == "RISK_ACCEPTED")]')
+      fi
+
+      COUNT=$(echo "$ACCEPTED" | jq 'length')
+
+      echo "##vso[task.setvariable variable=CONVISO_RISK_COUNT]$COUNT"
+
+      # ─────────────────────────────────────────────────────────────────────────
+      # ETAPA 4 — Exibição do relatório customizado por Tipo
+      # ─────────────────────────────────────────────────────────────────────────
+      echo ""
+      echo "=================================================================================="
+      echo "           CONVISO PLATFORM - RELATÓRIO DE RISCOS ACEITOS ($SCAN_TYPE)"
+      echo "=================================================================================="
+      printf  "  Asset : %-67s\n" "$ASSET_NAME"
+      printf  "  ID    : %-67s\n" "$ASSET_ID"
+      echo "=================================================================================="
+      echo ""
+
+      if [ "$COUNT" -gt 0 ]; then
+
+        echo "##vso[task.complete result=SucceededWithIssues;]Riscos aceitos detectados ($SCAN_TYPE)."
+        echo "##vso[task.logissue type=warning]Asset '$ASSET_NAME' possui $COUNT risco(s) aceito(s) (Risk Accepted) de $SCAN_TYPE na Conviso Platform — não bloqueia o pipeline, requer revisão periódica."
+
+        echo ""
+        echo "  Detalhamento dos Riscos Aceitos ($SCAN_TYPE)"
+        echo "  --------------------------------------------------------------------------"
+
+        INDEX=0
+        echo "$ACCEPTED" | jq -c '.[]' | while read -r v; do
+          INDEX=$((INDEX + 1))
+          ID_V=$(echo "$v"  | jq -r '.id       // "N/A"')
+          TITLE=$(echo "$v" | jq -r '.title    // "Sem Título"')
+          SEV=$(echo "$v"   | jq -r '.severity // "Desconhecida"')
+          STA=$(echo "$v"   | jq -r '.status   // "Desconhecido"')
+
+          echo "   [$INDEX] Título     : $TITLE"
+          echo "       Severidade : $SEV"
+          echo "       Status     : $STA"
+          echo "       ID         : $ID_V"
+          echo ""
+        done
+
+        echo "  ------------------------------------------------------------------------------------------------------------------------------------------"
+        echo "   ℹ️  Riscos aceitos NÃO bloqueiam o pipeline."
+        echo "      Requerem revisão e aprovação periódica pela equipe de segurança."
+        echo ""
+        echo "   🔗 Ver na plataforma:"
+        if [ "$SCAN_TYPE" == "SAST" ]; then
+          echo "      https://app.convisoappsec.com/spa/company/$COMPANY_ID/vulnerabilities?assetIds=$ASSET_ID&statuses=RISK_ACCEPTED&failureTypes=SAST_FINDING"
+        elif [ "$SCAN_TYPE" == "SCA" ]; then
+          echo "      https://app.convisoappsec.com/spa/company/$COMPANY_ID/vulnerabilities?assetIds=$ASSET_ID&statuses=RISK_ACCEPTED&failureTypes=SCA_FINDING"
+        else
+          echo "      https://app.convisoappsec.com/spa/company/$COMPANY_ID/vulnerabilities?assetIds=$ASSET_ID&statuses=RISK_ACCEPTED"
+        fi
+        echo "  ------------------------------------------------------------------------------------------------------------------------------------------"
+
+      else
+        echo "  ✅  Nenhum risco aceito registrado para este Asset em $SCAN_TYPE."
+        echo ""
+      fi
+
+      echo ""
+    displayName: "Conviso Platform: Check Accepted Risks (${{ parameters.scanType }})"
+    condition: always()
+    continueOnError: true
+    env:
+      ENV_API_KEY: $(CONVISO-API-KEY)
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # BLOCO 2 — Risk Parameters do Asset (MANTIDO INTACTO)
+  # ═══════════════════════════════════════════════════════════════════════════
+  - bash: |
+      COMPANY_ID="${{ parameters.companyId }}"
+      GRAPHQL_URL="${{ parameters.graphqlUrl }}"
+      ASSET_NAME="${{ parameters.convisoAssetName }}"
+      ASSET_ID="$(CONVISO_ASSET_ID_RESOLVED)"
+      FORM_URL="https://forms.office.com/Pages/ResponsePage.aspx?id=DmBElwQ-Lkm6oSXsJFxvEHyiLUaP2v5Js3mvbPTfO3RUM1ZMWU1OMzRSRklCWEtWMkg5MVVGTE80TCQlQCN0PWcu"
+
+      call_conviso_api() {
+        curl -s --retry 3 --retry-delay 2 --max-time 15 \
+          -X POST \
+          -H "x-api-key: $ENV_API_KEY" \
+          -H "Content-Type: application/json" \
+          -d "$1" \
+          "$GRAPHQL_URL"
+      }
+
+      if [ -z "$ASSET_ID" ] || [ "$ASSET_ID" == "\$(CONVISO_ASSET_ID_RESOLVED)" ]; then
+        echo "##vso[task.logissue type=warning]⚠️ Conviso Risk Parameters: Asset ID não resolvido (verifique se o bloco 'Check Accepted Risks' foi executado)."
+        exit 0
+      fi
+
+      RISKPARAMS_PAYLOAD=$(jq -n --arg cid "$COMPANY_ID" --arg name "$ASSET_NAME" \
+        '{query: "{ assets(companyId: \"\($cid)\", page: 1, limit: 50, search: { name: \"\($name)\" }) { collection { id name businessImpact dataClassification audience criticity } } }"}')
+
+      RISKPARAMS_RESP=$(call_conviso_api "$RISKPARAMS_PAYLOAD")
+
+      echo "  Verificação de Risk Parameters do Asset"
+      echo ""
+
+      if echo "$RISKPARAMS_RESP" | grep -q '"errors"'; then
+        echo "##vso[task.logissue type=warning]⚠️ Conviso Risk Parameters: Falha ao consultar os parâmetros de risco do Asset '$ASSET_NAME'."
+        echo "DEBUG: $RISKPARAMS_RESP"
+        exit 0
+      fi
+
+      ASSET_RISKDATA=$(echo "$RISKPARAMS_RESP" | jq -c --arg name "$ASSET_NAME" \
+        '[.data.assets.collection[]? | select(.name == $name)][0] // empty')
+
+      if [ -z "$ASSET_RISKDATA" ]; then
+        echo "##vso[task.logissue type=warning]⚠️ Conviso Risk Parameters: Não foi possível localizar os dados de risco do Asset '$ASSET_NAME'."
+        exit 0
+      fi
+
+      BUSINESS_IMPACT=$(echo "$ASSET_RISKDATA" | jq -r '.businessImpact // empty')
+      DATA_CLASS_COUNT=$(echo "$ASSET_RISKDATA" | jq '(.dataClassification // []) | length')
+      AUDIENCE=$(echo "$ASSET_RISKDATA" | jq -r '.audience // empty')
+
+      MISSING_PARAMS=""
+      [ -z "$BUSINESS_IMPACT" ] && MISSING_PARAMS="${MISSING_PARAMS}Business Impact, "
+      [ "$DATA_CLASS_COUNT" -eq 0 ] && MISSING_PARAMS="${MISSING_PARAMS}Data Classification, "
+      [ -z "$AUDIENCE" ] && MISSING_PARAMS="${MISSING_PARAMS}Attack Surface (Audience), "
+      MISSING_PARAMS=$(echo "$MISSING_PARAMS" | sed 's/, $//')
+
+      if [ -n "$MISSING_PARAMS" ]; then
+        echo "##vso[task.complete result=SucceededWithIssues;]Asset sem Risk Parameters configurados."
+        echo "##vso[task.logissue type=warning]Asset '$ASSET_NAME' está sem Risk Parameters ($MISSING_PARAMS) — isso interfere no cálculo do Risk Score. Veja os detalhes no log do pipeline."
+
+        echo ""
+        echo "  ---------------------------------------------------------------------------------------------------------------------------------------------------------------"
+        echo "   🚨  ATENÇÃO — RISK PARAMETERS AUSENTES NO ASSET"
+        echo "  ---------------------------------------------------------------------------------------------------------------------------------------------------------------"
+        echo ""
+        echo "   Asset                   : $ASSET_NAME"
+        echo "   Parâmetro(s) ausente(s) : $MISSING_PARAMS"
+        echo ""
+        echo "   ⚠️  Isso interfere DIRETAMENTE no cálculo do Risk Score da aplicação na Conviso Platform."
+        echo ""
+        echo "   📝  Preencha o formulário abaixo para que o Security Champion configure os Risk Parameters do ativo:"
+        echo ""
+        echo "   🔗  $FORM_URL"
+        echo ""
+        echo "  ---------------------------------------------------------------------------------------------------------------------------------------------------------------"
+      else
+        echo "  ✅  Asset com Risk Parameters configurados."
+        echo "      Business Impact: $BUSINESS_IMPACT | Data Classification: definido | Attack Surface: $AUDIENCE"
+      fi
+
+      echo ""
+    displayName: "Conviso Platform: Check Risk Parameters"
+    condition: always()
+    continueOnError: true
+    env:
+      ENV_API_KEY: $(CONVISO-API-KEY)

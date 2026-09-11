@@ -1,0 +1,585 @@
+parameters:
+#############################################################################
+# Infraestrutura da Pipeline
+#############################################################################
+- name: agentPool
+  type: string
+  default: GeneralPurposeLinuxAgentsCI
+  displayName: 'Agent Pool para execução'
+
+- name: useNetworkProxy
+  type: boolean
+  default: false
+  displayName: 'Configurar proxy de rede para acesso externo (se necessário)'
+
+- name: workingDirectory
+  type: string
+  default: '$(Build.SourcesDirectory)'
+  displayName: 'Diretório de trabalho'
+
+#############################################################################
+# Modo de Execução
+#############################################################################
+- name: prValidationOnly
+  type: boolean
+  default: false
+  displayName: 'Executa apenas a validação, não publica nem gera versão'
+
+- name: enableLint
+  type: boolean
+  default: true
+  displayName: 'Executar lint antes do build (opcional)'
+
+- name: enableTest
+  type: boolean
+  default: true
+  displayName: 'Executar testes OPA durante o pipeline'
+
+#############################################################################
+# Estrutura do Bundle OPA
+#############################################################################
+- name: policiesPath
+  type: string
+  default: 'policies'
+  displayName: 'Diretório das policies (relativo à raiz)'
+
+- name: testsPath
+  type: string
+  default: 'tests'
+  displayName: 'Diretório dos testes OPA (relativo à raiz)'
+
+- name: waiversPath
+  type: string
+  default: 'waivers'
+  displayName: 'Diretório dos waivers (relativo à raiz)'
+
+- name: useWaivers
+  type: boolean
+  default: true
+  displayName: 'Habilita cópia de waivers para o bundle'
+
+- name: bundleAdditionalIncludes
+  type: object
+  default:
+    items: []
+  displayName: 'Arquivos ou diretórios adicionais para incluir no bundle'
+
+- name: bundleExcludePatterns
+  type: object
+  default:
+    items:
+      - README.md
+      - "*_test.rego"
+  displayName: 'Padrões de arquivos a excluir do bundle'
+
+#############################################################################
+# Versionamento
+#############################################################################
+- name: versionFile
+  type: string
+  default: 'version.txt'
+  displayName: 'Arquivo de versão (relativo à raiz)'
+
+- name: branchingStrategy
+  type: string
+  default: 'trunkbased'
+  displayName: 'Estratégia de versionamento'
+  values:
+    - 'trunkbased'
+    - 'vivoflow'
+    - 'releaseflow'
+    - 'gitlabflow'
+    - 'gitlabflow-semantic'
+    - 'custom'
+    - 'monorepo'
+
+#############################################################################
+# Integrações
+#############################################################################
+- name: enableFortifyExclusions
+  type: boolean
+  default: false
+  displayName: 'Faz checkout do repositório Fortify Exclusions'
+
+#############################################################################
+# Publicação de Artefatos
+#############################################################################
+- name: artifactFeed
+  type: string
+  default: $(DEFAULT_FEED_NAME)
+  displayName: 'Azure Artifacts feed para publicar o bundle'
+
+- name: buildArtifactName
+  type: string
+  default: '$(Build.Repository.Name)'
+  displayName: 'Nome do pipeline artifact gerado pelo build'
+
+- name: projectScopedFeed
+  type: boolean
+  default: true
+  displayName: 'Usar feed com escopo do projeto (true) ou organização (false)'
+
+variables:
+  # Variáveis utilizadas na geração do bundle
+  - name: SIGLA
+    value: $[ lower(split(variables['System.TeamProject'],' ')[0]) ]
+  - name: BUNDLE_NAME
+    value: ${{ parameters.buildArtifactName }}
+
+  # Variável utilizada para determinar o feed padrão do projeto
+  - name: DEFAULT_FEED_NAME
+    value: $[ lower(split(variables['System.TeamProject'],' ')[0]) ]
+    
+  # Variáveis utilizadas por templates de Segurança (Fortify/SCA)
+  - name: CACORP_LOCATION
+    value: $(Agent.HomeDirectory)/../../certs/CACORP.pem
+  - name: FORTIFY_APP_DEFAULT_VERSION
+    value: DevSecOps
+  - name: APP_LANGUAGE
+    value: 'other'
+
+  # Configurações de KeyVault para Segurança
+  - name: AKV_DEVOPS_NAME
+    value: 'kv-azdevops-shared'
+
+  # Variables for Proxy
+  - name: PROXY_NSKP_SERVER
+    value: "nskp.redecorp.br:8080"
+  - name: PROXY_SQUID_SERVER
+    value: "10.240.58.39:3128"
+  - name: PROXY_AGENT_HTTP
+    value: "http://$(PROXY_NSKP_SERVER)"
+  - name: PROXY_AGENT_HTTPS
+    value: "http://$(PROXY_NSKP_SERVER)"
+  - name: PROXY_AGENT_NO_PROXY
+    value: "localhost,0.0.0.0,127.0.0.1,10.244.0.0/16,192.168.0.0/16,10.129.178.173,nexus.telefonica.com.br,acrsharedservices01.azurecr.io,appcs-azdevops-shared.azconfig.io,scm.azurewebsites.net"
+
+stages:
+  # ==================================================================
+  # Stage 1: OPA Bundle Build - Build, Validação, Testes e Publicação do Opa Bundle
+  # Descrição: Build, formata e testa as policies (opa fmt / opa test), gera o bundle
+  #            e publica como pipeline artifact. Versão obtida via VersionManagerVivo.
+  # Observações: Copia waivers se `useWaivers=true` para inclusão no bundle.
+  # ==================================================================
+  - stage: OpaBundleBuild
+    displayName: 'Validate, Test and Build OPA Bundle'
+    jobs:
+    - job: OpaBundleBuild
+      displayName: 'Build OPA Bundle'
+      pool: ${{ parameters.agentPool }}
+      steps:
+      # ==================================================================
+      # Obtém o código-fonte do repositório para execução das validações,
+      # testes e geração do bundle OPA.
+      # ==================================================================
+      - checkout: self
+
+      # ==================================================================
+      # [Observabilidade] Exibe parâmetros quando em modo debug
+      # ==================================================================
+      - task: VivoUtilsFromVivo@1
+        displayName: 'Show Pipeline Parameters'
+        condition: eq(variables['System.Debug'], 'true')
+        inputs:
+          command: 'show-pipeline-parameters'
+          parameters: '${{ convertToJson(parameters) }}'
+
+      # ==================================================================
+      # Executa verificações de lint das policies Rego utilizando
+      # opa fmt e, quando disponível, opa vet.
+      # ==================================================================
+      - ${{ if eq(parameters.enableLint, true) }}:
+        - script: |
+            set -euo pipefail
+            echo "==> Lint: opa fmt"
+            opa fmt ${{ parameters.policiesPath }} ${{ parameters.testsPath }} || true
+
+            echo "==> Lint: opa vet (if available)"
+            if opa vet --help >/dev/null 2>&1; then
+              opa vet ${{ parameters.policiesPath }} || true
+            else
+              echo "opa vet not available; skipping"
+            fi
+          displayName: 'Run OPA lint (opa fmt + opa vet)'
+      
+      # ==================================================================
+      # Executa validação das policies Rego e todos os testes unitários
+      # definidos no diretório de testes utilizando opa test.
+      # ==================================================================
+      - ${{ if eq(parameters.enableTest, true) }}:
+        - script: |
+            set -euo pipefail
+            echo "==> Rego formatting (opa fmt)"
+            opa fmt ${{ parameters.policiesPath }} ${{ parameters.testsPath }} || true
+
+            echo "==> Run OPA tests"
+            opa test ${{ parameters.policiesPath }} ${{ parameters.testsPath }} -v
+          displayName: 'Validate Rego & Run OPA Tests'
+
+      # ==================================================================
+      # Calcula automaticamente a próxima versão do bundle utilizando
+      # o VersionManager, conforme a estratégia de versionamento definida.
+      # ==================================================================
+      - task: VersionManagerVivo@8
+        displayName: 'Next version'
+        inputs:
+          command: 'nextVersion'
+          branchingStrategy: ${{ parameters.branchingStrategy }}
+          versionFile: ${{ parameters.workingDirectory }}/${{ parameters.versionFile }}
+          bumpMethod: 'patch'
+          passthroughVersion: ${{ parameters.prValidationOnly }}
+        name: VersionManagerVivo
+
+      # ==================================================================
+      # Gera o bundle OPA em formato .tar.gz, incluindo as policies,
+      # arquivos adicionais, waivers (quando habilitados) e o manifesto
+      # de versão.
+      # ==================================================================
+      - script: |
+          set -euo pipefail
+
+          echo "==> Build OPA bundle in-pipeline (no repo scripts)"
+          echo
+
+          echo "==> Parameters"
+          echo "Policies path       : ${{ parameters.policiesPath }}"
+          echo "Waivers path        : ${{ parameters.waiversPath }}"
+          echo "Use waivers         : ${{ parameters.useWaivers }}"
+          echo "Version file        : ${{ parameters.versionFile }}"
+          echo "Bundle name         : $(BUNDLE_NAME)"
+
+          echo "Additional includes:"
+          for item in ${{ join(' ', parameters.bundleAdditionalIncludes.items) }}; do
+            echo "  - $item"
+          done
+
+          echo "Exclude patterns:"
+          for pattern in ${{ join(' ', parameters.bundleExcludePatterns.items) }}; do
+            echo "  - $pattern"
+          done
+
+          echo
+          echo "VersionManager VERSION expansion: '$(VersionManagerVivo.VERSION)'"
+
+          export TMPDIR="$(Agent.TempDirectory)"
+
+          BUNDLE_DIR=$(mktemp -d)
+          BUNDLE_VERSION=""
+          trap 'rm -rf "${BUNDLE_DIR}"' EXIT
+
+          echo
+          echo "Temporary bundle directory: ${BUNDLE_DIR}"
+          echo
+
+          echo "==> Repository structure"
+          find . -maxdepth 2 -type d | sort
+          echo
+
+          if [ -d "${{ parameters.policiesPath }}" ]; then
+            echo "Copying policies..."
+
+            find_cmd=(find "${{ parameters.policiesPath }}" -type f)
+
+            for pattern in ${{ join(' ', parameters.bundleExcludePatterns.items) }}; do
+              find_cmd+=(! -name "$pattern")
+            done
+
+            "${find_cmd[@]}" | while read -r file; do
+              dest="${file#${{ parameters.policiesPath }}/}"
+
+              echo "Including: $dest"
+
+              mkdir -p "${BUNDLE_DIR}/policies/$(dirname "$dest")"
+              cp "$file" "${BUNDLE_DIR}/policies/$dest"
+            done
+
+            echo
+            echo "Policies copied:"
+            find "${BUNDLE_DIR}/policies" | sort
+            echo
+          else
+            echo "ERROR: policies directory not found: ${{ parameters.policiesPath }}" >&2
+            exit 2
+          fi
+
+          if [ -n "${{ join(' ', parameters.bundleAdditionalIncludes.items) }}" ]; then
+            echo "Copying additional bundle files..."
+
+            for item in ${{ join(' ', parameters.bundleAdditionalIncludes.items) }}; do
+              if [ -e "$item" ]; then
+                echo "Including: $item"
+
+                if [ -d "$item" ]; then
+                  mkdir -p "${BUNDLE_DIR}/$item"
+                else
+                  mkdir -p "${BUNDLE_DIR}/$(dirname "$item")"
+                fi
+
+                cp -r "$item" "${BUNDLE_DIR}/$item"
+              else
+                echo "WARNING: additional include not found: $item"
+              fi
+            done
+          else
+            echo "No additional bundle files configured."
+          fi
+
+          USE_WAIVERS="${{ lower(parameters.useWaivers) }}"
+
+          if [ "${USE_WAIVERS}" = "true" ]; then
+            if [ -d "${{ parameters.waiversPath }}" ]; then
+              echo
+              echo "Copying waivers..."
+
+              cp -r "${{ parameters.waiversPath }}" "${BUNDLE_DIR}/waivers"
+
+              echo "Waivers copied:"
+              find "${BUNDLE_DIR}/waivers" | sort
+              echo
+            else
+              echo "WARNING: waivers directory not found: ${{ parameters.waiversPath }}"
+            fi
+          else
+            echo "Waivers disabled."
+          fi
+
+          if [ -n "$(VersionManagerVivo.VERSION)" ]; then
+            BUNDLE_VERSION="$(VersionManagerVivo.VERSION)"
+            echo "Using VersionManager version: ${BUNDLE_VERSION}"
+          fi
+
+          if [ -z "${BUNDLE_VERSION}" ] && [ -f "${{ parameters.versionFile }}" ]; then
+            BUNDLE_VERSION=$(tr -d ' \t\n\r' < "${{ parameters.versionFile }}")
+            echo "Using version from file: ${BUNDLE_VERSION}"
+          fi
+
+          if [ -z "${BUNDLE_VERSION}" ]; then
+            BUNDLE_VERSION=$(date -u +%Y%m%d%H%M%S)
+            echo "Using timestamp version: ${BUNDLE_VERSION}"
+          fi
+
+          printf '%s\n' \
+          '{' \
+          "  \"name\": \"${BUNDLE_NAME}\"," \
+          "  \"acronym\": \"$(SIGLA)\"," \
+          "  \"version\": \"${BUNDLE_VERSION}\"," \
+          "  \"generated\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"" \
+          '}' > "${BUNDLE_DIR}/.manifest"
+
+          echo
+          echo "==> Bundle structure"
+          find "${BUNDLE_DIR}" | sort
+          echo
+
+          TAR_FILE="$(Build.ArtifactStagingDirectory)/${BUNDLE_NAME}-${BUNDLE_VERSION}.tar.gz"
+
+          tar -czf "${TAR_FILE}" -C "${BUNDLE_DIR}" .
+
+          echo
+          echo "==> Bundle created"
+          echo "${TAR_FILE}"
+
+          echo
+          echo "Bundle size:"
+          du -h "${TAR_FILE}"
+
+          echo
+          echo "Bundle contents:"
+          tar -tzf "${TAR_FILE}" | sort
+        displayName: 'Build Bundle OPA (tar.gz)'
+      
+      # ==================================================================
+      # Publica o bundle gerado como Pipeline Artifact para consumo
+      # pelos estágios posteriores da pipeline.
+      # ==================================================================
+      - task: PublishPipelineArtifact@1
+        inputs:
+          targetPath: '$(Build.ArtifactStagingDirectory)'
+          artifact: '${{ parameters.buildArtifactName }}'
+          publishLocation: 'pipeline'
+        displayName: 'Publish bundle as pipeline artifact'
+
+# ==================================================================
+# Stage 2: SecurityAnalysis - Security Analysis (Fortify / SCA)
+# Descrição: Executa capacidades de AppSec em paralelo (Fortify SAST, SCA),
+#            utilizando templates que buscam chaves e flags de configuração.
+# Observações: Jobs são condicionais conforme flags retornadas por AppSec config.
+# ==================================================================
+  - stage: SecurityAnalysis
+    displayName: 'Security Analysis'
+    dependsOn:
+    - OpaBundleBuild
+    condition: succeeded()
+    jobs:
+
+    - job: AppSecConfigKeys
+      displayName: 'Get AppSec Config Keys'
+      pool: ${{ parameters.agentPool }}
+      steps:
+      - template: /security/get_appconfig_keys_framework.yml
+        parameters:
+          azureSubscription: DevOpsSharedResources
+          appConfigurationEndpoint: https://appcs-azdevops-shared.azconfig.io
+          useNetworkProxy: ${{ parameters.useNetworkProxy }}
+
+# ==================================================================
+# CAPACIDADE: FORTIFY SCAN (SAST)
+# ==================================================================
+# Descrição: Análise estática de código (SAST) usando Fortify ScanCentral e SSC, com integração à Conviso e publicação de artefatos.
+# Documentação: https://dvps.redecorp.azr/portal/codeplay/capacidades/catalog/sast
+# Observações: Exporta variáveis e publica artefatos para uso no Security Gate.
+# ==================================================================
+    - job: FortifyScan
+      displayName: 'Fortify Scan (SAST)'
+      dependsOn: 
+      - AppSecConfigKeys
+      pool: ${{ parameters.agentPool }}
+      variables:
+        USE_FORTIFY: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.USE_FORTIFY'] ]
+        USE_CONVISO: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.USE_CONVISO'] ]
+        SKIP_SECURITY_GATE: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.SKIP_SECURITY_GATE'] ]
+        FORTIFY_LOCAL_SCANCENTRAL_VERSION: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.FORTIFY_LOCAL_SCANCENTRAL_VERSION'] ]
+      condition: and(succeeded(), eq(variables.USE_FORTIFY, true))
+      steps:
+      - template: /security/define_appsec_app_version.yml
+
+      - template: /security/run_fortify_scan.yml
+        parameters:
+          fortifyExclusionRepository: 'FortifyExclusion'
+          enableFortifyExclusions: ${{ parameters.enableFortifyExclusions }}
+          appLanguage: 'other'
+          appVersion: "$(FORTIFY_APP_VERSION)" # OBS: A variável FORTIFY_APP_VERSION é definida no template /security/define_appsec_app_version.yml
+
+# ==================================================================
+# CAPACIDADE: SCA SCAN (SCA)
+# ==================================================================
+# Descrição: Análise de composição de software (SCA) usando Dependency Track, com integração à Conviso e publicação de artefatos.
+# Documentação: https://dvps.redecorp.azr/portal/codeplay/capacidades/catalog
+# Observações: Exporta variáveis e publica artefatos para uso no Security Gate.
+# ==================================================================
+    - job: SCAScan
+      displayName: 'SCA Scan'
+      dependsOn: AppSecConfigKeys
+      pool: ${{ parameters.agentPool }}
+      variables:
+        USE_DEPENDENCY_TRACK: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.USE_DEPENDENCY_TRACK'] ]
+        USE_DT_DOCKER: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.USE_DT_DOCKER'] ]
+        USE_CONVISO: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.USE_CONVISO'] ]
+        SKIP_SECURITY_GATE_SCA: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.SKIP_SECURITY_GATE_SCA'] ]
+      condition: and(
+                    succeeded(),
+                    eq(variables.USE_DEPENDENCY_TRACK, true)
+                  )
+      steps:
+      - template: /security/define_appsec_app_version.yml
+
+      - template: /security/run_sca_scan.yml
+        parameters:
+          appVersion: "$(FORTIFY_APP_VERSION)"
+          buildArtifactName: '${{ parameters.buildArtifactName }}'
+# ==================================================================
+# Stage 3: PublishArtifact - Publish bundle to Azure Artifacts
+# Descrição: Faz download do artefato buildado, determina versão, restaura
+#            arquivos no working directory e publica via Universal Packages.
+# Observações: Executa para branches não-PR de validação; requer `artifactFeed`.
+# ==================================================================
+  - ${{ if eq(parameters.prValidationOnly, false) }}:
+    - stage: PublishArtifact
+      displayName: 'Publish Artifact'
+      dependsOn:
+      - OpaBundleBuild
+      - SecurityAnalysis
+      condition: and(succeeded(), ne('${{ parameters.prValidationOnly }}','true'))
+      jobs:
+        - job: DeployArtifact
+          displayName: 'Publish Bundle Artifact'
+          pool: ${{ parameters.agentPool }}
+          steps:
+          - checkout: self
+
+          # ==================================================================
+          # Download do Artefato Buildado e Testado
+          # ==================================================================
+          - task: DownloadPipelineArtifact@2
+            displayName: 'Download Build Artifacts'
+            inputs:
+              buildType: 'current'
+              artifactName: '${{ parameters.buildArtifactName }}'
+              targetPath: '$(System.ArtifactsDirectory)/${{ parameters.buildArtifactName }}'
+
+          # ==================================================================
+          # [Versionamento] Definição da versão (VersionManager)
+          # ==================================================================
+          - task: VersionManagerVivo@8
+            displayName: 'Next version'
+            inputs:
+              command: 'nextVersion'
+              branchingStrategy: ${{ parameters.branchingStrategy }}
+              versionFile: '${{ parameters.workingDirectory }}/${{ parameters.versionFile }}'
+              bumpMethod: 'patch'
+            name: VersionManagerVivo
+
+          # ==================================================================
+          # Publicação via Universal Packages
+          # ==================================================================
+          - task: UniversalPackages@0
+            displayName: 'Publish bundle to Azure Artifacts (Universal Packages)'
+            inputs:
+              command: 'publish'
+              publishDirectory: '$(System.ArtifactsDirectory)/${{ parameters.buildArtifactName }}'
+              feedsToUsePublish: 'internal'
+              ${{ if eq(parameters.projectScopedFeed, true) }}:
+                vstsFeedPublish: '$(System.TeamProject)/${{ parameters.artifactFeed }}'
+              ${{ else }}:
+                vstsFeedPublish: '${{ parameters.artifactFeed }}'
+              packagePublishDescription: 'OPA bundle'
+              vstsFeedPackagePublish: '${{ parameters.buildArtifactName }}'
+              versionOption: "custom"
+              versionPublish: '$(VersionManagerVivo.VERSION)'
+
+# ==================================================================
+# Stage 4: VersionCommit - Commit e Tag da Versão de Release
+# Descrição: Atualiza versão no version.txt, cria commit e tag Git
+#            Executa apenas na master, quando não é PR de validação
+# ==================================================================
+  - ${{ if eq(parameters.prValidationOnly, false) }}:
+    - stage: VersionCommit
+      displayName: 'Commit Version'
+      dependsOn:
+      - OpaBundleBuild
+      - SecurityAnalysis
+      - PublishArtifact
+      condition: succeeded()
+      jobs:
+        - job: CommitVersion
+          displayName: 'Commit and Tag Version'
+          pool: ${{ parameters.agentPool }}
+          steps:
+          # ==================================================================
+          # Checkout para Commit da Versão
+          # ==================================================================
+          - checkout: self
+            clean: true
+            persistCredentials: true
+            fetchDepth: 0
+
+          # ==================================================================
+          # [Versionamento] Reafirma versão e realiza commit/tag
+          # ==================================================================
+          - task: VersionManagerVivo@8
+            displayName: 'Next version'
+            inputs:
+              command: 'nextVersion'
+              branchingStrategy: ${{ parameters.branchingStrategy }}
+              versionFile: ${{ parameters.workingDirectory }}/${{ parameters.versionFile }}
+              bumpMethod: 'patch'
+            name: VersionManagerVivo
+              
+          - task: VersionManagerVivo@8
+            displayName: 'Commit and Tag Version'
+            inputs:
+              command: 'commitVersion'
+              version: '$(VersionManagerVivo.VERSION)'
+              versionFile: '${{ parameters.workingDirectory }}/${{ parameters.versionFile }}'
+              createTag: true
+              pushChanges: true

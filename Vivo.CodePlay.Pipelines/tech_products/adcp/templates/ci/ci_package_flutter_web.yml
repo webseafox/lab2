@@ -1,0 +1,142 @@
+﻿parameters:
+  - name: use_flutter_version_latest
+    default: true
+
+stages:
+
+- stage: package
+  displayName: "Build & Package"
+  dependsOn:
+  - gates
+  - security
+  pool: $(PRIVATE_AGENT_DEFAULT)
+  jobs:
+ 
+  - job: "Package"
+    condition: or (
+      in(variables['Build.SourceBranch'], 'refs/heads/master'),
+      startsWith(variables['Build.SourceBranch'], 'refs/heads/feature/')
+      )
+    displayName: "Package (Web)"
+    pool: $(PRIVATE_AGENT_SHARED)
+    steps:
+
+    - checkout: self
+      persistCredentials: true
+
+    # Reset Git Config
+    - task: Bash@3
+      displayName: 'Reset Git Config'
+      name: reset_git_config
+      continueOnError: true
+      inputs:
+        targetType: inline
+        script: |
+
+          echo "Git config before:"
+          git config --global --list
+
+          # Define a pattern to match the keys you want to remove
+          patterns=(
+            "ADCP%20-%20FLUTTER"
+            "ECVV%20-%20ECOSISTEMA%20VIVO"
+          )
+
+          for pattern in "${patterns[@]}"; do
+              for key in $(git config --global --get-regexp "url\..*${pattern}.*" | awk '{print $1}'); do
+                  git config --global --unset-all "$key"
+              done
+          done
+
+          echo "Git config after:"
+          git config --global --list
+
+    # Set Git Config
+    - task: Bash@3
+      displayName: 'Set Git Config'
+      name: git_config
+      inputs:
+        targetType: inline
+        script: |
+
+          git config --global user.email "azuredevops@telefonicati.onmicrosoft.com"
+          git config --global user.name "Azure DevOps"
+          git config --global url."https://$GIT_ACCESS_TOKEN@dev.azure.com/telefonica-vivo-brasil/ECVV%20-%20ECOSISTEMA%20VIVO".insteadOf "https://telefonica-vivo-brasil@dev.azure.com/telefonica-vivo-brasil/ECVV%20-%20ECOSISTEMA%20VIVO"
+          git config --global url."https://$GIT_ACCESS_TOKEN@dev.azure.com/telefonica-vivo-brasil/ADCP%20-%20FLUTTER".insteadOf "https://telefonica-vivo-brasil@dev.azure.com/telefonica-vivo-brasil/ADCP%20-%20FLUTTER"
+          git config --global --list
+      env:
+        GIT_ACCESS_TOKEN: $(GIT_ACCESS_TOKEN)
+
+    - ${{ if eq(parameters.use_flutter_version_latest, 'True' ) }}: 
+
+      - task: Cache@2
+        displayName: "Flutter Install Cache"
+        inputs:
+          key: 'Flutter | "$(Agent.OS)" | "$(FLUTTER_VERSION_LATEST)"'
+          path: '$(Agent.ToolsDirectory)/Flutter'
+          cacheHitVar: FLUTTER_INSTALL_RESTORED
+
+      # Install Flutter
+      - task: FlutterInstall@0
+        displayName: "Install Flutter SDK"
+        inputs:
+          mode: 'auto'
+          channel: 'stable'
+          version: 'custom'
+          customVersion: $(FLUTTER_VERSION_LATEST)
+
+    - ${{ else }}:
+      # Set Flutter Env in Vivo Agent
+      - task: FlutterEnv@0
+        displayName: 'Flutter Env'
+        inputs:
+          pathType: flutterDirectory
+          flutterDirectory: '/home/svc_devopscorp/.asdf/installs/flutter/3.19.5'     
+
+    # Flutter Build Web
+    - task: FlutterBuild@0
+      inputs:
+        target: 'web'
+        projectDirectory: '.'
+        extraArgsSeparator: '--web-renderer canvaskit --release'
+      env:
+        ASDF_JAVA_VERSION: 'openjdk-17.0.2'       
+
+    # Run Flutter diagnostics if build fails
+    - task: FlutterCommand@0
+      displayName: "Run Flutter diagnostics"
+      condition: failed()
+      inputs:
+        projectDirectory: '.'
+        arguments: 'doctor -v'
+      env:
+        ASDF_JAVA_VERSION: 'openjdk-17.0.2'       
+
+    - task: CopyFiles@2
+      displayName: "Copy Web to Staging"
+      inputs:
+        sourceFolder: '$(Build.SourcesDirectory)'
+        contents: '**'
+        targetFolder: '$(Build.StagingDirectory)'
+        flattenFolders: false
+
+    - task: PublishBuildArtifacts@1
+      displayName: "Publish Web Artifacts"
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+        ArtifactName: 'web_package'
+        publishLocation: 'Container'
+
+    # Clear git config
+    - task: Bash@3
+      displayName: 'Clear Git Config'
+      name: clear_git_config
+      condition: always()
+      continueOnError: true
+      inputs:
+        targetType: inline
+        script: |
+          git config --global --unset-all url."https://$GIT_ACCESS_TOKEN@dev.azure.com/telefonica-vivo-brasil/ECVV%20-%20ECOSISTEMA%20VIVO".insteadOf "https://telefonica-vivo-brasil@dev.azure.com/telefonica-vivo-brasil/ECVV%20-%20ECOSISTEMA%20VIVO"
+          git config --global --unset-all url."https://$GIT_ACCESS_TOKEN@dev.azure.com/telefonica-vivo-brasil/ADCP%20-%20FLUTTER".insteadOf "https://telefonica-vivo-brasil@dev.azure.com/telefonica-vivo-brasil/ADCP%20-%20FLUTTER"
+      env:
+        GIT_ACCESS_TOKEN: $(GIT_ACCESS_TOKEN)  

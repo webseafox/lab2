@@ -1,0 +1,705 @@
+# ==================================================================
+# Pipeline: Deploy VSIX Extension - Publicação de Extensões Azure DevOps
+# ==================================================================
+# 
+# Este pipeline realiza o build, empacotamento, deploy e instalação de extensões 
+# Azure DevOps empacotadas como Universal Package, incluindo suporte a múltiplos 
+# ambientes, validação de extensão e instalação automática no marketplace corporativo.
+#
+# ==================================================================
+# CARACTERÍSTICAS PRINCIPAIS:
+# ==================================================================
+# • Build automatizado com Node.js e npm
+# • Empacotamento em formato .vsix
+# • Deploy para múltiplos ambientes (preprod/produção)
+# • Validação automática da extensão
+# • Instalação no marketplace corporativo
+# • Suporte a Trunk-based e GITLABFLOW
+# • Validação de conteúdo de documentação (detecção de placeholders)
+#
+# ==================================================================
+# PRÉ-REQUISITOS:
+# ==================================================================
+# • Arquivo .tool-versions na raiz do repositório (asdf) com a versão do Node.js
+#   Exemplo: nodejs 20.11.0
+# • Arquivo vss-extension.json configurado
+# • Service connections configuradas para publicação da extensão
+# • Environments configurados no Azure DevOps
+#
+# ==================================================================
+# EXEMPLO DE USO - TRUNK BASED DEVELOPMENT:
+# ==================================================================
+# name: '[$(Date:yyyyMMdd)$(Rev:.r)]'
+# 
+# trigger: none
+# 
+# parameters:
+#   - name: environment
+#     displayName: 'Escolha o ambiente para publicar'
+#     type: string
+#     default: preprod # Se utilizar feature flags, alterar direto para producao
+#     values:
+#     - preprod
+#     - producao
+# 
+# resources:
+#   repositories:
+#     - repository: CodePlay
+#       name: DevOps/Vivo.CodePlay.Pipelines
+#       type: git
+#       ref: refs/heads/master
+# 
+# extends:
+#   template: /framework/pipelines/cd/deploy-vsix-extension/pipeline.yaml@CodePlay
+#   parameters:
+#     environment: "${{parameters.environment}}"
+#     enableTest: true
+#     enableCoverage: true
+#
+# ==================================================================
+# EXEMPLO DE USO - GITLABFLOW DEVELOPMENT:
+# ==================================================================
+# name: '[$(Date:yyyyMMdd)$(Rev:.r)]'
+# 
+# trigger: none
+# 
+# parameters:
+#   - name: environmentBranchMap
+#     type: object
+#     default:
+#       master: 'producao'
+#       develop: 'preprod'
+# 
+# resources:
+#   repositories:
+#     - repository: CodePlay
+#       name: DevOps/Vivo.CodePlay.Pipelines
+#       type: git
+#       ref: refs/heads/master
+# 
+# extends:
+#   template: /framework/pipelines/cd/deploy-vsix-extension/pipeline.yaml@CodePlay
+#   parameters:
+#     environment: "${{ parameters.environmentBranchMap[variables['Build.SourceBranchName']] }}"
+#     enableTest: false
+#     enableCoverage: false
+#     packageFolder: 'dist'
+#
+# ==================================================================
+
+parameters:
+  # ==================================================================
+  # Parâmetros de Controle de Ambiente
+  # ==================================================================
+  # Define qual ambiente será usado para o deploy da extensão.
+  # Valores aceitos: 'preprod' para ambiente de pré-produção 
+  # ou 'producao' para ambiente de produção.
+  - name: environment
+    displayName: 'Escolha o ambiente para publicar'
+    type: string
+    default: producao
+    values:
+    - preprod
+    - producao
+
+  # ==================================================================
+  # Mapeamento de Ambientes
+  # ==================================================================
+  # Mapeamento de sufixos para diferentes ambientes.
+  # O sufixo é adicionado ao nome da extensão para diferenciação.
+  # Esse mapa serve apenas para mapear o sufixo correto baseado no ambiente, não deve ser alterado.
+  - name: envSufixMap
+    type: object
+    displayName: 'Mapeamento de Sufixos por Ambiente (não alterar)'
+    default:
+      preprod: '-preprod'
+      producao: ''
+
+  # ==================================================================
+  # Parâmetros para habilitar capacidades do Pipeline
+  # ==================================================================
+  # Controla quais etapas do pipeline serão executadas.
+  # Útil para otimização ou troubleshooting específico.
+  
+  # Habilita execução do linter para análise de qualidade de código
+  - name: enableLint
+    type: boolean
+    default: true
+    displayName: 'Executar Linter'
+
+  # Habilita execução do build e transpilação do código
+  - name: enableBuild
+    type: boolean
+    default: true
+    displayName: 'Executar Build'
+    
+  # Habilita execução dos testes unitários
+  - name: enableTest
+    type: boolean
+    default: true
+    displayName: 'Executar Testes'
+    
+  # Habilita execução da análise de cobertura de código
+  - name: enableCoverage
+    type: boolean
+    default: true
+    displayName: 'Executar Cobertura'
+
+  # ==================================================================
+  # Configuração de Empacotamento
+  # ==================================================================
+  # Define o diretório que contém os arquivos transpilados/buildados
+  # que serão incluídos no pacote .vsix da extensão.
+  # Exemplos: 'dist', 'build', 'out', 'Extension'
+  - name: packageFolder
+    type: string
+    default: './'
+    displayName: 'Pasta para empacotar (diretório dos arquivos transpilados). Ex: "./Extension", "./dist", "./package"'
+
+  - name: vssExtensionFile
+    type: string
+    default: './vss-extension.json'
+    displayName: 'Endereco relativo do arquivo "vss-extension.json"'
+
+  - name: runQualityGate
+    type: boolean
+    default: true
+    displayName: 'Executar Quality Gate (SonarQube)'
+  # ==================================================================
+  # Configurações do Sonar
+  # ==================================================================
+
+  - name: useSonarConfigFile
+    type: boolean
+    default: true
+    displayName: 'Usar arquivo de configuração do SonarQube?'
+
+  - name: sonarConfigFilePath
+    type: string
+    default: '.azuredevops/sonar-project.properties'
+    displayName: 'Caminho do arquivo de configuração do SonarQube'
+
+  - name: sonarPollingTimeoutSec
+    type: string
+    default: '300'
+    displayName: 'Timeout do Polling SonarQube (s)'
+
+  - name: sonarJavaVersion
+    type: string
+    default: 'openjdk-17.0.2'
+    displayName: 'Versão do Java para análise SonarQube'
+    values:
+      - 'openjdk-21.0.2'
+      - 'openjdk-17.0.2'
+      - 'openjdk-11.0.2'
+
+  # ==================================================================
+  # Service Connection do SonarQube
+  # Hoje ainda permite referenciar manualmente o Sonar VIP ou comum.
+  # Será depreciado em breve (história futura) para aderir à governança da ADR 0006.
+  # ==================================================================
+  - name: sonarServiceConnection
+    type: string
+    default: 'VIVO_SONARQUBE'
+    displayName: '(DEPRECATED) Service Connection do SonarQube'
+
+  - name: sonarQualityGate
+    type: string
+    default: 'AzureDevOps-Default'
+    displayName: 'Quality Gate do SonarQube'
+
+  - name: sonarScannerMode
+    type: string
+    default: 'cli'
+    displayName: 'Modo do scanner SonarQube'
+    values:
+      - 'cli'
+      - 'dotnet'
+
+  - name: sonarProjectKey
+    type: string
+    default: '$(System.TeamProject)-$(Build.Repository.Name)'
+    displayName: 'Chave do projeto no SonarQube'
+
+  - name: sonarProjectName
+    type: string
+    default: '$(System.TeamProject)-$(Build.Repository.Name)'
+    displayName: 'Nome do projeto no SonarQube'
+# ==================================================================
+# Configurações de App Configuration
+# ==================================================================
+  - name: useAppConfig
+    type: boolean
+    default: true
+    displayName: 'Usar Azure App Configuration para SonarQube'
+
+  # ==================================================================
+  # Configurações de Versionamento
+  # ==================================================================
+  - name: branchingStrategy
+    type: string
+    default: 'trunkbased'
+    displayName: 'Estratégia de versionamento'
+    values:
+      - 'trunkbased'
+      - 'vivoflow'
+      - 'releaseflow'
+      - 'gitlabflow'
+      - 'gitlabflow-semantic'
+      - 'custom'
+      - 'monorepo'
+
+  - name: versionFiles
+    type: string
+    default: ''
+    displayName: >
+      Arquivos de versionamento personalizados 
+      separados por 
+      quebra de linha '\n' ou 
+      ponto e virgula ';' 
+      Ex: 'package.json;task'
+
+  - name: prValidationOnly
+    type: boolean
+    default: false
+    displayName: 'Executa apenas a validação, não publica nem gera versão'
+
+variables:
+  SIGLA: $[ lower(split(variables['System.TeamProject'],' ')[0]) ]
+
+# ==================================================================
+# ESTRUTURA DO PIPELINE
+# ==================================================================
+# O pipeline é composto por 2 estágios principais:
+# 
+# 1. BUILD STAGE:
+#    - Setup do ambiente Node.js
+#    - Validação de conteúdo dos arquivos de documentação
+#    - Instalação de dependências
+#    - Execução de linter (opcional)
+#    - Build e transpilação
+#    - Execução de testes (opcional)
+#    - Análise de cobertura (opcional)
+#    - Empacotamento da extensão .vsix
+#    - Publicação do artefato
+#
+# 2. DEPLOY STAGE:
+#    - Download do artefato .vsix
+#    - Publicação no marketplace do ambiente
+#    - Validação da extensão
+#    - Instalação automática no ambiente
+#
+# ==================================================================
+# ESTÁGIOS DO PIPELINE
+# ==================================================================
+stages:
+  - stage: Build
+    displayName: 'Build & Package VSIX Extension'
+    condition: succeeded()
+    jobs:
+      - job: build
+        displayName: 'Build, Unit Test and Pack'
+        pool: GeneralPurposeLinuxAgentsCI
+        steps:
+        # Configuração inicial do ambiente e categorização
+        - script: |
+            echo "##vso[build.addbuildtag]nodejs"
+            echo "##vso[build.addbuildtag]azuredevops"
+            echo "##vso[build.addbuildtag]extension"
+            echo "##vso[build.addbuildtag]ci-framework"
+            echo "##vso[build.addbuildtag]build-vsix-extension.yaml"
+            echo "##vso[build.addbuildtag]vsix"
+            echo "##vso[build.addbuildtag]marketplace"
+            # TODO: talvez no futuro
+            # echo "##vso[build.addbuildtag]$(CATALOG_YAML_ACRONYM)"
+            # echo "##vso[build.addbuildtag]$(CATALOG_YAML_MODULE)"
+          displayName: 'Set Build Tags'
+
+        # Checkout do repositório com configurações otimizadas
+        - checkout: self
+          fetchDepth: 1
+          persistCredentials: true
+
+        # AVISO TEMPORÁRIO: Este bloco será removido após a remoção definitiva do parâmetro 'sonarServiceConnection'.
+        # Exibe warning para quem ainda sobrescreve manualmente o parâmetro.
+        - ${{ if ne(parameters.sonarServiceConnection, 'VIVO_SONARQUBE') }}:
+          - script: |
+              echo "##vso[task.logissue type=warning]O parâmetro 'sonarServiceConnection' está depreciado e será removido após 30/06/2026. Consulte ADR 0006 e ADR 0008 para detalhes. A escolha da instância Sonar será automática via custom task e vip.json. Atualize seu pipeline!"
+              echo "##vso[task.logissue type=warning]ADR 0006: https://dev.azure.com/telefonica-vivo-brasil/DevOps/_git/Vivo.CodePlay.Pipelines?path=/doc/adr/0006-uso-do-sonar.md"
+              echo "##vso[task.logissue type=warning]ADR 0008: https://dev.azure.com/telefonica-vivo-brasil/DevOps/_git/Vivo.CodePlay.Pipelines?path=/framework/docs/adr/0008-sonar-vip-governance.md"
+              echo "##vso[task.complete result=SucceededWithIssues;]"
+            displayName: '⚠️ AVISO: Depreciação do sonarServiceConnection'
+
+        # Validação de conteúdo obrigatório nos arquivos de documentação
+        - task: AzdoTaskRegexValidateContentFromVivo@1
+          displayName: 'Validate Documentation Files'
+          inputs:
+            globPattern: '{CONTRIBUTING.md,README.md}'
+            regexPattern: '<!-- MUDAR_AQUI:.*?-->'
+            failMode: 'failOnFound'
+            regexFlags: 's'
+            verbose: true
+            skipFileErrors: false
+            errorMessage: "É necessário alterar os arquivos CONTRIBUTING.md e README.md com o conteúdo específico de sua task antes de publicar."
+
+        # Version Bump
+        - task: VersionManagerVivo@8
+          displayName: 'Next Version'
+          inputs:
+            command: 'nextVersion'
+            branchingStrategy: ${{ parameters.branchingStrategy }}
+            fileStrategy: 'customTask'
+            versionFiles: '${{ parameters.versionFiles }}'
+            passthroughVersion: '${{ parameters.prValidationOnly }}'
+          name: VersionManagerVivo
+
+        # Setup do ambiente Node.js baseado no arquivo .tool-versions (ASDF)
+
+
+        # Autenticação com registries e repositórios
+        - task: npmAuthenticate@0
+          displayName: 'Authenticate NPM Registry'
+          inputs: 
+            workingFile: ".npmrc"
+
+        ### MUDAR PARA VERSION MANAGER NO FUTURO ###
+        # Extração de metadados para versionamento
+        - task: JsonParseFromVivo@4
+          displayName: 'Extract Extension Metadata'
+          inputs:
+            type: 'file'
+            origin: ${{ parameters.vssExtensionFile }}
+            jpaths: |
+              var VSSEXTENSION_JSON_ID = .id
+              var VSSEXTENSION_JSON_NAME = .name
+        
+        # Execução de análise de código e qualidade
+        - task: Npm@1
+          displayName: 'Install Dependencies'
+          inputs:
+            command: 'install'
+
+        # Execução de análise de código e qualidade
+        - task: Npm@1
+          condition: and( succeeded(), ${{ parameters.enableLint }} )
+          displayName: 'Run Code Linter'
+          inputs:
+            command: 'custom'
+            customCommand: 'run lint'
+
+        # Build e transpilação do projeto
+        - task: Npm@1
+          condition: and( succeeded(), ${{ parameters.enableBuild }} )
+          displayName: 'Build and Transpile Code'
+          inputs:
+            command: 'custom'
+            customCommand: 'run build'
+        
+        # Execução de testes unitários (pressupõe que o script de teste ou jest-junit gere test-results/junit.xml)
+        - script: |
+            command="test"
+            if [[ ${ENABLE_COVERAGE} == "True" ]]; then
+              echo "[debug] ENABLE_COVERAGE is set to True"
+              command="coverage"
+            fi
+            echo "[debug] Running unit tests..."
+            set -o pipefail
+            echo "##[command] npm run ${command}"
+            npm run ${command} 2>&1 | sed 's/##//g'
+            TEST_EXIT=${PIPESTATUS[0]}
+            echo "[debug] Original exit code: $TEST_EXIT"
+            if [ "$TEST_EXIT" -eq 0 ]; then
+              echo "##vso[task.complete result=Succeeded;]DONE"
+              exit 0
+            else
+              echo "##vso[task.logissue type=error]Testes falharam (exit code $TEST_EXIT)."
+              exit $TEST_EXIT
+            fi
+          condition: and( succeeded(), or( ${{ parameters.enableTest }}, ${{ parameters.enableCoverage }} ) )
+          displayName: 'Run Unit Tests'
+          env:
+            ENABLE_COVERAGE: ${{ parameters.enableCoverage }}
+
+        # Publicação da cobertura (espera que o script de cobertura gere coverage/cobertura-coverage.xml)
+        - task: PublishCodeCoverageResults@2
+          condition: and( always(), ${{ parameters.enableCoverage }} )
+          displayName: 'Publish Code Coverage'
+          inputs:
+            summaryFileLocation: '**/lcov.info'
+            failIfCoverageEmpty: false
+
+        # Publicação dos resultados de testes
+        - task: PublishTestResults@2
+          # Publica mesmo se os testes falharem, permitindo inspeção dos relatórios
+          condition: and( always(), ${{ parameters.enableTest }} )
+          displayName: 'Publish Test Results'
+          inputs:
+            testResultsFormat: 'JUnit'
+            testResultsFiles: '**/test-results.xml'
+            mergeTestResults: true
+            failTaskOnFailedTests: false
+            testRunTitle: 'Unit Tests'
+
+#############################################################################
+# CAPACIDADE: QUALITY GATE (SONARQUBE)
+#############################################################################
+# Descrição: Análise estática de código e quality gate
+# Documentação: https://dvps-dev.redecorp.azr/portal/codeplay/capacidades/catalog/quality-gate
+# Pré-requisitos:
+#   - Service Connection 'SonarQube' configurada
+#   - Projeto configurado no SonarQube
+#   - Quality Gate definido no SonarQube
+# Configuração: Parâmetro 'runQualityGate' = true
+# Observações: Não executa em Pull Requests
+#############################################################################
+        - ${{ if eq(parameters.runQualityGate, true) }}:
+          # ==================================================================
+          # [SonarQube] Análise Completa de Qualidade de Código
+          # ==================================================================
+          - task: SonarAnalysisFromVivo@4
+            displayName: 'SonarQube Full Analysis'
+            inputs:
+              command: 'analysis'
+              SonarQubeVip: 'VIVO_SONARQUBE_VIP'
+              SonarQube: 'VIVO_SONARQUBE'
+              scannerMode: ${{ parameters.sonarScannerMode }}
+              ${{ if eq(parameters.useSonarConfigFile, true) }}:
+                configFile: ${{ parameters.sonarConfigFilePath }}
+              cliProjectKey: ${{ parameters.sonarProjectKey }}
+              cliProjectName: ${{ parameters.sonarProjectName }}
+              cliProjectVersion: $(VersionManagerVivo.VERSION)
+              qualityGate: ${{ parameters.sonarQualityGate }}
+              acronym: $(SIGLA)
+              reportPath: '$(Agent.TempDirectory)/sonar/$(Build.BuildId)/report-task.txt'
+              pollingTimeoutSec: ${{ parameters.sonarPollingTimeoutSec }}
+              useOpaRepository: 'true'
+              codePlayServiceConnection: 'CodePlay'
+              opaProject: 'DVPS - DEVOPS'
+              opaRepository: 'Vivo.OpenPolicy.SonarQube'
+              opaBranch: 'master'
+              useAppConfig: ${{ parameters.useAppConfig }}
+              azureSubscription: 'DevOpsSharedResources'
+              appConfigurationEndpoint: 'https://appcs-azdevops-shared.azconfig.io'
+              sonarUrlPemCertificate: $(Agent.HomeDirectory)/../../certs/CACORP.pem
+              extraProperties: |
+                sonar.scanner.metadataFilePath=$(Agent.TempDirectory)/sonar/$(Build.BuildId)/report-task.txt
+                sonar.qualitygate.wait=false
+                sonar.qualitygate.timeout=${{ parameters.sonarPollingTimeoutSec }}
+                sonar.javascript.lcov.reportPaths=**/lcov.info
+            env:
+              ASDF_JAVA_VERSION: ${{ parameters.sonarJavaVersion }}
+
+        # Preparação das ferramentas de empacotamento
+        - task: TfxInstaller@5
+          displayName: 'Ensure Tfx CLI'
+          # inputs:
+          #   version: 'v0.x'
+          env:
+            NPM_CONFIG_USERCONFIG: .npmrc
+          
+        # Empacotamento da extensão VSIX
+        - task: PackageAzureDevOpsExtension@5
+          displayName: 'Package VSIX'
+          inputs:
+            rootFolder: $(Build.SourcesDirectory)/${{ parameters.packageFolder }}
+            extensionId: $(VSSEXTENSION_JSON_ID)${{ parameters.envSufixMap[parameters.environment] }}
+            extensionName: $(VSSEXTENSION_JSON_NAME)${{ parameters.envSufixMap[parameters.environment] }}
+            updateTasksVersion: false
+        # Identificação do arquivo VSIX gerado
+        - script: |-
+            ls -laR
+            VSIX_FILE=$(ls *.vsix | head -n 1)
+            echo "##[debug] VSIX_FILE: $VSIX_FILE"
+            if [ -z "$VSIX_FILE" ]; then
+              echo "No VSIX file found in the current directory."
+              exit 1
+            fi
+            echo "##vso[task.setvariable variable=VSIX_FILE]${VSIX_FILE}"
+          displayName: "Find vsix file"
+
+
+          # Publish to pipeline artifacts
+        - task: PublishPipelineArtifact@1
+          displayName: 'Publish VSIX Artifact'
+          inputs:
+            targetPath: $(VSIX_FILE)
+            artifactName: 'vsix'
+            publishLocation: 'pipeline'
+            
+  - stage: Deploy
+    displayName: 'Deploy on (${{ parameters.environment }})'
+    condition: and(succeeded(), eq('${{ parameters.prValidationOnly }}', 'false'))
+    jobs:
+      - deployment: 'deployVSIXExtension'
+        displayName: 'Deploy on (${{ parameters.environment }})'
+        pool: GeneralPurposeLinuxAgentsCD
+        environment:
+          name: 'deploy-${{ parameters.environment }}'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+              # Configuração inicial e checkout do repositório
+              - checkout: self
+                fetchDepth: 1
+                persistCredentials: true
+              # Version Bump
+              - task: VersionManagerVivo@8
+                displayName: 'Next Version'
+                inputs:
+                  command: 'nextVersion'
+                  branchingStrategy: ${{ parameters.branchingStrategy }}
+                  fileStrategy: 'customTask'
+                  versionFiles: '${{ parameters.versionFiles }}'
+                name: VersionManagerVivo
+
+              - task: JsonParseFromVivo@4
+                displayName: 'Get vss-extension.json info'
+                inputs:
+                  type: 'file'
+                  origin: ${{ parameters.vssExtensionFile }}
+                  jpaths: |
+                    var VSSEXTENSION_JSON_ID = .id
+                    var VSSEXTENSION_JSON_NAME = .name
+
+
+              # Download vsix file from pipeline artifacts
+              - task: DownloadPipelineArtifact@2
+                displayName: 'Download VSIX Artifact'
+                inputs:
+                  artifactName: 'vsix'
+                  targetPath: '$(Build.ArtifactStagingDirectory)'
+
+              # Setup do ambiente Node.js baseado no arquivo .tool-versions (ASDF)
+              # Preparação das ferramentas de empacotamento
+              - task: TfxInstaller@5
+                displayName: 'Ensure Tfx CLI'
+                # inputs:
+                #   version: 'v0.x'
+                env:
+                  NPM_CONFIG_USERCONFIG: .npmrc
+
+              # Identificação do arquivo VSIX gerado
+              - script: |-
+                  ls -laR $ARTIFACTS_PATH
+                  echo "##vso[task.setvariable variable=VSIX_FILE]$(ls ${ARTIFACTS_PATH}/*.vsix | head -n 1)"
+                displayName: "Find vsix file"
+                env:
+                  ARTIFACTS_PATH: $(Build.ArtifactStagingDirectory)
+
+              # Publicação da extensão no marketplace do ambiente
+              - task: PublishAzureDevOpsExtension@5
+                continueOnError: true
+                displayName: 'Publish extension on ${{ parameters.environment }} '
+                inputs:
+                  connectTo: 'VsTeam'
+                  connectedServiceName: 'vso-telefonica-vivo-brasil${{ parameters.envSufixMap[parameters.environment] }}'
+                  fileType: 'vsix'
+                  vsixFile: $(VSIX_FILE)
+                  updateTasksVersion: false
+                  shareWith: telefonica-vivo-brasil${{ parameters.envSufixMap[parameters.environment] }}
+                  
+              # Validação da extensão publicada
+              - task: IsAzureDevOpsExtensionValid@5
+                displayName: 'Validate the private extension on the marketplace'
+                inputs:
+                  connectTo: "VsTeam"
+                  connectedServiceName: "vso-telefonica-vivo-brasil${{ parameters.envSufixMap[parameters.environment] }}" 
+                  method: 'vsix'
+                  vsixFile: $(VSIX_FILE)
+
+              # Instalação da extensão no ambiente de destino
+              - task: InstallAzureDevOpsExtension@5
+                displayName: 'Install on (${{ parameters.environment }})'
+                inputs:
+                  connectTo: 'VsTeam'
+                  connectedServiceName: 'vso-telefonica-vivo-brasil${{ parameters.envSufixMap[parameters.environment] }}'
+                  method: 'vsix'
+                  vsixFile: $(VSIX_FILE)
+                  accounts: https://dev.azure.com/telefonica-vivo-brasil${{ parameters.envSufixMap[parameters.environment] }}
+              - script: |
+                  ACCESS_URL=https://marketplace.visualstudio.com/items?itemName=telefonica-vivo-devops-brasil.${EXTENSION_ID}
+                  echo "##vso[task.setvariable variable=ACCESS_URL;isOutput=true;issecret=false;]${ACCESS_URL}"
+                  echo "##vso[build.updatebuildnumber]deploy-${VERSION}-${ENVIRONMENT}"
+                  echo "##vso[build.addbuildtag]version-${VERSION}"
+                  echo "##vso[build.addbuildtag]environment-${ENVIRONMENT}"
+                  echo ""
+                  echo "##[section]🚀 DEPLOY CONCLUÍDO COM SUCESSO!"
+                  echo "##[command]✅ Extensão Azure DevOps publicada e instalada"
+                  echo "##[command]📦 Nome: ${EXTENSION_NAME}"
+                  echo "##[command]🔗 Marketplace: ${ACCESS_URL}"
+                  echo "##[command]🌍 Ambiente: ${ENVIRONMENT}"
+                  echo "##[command]📋 Versão: ${VERSION}"
+                  echo ""
+                env:
+                  VERSION: $(VersionManagerVivo.VERSION)
+                  ENVIRONMENT: ${{ parameters.environment }}
+                  EXTENSION_ID: $(VSSEXTENSION_JSON_ID)${{ parameters.envSufixMap[parameters.environment] }}
+                  EXTENSION_NAME: $(VSSEXTENSION_JSON_NAME)${{ parameters.envSufixMap[parameters.environment] }}
+                name: DeploymentSummary
+                displayName: 'Resumo do Deploy'
+                condition: always()
+              - task: VivoEventHubTools@3
+                displayName: 'Registro de deploy no Event Hub'
+                condition: always()
+                continueOnError: true
+                inputs:
+                  command: 'deploy'
+                  eventHubConnection: 'EVHCodeProd'
+                  componentVersion: '$(VersionManagerVivo.VERSION)'
+                  deployArtifactName: $(VSSEXTENSION_JSON_ID)${{ parameters.envSufixMap[parameters.environment] }}
+                  deployArtifactType: 'vsix-extension'
+                  deployEnvironmentType: 'azure-marketplace'
+                  deployEnvironmentName: '${{ parameters.environment }}'
+                  deployEnvironmentAccessUrl: '$(DeploymentSummary.ACCESS_URL)'
+                  pipelineType: 'framework/deploy-vsix-extension'
+              - task: VersionManagerVivo@8
+                displayName: 'Commit and Tag Version'
+                condition: succeeded()
+                name: commitVersion
+                inputs:
+                  command: 'commitVersion'
+                  version: '$(VersionManagerVivo.VERSION)'
+                  versionFiles: '${{ parameters.versionFiles }}'
+                  createTag: true
+                  pushChanges: true
+                  fileStrategy: 'customTask'
+# ==================================================================
+# TROUBLESHOOTING E CONFIGURAÇÕES ADICIONAIS
+# ==================================================================
+#
+# PROBLEMAS COMUNS E SOLUÇÕES:
+#
+# 1. Erro "No VSIX file found":
+#    - Verifique se o build foi executado com sucesso
+#    - Confirme se o packageFolder está correto
+#    - Verifique se o vss-extension.json está na raiz do projeto
+#
+# 2. Erro de autenticação com npm:
+#    - Verifique se o arquivo .npmrc está configurado
+#    - Confirme as permissões do service connection
+#
+# 3. Falha na publicação da extensão:
+#    - Verifique se o service connection está configurado corretamente
+#    - Confirme se o environment está criado no Azure DevOps
+#    - Verifique se a extensão já existe com o mesmo ID
+#
+# 4. Falha na instalação da extensão:
+#    - Verifique se a conta de destino tem permissões adequadas
+#    - Confirme se a extensão foi publicada com sucesso
+#
+# CONFIGURAÇÕES NECESSÁRIAS:
+#
+# Service Connections necessárias:
+# - vso-telefonica-vivo-brasil-preprod (para ambiente preprod)
+# - vso-telefonica-vivo-brasil (para ambiente produção)
+#
+# Environments necessários:
+# - deploy-preprod
+# - deploy-producao
+#
+# Agent Pools utilizadas:
+# - GeneralPurposeLinuxAgentsCI (para build)
+# - GeneralPurposeLinuxAgentsCD (para deploy)
+#
+# ==================================================================

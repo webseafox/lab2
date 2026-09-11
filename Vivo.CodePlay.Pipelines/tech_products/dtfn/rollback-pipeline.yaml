@@ -1,0 +1,340 @@
+# ==================================================================
+# Pipeline: Rollback - DTFN
+# ------------------------------------------------------------------
+# Template genérico de Rollback do produto DTFN (Databricks).
+# Localização: tech_products/dtfn/rollback-pipeline.yaml
+#              @ Vivo.CodePlay.Pipelines
+#
+# Restaura Jobs e Notebooks de um ambiente (QA ou PROD) a partir do
+# artefato mais recente publicado pela Pipeline CD (cd-pipeline.yaml):
+# stage Backup_QA para QA, stage Backup_Prod para PROD.
+#
+# Este template é ambiente-agnóstico: os wrappers no repositório do
+# produto (app-dtfn-rollback-qa.yml, app-dtfn-rollback-prod.yml)
+# fornecem os parâmetros específicos de cada ambiente (Key Vault,
+# Variable Group, nomes de artefato e de scripts).
+#
+# SUBSTITUI: tech_products/dtfn/rollback-prod-pipeline.yaml (PROD-only).
+# Os defaults de todos os parâmetros abaixo mantêm o comportamento
+# equivalente ao template antigo, então o wrapper de PROD existente
+# pode ser migrado só trocando o `template:` no `extends:`.
+#
+# AUTENTICAÇÃO GIT: usa $(System.AccessToken) via GIT_CONFIG_*, o
+# mesmo mecanismo já usado pelo deploy normal (cd-clonarepo_qa_v3.py/
+# cd-clonarepo_prod_v3.py). Não depende de nenhum PAT guardado em Key
+# Vault — versões anteriores deste template buscavam um secret
+# `token-pat` que, na prática, não é mais necessário (o deploy normal
+# já não usa esse secret para operações de git desde a migração para
+# System.AccessToken; só sobrava um "Teste PAT" órfão que não
+# alimentava nenhum script). Como esse secret não é garantido em
+# todo Key Vault por ambiente, mantê-lo geraria falha em ambientes
+# onde ele nunca foi provisionado (ex.: QA).
+# ==================================================================
+
+parameters:
+# ==================================================================
+# Infraestrutura e Ambiente
+# ==================================================================
+  - name: agentPoolCI
+    type: string
+    default: 'GeneralPurposeLinuxAgentsCI'
+    displayName: 'Pool de agentes para os jobs de análise de segurança'
+
+  - name: agentPoolCD
+    type: string
+    default: 'GeneralPurposeLinuxAgentsCD'
+    displayName: 'Pool de agentes para o job de rollback'
+
+  - name: cdPipelineAlias
+    type: string
+    default: 'cdPipeline'
+    displayName: 'Alias do resources.pipelines declarado no arquivo raiz (aponta para a Pipeline CD)'
+
+  - name: notebooksRepoAlias
+    type: string
+    default: ''
+    displayName: 'Alias do resources.repositories do repositório de notebooks, SÓ quando for diferente do self (ex.: PROD usa comp-dtfn-prod). Deixe vazio para QA — o rollbackCopiaScript de QA clona o próprio self.'
+
+# ==================================================================
+# Configurações de Segurança
+# ==================================================================
+  - name: fortifyExclusionRepository
+    type: string
+    default: 'FortifyExclusion'
+    displayName: 'Alias do repositório de exclusões do Fortify'
+
+  - name: enableFortifyExclusions
+    type: boolean
+    default: true
+    displayName: 'Usar exclusões do Fortify'
+
+  - name: convisoCompany
+    type: number
+    default: 430
+    displayName: 'Conviso Company ID'
+
+  - name: vivoFlow
+    type: string
+    default: 'DTFN_Preprod'
+    displayName: 'Fluxo Vivo para AppSec'
+
+# ==================================================================
+# Variable Group (Library) — específico do ambiente de rollback
+# ==================================================================
+  - name: variableGroupRollback
+    type: string
+    default: 'vg-dtfn-cd-prod-apply'
+    displayName: 'Variable Group usado no rollback deste ambiente'
+
+# ==================================================================
+# Azure Key Vault — específico do ambiente de rollback
+# (usado apenas para o token do Databricks; git usa System.AccessToken)
+# ==================================================================
+  - name: keyVaultServiceConnection
+    type: string
+    default: 'sc-adf-dtfn-brsouth-prod'
+    displayName: 'Service Connection do Key Vault do ambiente de rollback'
+
+  - name: keyVaultName
+    type: string
+    default: 'kv-dtfn-brsouth-001-prod'
+    displayName: 'Nome do Key Vault do ambiente de rollback'
+
+# ==================================================================
+# Artefatos de origem — publicados pela stage de Backup correspondente
+# na Pipeline CD (Backup_QA ou Backup_Prod)
+# ==================================================================
+  - name: cdArtifactJobsName
+    type: string
+    default: 'DatabricksJobsPROD'
+    displayName: 'Nome do artefato de Jobs publicado pelo Backup do ambiente'
+
+  - name: cdArtifactNotebooksName
+    type: string
+    default: 'DatabricksNotebooksPROD'
+    displayName: 'Nome do artefato de Notebooks publicado pelo Backup do ambiente'
+
+# ==================================================================
+# Scripts de rollback — um conjunto por ambiente no repositório do produto
+# ==================================================================
+  - name: scriptsPath
+    type: string
+    default: 'scripts/ci-cd'
+    displayName: 'Diretório dos scripts de CI/CD no repositório do produto'
+
+  - name: rollbackImportScript
+    type: string
+    default: 'rollback-importarjobs_sp_prod_v5_cluster.py'
+    displayName: 'Script de importação/rollback de Jobs'
+
+  - name: rollbackCopiaScript
+    type: string
+    default: 'rollback-copia_nbs_prod_v1.py'
+    displayName: 'Script de cópia de Notebooks para o repositório Git'
+
+  - name: rollbackImplantaScript
+    type: string
+    default: 'rollback-implanta_nbs_prod_v1.py'
+    displayName: 'Script de implantação dos Notebooks no Databricks Repos'
+
+  - name: clientSecretArgName
+    type: string
+    default: '--client-secret-prod'
+    displayName: 'Nome do argumento de client secret esperado pelo script de importação de Jobs'
+
+  - name: clientSecretVar
+    type: string
+    default: 'AZURE_CLIENT_SECRET_PROD'
+    displayName: 'Nome da variável de pipeline (Variable Group) com o client secret do Service Principal do ambiente'
+
+  - name: databricksTokenVarName
+    type: string
+    default: 'PROD_TOKEN'
+    displayName: 'Nome da env var de token do Databricks esperada pelo script de implantação de Notebooks'
+
+# ==================================================================
+# Estágios do Pipeline
+# ==================================================================
+stages:
+
+# ==================================================================
+# Stage 1: SecurityAnalysis - SAST (Fortify) e SCA (Dependency-Track)
+# ==================================================================
+- stage: SecurityAnalysis
+  displayName: 'Análise de Segurança'
+  jobs:
+    - job: AppSecConfigKeys
+      displayName: 'Get AppSec Config Keys'
+      pool:
+        name: ${{ parameters.agentPoolCI }}
+      steps:
+        - template: /security/get_appconfig_keys_framework.yml@CodePlay
+          parameters:
+            azureSubscription: DevOpsSharedResources
+            appConfigurationEndpoint: https://appcs-azdevops-shared.azconfig.io
+
+    - job: FortifyScan
+      displayName: 'Fortify Scan'
+      dependsOn:
+        - AppSecConfigKeys
+      variables:
+        USE_FORTIFY: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.USE_FORTIFY'] ]
+        USE_CONVISO: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.USE_CONVISO'] ]
+        SKIP_SECURITY_GATE: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.SKIP_SECURITY_GATE'] ]
+        FORTIFY_LOCAL_SCANCENTRAL_VERSION: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.FORTIFY_LOCAL_SCANCENTRAL_VERSION'] ]
+      condition: and(succeeded(), eq(variables.USE_FORTIFY, 'true'))
+      pool:
+        name: ${{ parameters.agentPoolCI }}
+      steps:
+        - template: /security/define_appsec_app_version.yml@CodePlay
+
+        - template: /security/run_fortify_scan.yml@CodePlay
+          parameters:
+            fortifyExclusionRepository: ${{ parameters.fortifyExclusionRepository }}
+            enableFortifyExclusions: ${{ parameters.enableFortifyExclusions }}
+            appLanguage: 'other'
+            appVersion: "$(FORTIFY_APP_VERSION)"
+            vivoFlow: ${{ parameters.vivoFlow }}
+
+    # ------------------------------------------
+    # PREPARAÇÃO PARA O SCA
+    # ------------------------------------------
+    - job: PrepareSCAArtifact
+      displayName: 'Preparar Artefato para SCA'
+      dependsOn:
+        - AppSecConfigKeys
+      pool:
+        name: ${{ parameters.agentPoolCI }}
+      steps:
+        - checkout: self
+        - task: PublishBuildArtifacts@1
+          inputs:
+            pathToPublish: '$(Build.SourcesDirectory)'
+            artifactName: 'app'
+            publishLocation: 'Container'
+          displayName: 'Publicar Código Fonte como artefato app'
+
+    # ------------------------------------------
+    # SCAN SCA (Dependency-Track)
+    # ------------------------------------------
+    - job: SCAScan
+      displayName: 'SCA Scan'
+      dependsOn:
+        - AppSecConfigKeys
+        - PrepareSCAArtifact
+      variables:
+        USE_DEPENDENCY_TRACK: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.USE_DEPENDENCY_TRACK'] ]
+        AKV_DEVOPS_NAME: 'kv-azdevops-shared'
+        FORTIFY_APP_DEFAULT_VERSION: 'DevSecOps'
+      condition: and(succeeded(), eq(variables.USE_DEPENDENCY_TRACK, 'true'))
+      pool:
+        name: ${{ parameters.agentPoolCI }}
+      steps:
+        - template: /security/define_appsec_app_version.yml@CodePlay
+
+        - template: /security/run_sca_scan.yml@CodePlay
+          parameters:
+            appVersion: "$(FORTIFY_APP_VERSION)"
+            convisoCompany: ${{ parameters.convisoCompany }}
+            vivoFlow: ${{ parameters.vivoFlow }}
+
+# ==================================================================
+# Stage 2: Rollback
+# ------------------------------------------------------------------
+# Depende implicitamente de SecurityAnalysis (stage anterior na lista,
+# sem dependsOn explícito).
+# ==================================================================
+- stage: Rollback
+  displayName: Rollback
+
+  variables:
+    - group: ${{ parameters.variableGroupRollback }}
+
+  jobs:
+
+    - job: RollbackJob
+      displayName: Rollback
+      pool:
+        name: ${{ parameters.agentPoolCD }}
+
+      steps:
+
+        # ------------------------------------------
+        # Checkout do repositório de notebooks, quando for DIFERENTE
+        # do self (ex.: PROD usa comp-dtfn-prod).
+        # ------------------------------------------
+        # Sem isso, o Azure DevOps não concede ao System.AccessToken
+        # acesso a esse repositório neste job (mesmo já estando
+        # declarado em resources.repositories no wrapper) — o
+        # rollbackCopiaScript falharia com "TF401019: does not exist
+        # or you do not have permissions". Precisa vir em PAR com o
+        # checkout de self: assim que qualquer outro checkout aparece
+        # no job, o Azure DevOps para de fazer o checkout implícito do
+        # self, e todo scriptPath relativo (que vive no self) quebraria
+        # sem esse segundo checkout explícito.
+        #
+        # Quando notebooksRepoAlias fica vazio (QA, cujo
+        # rollbackCopiaScript clona o próprio self), nenhum checkout é
+        # adicionado aqui — self continua sendo checked out
+        # implicitamente, como já funcionava antes.
+        - ${{ if ne(parameters.notebooksRepoAlias, '') }}:
+          - checkout: self
+            path: s
+            persistCredentials: true
+
+          - checkout: ${{ parameters.notebooksRepoAlias }}
+            path: notebooks-repo
+            persistCredentials: true
+
+        - download: ${{ parameters.cdPipelineAlias }}
+          artifact: ${{ parameters.cdArtifactJobsName }}
+          displayName: Download Jobs Artifact (Backup)
+
+        - download: ${{ parameters.cdPipelineAlias }}
+          artifact: ${{ parameters.cdArtifactNotebooksName }}
+          displayName: Download Notebooks Artifact (Backup)
+
+        # ------------------------------------------
+        # TOKEN KEY VAULT (somente token do Databricks;
+        # autenticação git usa System.AccessToken, não Key Vault)
+        # ------------------------------------------
+        - task: AzureKeyVault@2
+          displayName: 'Azure Key Vault: token-databricks'
+          inputs:
+            azureSubscription: ${{ parameters.keyVaultServiceConnection }}
+            KeyVaultName: ${{ parameters.keyVaultName }}
+            SecretsFilter: 'token-databricks'
+            RunAsPreJob: false
+
+        # ------------------------------------------
+        # Importar Jobs (Rollback)
+        # ------------------------------------------
+        - task: PythonScript@0
+          displayName: Importar Jobs (Rollback)
+          inputs:
+            scriptSource: filePath
+            scriptPath: ${{ parameters.scriptsPath }}/${{ parameters.rollbackImportScript }}
+            arguments: '${{ parameters.clientSecretArgName }} $(${{ parameters.clientSecretVar }}) --jobs-folder $(PIPELINE.WORKSPACE)/${{ parameters.cdPipelineAlias }}/${{ parameters.cdArtifactJobsName }}'
+
+        # ------------------------------------------
+        # Copia Notebooks - Repo (Rollback)
+        # ------------------------------------------
+        - task: PythonScript@0
+          displayName: Copia Notebooks - Repo (Rollback)
+          inputs:
+            scriptSource: filePath
+            scriptPath: ${{ parameters.scriptsPath }}/${{ parameters.rollbackCopiaScript }}
+            arguments: '--notebooks-folder $(PIPELINE.WORKSPACE)/${{ parameters.cdPipelineAlias }}/${{ parameters.cdArtifactNotebooksName }}'
+          env:
+            SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+
+        # ------------------------------------------
+        # Implanta Notebooks Databricks (Rollback)
+        # ------------------------------------------
+        - task: PythonScript@0
+          displayName: Implanta Notebooks Databricks (Rollback)
+          inputs:
+            scriptSource: filePath
+            scriptPath: ${{ parameters.scriptsPath }}/${{ parameters.rollbackImplantaScript }}
+          env:
+            ${{ parameters.databricksTokenVarName }}: $(token-databricks)

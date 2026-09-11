@@ -1,0 +1,320 @@
+parameters:
+- name: skipSecurityGate
+  default: false
+- name: azureSubscription
+  default: "$(APP_CONFIGURATION_AZURE_SUBSCRIPTION)"
+- name: appConfigurationEndpoint
+  default: "$(APP_CONFIGURATIN_ENDPOINT)"
+
+steps:
+
+# Busca o ID do projeto no Dependency-Track
+
+- bash: |
+    echo "##[debug]Getting Project ID..."
+    echo "DT ENDPOINT: ${DT_SCA_ENDPOINT}"
+    echo "Nome do projeto: ${DT_APP_DEFAULT_NAME} e versão: ${DT_APP_DEFAULT_VERSION}"
+
+    DT_APP_DEFAULT_NAME="${DT_APP_DEFAULT_NAME}-docker"
+    DT_APP_DEFAULT_NAME="${DT_APP_DEFAULT_NAME// /%20}"
+
+    echo ${DT_APP_DEFAULT_NAME}
+
+    RESPONSE=$(curl -s --cacert ${CACORP_LOCATION} \
+                 -X GET "${DT_SCA_ENDPOINT}/v1/project/lookup?name=${DT_APP_DEFAULT_NAME}&version=${DT_APP_DEFAULT_VERSION}" \
+                 -H "X-API-Key: ${DT_TOKEN}" \
+                 -H 'Content-Type: application/json')
+
+    echo "##[debug]Valor do Lookup: ${RESPONSE}"
+
+    DT_PROJECT_ID=$(jq -r '.uuid' <<< "$RESPONSE")
+
+    echo "##[debug]Valor do UUID: ${DT_PROJECT_ID}"
+    
+    echo "##vso[task.setvariable variable=dtProjectId]$DT_PROJECT_ID"
+    
+  displayName: Getting Dependency-Track Project ID
+  condition: and( eq(variables.USE_DT_DOCKER, 'true'), eq(variables.USE_CONVISO, 'true'))
+  env:
+    DT_SCA_ENDPOINT: $(DT_SCA_ENDPOINT)
+    CACORP_LOCATION: $(CACORP_LOCATION)
+    DT_TOKEN: $(DEPENDENCY-TRACK-TOKEN)
+    DT_PROJECT_ID: $(DT_PROJECT_ID)
+    DT_APP_DEFAULT_VERSION: $(DT_APP_DEFAULT_VERSION)
+    DT_APP_DEFAULT_NAME: $(DT_APP_DEFAULT_NAME)
+
+# Sincronização com a Conviso
+
+# Conviso Associate Project
+
+- bash: |
+    echo "##[debug]Associating Dependency-Track Project with Conviso"
+
+    echo "Company ID: ${CONVISO_COMPANY_ID}"
+    echo ${CONVISO_APP_ENDPOINT}
+    echo ${PROXY_AGENT_HTTPS}
+    echo ${CONVISO_API_KEY}
+    echo ${DT_PROJECT_ID}
+
+    sleep 5s
+    i="0"
+    retries="10"    
+    while [[ $i -lt $retries ]]
+    do
+      RESPONSE=$(curl -s -S -g -X POST "${CONVISO_APP_ENDPOINT}/api/v2/integrations/scanners/dependency_track/associate_project" \
+      --proxy "${PROXY_AGENT_HTTPS}" \
+      --header 'Content-Type: application/json' \
+      --header "x-api-key: ${CONVISO_API_KEY}" \
+      --data '{"company_id": '${CONVISO_COMPANY_ID}',"project_id": "'${DT_PROJECT_ID}'"}')
+
+      if [[ ! -z "$RESPONSE" ]]; then      
+        break             
+      fi
+      echo "Algo inesperado aconteceu. Tentando associar o projeto novamente. Aguarde..."
+      sleep 5s
+      i=$[$i+1]
+    done
+
+    ASSOCIATION_ID=$(echo $RESPONSE | jq .data.id)
+    echo "Association_ID: ${ASSOCIATION_ID}"
+
+    if [[ -z "$ASSOCIATION_ID" ]]; then      
+      echo "##vso[task.logissue type=error;] An error occurred while requesting Conviso API. Please, try running the pipeline again. If the error persists, contact the AppSec team on appsec_vivo.br@telefonica.com"
+      echo "##vso[task.complete result=Failed;]"
+      exit
+    fi
+        
+    ERROR=$(echo $RESPONSE | jq '.error.status_type // empty')
+    if [[ ! -z "$ERROR" ]]; then
+      MESSAGE=$(echo $RESPONSE | jq '.error.details // empty')
+      echo "##vso[task.logissue type=error;] An error occurred while requesting Conviso API. ${ERROR} - ${MESSAGE}"
+      echo "##vso[task.complete result=Failed;]"
+      exit
+    fi
+        
+    echo "##vso[task.setvariable variable=${CONVISO_ASSOCIATION_ID_OUT}]$ASSOCIATION_ID"
+    echo "Exportando ID da Associação '${ASSOCIATION_ID}' do Conviso com o Dependency-Track para variável '${CONVISO_ASSOCIATION_ID_OUT}'."
+
+  displayName: Conviso Associate Project
+  condition: and( eq(variables.USE_DT_DOCKER, 'true'), eq(variables.USE_CONVISO, 'true'))
+  env:
+    CONVISO_APP_ENDPOINT: "$(CONVISO_APP_ENDPOINT)"
+    CONVISO_API_KEY: "$(CONVISO-API-KEY)"
+    FORTIFY_PROJECT_ID: "$(fortifyProjectId)"
+    CONVISO_COMPANY_ID: "$(CONVISO_COMPANY_ID)"
+    CONVISO_PROJECT_ID_OUT: "CONVISO_PROJECT_ID"
+    CONVISO_ASSOCIATION_ID_OUT: "CONVISO_ASSOCIATION_ID"
+    PROXY_AGENT_HTTPS: "$(PROXY_AGENT_HTTPS)"
+    DT_PROJECT_ID: $(dtProjectId)
+    displayName: "Getting Conviso Association and Project IDs"
+
+# Realizando sincronização com a Conviso
+
+- bash: |
+    echo "##[debug]Synchronizing Dependency-Track Project with Conviso"
+
+    echo "CONVISO_ASSOCIATION_ID: ${CONVISO_ASSOCIATION_ID}"
+    echo "Company ID: ${CONVISO_COMPANY_ID}"
+
+    syncStartDateTime=$(date -u +"%Y-%m-%dT%H:%M:%S%z")
+
+    echo "##vso[task.setvariable variable=SYNC_START_DATE_TIME]$syncStartDateTime" 
+    echo "##[debug]Set Current Date and Time '${syncStartDateTime}' to 'SYNC_START_DATE_TIME'."
+
+    sleep 5s
+    i="0"
+    retries="10"    
+    while [[ $i -lt $retries ]]
+    do
+      RESPONSE=$(curl -s -S -g -X POST "${CONVISO_APP_ENDPOINT}/api/v2/integrations/scanners/dependency_track/synchronize" \
+      --proxy "${PROXY_AGENT_HTTPS}" \
+      --header 'Content-Type: application/json' \
+      --header "x-api-key: ${CONVISO_API_KEY}" \
+      --data '{"company_id": '${CONVISO_COMPANY_ID}',"integration_association_id": "'${CONVISO_ASSOCIATION_ID}'"}')
+
+      echo ${RESPONSE}
+
+      if [[ ! -z "$RESPONSE" ]]; then      
+        break             
+      fi
+      echo "Algo inesperado aconteceu. Tentando realizar a sincronização novamente. Aguarde..."
+      sleep 5s
+      i=$[$i+1]
+    done
+
+    TRACK_KEY=$(echo $RESPONSE | jq -r .data.job.track_key)
+    ASSET_ID=$(echo $RESPONSE | jq -r .data.asset.id)
+
+    echo "Conviso Asset ID: ${ASSET_ID}"
+
+    if [[ -z "$ASSET_ID" ]]; then      
+      echo "##vso[task.logissue type=error;] An error occurred while requesting Conviso API. Please, try running the pipeline again. If the error persists, contact the AppSec team on appsec_vivo.br@telefonica.com"
+      echo "##vso[task.complete result=Failed;]"
+      exit
+    fi
+
+    echo "##[debug]Track ID Conviso Sync: '${TRACK_KEY}'."
+
+    echo "##vso[task.setvariable variable=convisoAssetId]$ASSET_ID"
+    echo "##[debug]Set Asset ID Conviso Sync '${ASSET_ID}' to 'convisoAssetId'."
+
+  displayName: Conviso Synchronization  
+  condition: and( eq(variables.USE_DT_DOCKER, 'true'), eq(variables.USE_CONVISO, 'true'))
+  env:
+    CONVISO_APP_ENDPOINT: "$(CONVISO_APP_ENDPOINT)"
+    CONVISO_API_KEY: "$(CONVISO-API-KEY)"
+    CONVISO_COMPANY_ID: "$(CONVISO_COMPANY_ID)"
+    CONVISO_PROJECT_ID_OUT: "CONVISO_PROJECT_ID"
+    CONVISO_ASSOCIATION_ID: "$(CONVISO_ASSOCIATION_ID)"
+    CONVISO_ASSOCIATION_ID_OUT: "CONVISO_ASSOCIATION_ID"
+    PROXY_AGENT_HTTPS: "$(PROXY_AGENT_HTTPS)"
+    DT_PROJECT_ID: $(dtProjectId)
+    displayName: "Starting Conviso Synchronization"
+
+# Busca o status do sync na Conviso
+
+- bash: |
+    echo "##[debug]Getting Conviso Sync Status"
+
+    echo "CONVISO_ASSOCIATION_ID: ${CONVISO_ASSOCIATION_ID}"
+    echo "CONVISO_ASSET_ID: ${CONVISO_ASSET_ID}"
+    DATA="{\"operationName\":null,\"variables\":{},\"query\":\"{ syncStatus(assetId: ${CONVISO_ASSET_ID}, integration: DEPENDENCY_TRACK, startDate: \\\"${SYNC_START_DATE_TIME}\\\") { status failureReason } }\"}"
+    echo $DATA
+
+    sleep 5s
+    i="0"
+    retries="10"
+    echo "Aguardando Sincronização finalizar"
+    while [[ $i -lt $retries ]]
+    do
+        RESPONSE_RAW=$(curl -s -S -w "\n%{http_code}" "${CONVISO_GRAPHQL_ENDPOINT}" \
+          --proxy "${PROXY_AGENT_HTTPS}" \
+          --header "Content-Type: application/json" \
+          --header "x-api-key: ${CONVISO_API_KEY}" \
+          --data-raw "${DATA}")
+
+        RESPONSE=$(sed '$d' <<< "$RESPONSE_RAW")
+        RESPONSE_CODE=$(tail -n1 <<< "$RESPONSE_RAW")
+
+        echo "##[debug]RESPONSE.........: ${RESPONSE}"
+        echo "##[debug]RESPONSE_CODE....: ${RESPONSE_CODE}"
+              
+        SYNC_STATUS=$(echo $RESPONSE | jq -r .data.syncStatus.status)
+        echo "Status atual da Sincronização: ${SYNC_STATUS}"
+
+        if [[ "$SYNC_STATUS" == "succeeded" ]]
+        then
+            echo "Sincronização finalizada com sucesso"
+            exit 0
+        fi
+        sleep 30s
+        i=$[$i+1]
+    done
+
+    echo "##vso[task.logissue type=error;]Tempo esgotado - A Sincronização não foi finalizada, tente rodar novamente."
+    echo "##vso[task.complete result=Failed;]"  
+
+  displayName: Getting Conviso Synchronization status  
+  condition: and( eq(variables.USE_DT_DOCKER, 'true'), eq(variables.USE_CONVISO, 'true'))
+  env:
+    CONVISO_APP_ENDPOINT: "$(CONVISO_APP_ENDPOINT)"
+    CONVISO_GRAPHQL_ENDPOINT: "$(CONVISO_GRAPHQL_ENDPOINT)"
+    CONVISO_API_KEY: "$(CONVISO-API-KEY)"
+    CONVISO_TRACK_KEY: "$(convisoTrackId)"
+    CONVISO_ASSET_ID: "$(convisoAssetId)"
+    PROXY_AGENT_HTTPS: "$(PROXY_AGENT_HTTPS)"
+    SYNC_START_DATE_TIME: "$(syncStartDateTime)"
+    SYNC_START_DATE_TIME_NEW: "$(SYNC_START_DATE_TIME)"
+
+# Busca o dados do Security Gate
+
+- bash: |
+    echo "##[debug]Getting Conviso Vulnerability Metrics"
+
+    echo "CONVISO_ASSOCIATION_ID: ${CONVISO_ASSOCIATION_ID}"
+    echo "CONVISO_ASSET_ID: ${CONVISO_ASSET_ID}"
+    echo "CONVISO_GRAPHQL_ENDPOINT: ${CONVISO_GRAPHQL_ENDPOINT}"
+
+    SG_STATUS_TO_BE_BLOCKED="IDENTIFIED IN_PROGRESS"
+    DATA="{\"operationName\":null,\"variables\":{},\"query\":\"{ issuesStats(companyId: ${CONVISO_COMPANY_ID}, filters: {assetIds: [${CONVISO_ASSET_ID}], integrationTypes: Dependency_Track, statuses: [$SG_STATUS_TO_BE_BLOCKED]}) { severities { count value } } }\"}"
+    echo $DATA
+
+    i="0"
+    retries="10"    
+    while [[ $i -lt $retries ]]
+    do
+      RESPONSE=$(curl -s -S "${CONVISO_GRAPHQL_ENDPOINT}" \
+        --proxy "${PROXY_AGENT_HTTPS}" \
+        --header "Content-Type: application/json" \
+        --header "x-api-key: ${CONVISO_API_KEY}" \
+        --data-raw "${DATA}")
+      
+      if [[ ! -z "$RESPONSE" ]]; then      
+        break             
+      fi
+      echo "Tentando obter as métricas novamente. Aguarde..."
+      sleep 5s
+      i=$[$i+1]
+    done
+    
+    echo "RESPONSE: ${RESPONSE}"
+
+    CRITICAL_SEVERITY_COUNT=$(echo $RESPONSE | jq -r .data.issuesStats.severities[4].count)
+    HIGH_SEVERITY_COUNT=$(echo $RESPONSE | jq -r .data.issuesStats.severities[3].count)
+
+    echo "Vulnerabilidades Criticas: ${CRITICAL_SEVERITY_COUNT}"
+    echo "Vulnerabilidades Altas: ${HIGH_SEVERITY_COUNT}"
+
+    if [[ -z "$CRITICAL_SEVERITY_COUNT" || -z "$HIGH_SEVERITY_COUNT"  ]]; then
+      echo "##vso[task.logissue type=error;]Não foi possível obter métricas de vulnerabilidades. Por favor, tente novamente"
+      echo "##vso[task.complete result=Failed;]"
+      exit
+    fi
+
+    if [ "$CRITICAL_SEVERITY_COUNT" -gt "${SG_SEVERITY_CRITICAL}" ]; then
+      echo "##vso[task.logissue type=error;]Scan Found Critical Vulnerabilities: $CRITICAL_SEVERITY_COUNT"
+      echo "##vso[task.complete result=Failed;]"
+      exit
+    fi
+
+    if [ "$HIGH_SEVERITY_COUNT" -gt "${SG_SEVERITY_HIGH}" ]; then
+      echo "##vso[task.logissue type=error;]Scan found High Vulnerabilities: $HIGH_SEVERITY_COUNT"
+      echo "##vso[task.complete result=Failed;]"
+      exit
+    fi
+
+    echo "##[debug] No Critical or High vulnerabilities found!"
+    exit 0
+
+  env:
+    CONVISO_APP_ENDPOINT: "$(CONVISO_APP_ENDPOINT)"
+    CONVISO_PROJECT_API_CODE: "$(convisoProjectApiCode)"
+    CONVISO_GRAPHQL_ENDPOINT: "$(CONVISO_GRAPHQL_ENDPOINT)"
+    CONVISO_API_KEY: "$(CONVISO-API-KEY)"
+    CONVISO_ASSET_ID: "$(convisoAssetId)"
+    CONVISO_COMPANY_ID: "$(CONVISO_COMPANY_ID)"
+    SG_SEVERITY_CRITICAL: "0"
+    SG_SEVERITY_HIGH: "0"
+    SG_SEVERITY_MEDIUM: ""
+    SG_SEVERITY_LOW: ""
+    PROXY_AGENT_HTTPS: "$(PROXY_AGENT_HTTPS)"
+  continueOnError: true
+  displayName: "Getting Security Gate Data and Validate"
+  condition: and( eq(variables.USE_DT_DOCKER, 'true'), eq(variables.USE_CONVISO, 'true'))
+
+- task: Bash@3
+  displayName: "Evaluate Security Gate"
+  inputs:
+    targetType: 'inline'
+    script: |
+
+      echo "SKIP_SECURITY_GATE_SCA: ${SKIP_SECURITY_GATE_SCA}"
+      if [[ ! "${SKIP_SECURITY_GATE_SCA}" =~ ^(T|t)rue$ ]]; then
+        echo "##vso[task.logissue type=error;]O Security Gate falhou pois foram encontradas potenciais vulnerabilidades críticas e altas por nossas ferramentas de segurança em código fonte para este projeto. Para mais informações, acesse a wiki do time de AppSec da Vivo em https://wikicorp.telefonica.com.br/pages/viewpage.action?pageId=524036659"
+        echo "##vso[task.complete result=Failed;]"
+        exit
+      fi
+      echo "##[warning]O Security Gate NÃO está habilitado para este projeto, entretanto, foram identificadas vulnerabilidades de alta criticidade em seu código fonte. Antes de seguir com este código para outros ambientes, consulte em https://wikicorp.telefonica.com.br/pages/viewpage.action?pageId=524036659 para verificar como solicitar acesso as informações dessas descobertas para as respectivas tratativas. É responsabilidade de todos o mantimento de código fonte seguro no ambiente, faça sua parte."
+  condition: and( in(variables['Agent.JobStatus'], 'SucceededWithIssues'), eq(variables.USE_DT_DOCKER, 'true'), eq(variables.USE_CONVISO, 'true'))
+  env:
+    SKIP_SECURITY_GATE_SCA: ${{ parameters.skipSecurityGate }} 

@@ -1,0 +1,221 @@
+stages:
+- stage: define_environment
+  displayName: 'Define environment to deploy'
+  dependsOn: pipeline_init
+  pool: $(GENERAL_PURPOSE_CI_AGENT)
+  condition: |
+      or(
+        eq(contains(variables['Build.SourceVersionMessage'], '[DeployD1]'), true),
+        eq(contains(variables['Build.SourceVersionMessage'], '[DeployD2]'), true),
+        eq(contains(variables['Build.SourceVersionMessage'], '[DeployD3]'), true),
+        and( 
+          eq(contains(variables['Build.SourceVersionMessage'], '[DeployS1]'), true),
+          eq(variables['Build.SourceBranch'], 'refs/heads/stage')
+        ),
+        eq(contains(variables['Build.SourceVersionMessage'], '[DeployS2]'), true),
+        eq(contains(variables['Build.SourceVersionMessage'], '[DeployS3]'), true),
+        eq(contains(variables['Build.SourceVersionMessage'], '[DeployP1]'), true)
+      )
+  variables:
+    - name: ENVIRONMENT_CODE
+      value: ''	
+  jobs:
+    - job: job_define_environment_code
+      displayName: "Define environment"
+      steps:
+      - checkout: none
+      - ${{ if contains(variables['Build.SourceVersionMessage'], '[DeployD1]') }}:
+        - bash: |
+            echo "##vso[task.setvariable variable=ENVIRONMENT_CODE;isOutput=true]d1"
+            echo "##[debug] If commit message contains [DeployD1], then environment is d1"
+          displayName: 'Defining environment for deployment'
+          name: define_environment_code
+      - ${{ if contains(variables['Build.SourceVersionMessage'], '[DeployD2]') }}:
+        - bash: |
+            echo "##vso[task.setvariable variable=ENVIRONMENT_CODE;isOutput=true]d2"
+            echo "##[debug] If commit message contains [DeployD2], then environment is d2"
+          displayName: 'Defining environment for deployment'
+          name: define_environment_code
+      - ${{ if contains(variables['Build.SourceVersionMessage'], '[DeployD3]') }}:
+        - bash: |
+            echo "##vso[task.setvariable variable=ENVIRONMENT_CODE;isOutput=true]d3"
+            echo "##[debug] If commit message contains [DeployD3], then environment is d3"
+          displayName: 'Defining environment for deployment'
+          name: define_environment_code
+      - ${{ if and(contains(variables['Build.SourceVersionMessage'], '[DeployS1]'), eq(variables['Build.SourceBranch'], 'refs/heads/stage')) }}:
+        - bash: |
+            echo "##vso[task.setvariable variable=ENVIRONMENT_CODE;isOutput=true]s1"
+            echo "##[debug] If commit message contains [DeployS1], then environment is s1"
+          displayName: 'Defining environment for deployment'
+          name: define_environment_code
+      - ${{ if contains(variables['Build.SourceVersionMessage'], '[DeployS2]') }}:
+        - bash: |
+            echo "##vso[task.setvariable variable=ENVIRONMENT_CODE;isOutput=true]s2"
+            echo "##[debug] If commit message contains [DeployS2], then environment is s2"
+          displayName: 'Defining environment for deployment'
+          name: define_environment_code
+      - ${{ if contains(variables['Build.SourceVersionMessage'], '[DeployS3]') }}:
+        - bash: |
+            echo "##vso[task.setvariable variable=ENVIRONMENT_CODE;isOutput=true]s3"
+            echo "##[debug] If commit message contains [DeployS3], then environment is s3"
+          displayName: 'Defining environment for deployment'
+          name: define_environment_code
+      - ${{ if contains(variables['Build.SourceVersionMessage'], '[DeployP1]') }}:
+        - bash: |
+            echo "##vso[task.setvariable variable=ENVIRONMENT_CODE;isOutput=true]p1"
+            echo "##[debug] If commit message contains [DeployP1], then environment is p1"
+          displayName: 'Defining environment for deployment'
+          name: define_environment_code
+
+    - job: print_environment_code
+      displayName: "Print environment code"
+      dependsOn: job_define_environment_code
+      variables:
+        - name: ENVIRONMENT_CODE
+          value: $[ dependencies.job_define_environment_code.outputs['define_environment_code.ENVIRONMENT_CODE'] ]
+      steps:
+      - checkout: none
+      - bash: |
+          echo "Confirm deploy in Environment SAP: $(ENVIRONMENT_CODE)"
+        displayName: 'Print Environment Code'
+
+- stage: build_in_sap
+  displayName: 'Build in SAP'
+  dependsOn: define_environment
+  pool: $(GENERAL_PURPOSE_CD_AGENT)
+  variables:
+    - name: ENVIRONMENT_CODE
+      value: $[ stageDependencies.define_environment.job_define_environment_code.outputs['define_environment_code.ENVIRONMENT_CODE'] ]
+  jobs:
+    - job: validate_environment
+      displayName: "Validate environment"
+      steps:
+      - checkout: none
+      - ${{ if eq(variables['ENVIRONMENT_CODE'], '') }}:
+        - bash: |
+            echo "##[debug] Ambiente indefinido para a branch $(Build.SourceBranch). Adicione [DeployD1] na mensagem do commit se deseja fazer o deploy em d1, por exemplo. Ambientes possíveis: d1, d2 e d3."
+            exit 1
+          displayName: 'Fail if environment variable is not set'
+
+      - bash: |
+          echo "##[debug] O deploy será feito no ambiente: $ENVIRONMENT_CODE"
+        name: define_environment_info
+        displayName: 'Log informations to deploy envirionment'
+
+    - job: build
+      timeoutInMinutes: 180
+      displayName: "Build in SAP"
+      steps:
+      - checkout: self
+      - task: build-hybris-in-sap@0
+        displayName: 'Building in SAP'
+        name: trigger_build_in_sap
+        retryCountOnTaskFailure: 10
+        inputs:
+          propertiesFilePath: '$(System.DefaultWorkingDirectory)/.azuredevops/pipeline.properties'
+      - script: |
+          echo "##vso[task.setvariable variable=_BUILD_CODE;isoutput=true]$BUILD_CODE"
+          echo "##[debug] número do build $BUILD_CODE" 
+        displayName: 'Setting build code variable'
+        name: set_build_code
+
+- stage: database_backup
+  displayName: "Database Backup"
+  dependsOn: define_environment
+  pool: $(GENERAL_PURPOSE_CD_AGENT)
+  condition: or(eq(variables['ENVIRONMENT_CODE'], 's1'), eq(variables['ENVIRONMENT_CODE'], 'p1'))
+  variables:
+    - name: ENVIRONMENT_CODE
+      value: $[ stageDependencies.define_environment.job_define_environment_code.outputs['define_environment_code.ENVIRONMENT_CODE'] ]  
+  jobs:
+    - job: backup
+      displayName: 'Backup do SAP Commerce Cloud'
+      steps:
+      - checkout: none
+
+      - bash: |
+          DESCRIPTION="$(ENVIRONMENT_CODE)-$(Build.BuildNumber)"
+
+          echo "##[debug]Iniciando criação do backup no ambiente $(ENVIRONMENT_CODE)..."
+
+          response=$(curl -s -o response.json -w "%{http_code}" \
+            -X POST "https://portalapi.commerce.ondemand.com/v2/subscriptions/$(CCV2_SUBSCRIPTION_CODE)/environments/$(ENVIRONMENT_CODE)/databackups" \
+            -H "Authorization: Bearer $(CCV2_AUTH_ACCESS_TOKEN)" \
+            -H "Content-Type: application/json" \
+            -d "{\"description\":\"$DESCRIPTION\"}")
+
+          echo "##[debug]Body: {\"description\":\"$DESCRIPTION\"}";
+
+          if [ "$response" -eq 201 ]; then
+            echo "##[debug]Backup criado com sucesso."
+            cat response.json
+
+            databackupCode=$(jq -r '.databackupCode' response.json)
+            echo "##[debug]databackupCode extraído: $databackupCode"
+
+            echo "##vso[task.setvariable variable=databackupCode]$databackupCode"
+          else
+            echo "##[debug]Erro ao criar o backup. Código de resposta: $response"
+            cat response.json
+            exit 1
+          fi
+        displayName: 'Criar Backup do SAP Commerce Cloud'
+
+- stage: deploy_in_sap
+  dependsOn: [ build_in_sap, define_environment ]
+  pool: $(GENERAL_PURPOSE_CD_AGENT)
+  displayName: 'Deploy in SAP'
+  variables:
+    - name: BUILD_CODE
+      value: $[ stageDependencies.build_in_sap.build.outputs['set_build_code._BUILD_CODE'] ]  
+    - name: ENVIRONMENT_CODE
+      value: $[ stageDependencies.define_environment.job_define_environment_code.outputs['define_environment_code.ENVIRONMENT_CODE'] ]
+  jobs:
+    - job: confirm_deploy
+      displayName: "Confirm deploy in Environment SAP"
+      pool: server
+      condition: or(eq(variables['ENVIRONMENT_CODE'], 'p1'), eq(variables['ENVIRONMENT_CODE'], 's1'))
+      steps:
+      - task: ManualValidation@0
+        name: deploy_validation
+        displayName: "Confirm Deploy"
+        timeoutInMinutes: 1440
+        inputs:
+          notifyUsers: ''
+          instructions: "Confirm Deploy?"
+          onTimeout: 'reject'
+
+    - job: deploy
+      displayName: "Deploy in SAP"
+      dependsOn: confirm_deploy
+      condition: or(eq(dependencies.confirm_deploy.result, 'Succeeded'), and(ne(variables['ENVIRONMENT_CODE'], 'p1'), ne(variables['ENVIRONMENT_CODE'], 's1')))
+      steps:
+      - checkout: self
+      - bash: |
+          RED='\033[0;31m'
+          GREEN='\033[0;32m'
+          BLUE='\033[0;34m'
+          YELLOW='\033[1;33m'
+
+          printf "
+          ${YELLOW}=================================================================================================================================
+          ${YELLOW}                                                     DEPLOY APPLICATION
+          ${YELLOW}=================================================================================================================================
+          O deploy do build ${BLUE}$BUILD_CODE${YELLOW} será feito no ambiente: ${BLUE}$ENVIRONMENT_CODE.
+          
+          Se houver alguma falha, o pipeline será interrompido automaticamente. Certifique-se de que todas as dependências estejam em ordem.
+          
+          Para mais detalhes, verifique o log do pipeline ou consulte a documentação.
+          ${YELLOW}=================================================================================================================================
+
+          "
+        name: define_environment_info
+        displayName: 'Log informations to deploy environment'
+
+      - task: deploy-hybris-in-sap@0
+        displayName: 'Deploying in SAP'
+        retryCountOnTaskFailure: 10
+        inputs:
+          propertiesFilePath: '$(System.DefaultWorkingDirectory)/.azuredevops/pipeline.properties'
+          environmentCode: '$(ENVIRONMENT_CODE)'
+          buildCode: '$(BUILD_CODE)'

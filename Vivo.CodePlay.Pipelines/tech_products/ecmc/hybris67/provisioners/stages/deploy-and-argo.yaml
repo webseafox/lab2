@@ -1,0 +1,221 @@
+﻿parameters:
+- name: qaEnvironment
+  type: string
+  default: 'preprod'
+
+stages:
+- stage: package
+  dependsOn:
+  - ${{ if not(startsWith(variables['Build.SourceBranch'], 'refs/tags/')) }}:
+    - build_test
+  - deploy
+  displayName: "Helm and push to argoCd"
+  pool:
+    name: $(PRIVATE_AGENT_DEFAULT)
+    # demands: Agent.Version -gtVersion 2.210.1
+
+  jobs:
+    - job: "start_helm"
+      workspace:
+        clean: all
+      displayName: "Download Helm and Push to ArgoCD"
+      steps:
+      - checkout: self
+        persistCredentials: true
+        fetchDepth: 1
+        displayName: "Checkout project"
+
+      - checkout: ArgoCd
+        persistCredentials: true
+        fetchDepth: 1
+        displayName: "Checkout ArgoCD"
+        clean: true
+
+      - checkout: argocd-production
+        persistCredentials: true
+        fetchDepth: 1
+        displayName: "Checkout ArgoCD-production"
+        clean: true
+
+      - ${{ if startsWith(variables['Build.SourceBranch'], 'refs/tags/') }}:
+        - bash: |
+            function git_commands {
+              git config --replace-all user.name "Azure DevOps"
+              git config --replace-all user.email "azuredevops@telefonicati.onmicrosoft.com"
+              git fetch
+              git checkout master
+              git reset --hard origin/master
+              echo "##[section]Git pull concluído"
+
+              git pull origin master
+              echo "##[section]Git pull concluído"
+
+            }
+
+            BRANCH=$(Build.SourceBranch)
+            SET_VERSION=${BRANCH#refs/tags/}
+
+            echo "##[section]A TAG é --> $SET_VERSION"
+            echo "##[section]O ambiente de deploy será em --> $ENVIRONMENT"
+
+            cd $(Build.SourcesDirectory)/$(Build.Repository.Name)
+            echo "##vso[task.setvariable variable=SET_VERSION]$SET_VERSION"
+            git checkout $(Build.SourceBranch)
+
+            echo -n $SET_VERSION > VERSION
+            echo "##[section]Nova versão: $SET_VERSION"
+
+            echo "##vso[task.setvariable variable=NEW_VERSION;]$SET_VERSION"
+            echo -n $SET_VERSION > VERSION
+
+            echo "##[section]Download Helm Chart"
+
+            rm -rf infra-helm-vivo-hybris-1.0.26.tgz
+            wget --user=jenkins-ecom --password="${JKS_PASS}" '$(NEXUS_REPOSITORY_URL)/$(HELM_CHART_NAME)-$(CHART_VERSION).tgz'
+            tar -xvf "$(HELM_CHART_NAME)-$(CHART_VERSION).tgz"
+
+
+            if [[ "$ENVIRONMENT" == "production" || "$ENVIRONMENT" == "producao" ]]; then
+              cd ../argocd-production
+              git_commands
+              cd $(Build.SourcesDirectory)/$(Build.Repository.Name)
+
+              for scopes in backoffice cronjob hac webservices; do
+                if helm template $scopes infra-helm-vivo-hybris --namespace production --set namespace=production -f deploy/istio/production/$scopes-values.yaml --set image.tag=$SET_VERSION > $scopes.yaml; then
+                    echo "##[section]Template gerado com sucesso para $scopes !!"
+                    mv $scopes.yaml ../argocd-production/production
+                    cd ../argocd-production/production
+
+                    git add $scopes.yaml
+                    git commit -m "Nova versão do $scopes no namespace production"
+                    git push origin master
+
+                    cd $(Build.SourcesDirectory)/$(Build.Repository.Name)
+                    else
+                      echo "##[error]Falha ao gerar template para $scopes ou ao fazer commit no argocd-production"
+                      exit 1
+                  fi
+              done
+            else
+              cd ../argocd
+              git_commands
+              cd $(Build.SourcesDirectory)/$(Build.Repository.Name)
+
+              for ambiente in prodlike preprod qa1 qa2; do
+                for scopes in backoffice cronjob hac webservices; do
+                  if helm template $scopes infra-helm-vivo-hybris --namespace $ambiente  --set namespace=$ambiente  -f deploy/istio/$ambiente/$scopes-values.yaml --set image.tag=$SET_VERSION > $scopes.yaml; then
+                    echo "Template gerado com sucesso para $scopes !!"
+                    mv $scopes.yaml ../argocd/$ambiente
+                    cd ../argocd/$ambiente
+
+                    git add $scopes.yaml
+                    git commit -m "Nova versão do $scopes no namespace $ambiente"
+                    git push origin master
+
+                    cd $(Build.SourcesDirectory)/$(Build.Repository.Name)
+                  else
+                    echo "##[error]Falha ao gerar template para $scopes ou ao fazer commit no argocd"
+                    exit 1
+                  fi
+                done
+              done
+            fi
+          displayName: 'Download Helm Chart and push to ArgoCd'
+          env:
+            ENVIRONMENT: ${{ parameters.qaEnvironment }}
+            JKS_PASS: $(JKS_PASS)
+      - ${{ else }}:
+        - bash: |
+            function git_commands {
+              git config --replace-all user.name "Azure DevOps"
+              git config --replace-all user.email "azuredevops@telefonicati.onmicrosoft.com"
+              git fetch
+              git checkout master
+              git reset --hard origin/master
+              echo "##[section]Git pull concluído"
+
+              git pull origin master
+              echo "##[section]Git pull concluído"
+
+            }
+            cd $(Build.SourcesDirectory)/$(Build.Repository.Name)
+            echo "##vso[task.setvariable variable=SET_VERSION]$SET_VERSION"
+
+            echo "##[section]A TAG é --> $SET_VERSION"
+            echo "##[section]O ambiente de deploy será em --> $ENVIRONMENT"
+
+            git checkout $(Build.SourceBranch)
+            NEW_VERSION=$(cat VERSION)
+            CURRENT_VERSION=$(cat VERSION)
+            echo "##[section]VERSION $VERSION"
+
+            IFS='.' read -ra VERSION_PARTS <<< "$CURRENT_VERSION"
+            PATCH_VERSION=$((${VERSION_PARTS[2]} + 1))
+            SET_VERSION="${VERSION_PARTS[0]}.${VERSION_PARTS[1]}.${PATCH_VERSION}"
+
+            echo -n $SET_VERSION > VERSION
+
+            echo "##[section]Nova versão: $SET_VERSION"
+
+            echo "##vso[task.setvariable variable=NEW_VERSION;]$SET_VERSION"
+            echo "##vso[task.setvariable variable=NEW_VERSION_FILE;isOutput]$SET_VERSION"
+            echo -n $SET_VERSION > VERSION
+
+            echo "##[section]Download Helm Chart"
+
+            rm -rf infra-helm-vivo-hybris-1.0.26.tgz
+            wget --user=jenkins-ecom --password="${JKS_PASS}" '$(NEXUS_REPOSITORY_URL)/$(HELM_CHART_NAME)-$(CHART_VERSION).tgz'
+            tar -xvf "$(HELM_CHART_NAME)-$(CHART_VERSION).tgz"
+
+            if [[ "$ENVIRONMENT" == "production" || "$ENVIRONMENT" == "producao" ]]; then
+              cd ../argocd-production
+              git_commands
+              cd $(Build.SourcesDirectory)/$(Build.Repository.Name)
+
+              for scopes in backoffice cronjob hac webservices; do
+                if helm template $scopes infra-helm-vivo-hybris --namespace production --set namespace=production -f deploy/istio/production/$scopes-values.yaml --set image.tag=$SET_VERSION > $scopes.yaml; then
+                  echo "##[section]Template gerado com sucesso para $scopes !!"
+                  mv $scopes.yaml ../argocd-production/production
+                  cd ../argocd-production/production
+
+                  git add $scopes.yaml
+                  git commit -m "Nova versão do $scopes no namespace production"
+                  git push origin master
+
+                  cd $(Build.SourcesDirectory)/$(Build.Repository.Name)
+                else
+                  echo "##[error]Falha ao gerar template para $scopes ou ao fazer commit no argocd-production"
+                  exit 1
+                fi
+              done
+            else
+              cd ../argocd
+              git_commands
+              cd $(Build.SourcesDirectory)/$(Build.Repository.Name)
+
+              for ambiente in prodlike preprod qa1 qa2; do
+                for scopes in backoffice cronjob hac webservices; do
+                  if helm template $scopes infra-helm-vivo-hybris --namespace $ambiente  --set namespace=$ambiente  -f deploy/istio/$ambiente/$scopes-values.yaml --set image.tag=$SET_VERSION > $scopes.yaml; then
+                    echo "##[section]Template gerado com sucesso para $scopes !!"
+
+                    mv $scopes.yaml ../argocd/$ambiente
+                    cd ../argocd/$ambiente
+
+                    git add $scopes.yaml
+                    git commit -m "Nova versão do $scopes no namespace $ambiente"
+                    git push origin master
+
+                    cd $(Build.SourcesDirectory)/$(Build.Repository.Name)
+                  else
+                    echo "##[error]Falha ao gerar template para $scopes ou ao fazer commit no argocd"
+                    exit 1
+                  fi
+                done
+              done
+            fi
+          displayName: 'Download Helm Chart and push to ArgoCd'
+          env:
+            ENVIRONMENT: ${{ parameters.qaEnvironment }}
+            JKS_PASS: $(JKS_PASS)
+
+

@@ -1,0 +1,132 @@
+# This YAML file defines the stages and jobs for the "Files" stage in the pipeline.
+# It includes parameters, conditions, variables, and steps for each job.
+
+parameters:
+  - name: config
+    type: object
+  - name: flow
+    type: object
+
+stages:
+  - stage: stage_files
+    displayName: "Files"
+    pool: $(POOL)
+    dependsOn:
+      - stage_prep
+    condition: |
+      and(
+        in(dependencies.stage_prep.result, 'Succeeded', 'SucceededWithIssues'),
+        or(
+          eq(variables['FLOW'], 'CD'),
+          ne(variables['APPLICATION_NAME'], 'bi-publisher-reports')
+        )
+      )
+    variables:
+      - name: VERSION
+        value: $[ stageDependencies.stage_prep.version.outputs['version.VERSION'] ]
+      - name: _APP_EXECUTION_MODE
+        value: $[ stageDependencies.stage_prep.execution_mode.outputs['mode.APP_EXECUTION_MODE'] ]
+    jobs:
+      # Loop through each helm_chart in the config.applicationParameters.helmCharts parameter
+      - ${{ if ne(parameters.config.applicationParameters.helmCharts, '') }}:
+          - ${{ each helm_chart in split(parameters.config.applicationParameters.helmCharts, ',')}}:
+              - job: ${{ replace(helm_chart,'-','_') }}
+                displayName: "${{ replace(helm_chart, 'package-', '') }}"
+                condition: |
+                  or(
+                    eq(variables['APPLICATION_NAME'], 'elastic-charging-engine'),
+                    eq(variables['FLOW'], 'CD')
+                  )
+                steps:
+                  - template: ../../../task_groups/checkout/checkout.yml
+                    parameters:
+                      repository: "${{ replace(helm_chart, 'package-', '') }}"
+                      path: ${{ replace(helm_chart, 'package-', '') }}
+                  - ${{ if and(eq(parameters.flow.flow, 'CI'), eq(helm_chart, 'package-oc-cn-ece-helm-chart')) }}:
+                      - template: ../../../tasks/ece/update_flags.yml
+                        parameters:
+                          helmChart: ${{ replace(helm_chart, 'package-', '') }}
+                          eceExecutionMode: $(_APP_EXECUTION_MODE)
+                  - ${{ if and(or(eq(parameters.flow.flow, 'CI'), and(eq(parameters.flow.flow, 'CD'), ne(parameters.flow.cd_params.appVersion, 'LATEST'))), not(and(eq(parameters.config.applicationParameters.applicationName, 'pricing-design-center'), eq(helm_chart, 'package-oc-cn-op-job-helm-chart'))), ne(parameters.config.applicationParameters.applicationName, 'oracle-communications-offline-mediation-controller'), not(and(eq(parameters.config.applicationParameters.applicationName, 'elastic-charging-engine'), eq(helm_chart, 'package-oc-cn-helm-chart')))) }}:
+                      - template: ../../../tasks/helm/update_version.yml
+                        parameters:
+                          condition: eq(variables['FLOW'], 'CD')
+                          helmChart: ${{ replace(helm_chart, 'package-', '') }}
+                          helmChartFile: $(HELM_CHART_FILE)
+                          helmChartVersionKey: $(HELM_CHART_VERSION_KEY)
+                          ${{ if eq(parameters.config.applicationParameters.applicationName, 'elastic-charging-engine')  }}:
+                            applicationVersion: $(CONTAINER_IMAGE_NAME):$(VERSION)
+                          ${{ if in(parameters.config.applicationParameters.applicationName, 'billingcare', 'billingcare-extension', 'pricing-design-center')  }}:
+                            applicationVersion: :$(VERSION)
+                          ${{ if notIn(parameters.config.applicationParameters.applicationName, 'billingcare', 'billingcare-extension', 'pricing-design-center', 'elastic-charging-engine')  }}:
+                            applicationVersion: $(VERSION)
+                  - template: ../../../task_groups/artifact/publish.yml
+                    parameters:
+                      artifactName: ${{ replace(helm_chart, 'package-', '') }}
+                      targetPath: $(Pipeline.Workspace)/${{ replace(helm_chart, 'package-', '') }}
+      - ${{ if eq(parameters.config.applicationParameters.applicationName, 'pricing-design-center') }}:
+          - job: pdc
+            displayName: "Pricing-Design-Center Process"
+            condition: eq(variables['_APP_EXECUTION_MODE'], 'DEPLOY')
+            steps:
+              - template: ../../../task_groups/checkout/checkout.yml
+                parameters:
+                  repository: "git://CLDM - CLOUD BRM/obrm-pricing-config@$(Build.SourceBranchName)"
+                  path: pricing-config
+
+              - template: ../../../task_groups/pdc/process_files.yml
+                parameters:
+                  workingDirectory: $(Pipeline.Workspace)/pricing-config/pricing_config
+                  XMLFilesFolderToDeploy: $(Agent.BuildDirectory)/pricing-config-components-to-deploy
+
+      # Single job to checkout source code and shared files and publish them as one artifact.
+      - job: publish_source_with_shared
+        displayName: "Publish Source with Shared Files"
+        condition: |
+          and(
+            notIn(variables['TECHNOLOGY'], 'helmCharts', 'onlyHelmUpdate'),
+            or(
+              eq(variables['FLOW'], 'CD'),
+              ne(variables['APPLICATION_NAME'], 'bi-publisher-reports')
+            )
+          )
+        steps:
+          - template: ../../../task_groups/checkout/checkout.yml
+            parameters:
+              repository: self
+              path: source_code
+          - ${{ if eq(parameters.flow.flow, 'CI') }}:
+              - template: ../../../task_groups/checkout/checkout.yml
+                parameters:
+                  repository: shared-files
+                  path: source_code/shared
+
+          - script: |
+              set -euo pipefail
+
+              echo "##[section] Preparando arquivos para upload..."
+
+              echo "##[command]Removendo diretorios .git..."
+              find "$(Pipeline.Workspace)/source_code" -type d -name ".git" -prune -exec rm -rfv {} +
+
+              POM_FILE="$(Pipeline.Workspace)/source_code/pom.xml"
+              if [ -f "${POM_FILE}" ]; then
+                echo "##[section] Atualizando versao do pom.xml para $(VERSION) ..."
+                mvn -f "${POM_FILE}" -DnewVersion="$(VERSION)" -DgenerateBackupPoms=false versions:set
+              else
+                echo "##[debug] Nenhum pom.xml encontrado. Pulando update de versao."
+              fi
+            displayName: "Prepare files for upload"
+            failOnStderr: false
+
+          - ${{ if eq(parameters.flow.flow, 'CI') }}:
+              - template: ../../../task_groups/artifact/publish.yml
+                parameters:
+                  artifactName: source_with_shared_files_raw
+                  targetPath: $(Pipeline.Workspace)/source_code
+
+          - ${{ if ne(parameters.flow.flow, 'CI') }}:
+              - template: ../../../task_groups/artifact/publish.yml
+                parameters:
+                  artifactName: source_with_shared_files
+                  targetPath: $(Pipeline.Workspace)/source_code

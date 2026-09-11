@@ -1,0 +1,985 @@
+parameters:
+- name: components_to_install
+- name: qa_environment
+- name: skip_deploy
+
+stages:
+- stage: deploy
+  displayName: "Deploy ${{ parameters.qa_environment }}"
+  dependsOn:
+  - package
+
+  ${{ if contains(parameters.qa_environment, 'producao') }}:
+    pool: "VivoOnPremPrdAgents"
+  ${{ else }}:
+    pool: "VivoOnPremHmlAgents"
+
+  jobs:
+  - job: bundles_to_install
+    displayName: Select Bundles
+    condition: eq('${{ parameters.skip_deploy }}', false)
+    variables:
+      - template: /.azuredevops/config/${{ parameters.qa_environment }}/environments_variables.yml@self
+    steps:
+    - download: none 
+    - checkout: self
+
+    ## ARTIFACTS ANOTHER BUILD ID
+    - ${{ if startsWith(variables['Build.SourceBranch'], 'refs/tags') }}:
+      - bash: |
+          build_id=$(yq '.buildId' $(Build.SourcesDirectory)/.azuredevops/build.yaml)
+          echo "##vso[task.setvariable variable=BUILD_ID]$build_id"
+          echo "##[debug] Exporting variable 'BUILD_ID': $build_id"
+        name: export_build_id
+        displayName: Extract Build ID 
+
+      - task: DownloadBuildArtifacts@1
+        displayName: 'Download Specific Build Artifact'
+        inputs:
+          buildType: specific
+          project: '$(PROJECT_NAME)' 
+          pipeline: '$(PIPELINE_NAME)' 
+          buildVersionToDownload: specific
+          buildId: '$(BUILD_ID)' 
+          artifactName: 'bundles' 
+          downloadPath: '$(System.ArtifactsDirectory)'
+    ## ARTIFACTS CURRENT BUILD ID
+    - ${{ else }}:
+      - task: DownloadBuildArtifacts@1
+        displayName: 'Download Pipeline Artifact'
+        inputs:
+          buildType: current
+          artifactName: 'bundles'
+          downloadPath: '$(System.ArtifactsDirectory)'
+          
+    - task: Bash@3
+      name: package_bundles
+      displayName: 'Package Bundles'
+      inputs:
+        targetType: inline
+        script: |
+          mkdir bundles_temp_dir
+          tar -xf $(System.ArtifactsDirectory)/bundles/bundles.tar -C bundles_temp_dir
+          mkdir selected_bundles;
+
+          component="${{parameters.components_to_install}}"
+
+          case $component in
+            "batch_events") component="ctr-smart-sim-batch-events-*.jar" ;;
+            "batch_file") component="ctr-smart-sim-batch-file-*.jar" ;;
+            "catalog") component="ctr-smart-sim-config-catalog-*.jar" ;;
+            "provisioners") component="ctr-smart-sim-provisioners-*.jar" ;;
+            "processor") component="ctr-smart-sim-events-processor-*.jar" ;;
+            *) component="ctr-smart-sim-batch-events-*.jar,ctr-smart-sim-batch-file-*.jar,ctr-smart-sim-config-catalog-*.jar,ctr-smart-sim-provisioners-*.jar,ctr-smart-sim-events-processor-*.jar" ;; # Caso padrão
+          esac
+
+          echo "##[debug] The files that will be copied are -> $component"
+
+          for file in $(echo "$component" | tr "," "\n")
+          do
+            cp bundles_temp_dir/$file selected_bundles/    
+            
+            if [ -f selected_bundles/$file ]; then
+              echo "##[debug] The copy of the $file file was successful."
+            else
+              echo "##[error] Error: The copy of the $file file failed."
+              echo "##vso[task.complete result=Failed;]"
+              echo "##vso[task.setvariable variable=INVALID_COMPONENT_TO_INSTALL;isOutput=true;]true"
+              echo "##[debug] Exporting variable 'INVALID_COMPONENT_TO_INSTALL': true"                                            
+
+              exit 1
+            fi                 
+          done
+          
+          echo "##[debug] Copy new_component"
+          cp new_component selected_bundles
+          echo "##[debug] List selected bundles:"
+          ls -la selected_bundles
+
+          echo "##vso[task.setvariable variable=INVALID_COMPONENT_TO_INSTALL;isOutput=true;]false"
+          echo "##[debug] Exporting variable 'INVALID_COMPONENT_TO_INSTALL': false"                    
+
+    - task: CopyFiles@2
+      displayName: Copy Bundles Files Staging Directory
+      inputs:
+        SourceFolder: '$(System.DefaultWorkingDirectory)/selected_bundles'
+        Contents: |
+          new_component
+          *.jar
+          *.war
+        TargetFolder: '$(Build.ArtifactStagingDirectory)'
+        CleanTargetFolder: true
+        OverWrite: true
+        flattenFolders: true
+
+    - task: PublishBuildArtifacts@1
+      displayName: Publish Bundles Artifacts
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+        ArtifactName: bundles
+        StoreAsTar: true  
+
+
+  - deployment: ${{ parameters.qa_environment }}
+    dependsOn: 
+    - bundles_to_install 
+    variables:
+      - template: /.azuredevops/config/${{ parameters.qa_environment }}/environments_variables.yml@self
+      - name: CACORP_LOCATION
+        value: $(Agent.HomeDirectory)/../../certs/CACORP.pem
+      - name: SENHA_SEGURA_USERNAME
+      - name: SENHA_SEGURA_PASSWORD
+      - name: AKV_DEVOPS_NAME
+        value: "kv-azdevops-shared"
+    condition: and(succeeded(), eq('${{ parameters.skip_deploy }}', false))
+    workspace:
+      clean: all
+    displayName: Deploy ${{ parameters.qa_environment }}
+
+    ${{ if or(contains(parameters.qa_environment, 'teste'), contains(parameters.qa_environment, 'lab')) }}:
+      environment: 
+        name: "deploy-sim_lab"
+        resourceType: VirtualMachine
+    ${{ else }}:
+      environment: "deploy-${{ parameters.qa_environment }}"
+
+    strategy:
+      runOnce:      
+        deploy:
+          steps:
+          - download: none
+          - checkout: none
+
+          - task: DownloadBuildArtifacts@1
+            displayName: 'Download Pipeline Artifact'
+            inputs:
+              buildType: current
+              artifactName: 'bundles'
+              downloadPath: '$(System.ArtifactsDirectory)'
+
+          - ${{ if or(or(contains(parameters.qa_environment, 'esteira1'), contains(parameters.qa_environment, 'esteira2')), or(contains(parameters.qa_environment, 'prodlike'), contains(parameters.qa_environment, 'preprod'))) }}:
+              - ${{ if contains(parameters.components_to_install, 'batch_events') }}:
+                - ${{ if contains(parameters.qa_environment, 'producao_impar') }}:
+                  - ${{ each service_connection in split(variables.BATCHEVENTS_SERVERS_IMPAR,',') }}:
+                    - task: SSH@0
+                      displayName: "Backup BatchEvents - ${{service_connection}}"
+                      inputs:
+                        sshEndpoint: ${{service_connection}}
+                        runOptions: inline
+                        failOnStdErr: false
+                        inline: |
+                          cp /opt/smartsim/bin/ctr-smart-sim-batch-events-*.jar /opt/smartsim/backup-bundles-data
+                          chmod 0755 -R /opt/smartsim/backup-bundles-data      
+                - ${{ elseif contains(parameters.qa_environment, 'producao_par') }}:
+                  - ${{ each service_connection in split(variables.BATCHEVENTS_SERVERS_PAR,',') }}:
+                    - task: SSH@0
+                      displayName: "Backup BatchEvents - ${{service_connection}}"
+                      inputs:
+                        sshEndpoint: ${{service_connection}}
+                        runOptions: inline
+                        failOnStdErr: false
+                        inline: |
+                          cp /opt/smartsim/bin/ctr-smart-sim-batch-events-*.jar /opt/smartsim/backup-bundles-data
+                          chmod 0755 -R /opt/smartsim/backup-bundles-data      
+                - ${{ else }}:
+                  - ${{ each service_connection in split(variables.BATCHEVENTS_SERVERS,',') }}:
+                    - task: GetCredentialsSenhaSegura@1
+                      displayName: 'Get Credentials Senha Segura'
+                      name: get_credentials_${{split(service_connection, '|')[0]}}
+                      inputs:
+                        clientId: 'b0b8aecf3534fb7f8367fa8b0c553947'
+                        clientSecret: '90db4470f1a0c0adb8b197109ba796647b7ae5568c45d3ee74cbbed7ec509774'
+                        credentialId: ${{ split(service_connection, '|')[1] }}
+                        SenhaSeguraEndpoint: 'https://10.238.69.35'
+                        #SenhaSeguraEndpoint: 'https://10.128.62.35'
+                        #SenhaSeguraEndpoint: 'https://10.243.17.35'
+                        #SenhaSeguraEndpoint: 'https://urano.redecorp.br'
+                        usernameVariable: 'SENHA_SEGURA_USERNAME'
+                        passwordVariable: 'SENHA_SEGURA_PASSWORD'
+                      env:
+                        NODE_EXTRA_CA_CERTS: $(CACORP_LOCATION)
+                        #HTTPS_PROXY: "http://10.240.58.39:3128"
+
+                    - task: DownloadSecureFile@1
+                      name: senhaSeguraKey
+                      displayName: Download Smart Key
+                      inputs:
+                        secureFile: 'smart_sim_qa.key'
+
+                    - task: Bash@3
+                      displayName: 'Decrypt Password'
+                      name: get_token_${{split(service_connection, '|')[0]}}
+                      continueOnError: true
+                      inputs:
+                        targetType: inline
+                        script: |
+                          echo "Username: $(get_credentials_${{ split(service_connection, '|')[0] }}.SENHA_SEGURA_USERNAME)"
+                          DECRYPTED_PASSWORD=$(echo -n $(get_credentials_${{ split(service_connection, '|')[0] }}.SENHA_SEGURA_PASSWORD) | base64 -d --ignore-garbage | openssl rsautl -decrypt -inkey $(senhaSeguraKey.secureFilePath) -oaep)
+                          echo "##vso[task.setvariable variable=DECRYPTED_PASSWORD;]$DECRYPTED_PASSWORD"
+                    
+                    - task: Bash@3
+                      displayName: 'Show Password'
+                      name: show_password_${{split(service_connection, '|')[0]}}
+                      continueOnError: true
+                      inputs:
+                        targetType: inline  
+                        script: |
+                          echo "Decrypted password: $(DECRYPTED_PASSWORD)"
+
+                    - task: UpdateCredentialsEndpointSshFromVivo@4
+                      displayName: "Update Service Connection"
+                      inputs:
+                        sshEndpoint: ${{ split(service_connection, '|')[0] }}
+                        username: $(get_credentials_${{ split(service_connection, '|')[0] }}.SENHA_SEGURA_USERNAME)
+                        password: $(DECRYPTED_PASSWORD)
+                      env:
+                        HTTPS_PROXY: "http://10.240.58.39:3128"
+                        PAT: $(AZURE_DEVOPS_PAT)
+                        #PAT: $(System.AccessToken)
+                    
+                    #Adicionando delay de 5segundos para atualização da service connection
+                    - task: Bash@3
+                      displayName: 'Delay for 5 seconds'
+                      inputs:
+                        targetType: inline
+                        script: |
+                          echo "Waiting for 5 seconds..."
+                          sleep 5
+              # Batch File
+              - ${{ elseif contains(parameters.components_to_install, 'batch_file') }}:
+                - ${{ if contains(parameters.qa_environment, 'producao_impar') }}:
+                  - ${{ each service_connection in split(variables.BATCHFILE_SERVERS_IMPAR,',') }}:
+                    - task: SSH@0
+                      displayName: "Backup BatchFile - ${{service_connection}}"
+                      inputs:
+                        sshEndpoint: ${{service_connection}}
+                        runOptions: inline
+                        failOnStdErr: false
+                        inline: |
+                          sudo su - ${{USER}}
+                          cp /opt/smartsim/bin/ctr-smart-sim-batch-file-*.jar /opt/smartsim/backup-bundles-data
+                          chmod 0755 -R /opt/smartsim/backup-bundles-data      
+                - ${{ elseif contains(parameters.qa_environment, 'producao_par') }}:
+                  - ${{ each service_connection in split(variables.BATCHFILE_SERVERS_PAR,',') }}:
+                    - task: SSH@0
+                      displayName: "Backup BatchFile - ${{service_connection}}"
+                      inputs:
+                        sshEndpoint: ${{service_connection}}
+                        runOptions: inline
+                        failOnStdErr: false
+                        inline: |
+                          sudo su - ${{USER}}
+                          cp /opt/smartsim/bin/ctr-smart-sim-batch-file-*.jar /opt/smartsim/backup-bundles-data
+                          chmod 0755 -R /opt/smartsim/backup-bundles-data      
+                - ${{ else }}:
+                  - ${{ each service_connection in split(variables.BATCHFILE_SERVERS,',') }}:
+                    - task: GetCredentialsSenhaSegura@1
+                      displayName: 'Get Credentials Senha Segura'
+                      name: get_credentials_${{split(service_connection, '|')[0]}}
+                      inputs:
+                        clientId: 'b0b8aecf3534fb7f8367fa8b0c553947'
+                        clientSecret: '90db4470f1a0c0adb8b197109ba796647b7ae5568c45d3ee74cbbed7ec509774'
+                        credentialId: ${{ split(service_connection, '|')[1] }}
+                        SenhaSeguraEndpoint: 'https://10.238.69.35'
+                        #SenhaSeguraEndpoint: 'https://10.128.62.35'
+                        #SenhaSeguraEndpoint: 'https://10.243.17.35'
+                        #SenhaSeguraEndpoint: 'https://urano.redecorp.br'
+                        usernameVariable: 'SENHA_SEGURA_USERNAME'
+                        passwordVariable: 'SENHA_SEGURA_PASSWORD'
+                      env:
+                        NODE_EXTRA_CA_CERTS: $(CACORP_LOCATION)
+                        #HTTPS_PROXY: "http://10.240.58.39:3128"
+
+                    - task: DownloadSecureFile@1
+                      name: senhaSeguraKey
+                      displayName: Download Smart Key
+                      inputs:
+                        secureFile: 'smart_sim_qa.key'
+
+                    - task: Bash@3
+                      displayName: 'Decrypt Password'
+                      name: get_token_${{split(service_connection, '|')[0]}}
+                      continueOnError: true
+                      inputs:
+                        targetType: inline
+                        script: |
+                          echo "Username: $(get_credentials_${{ split(service_connection, '|')[0] }}.SENHA_SEGURA_USERNAME)"
+                          DECRYPTED_PASSWORD=$(echo -n $(get_credentials_${{ split(service_connection, '|')[0] }}.SENHA_SEGURA_PASSWORD) | base64 -d --ignore-garbage | openssl rsautl -decrypt -inkey $(senhaSeguraKey.secureFilePath) -oaep)
+                          echo "##vso[task.setvariable variable=DECRYPTED_PASSWORD;]$DECRYPTED_PASSWORD"
+
+                    - task: UpdateCredentialsEndpointSshFromVivo@4
+                      displayName: "Update Service Connection"
+                      inputs:
+                        sshEndpoint: ${{ split(service_connection, '|')[0] }}
+                        username: $(get_credentials_${{ split(service_connection, '|')[0] }}.SENHA_SEGURA_USERNAME)
+                        password: $(DECRYPTED_PASSWORD)
+                      env:
+                        HTTPS_PROXY: "http://10.240.58.39:3128"
+                        PAT: $(AZURE_DEVOPS_PAT)
+              # Provisioners
+              - ${{ elseif contains(parameters.components_to_install, 'provisioners') }}:
+                - ${{ if contains(parameters.qa_environment, 'producao_impar') }}:
+                  - ${{ each service_connection in split(variables.PROVISIONER_SERVERS_IMPAR,',') }}:
+                    - task: SSH@0
+                      displayName: "Backup Provisioners - ${{service_connection}}"
+                      inputs:
+                        sshEndpoint: ${{service_connection}}
+                        runOptions: inline
+                        failOnStdErr: false
+                        inline: |
+                          sudo su - ${{USER}}
+                          cp /opt/smartsim/bin/ctr-smart-sim-provisioners-*.jar /opt/smartsim/backup-bundles-data
+                          chmod 0755 -R /opt/smartsim/backup-bundles-data
+                - ${{ elseif contains(parameters.qa_environment, 'producao_par') }}:
+                  - ${{ each service_connection in split(variables.PROVISIONER_SERVERS_PAR,',') }}:
+                    - task: SSH@0
+                      displayName: "Backup Provisioners - ${{service_connection}}"
+                      inputs:
+                        sshEndpoint: ${{service_connection}}
+                        runOptions: inline
+                        failOnStdErr: false
+                        inline: |
+                          sudo su - ${{USER}}
+                          cp /opt/smartsim/bin/ctr-smart-sim-provisioners-*.jar /opt/smartsim/backup-bundles-data
+                          chmod 0755 -R /opt/smartsim/backup-bundles-data
+                - ${{ else }}:    
+                  - ${{ each service_connection in split(variables.PROVISIONER_SERVERS,',') }}:
+                    - task: GetCredentialsSenhaSegura@1
+                      displayName: 'Get Credentials Senha Segura'
+                      name: get_credentials_${{split(service_connection, '|')[0]}}
+                      inputs:
+                        clientId: 'b0b8aecf3534fb7f8367fa8b0c553947'
+                        clientSecret: '90db4470f1a0c0adb8b197109ba796647b7ae5568c45d3ee74cbbed7ec509774'
+                        credentialId: ${{ split(service_connection, '|')[1] }}
+                        SenhaSeguraEndpoint: 'https://10.238.69.35'
+                        #SenhaSeguraEndpoint: 'https://10.128.62.35'
+                        #SenhaSeguraEndpoint: 'https://10.243.17.35'
+                        #SenhaSeguraEndpoint: 'https://urano.redecorp.br'
+                        usernameVariable: 'SENHA_SEGURA_USERNAME'
+                        passwordVariable: 'SENHA_SEGURA_PASSWORD'
+                      env:
+                        NODE_EXTRA_CA_CERTS: $(CACORP_LOCATION)
+                        #HTTPS_PROXY: "http://10.240.58.39:3128"
+
+                    - task: DownloadSecureFile@1
+                      name: senhaSeguraKey
+                      displayName: Download Smart Key
+                      inputs:
+                        secureFile: 'smart_sim_qa.key'
+
+                    - task: Bash@3
+                      displayName: 'Decrypt Password'
+                      name: get_token_${{split(service_connection, '|')[0]}}
+                      continueOnError: true
+                      inputs:
+                        targetType: inline
+                        script: |
+                          echo "Username: $(get_credentials_${{ split(service_connection, '|')[0] }}.SENHA_SEGURA_USERNAME)"
+                          DECRYPTED_PASSWORD=$(echo -n $(get_credentials_${{ split(service_connection, '|')[0] }}.SENHA_SEGURA_PASSWORD) | base64 -d --ignore-garbage | openssl rsautl -decrypt -inkey $(senhaSeguraKey.secureFilePath) -oaep)
+                          echo "##vso[task.setvariable variable=DECRYPTED_PASSWORD;]$DECRYPTED_PASSWORD"
+
+                    - task: UpdateCredentialsEndpointSshFromVivo@4
+                      displayName: "Update Service Connection"
+                      inputs:
+                        sshEndpoint: ${{ split(service_connection, '|')[0] }}
+                        username: $(get_credentials_${{ split(service_connection, '|')[0] }}.SENHA_SEGURA_USERNAME)
+                        password: $(DECRYPTED_PASSWORD)
+                      env:
+                        HTTPS_PROXY: "http://10.240.58.39:3128"
+                        PAT: $(AZURE_DEVOPS_PAT)
+              # Processor
+              - ${{ elseif contains(parameters.components_to_install, 'processor') }}:
+                - ${{ if contains(parameters.qa_environment, 'producao_impar') }}:
+                  - ${{ each service_connection in split(variables.PROCESSOR_SERVERS_IMPAR,',') }}:
+                    - task: SSH@0
+                      displayName: "Backup Processor - ${{service_connection}}"
+                      inputs:
+                        sshEndpoint: ${{service_connection}}
+                        runOptions: inline
+                        failOnStdErr: false
+                        inline: |
+                          sudo su - ${{USER}}
+                          cp /opt/smartsim/bin/ctr-smart-sim-events-processor-*.jar /opt/smartsim/backup-bundles-data
+                          chmod 0755 -R /opt/smartsim/backup-bundles-data
+                - ${{ elseif contains(parameters.qa_environment, 'producao_par') }}:
+                  - ${{ each service_connection in split(variables.PROCESSOR_SERVERS_PAR,',') }}:
+                    - task: SSH@0
+                      displayName: "Backup Processor - ${{service_connection}}"
+                      inputs:
+                        sshEndpoint: ${{service_connection}}
+                        runOptions: inline
+                        failOnStdErr: false
+                        inline: |
+                          sudo su - ${{USER}}
+                          cp /opt/smartsim/bin/ctr-smart-sim-events-processor-*.jar /opt/smartsim/backup-bundles-data
+                          chmod 0755 -R /opt/smartsim/backup-bundles-data
+                - ${{ else }}:
+                  - ${{ each service_connection in split(variables.PROCESSOR_SERVERS,',') }}:
+                    - task: GetCredentialsSenhaSegura@1
+                      displayName: 'Get Credentials Senha Segura'
+                      name: get_credentials_${{split(service_connection, '|')[0]}}
+                      inputs:
+                        clientId: 'b0b8aecf3534fb7f8367fa8b0c553947'
+                        clientSecret: '90db4470f1a0c0adb8b197109ba796647b7ae5568c45d3ee74cbbed7ec509774'
+                        credentialId: ${{ split(service_connection, '|')[1] }}
+                        SenhaSeguraEndpoint: 'https://10.238.69.35'
+                        #SenhaSeguraEndpoint: 'https://10.128.62.35'
+                        #SenhaSeguraEndpoint: 'https://10.243.17.35'
+                        #SenhaSeguraEndpoint: 'https://urano.redecorp.br'
+                        usernameVariable: 'SENHA_SEGURA_USERNAME'
+                        passwordVariable: 'SENHA_SEGURA_PASSWORD'
+                      env:
+                        NODE_EXTRA_CA_CERTS: $(CACORP_LOCATION)
+                        #HTTPS_PROXY: "http://10.240.58.39:3128"
+
+                    - task: DownloadSecureFile@1
+                      name: senhaSeguraKey
+                      displayName: Download Smart Key
+                      inputs:
+                        secureFile: 'smart_sim_qa.key'
+
+                    - task: Bash@3
+                      displayName: 'Decrypt Password'
+                      name: get_token_${{split(service_connection, '|')[0]}}
+                      continueOnError: true
+                      inputs:
+                        targetType: inline
+                        script: |
+                          echo "Username: $(get_credentials_${{ split(service_connection, '|')[0] }}.SENHA_SEGURA_USERNAME)"
+                          DECRYPTED_PASSWORD=$(echo -n $(get_credentials_${{ split(service_connection, '|')[0] }}.SENHA_SEGURA_PASSWORD) | base64 -d --ignore-garbage | openssl rsautl -decrypt -inkey $(senhaSeguraKey.secureFilePath) -oaep)
+                          echo "##vso[task.setvariable variable=DECRYPTED_PASSWORD;]$DECRYPTED_PASSWORD"
+
+                    - task: UpdateCredentialsEndpointSshFromVivo@4
+                      displayName: "Update Service Connection"
+                      inputs:
+                        sshEndpoint: ${{ split(service_connection, '|')[0] }}
+                        username: $(get_credentials_${{ split(service_connection, '|')[0] }}.SENHA_SEGURA_USERNAME)
+                        password: $(DECRYPTED_PASSWORD)
+                      env:
+                        HTTPS_PROXY: "http://10.240.58.39:3128"
+                        PAT: $(AZURE_DEVOPS_PAT)
+              # Catalog
+              - ${{ elseif contains(parameters.components_to_install, 'catalog') }}:
+                - ${{ if contains(parameters.qa_environment, 'producao_impar') }}:
+                  - ${{ each service_connection in split(variables.CATALOG_SERVERS_IMPAR,',') }}:
+                    - task: SSH@0
+                      displayName: "Backup Processor - ${{service_connection}}"
+                      inputs:
+                        sshEndpoint: ${{service_connection}}
+                        runOptions: inline
+                        failOnStdErr: false
+                        inline: |
+                          sudo su - ${{USER}}
+                          cp /opt/smartsim/bin/ctr-smart-sim-config-catalog-*.jar /opt/smartsim/backup-bundles-data
+                          chmod 0755 -R /opt/smartsim/backup-bundles-data
+                - ${{ elseif contains(parameters.qa_environment, 'producao_par') }}:
+                  - ${{ each service_connection in split(variables.CATALOG_SERVERS_PAR,',') }}:
+                    - task: SSH@0
+                      displayName: "Backup Catalog - ${{service_connection}}"
+                      inputs:
+                        sshEndpoint: ${{service_connection}}
+                        runOptions: inline
+                        failOnStdErr: false
+                        inline: |
+                          sudo su - ${{USER}}
+                          cp /opt/smartsim/bin/ctr-smart-sim-config-catalog-*.jar /opt/smartsim/backup-bundles-data
+                          chmod 0755 -R /opt/smartsim/backup-bundles-data
+                - ${{ else }}:
+                  - ${{ each service_connection in split(variables.CATALOG_SERVERS,',') }}:
+                    - task: GetCredentialsSenhaSegura@1
+                      displayName: 'Get Credentials Senha Segura'
+                      name: get_credentials_${{split(service_connection, '|')[0]}}
+                      inputs:
+                        clientId: 'b0b8aecf3534fb7f8367fa8b0c553947'
+                        clientSecret: '90db4470f1a0c0adb8b197109ba796647b7ae5568c45d3ee74cbbed7ec509774'
+                        credentialId: ${{ split(service_connection, '|')[1] }}
+                        SenhaSeguraEndpoint: 'https://10.238.69.35'
+                        #SenhaSeguraEndpoint: 'https://10.128.62.35'
+                        #SenhaSeguraEndpoint: 'https://10.243.17.35'
+                        #SenhaSeguraEndpoint: 'https://urano.redecorp.br'
+                        usernameVariable: 'SENHA_SEGURA_USERNAME'
+                        passwordVariable: 'SENHA_SEGURA_PASSWORD'
+                      env:
+                        NODE_EXTRA_CA_CERTS: $(CACORP_LOCATION)
+                        #HTTPS_PROXY: "http://10.240.58.39:3128"
+
+                    - task: DownloadSecureFile@1
+                      name: senhaSeguraKey
+                      displayName: Download Smart Key
+                      inputs:
+                        secureFile: 'smart_sim_qa.key'
+
+                    - task: Bash@3
+                      displayName: 'Decrypt Password'
+                      name: get_token_${{split(service_connection, '|')[0]}}
+                      continueOnError: true
+                      inputs:
+                        targetType: inline
+                        script: |
+                          echo "Username: $(get_credentials_${{ split(service_connection, '|')[0] }}.SENHA_SEGURA_USERNAME)"
+                          DECRYPTED_PASSWORD=$(echo -n $(get_credentials_${{ split(service_connection, '|')[0] }}.SENHA_SEGURA_PASSWORD) | base64 -d --ignore-garbage | openssl rsautl -decrypt -inkey $(senhaSeguraKey.secureFilePath) -oaep)
+                          echo "##vso[task.setvariable variable=DECRYPTED_PASSWORD;]$DECRYPTED_PASSWORD"
+
+                    - task: UpdateCredentialsEndpointSshFromVivo@4
+                      displayName: "Update Service Connection"
+                      inputs:
+                        sshEndpoint: ${{ split(service_connection, '|')[0] }}
+                        username: $(get_credentials_${{ split(service_connection, '|')[0] }}.SENHA_SEGURA_USERNAME)
+                        password: $(DECRYPTED_PASSWORD)
+                      env:
+                        HTTPS_PROXY: "http://10.240.58.39:3128"
+                        PAT: $(AZURE_DEVOPS_PAT)
+              - ${{ else }}:
+                #Batch Events
+                - ${{ if contains(parameters.qa_environment, 'producao_impar') }}:
+                  - ${{ each service_connection in split(variables.BATCHEVENTS_SERVERS_IMPAR,',') }}:
+                    - task: SSH@0
+                      displayName: "Backup BatchEvents - ${{service_connection}}"
+                      inputs:
+                        sshEndpoint: ${{service_connection}}
+                        runOptions: inline
+                        failOnStdErr: false
+                        inline: |
+                          sudo su - ${{USER}}
+                          cp /opt/smartsim/bin/ctr-smart-sim-batch-events-*.jar /opt/smartsim/backup-bundles-data
+                          chmod 0755 -R /opt/smartsim/backup-bundles-data      
+                - ${{ elseif contains(parameters.qa_environment, 'producao_par') }}:
+                  - ${{ each service_connection in split(variables.BATCHEVENTS_SERVERS_PAR,',') }}:
+                    - task: SSH@0
+                      displayName: "Backup BatchEvents - ${{service_connection}}"
+                      inputs:
+                        sshEndpoint: ${{service_connection}}
+                        runOptions: inline
+                        failOnStdErr: false
+                        inline: |
+                          sudo su - ${{USER}}
+                          cp /opt/smartsim/bin/ctr-smart-sim-batch-events-*.jar /opt/smartsim/backup-bundles-data
+                          chmod 0755 -R /opt/smartsim/backup-bundles-data      
+                - ${{ else }}:
+                  - ${{ each service_connection in split(variables.BATCHEVENTS_SERVERS,',') }}:
+                    - task: GetCredentialsSenhaSegura@1
+                      displayName: 'Get Credentials Senha Segura'
+                      name: get_credentials_${{split(service_connection, '|')[0]}}
+                      inputs:
+                        clientId: 'b0b8aecf3534fb7f8367fa8b0c553947'
+                        clientSecret: '90db4470f1a0c0adb8b197109ba796647b7ae5568c45d3ee74cbbed7ec509774'
+                        credentialId: ${{ split(service_connection, '|')[1] }}
+                        SenhaSeguraEndpoint: 'https://10.238.69.35'
+                        #SenhaSeguraEndpoint: 'https://10.128.62.35'
+                        #SenhaSeguraEndpoint: 'https://10.243.17.35'
+                        #SenhaSeguraEndpoint: 'https://urano.redecorp.br'
+                        usernameVariable: 'SENHA_SEGURA_USERNAME'
+                        passwordVariable: 'SENHA_SEGURA_PASSWORD'
+                      env:
+                        NODE_EXTRA_CA_CERTS: $(CACORP_LOCATION)
+                        #HTTPS_PROXY: "http://10.240.58.39:3128"
+
+                    - task: DownloadSecureFile@1
+                      name: senhaSeguraKey
+                      displayName: Download Smart Key
+                      inputs:
+                        secureFile: 'smart_sim_qa.key'
+
+                    - task: Bash@3
+                      displayName: 'Decrypt Password'
+                      name: get_token_${{split(service_connection, '|')[0]}}
+                      continueOnError: true
+                      inputs:
+                        targetType: inline
+                        script: |
+                          echo "Username: $(get_credentials_${{ split(service_connection, '|')[0] }}.SENHA_SEGURA_USERNAME)"
+                          DECRYPTED_PASSWORD=$(echo -n $(get_credentials_${{ split(service_connection, '|')[0] }}.SENHA_SEGURA_PASSWORD) | base64 -d --ignore-garbage | openssl rsautl -decrypt -inkey $(senhaSeguraKey.secureFilePath) -oaep)
+                          echo "##vso[task.setvariable variable=DECRYPTED_PASSWORD;]$DECRYPTED_PASSWORD"
+
+                    - task: UpdateCredentialsEndpointSshFromVivo@4
+                      displayName: "Update Service Connection"
+                      inputs:
+                        sshEndpoint: ${{ split(service_connection, '|')[0] }}
+                        username: $(get_credentials_${{ split(service_connection, '|')[0] }}.SENHA_SEGURA_USERNAME)
+                        password: $(DECRYPTED_PASSWORD)
+                      env:
+                        HTTPS_PROXY: "http://10.240.58.39:3128"
+                        PAT: $(AZURE_DEVOPS_PAT)
+                #Provisioner
+                - ${{ if contains(parameters.qa_environment, 'producao_impar') }}:
+                  - ${{ each service_connection in split(variables.PROVISIONER_SERVERS_IMPAR,',') }}:
+                    - task: SSH@0
+                      displayName: "Backup Provisioners - ${{service_connection}}"
+                      inputs:
+                        sshEndpoint: ${{service_connection}}
+                        runOptions: inline
+                        failOnStdErr: false
+                        inline: |
+                          sudo su - ${{USER}}
+                          cp /opt/smartsim/bin/ctr-smart-sim-provisioners-*.jar /opt/smartsim/backup-bundles-data
+                          chmod 0755 -R /opt/smartsim/backup-bundles-data
+                - ${{ elseif contains(parameters.qa_environment, 'producao_par') }}:
+                  - ${{ each service_connection in split(variables.PROVISIONER_SERVERS_PAR,',') }}:
+                    - task: SSH@0
+                      displayName: "Backup Provisioners - ${{service_connection}}"
+                      inputs:
+                        sshEndpoint: ${{service_connection}}
+                        runOptions: inline
+                        failOnStdErr: false
+                        inline: |
+                          sudo su - ${{USER}}
+                          cp /opt/smartsim/bin/ctr-smart-sim-provisioners-*.jar /opt/smartsim/backup-bundles-data
+                          chmod 0755 -R /opt/smartsim/backup-bundles-data
+                - ${{ else }}:
+                  - ${{ each service_connection in split(variables.PROVISIONER_SERVERS,',') }}:
+                    - task: GetCredentialsSenhaSegura@1
+                      displayName: 'Get Credentials Senha Segura'
+                      name: get_credentials_${{split(service_connection, '|')[0]}}
+                      inputs:
+                        clientId: 'b0b8aecf3534fb7f8367fa8b0c553947'
+                        clientSecret: '90db4470f1a0c0adb8b197109ba796647b7ae5568c45d3ee74cbbed7ec509774'
+                        credentialId: ${{ split(service_connection, '|')[1] }}
+                        SenhaSeguraEndpoint: 'https://10.238.69.35'
+                        #SenhaSeguraEndpoint: 'https://10.128.62.35'
+                        #SenhaSeguraEndpoint: 'https://10.243.17.35'
+                        #SenhaSeguraEndpoint: 'https://urano.redecorp.br'
+                        usernameVariable: 'SENHA_SEGURA_USERNAME'
+                        passwordVariable: 'SENHA_SEGURA_PASSWORD'
+                      env:
+                        NODE_EXTRA_CA_CERTS: $(CACORP_LOCATION)
+                        #HTTPS_PROXY: "http://10.240.58.39:3128"
+
+                    - task: Bash@3
+                      displayName: 'Decrypt Password'
+                      name: get_token_${{split(service_connection, '|')[0]}}
+                      continueOnError: true
+                      inputs:
+                        targetType: inline
+                        script: |
+                          echo "Username: $(get_credentials_${{ split(service_connection, '|')[0] }}.SENHA_SEGURA_USERNAME)"
+                          DECRYPTED_PASSWORD=$(echo -n $(get_credentials_${{ split(service_connection, '|')[0] }}.SENHA_SEGURA_PASSWORD) | base64 -d --ignore-garbage | openssl rsautl -decrypt -inkey $(senhaSeguraKey.secureFilePath) -oaep)
+                          echo "##vso[task.setvariable variable=DECRYPTED_PASSWORD;]$DECRYPTED_PASSWORD"
+
+                    - task: UpdateCredentialsEndpointSshFromVivo@4
+                      displayName: "Update Service Connection"
+                      inputs:
+                        sshEndpoint: ${{ split(service_connection, '|')[0] }}
+                        username: $(get_credentials_${{ split(service_connection, '|')[0] }}.SENHA_SEGURA_USERNAME)
+                        password: $(DECRYPTED_PASSWORD)
+                      env:
+                        HTTPS_PROXY: "http://10.240.58.39:3128"
+                        PAT: $(AZURE_DEVOPS_PAT)
+                #Processor
+                - ${{ if contains(parameters.qa_environment, 'producao_impar') }}:
+                  - ${{ each service_connection in split(variables.PROCESSOR_SERVERS_IMPAR,',') }}:
+                    - task: SSH@0
+                      displayName: "Backup Processor - ${{service_connection}}"
+                      inputs:
+                        sshEndpoint: ${{service_connection}}
+                        runOptions: inline
+                        failOnStdErr: false
+                        inline: |
+                          sudo su - ${{USER}}
+                          cp /opt/smartsim/bin/ctr-smart-sim-events-processor-*.jar /opt/smartsim/backup-bundles-data
+                          chmod 0755 -R /opt/smartsim/backup-bundles-data
+                - ${{ elseif contains(parameters.qa_environment, 'producao_par') }}:
+                  - ${{ each service_connection in split(variables.PROCESSOR_SERVERS_PAR,',') }}:
+                    - task: SSH@0
+                      displayName: "Backup Processor - ${{service_connection}}"
+                      inputs:
+                        sshEndpoint: ${{service_connection}}
+                        runOptions: inline
+                        failOnStdErr: false
+                        inline: |
+                          sudo su - ${{USER}}
+                          cp /opt/smartsim/bin/ctr-smart-sim-events-processor-*.jar /opt/smartsim/backup-bundles-data
+                          chmod 0755 -R /opt/smartsim/backup-bundles-data
+                - ${{ else }}:
+                  - ${{ each service_connection in split(variables.PROCESSOR_SERVERS,',') }}:
+                    - task: GetCredentialsSenhaSegura@1
+                      displayName: 'Get Credentials Senha Segura'
+                      name: get_credentials_${{split(service_connection, '|')[0]}}
+                      inputs:
+                        clientId: 'b0b8aecf3534fb7f8367fa8b0c553947'
+                        clientSecret: '90db4470f1a0c0adb8b197109ba796647b7ae5568c45d3ee74cbbed7ec509774'
+                        credentialId: ${{ split(service_connection, '|')[1] }}
+                        SenhaSeguraEndpoint: 'https://10.238.69.35'
+                        #SenhaSeguraEndpoint: 'https://10.128.62.35'
+                        #SenhaSeguraEndpoint: 'https://10.243.17.35'
+                        #SenhaSeguraEndpoint: 'https://urano.redecorp.br'
+                        usernameVariable: 'SENHA_SEGURA_USERNAME'
+                        passwordVariable: 'SENHA_SEGURA_PASSWORD'
+                      env:
+                        NODE_EXTRA_CA_CERTS: $(CACORP_LOCATION)
+                        #HTTPS_PROXY: "http://10.240.58.39:3128"
+
+                    - task: Bash@3
+                      displayName: 'Decrypt Password'
+                      name: get_token_${{split(service_connection, '|')[0]}}
+                      continueOnError: true
+                      inputs:
+                        targetType: inline
+                        script: |
+                          echo "Username: $(get_credentials_${{ split(service_connection, '|')[0] }}.SENHA_SEGURA_USERNAME)"
+                          DECRYPTED_PASSWORD=$(echo -n $(get_credentials_${{ split(service_connection, '|')[0] }}.SENHA_SEGURA_PASSWORD) | base64 -d --ignore-garbage | openssl rsautl -decrypt -inkey $(senhaSeguraKey.secureFilePath) -oaep)
+                          echo "##vso[task.setvariable variable=DECRYPTED_PASSWORD;]$DECRYPTED_PASSWORD"
+
+                    - task: UpdateCredentialsEndpointSshFromVivo@4
+                      displayName: "Update Service Connection"
+                      inputs:
+                        sshEndpoint: ${{ split(service_connection, '|')[0] }}
+                        username: $(get_credentials_${{ split(service_connection, '|')[0] }}.SENHA_SEGURA_USERNAME)
+                        password: $(DECRYPTED_PASSWORD)
+                      env:
+                        HTTPS_PROXY: "http://10.240.58.39:3128"
+                        PAT: $(AZURE_DEVOPS_PAT)
+
+          - template: /tech_products/ngin/templates/cd/smartsim/cd_create_backup.yml
+            parameters:
+              qa_environment: ${{ parameters.qa_environment }}
+              components_to_install: ${{ parameters.components_to_install }}
+              BATCHEVENTS_SERVERS_IMPAR: ${{ variables.BATCHEVENTS_SERVERS_IMPAR }}
+              BATCHEVENTS_SERVERS_PAR: ${{ variables.BATCHEVENTS_SERVERS_PAR }}
+              BATCHEVENTS_SERVERS: ${{ variables.BATCHEVENTS_SERVERS }}
+              BATCHFILE_SERVERS_IMPAR: ${{ variables.BATCHFILE_SERVERS_IMPAR }}
+              BATCHFILE_SERVERS_PAR: ${{ variables.BATCHFILE_SERVERS_PAR }}
+              BATCHFILE_SERVERS: ${{ variables.BATCHFILE_SERVERS }}
+              PROVISIONER_SERVERS_IMPAR: ${{ variables.PROVISIONER_SERVERS_IMPAR }}
+              PROVISIONER_SERVERS_PAR: ${{ variables.PROVISIONER_SERVERS_PAR }}
+              PROVISIONER_SERVERS: ${{ variables.PROVISIONER_SERVERS }}
+              PROCESSOR_SERVERS_IMPAR: ${{ variables.PROCESSOR_SERVERS_IMPAR }}
+              PROCESSOR_SERVERS_PAR: ${{ variables.PROCESSOR_SERVERS_PAR }}
+              PROCESSOR_SERVERS: ${{ variables.PROCESSOR_SERVERS }}
+              CATALOG_SERVERS_IMPAR: ${{ variables.CATALOG_SERVERS_IMPAR }}
+              CATALOG_SERVERS_PAR: ${{ variables.CATALOG_SERVERS_PAR }}
+              CATALOG_SERVERS: ${{ variables.CATALOG_SERVERS }}
+
+          - template: /tech_products/ngin/templates/cd/smartsim/cd_install_bundles.yml
+            parameters:
+              qa_environment: ${{ parameters.qa_environment }}
+              components_to_install: ${{ parameters.components_to_install }}
+              BATCHEVENTS_SERVERS_IMPAR: ${{ variables.BATCHEVENTS_SERVERS_IMPAR }}
+              BATCHEVENTS_SERVERS_PAR: ${{ variables.BATCHEVENTS_SERVERS_PAR }}
+              BATCHEVENTS_SERVERS: ${{ variables.BATCHEVENTS_SERVERS }}
+              BATCHFILE_SERVERS_IMPAR: ${{ variables.BATCHFILE_SERVERS_IMPAR }}
+              BATCHFILE_SERVERS_PAR: ${{ variables.BATCHFILE_SERVERS_PAR }}
+              BATCHFILE_SERVERS: ${{ variables.BATCHFILE_SERVERS }}
+              PROVISIONER_SERVERS_IMPAR: ${{ variables.PROVISIONER_SERVERS_IMPAR }}
+              PROVISIONER_SERVERS_PAR: ${{ variables.PROVISIONER_SERVERS_PAR }}
+              PROVISIONER_SERVERS: ${{ variables.PROVISIONER_SERVERS }}
+              PROCESSOR_SERVERS_IMPAR: ${{ variables.PROCESSOR_SERVERS_IMPAR }}
+              PROCESSOR_SERVERS_PAR: ${{ variables.PROCESSOR_SERVERS_PAR }}
+              PROCESSOR_SERVERS: ${{ variables.PROCESSOR_SERVERS }}
+              CATALOG_SERVERS_IMPAR: ${{ variables.CATALOG_SERVERS_IMPAR }}
+              CATALOG_SERVERS_PAR: ${{ variables.CATALOG_SERVERS_PAR }}
+              CATALOG_SERVERS: ${{ variables.CATALOG_SERVERS }}
+
+          - template: /tech_products/ngin/templates/cd/smartsim/cd_stop_application.yml
+            parameters:
+              qa_environment: ${{ parameters.qa_environment }}
+              components_to_install: ${{ parameters.components_to_install }}
+              BATCHEVENTS_SERVERS_IMPAR: ${{ variables.BATCHEVENTS_SERVERS_IMPAR }}
+              BATCHEVENTS_SERVERS_PAR: ${{ variables.BATCHEVENTS_SERVERS_PAR }}
+              BATCHEVENTS_SERVERS: ${{ variables.BATCHEVENTS_SERVERS }}
+              BATCHFILE_SERVERS_IMPAR: ${{ variables.BATCHFILE_SERVERS_IMPAR }}
+              BATCHFILE_SERVERS_PAR: ${{ variables.BATCHFILE_SERVERS_PAR }}
+              BATCHFILE_SERVERS: ${{ variables.BATCHFILE_SERVERS }}
+              PROVISIONER_SERVERS_IMPAR: ${{ variables.PROVISIONER_SERVERS_IMPAR }}
+              PROVISIONER_SERVERS_PAR: ${{ variables.PROVISIONER_SERVERS_PAR }}
+              PROVISIONER_SERVERS: ${{ variables.PROVISIONER_SERVERS }}
+              PROCESSOR_SERVERS_IMPAR: ${{ variables.PROCESSOR_SERVERS_IMPAR }}
+              PROCESSOR_SERVERS_PAR: ${{ variables.PROCESSOR_SERVERS_PAR }}
+              PROCESSOR_SERVERS: ${{ variables.PROCESSOR_SERVERS }}
+              CATALOG_SERVERS_IMPAR: ${{ variables.CATALOG_SERVERS_IMPAR }}
+              CATALOG_SERVERS_PAR: ${{ variables.CATALOG_SERVERS_PAR }}
+              CATALOG_SERVERS: ${{ variables.CATALOG_SERVERS }}
+
+          - template: /tech_products/ngin/templates/cd/smartsim/cd_start_application.yml
+            parameters:
+              qa_environment: ${{ parameters.qa_environment }}
+              components_to_install: ${{ parameters.components_to_install }}
+              BATCHEVENTS_SERVERS_IMPAR: ${{ variables.BATCHEVENTS_SERVERS_IMPAR }}
+              BATCHEVENTS_SERVERS_PAR: ${{ variables.BATCHEVENTS_SERVERS_PAR }}
+              BATCHEVENTS_SERVERS: ${{ variables.BATCHEVENTS_SERVERS }}
+              BATCHFILE_SERVERS_IMPAR: ${{ variables.BATCHFILE_SERVERS_IMPAR }}
+              BATCHFILE_SERVERS_PAR: ${{ variables.BATCHFILE_SERVERS_PAR }}
+              BATCHFILE_SERVERS: ${{ variables.BATCHFILE_SERVERS }}
+              PROVISIONER_SERVERS_IMPAR: ${{ variables.PROVISIONER_SERVERS_IMPAR }}
+              PROVISIONER_SERVERS_PAR: ${{ variables.PROVISIONER_SERVERS_PAR }}
+              PROVISIONER_SERVERS: ${{ variables.PROVISIONER_SERVERS }}
+              PROCESSOR_SERVERS_IMPAR: ${{ variables.PROCESSOR_SERVERS_IMPAR }}
+              PROCESSOR_SERVERS_PAR: ${{ variables.PROCESSOR_SERVERS_PAR }}
+              PROCESSOR_SERVERS: ${{ variables.PROCESSOR_SERVERS }}
+              CATALOG_SERVERS_IMPAR: ${{ variables.CATALOG_SERVERS_IMPAR }}
+              CATALOG_SERVERS_PAR: ${{ variables.CATALOG_SERVERS_PAR }}
+              CATALOG_SERVERS: ${{ variables.CATALOG_SERVERS }}
+
+  - deployment: rollback_${{ parameters.qa_environment }}
+    displayName: Rollback Bundles
+    
+    dependsOn:
+    - bundles_to_install
+    - ${{ parameters.qa_environment }}
+
+    variables:
+      - template: /.azuredevops/config/${{ parameters.qa_environment }}/environments_variables.yml@self
+      - template: /.azuredevops/config/${{ parameters.qa_environment }}/server01_variables.yml@self
+      - name: INVALID_COMPONENT_TO_INSTALL
+        value: $[ dependencies.bundles_to_install.outputs['package_bundles.INVALID_COMPONENT_TO_INSTALL'] ]
+
+    condition: and(failed(), eq(variables.INVALID_COMPONENT_TO_INSTALL, false), eq('${{ parameters.skip_deploy }}', false))
+
+    ${{ if or(contains(parameters.qa_environment, 'teste'), contains(parameters.qa_environment, 'lab')) }}:
+      environment: 
+        name: "deploy-${{ parameters.qa_environment }}"
+        resourceType: VirtualMachine
+    ${{ else }}:
+      environment: "deploy-${{ parameters.qa_environment }}"
+
+    strategy:
+      runOnce:      
+        deploy:
+          steps:
+          - download: none
+          - checkout: none
+
+          - template: /tech_products/ngin/templates/cd/smartsim/cd_rollback_binaries.yml
+            parameters:
+              qa_environment: ${{ parameters.qa_environment }}
+              components_to_install: ${{ parameters.components_to_install }}
+              BATCHEVENTS_SERVERS_IMPAR: ${{ variables.BATCHEVENTS_SERVERS_IMPAR }}
+              BATCHEVENTS_SERVERS_PAR: ${{ variables.BATCHEVENTS_SERVERS_PAR }}
+              BATCHEVENTS_SERVERS: ${{ variables.BATCHEVENTS_SERVERS }}
+              BATCHFILE_SERVERS_IMPAR: ${{ variables.BATCHFILE_SERVERS_IMPAR }}
+              BATCHFILE_SERVERS_PAR: ${{ variables.BATCHFILE_SERVERS_PAR }}
+              BATCHFILE_SERVERS: ${{ variables.BATCHFILE_SERVERS }}
+              PROVISIONER_SERVERS_IMPAR: ${{ variables.PROVISIONER_SERVERS_IMPAR }}
+              PROVISIONER_SERVERS_PAR: ${{ variables.PROVISIONER_SERVERS_PAR }}
+              PROVISIONER_SERVERS: ${{ variables.PROVISIONER_SERVERS }}
+              PROCESSOR_SERVERS_IMPAR: ${{ variables.PROCESSOR_SERVERS_IMPAR }}
+              PROCESSOR_SERVERS_PAR: ${{ variables.PROCESSOR_SERVERS_PAR }}
+              PROCESSOR_SERVERS: ${{ variables.PROCESSOR_SERVERS }}
+              CATALOG_SERVERS_IMPAR: ${{ variables.CATALOG_SERVERS_IMPAR }}
+              CATALOG_SERVERS_PAR: ${{ variables.CATALOG_SERVERS_PAR }}
+              CATALOG_SERVERS: ${{ variables.CATALOG_SERVERS }}
+
+          - template: /tech_products/ngin/templates/cd/smartsim/cd_stop_application.yml
+            parameters:
+              qa_environment: ${{ parameters.qa_environment }}
+              components_to_install: ${{ parameters.components_to_install }}
+              BATCHEVENTS_SERVERS_IMPAR: ${{ variables.BATCHEVENTS_SERVERS_IMPAR }}
+              BATCHEVENTS_SERVERS_PAR: ${{ variables.BATCHEVENTS_SERVERS_PAR }}
+              BATCHEVENTS_SERVERS: ${{ variables.BATCHEVENTS_SERVERS }}
+              BATCHFILE_SERVERS_IMPAR: ${{ variables.BATCHFILE_SERVERS_IMPAR }}
+              BATCHFILE_SERVERS_PAR: ${{ variables.BATCHFILE_SERVERS_PAR }}
+              BATCHFILE_SERVERS: ${{ variables.BATCHFILE_SERVERS }}
+              PROVISIONER_SERVERS_IMPAR: ${{ variables.PROVISIONER_SERVERS_IMPAR }}
+              PROVISIONER_SERVERS_PAR: ${{ variables.PROVISIONER_SERVERS_PAR }}
+              PROVISIONER_SERVERS: ${{ variables.PROVISIONER_SERVERS }}
+              PROCESSOR_SERVERS_IMPAR: ${{ variables.PROCESSOR_SERVERS_IMPAR }}
+              PROCESSOR_SERVERS_PAR: ${{ variables.PROCESSOR_SERVERS_PAR }}
+              PROCESSOR_SERVERS: ${{ variables.PROCESSOR_SERVERS }}
+              CATALOG_SERVERS_IMPAR: ${{ variables.CATALOG_SERVERS_IMPAR }}
+              CATALOG_SERVERS_PAR: ${{ variables.CATALOG_SERVERS_PAR }}
+              CATALOG_SERVERS: ${{ variables.CATALOG_SERVERS }}
+
+          - template: /tech_products/ngin/templates/cd/smartsim/cd_start_application.yml
+            parameters:
+              qa_environment: ${{ parameters.qa_environment }}
+              components_to_install: ${{ parameters.components_to_install }}
+              BATCHEVENTS_SERVERS_IMPAR: ${{ variables.BATCHEVENTS_SERVERS_IMPAR }}
+              BATCHEVENTS_SERVERS_PAR: ${{ variables.BATCHEVENTS_SERVERS_PAR }}
+              BATCHEVENTS_SERVERS: ${{ variables.BATCHEVENTS_SERVERS }}
+              BATCHFILE_SERVERS_IMPAR: ${{ variables.BATCHFILE_SERVERS_IMPAR }}
+              BATCHFILE_SERVERS_PAR: ${{ variables.BATCHFILE_SERVERS_PAR }}
+              BATCHFILE_SERVERS: ${{ variables.BATCHFILE_SERVERS }}
+              PROVISIONER_SERVERS_IMPAR: ${{ variables.PROVISIONER_SERVERS_IMPAR }}
+              PROVISIONER_SERVERS_PAR: ${{ variables.PROVISIONER_SERVERS_PAR }}
+              PROVISIONER_SERVERS: ${{ variables.PROVISIONER_SERVERS }}
+              PROCESSOR_SERVERS_IMPAR: ${{ variables.PROCESSOR_SERVERS_IMPAR }}
+              PROCESSOR_SERVERS_PAR: ${{ variables.PROCESSOR_SERVERS_PAR }}
+              PROCESSOR_SERVERS: ${{ variables.PROCESSOR_SERVERS }}
+              CATALOG_SERVERS_IMPAR: ${{ variables.CATALOG_SERVERS_IMPAR }}
+              CATALOG_SERVERS_PAR: ${{ variables.CATALOG_SERVERS_PAR }}
+              CATALOG_SERVERS: ${{ variables.CATALOG_SERVERS }}
+
+  - job: manual_rollback_${{ parameters.qa_environment }}
+    displayName: Manual Rollback Bundles
+    pool: server
+    variables:
+      - template: /.azuredevops/config/${{ parameters.qa_environment }}/server01_variables.yml@self
+    dependsOn: 
+    - bundles_to_install
+    - ${{ parameters.qa_environment }}
+    - rollback_${{ parameters.qa_environment }}
+    condition: and( 
+                  failed('rollback_${{ parameters.qa_environment }}'),
+                  eq('${{ parameters.skip_deploy }}', false)
+                )
+    steps:
+    - task: ManualValidation@0
+      inputs:
+        notifyUsers: 'vinicius.silva1@telefonica.com'
+        instructions: 'Instruções: service conn - ${{ variables.SERVICE_CONNECTION }}'
+        onTimeout: 'resume'
+
+  - job: governance_deploy
+    displayName: Governance Deploy
+
+    ${{ if or(contains(parameters.qa_environment, 'producao'), contains(parameters.qa_environment, 'prod')) }}:
+      pool: "VivoOnPremPrdAgents"
+    ${{ else }}:
+      pool: "VivoOnPremHmlAgents"
+    
+    dependsOn: 
+    - ${{ parameters.qa_environment }}
+    condition: and(succeeded(), eq('${{ parameters.skip_deploy }}', false))    
+    steps:
+    - download: none 
+    - checkout: self
+
+    - script: |
+        if [ ! -f "catalog-info.yaml" ]; then
+          echo "##vso[task.logissue type=error] Unable to find catalog-info.yaml file (path=$(pwd))."
+        fi
+
+        COMPONENT_NAME="$(yq -r 'select(documentIndex == 0) | .metadata.name | select (.!=null)' catalog-info.yaml)"
+        echo "##vso[task.setvariable variable=COMPONENT_NAME]${COMPONENT_NAME}"
+        echo "##vso[task.setvariable variable=CATALOG_INFO_FILE_CONTENT]$(cat catalog-info.yaml)"
+      name: export_catalog_info
+      displayName: Reading Catalog Info File
+
+    - bash: |
+        version=$(grep version pom.xml | grep -v '<?xml' | grep '<version>'|head -n 1|awk '{print $1}'| cut -d'>' -f 2 | cut -d'<' -f 1)
+        echo "##vso[task.setvariable variable=APP_VERSION]$version"
+        echo "##[debug] Exporting variable 'APP_VERSION': $version"
+      name: export_current_version
+      displayName: Extract App Version 
+
+    ## DEPLOY TO PROD
+    - ${{ if startsWith(parameters.qa_environment, 'producao_') }}:
+      - task: VivoGovernance@1
+        inputs:
+          breakglass: $(GOVAPP_BREAK_GLASS)
+          cluster: "$(GOVAPP_CLUSTER)"
+          component: "$(COMPONENT_NAME)"
+          deployment: "$(COMPONENT_NAME)"
+          environment: "producao"
+          namespace: "$(GOVAPP_NAMESPACE)"
+          operation: "deploy"
+          serverEndpoint: $(GOVAPP_SERVICE_CONNECTION_NAME)
+          version: "$(APP_VERSION)"
+          catalogInfo: $(CATALOG_INFO_FILE_CONTENT)
+        continueOnError: true
+        condition: eq(lower(variables.GOVAPP_INTEGRATION_ENABLED), 'true')
+
+    - ${{ else }}:
+      - task: VivoGovernance@1
+        inputs:
+          breakglass: $(GOVAPP_BREAK_GLASS)
+          cluster: "$(GOVAPP_CLUSTER)"
+          component: "$(COMPONENT_NAME)"
+          deployment: "$(COMPONENT_NAME)"
+          environment: "${{ parameters.qa_environment }}"
+          namespace: "$(GOVAPP_NAMESPACE)"
+          operation: "deploy"
+          serverEndpoint: $(GOVAPP_SERVICE_CONNECTION_NAME)
+          version: "$(APP_VERSION)"
+          catalogInfo: $(CATALOG_INFO_FILE_CONTENT)
+        continueOnError: true
+        condition: eq(lower(variables.GOVAPP_INTEGRATION_ENABLED), 'true')

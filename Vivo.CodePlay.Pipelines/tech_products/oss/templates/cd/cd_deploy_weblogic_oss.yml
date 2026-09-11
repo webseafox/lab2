@@ -1,0 +1,727 @@
+parameters:
+- name: environment
+- name: infrastructureType
+- name: packageVersion
+  default: ''
+- name: pipelineType
+  displayName: 'Pipeline Type Reference'
+  type: string
+  default: ''
+- name: deployStrategy
+  default: ''
+- name: evenOrOdd
+  type: string
+  default: 'ODD,EVEN'
+
+- name: skipRestart
+  displayName: 'Skip server restart after deploy'
+  type: boolean
+  default: false
+
+stages:
+- template: cd_deploy_weblogic_sanity_check.yml
+  parameters:
+    environment: ${{ parameters.environment }}
+    infrastructureType: ${{ parameters.infrastructureType }}
+    evenOrOdd: ${{ parameters.evenOrOdd }}
+    ${{ if and(ne(parameters.packageVersion, ''), ne(parameters.packageVersion, 'none')) }}:
+      pipelineType: 'cd_only'
+    ${{ else }}:
+      pipelineType: 'ci_cd'
+
+- stage: cd_deploy
+  displayName: "CD - Deploy ${{ parameters.environment }}"
+  condition: succeeded()
+  pool:
+    name: $(AGENT_POOL_CD)
+
+  ${{ if or(eq(parameters.packageVersion, ''), eq(parameters.packageVersion, 'none')) }}:
+    dependsOn:
+    - environment_init
+    - ci_build
+    - ci_publish
+    - cd_weblogic_sanity_check
+  ${{ else }}:
+    dependsOn:
+    - environment_init
+    - cd_weblogic_sanity_check
+
+  ## -> Loads variables from other stages.
+  variables:
+  - ${{ if and(ne(parameters.packageVersion, ''), ne(parameters.packageVersion, 'none')) }}:
+    - name: DEPLOY_VERSION
+      value: ${{ parameters.packageVersion }}
+  - ${{ else }}:
+      - name: DEPLOY_VERSION
+        value: $[ stageDependencies.ci_build.build.outputs['new_version.NEW_VERSION'] ]
+  - name: NEXUS_DEPS_USR
+    value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEPS_USR'] ]
+  - name: NEXUS_DEPS_PSW
+    value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEPS_PSW'] ]
+  - name: NEXUS_DEFAULT_USR
+    value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEFAULT_USR'] ]
+  - name: NEXUS_DEFAULT_PSW
+    value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEFAULT_PSW'] ]
+  - template: /tech_products/oss/initialize/variables_catalog_info.yml
+  - template: /tech_products/oss/initialize/variables_source_data.yml
+
+  jobs:
+
+  - deployment: deploy
+    displayName: 'Deploy'
+    condition: and(
+      succeeded(),
+      or(
+      eq(variables['Build.SourceBranchName'],'master'),
+      eq(variables['Build.SourceBranchName'],'main'),
+      startsWith(variables['Build.SourceBranchName'],'hotfix'),
+      eq(variables['Build.SourceBranchName'],'prodlike'),
+      eq(variables['Build.SourceBranchName'],'preprod'),
+      eq(variables['Build.SourceBranchName'],'esteira1'),
+      eq(variables['Build.SourceBranchName'],'esteira2'),
+      eq(variables['Build.SourceBranchName'],'dev')))
+    environment:
+      name: deploy-${{ parameters.environment }}
+    continueOnError: true
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+
+          ## -> Skip Download
+          - download: none
+
+          ## -> Checkout the source code.
+          - checkout: self
+            displayName: Checkout Source Code
+            name: checkout_source_code
+            clean: true
+            path: source_code
+            submodules: recursive
+
+          ## -> Clean the pipeline workspace and checkout the code for HELM CHART.
+          ## -> 6d15af64-176c-496d-b583-fd2ae21d4df4 is the decorator for checkout.
+          - task: 6d15af64-176c-496d-b583-fd2ae21d4df4@1
+            displayName: Checkout Code
+            name: checkout_scripts
+            inputs:
+              repository: OSSDevOpsWeblogic
+              persistCredentials: "true"
+              clean: true
+              path: weblogic
+
+          - ${{ if and(eq(parameters.packageVersion, ''), ne(parameters.packageVersion, 'none')) }}:
+            ## -> Download and uncompress the downloaded artifact.
+            - task: DownloadBuildArtifacts@1
+              displayName: 'Download Build Artifacts'
+              inputs:
+                artifactName: $(ARTIFACT_NAME)
+                cleanDestinationFolder: false
+                extractTars: true
+                parallelizationLimit: 8
+                downloadPath: $(System.ArtifactsDirectory)
+
+            ## -> Set artifact information to variables.
+            - task: Bash@3
+              displayName: Get Artifact Info
+              name: artifact_info
+              inputs:
+                targetType: inline
+                workingDirectory: $(DEFAULT_WORKDIR_ARTIFACTS)
+                script: |
+
+                  if command -v tree >/dev/null 2>&1; then
+                    echo "##[group] Path tree"
+                    echo "$(tree)"
+                    echo "##[endgroup]"
+                  fi
+
+                  echo "##[debug] Artifact name: $(ARTIFACT_NAME)"
+                  echo "##[debug] Artifact file: $(ARTIFACT_FILE)"
+                  echo "##[debug] Artifact path: $(ARTIFACT_PATH)"
+                  echo "##[debug] Artifact id  : $(ARTIFACT_ID)"
+
+                  echo "##[debug] Extracted tar path: $(pwd)"
+                  echo "##[group] Extracted tar content"
+                  echo "$(ls -lh)"
+                  echo "##[endgroup]"
+
+                  targetDirectory="$(DEFAULT_WORKDIR_ARTIFACTS)/$(ARTIFACT_NAME)/$(ARTIFACT_PATH)"
+                  echo "##[debug] Target directory path: $targetDirectory"
+                  echo "##[group] Target directory content"
+                  echo "$(ls -lh $targetDirectory)"
+                  echo "##[endgroup]"
+                  echo "##vso[task.setvariable variable=TARGET_DIRECTORY]$targetDirectory"
+
+          ## -> Set artifact information to variables.
+          - task: Bash@3
+            displayName: Get Package
+            condition: succeeded()
+            inputs:
+              targetType: inline
+              script: |
+
+                echo "##[debug] Retrive from Repository: $(NEXUS_REPO_LIB_MVN)."
+                nexusURL='$(NEXUS_ENDPOINT_API_REPOSITORY)/search/assets?repository=$(NEXUS_REPO_LIB_MVN)&group=$(GROUP_ID)&name=$(ARTIFACT_ID)&version=$(DEPLOY_VERSION)'
+                if [ -z $nexusURL ]; then
+                  echo "##[error] Cannot find the package - please check if the package version $(ARTIFACT_ID)-$(DEPLOY_VERSION) exist in the repository"
+                  exit 1
+                fi
+                echo "##[debug] Search NEXUS url : $nexusURL"
+
+                downloadUrl=($(curl -u $(NEXUS_DEPS_USR):$(NEXUS_DEPS_PSW) $nexusURL | \
+                jq -r '.items[] | select(.downloadUrl | test("\\.(ear|war|jar)$")) | .downloadUrl'))
+                if [ -z $downloadUrl ]; then
+                  echo "##[error] Cannot find the package - please check if the package version $(ARTIFACT_ID)-$(DEPLOY_VERSION) exist in the repository"
+                  exit 1
+                fi
+
+                echo "##[debug] Download URL for package: $downloadUrl"
+                echo "##vso[task.setvariable variable=DOWNLOAD_NEXUS_URL]$downloadUrl"
+
+                artifactFile=$(basename $downloadUrl)
+                artifactPath=$(Pipeline.Workspace)/$artifactFile
+
+                echo "##[debug] WEBLOGIC_TRANSFER_MODE: ${WEBLOGIC_TRANSFER_MODE}"
+                if [[ ("${WEBLOGIC_TRANSFER_MODE}" == 'ssh') ]]; then
+                  echo "##[debug] Downloading package to transfer over SSH (AZURE to WEBLOGIC servers)."
+                  curl -u $(NEXUS_DEPS_USR):$(NEXUS_DEPS_PSW) $downloadUrl -o $artifactPath
+                else
+                  echo "##[debug] Package download will be performed directly in the WEBLOGIC servers."
+                fi
+
+                echo "##[debug] artifactFile: $artifactFile"
+                echo "##vso[task.setvariable variable=ARTIFACT_FILE]$artifactFile"
+                echo "##[debug] artifactPath: $artifactPath"
+                echo "##vso[task.setvariable variable=ARTIFACT_PATH]$artifactPath"
+
+          ## -> Set artifact information to variables.
+          - task: Bash@3
+            displayName: Get Weblogic Scripts
+            condition: succeeded()
+            inputs:
+              targetType: inline
+              script: |
+
+                echo "##[debug] Retrive from Repository:$(NEXUS_REPO_OSSDEVOPSLABS)."
+                nexusURL='$(NEXUS_ENDPOINT_API_REPOSITORY)/search/assets?repository=$(NEXUS_REPO_OSSDEVOPSLABS)&group=$(GROUP_ID_OSSDEVOPSLABS)&name=$(WEBLOGIC_OSS_SCRIPTS_REPO)&version=$(WEBLOGIC_OSS_SCRIPTS_VERSION)'
+                echo "##[debug] Search NEXUS url : $nexusURL"
+
+                downloadUrl=($(curl -u $(NEXUS_DEPS_USR):$(NEXUS_DEPS_PSW) $nexusURL | \
+                jq -r '.items[] | select(.downloadUrl | test("\\.(tar)$")) | .downloadUrl'))
+
+                echo "##[debug] Download URL for scripts: $downloadUrl"
+
+                echo "##[debug] WEBLOGIC_TRANSFER_MODE: ${WEBLOGIC_TRANSFER_MODE}"
+                if [[ ("${WEBLOGIC_TRANSFER_MODE}" == 'ssh') ]]; then
+                  echo "##[debug] Downloading scripts to transfer over SSH (AZURE to WEBLOGIC servers)."
+                  targetFile="$(Pipeline.Workspace)/weblogic/scripts/$(basename $downloadUrl)"
+                  curl -u $(NEXUS_DEPS_USR):$(NEXUS_DEPS_PSW) $downloadUrl -o $targetFile
+                  tar -xvf $targetFile --strip-components=2 ./scripts/python
+                else
+                  echo "##[debug] Scripts download will be performed directly in the WEBLOGIC servers."
+                fi
+
+                echo "##[debug] downloadURL for scripts: $downloadUrl"
+                echo "##vso[task.setvariable variable=DOWNLOAD_SCRIPTS_URL]$downloadUrl"
+
+          ## -> Set Weblogic Environment
+          - task: Bash@3
+            displayName: Set Weblogic Environment
+            name: weblogic_environment
+            condition: succeeded()
+            inputs:
+              targetType: inline
+              workingDirectory: $(Pipeline.Workspace)/source_code
+              script: |
+
+                echo "##[section] Package folder"
+                echo "##[debug] Using environment: ${{ parameters.environment }}"
+                packageFolder="oss_deployment_$(DEPLOY_VERSION)"
+                echo "##[debug] packageFolder: $packageFolder"
+
+                echo "##[section] Variables from weblogic file"
+                echo "##[debug] Looking for weblogic.(yml,yaml) file..."
+                weblogicConfigFile=$(find $(Pipeline.Workspace)/source_code/.azuredevops/config/${{ parameters.environment }} -name 'weblogic*')
+
+                if [ -z $weblogicConfigFile ]; then
+                  echo "##[error] weblogic.(yml,yaml) not found at $weblogicConfigFile. Aborting..."
+                  exit 1
+                fi
+
+                set_config_variable() {
+                  local configKey=$1
+                  local defaultValue=$2
+                  local folderName=$3
+                  local configValue=$(grep "$configKey:" $weblogicConfigFile | grep -v '^#' | awk '{print $2}' | tr -d '\r\n')
+
+                  # Special handling for WEBLOGIC_APPLICATIONS_SERVER_PATH and WEBLOGIC_SCRIPTS_SERVER_PATH
+                  if [ "$configKey" == "WEBLOGIC_APPLICATIONS_SERVER_PATH" ] || [ "$configKey" == "WEBLOGIC_SCRIPTS_SERVER_PATH" ]; then
+                    configValue+="$folderName"
+                  fi
+
+                  # Special handling for WEBLOGIC_PROPERTIES_SERVER_FILE
+                  if [ "$configKey" == "WEBLOGIC_PROPERTIES_SERVER_FILE" ]; then
+                    propertiesFileName=$configValue
+                  fi
+
+                  if [ -z "$configValue" ] && [ "$configKey" != "WEBLOGIC_PROPERTIES_SERVER_FILE" ]; then
+                    echo "##[warning] $configKey not found at $weblogicConfigFile."
+                    if [ -n "$defaultValue" ]; then
+                      echo "##[warning] Using default value: $defaultValue"
+                      configValue=$defaultValue
+                    else
+                      echo "##[error] No value found for $configKey and no default value provided. Exiting."
+                      exit 1
+                    fi
+                  fi
+
+                  echo "##[debug] $configKey: $configValue"
+                  echo "##vso[task.setvariable variable=$configKey;isOutput=true]$configValue"
+
+                }
+
+                ## -> VARIABLES FROM weblogic.yml
+                set_config_variable "WEBLOGIC_TIMEOUT" 300
+                set_config_variable "WEBLOGIC_ADMIN_SERVER_URL"
+                set_config_variable "WEBLOGIC_CLUSTER"
+                set_config_variable "WEBLOGIC_APPLICATIONS_SERVER_PATH" "" "$(ARTIFACT_ID)/oss_deployment_$(DEPLOY_VERSION)"
+                set_config_variable "WEBLOGIC_SCRIPTS_SERVER_PATH" "" "$(ARTIFACT_ID)/oss_scripts_$(DEPLOY_VERSION)"
+                set_config_variable "WEBLOGIC_PROPERTIES_SERVER_PATH"
+
+                propertiesFileName=""
+                set_config_variable "WEBLOGIC_PROPERTIES_SERVER_FILE"
+
+                if [ -n "$propertiesFileName" ]; then
+                  propertiesPath="$(DEFAULT_WORKDIR_WEBLOGIC_CONFIG)/${{ parameters.environment }}/"
+
+                  ## -> Normalize delimiters to commas
+                  normalizedPropertiesFilePath=$(echo "$propertiesFileName" | tr ';' ',')
+
+                  IFS=',' read -ra files <<< "$normalizedPropertiesFilePath"
+                  allAvailableProperties=""
+                  for propertiesName in "${files[@]}"; do
+                    availableProperties=$(find $propertiesPath -name "$propertiesName")
+                    if [ -z "$availableProperties" ]; then
+                      echo "##[warning] Properties file $propertiesName not found at $propertiesPath."
+                    else
+                      echo "##[debug] Properties available: $availableProperties"
+                      allAvailableProperties+="$propertiesName,"
+                    fi
+                  done
+
+                  ## -> Remove trailing comma
+                  allAvailableProperties=${allAvailableProperties%,}
+                  echo "##vso[task.setvariable variable=ALL_AVAILABLE_PROPERTIES;isOutput=true]$allAvailableProperties"
+                  echo "##[debug] ALL_AVAILABLE_PROPERTIES: $allAvailableProperties"
+                fi
+
+                echo "##[section] Variables from library variables"
+                environmentWeblogic=$(echo "${{ parameters.environment }}" | tr 'a-z' 'A-Z')
+                [[ "${{ parameters.environment }}" =~ ^(preprod|prodlike|esteira1|esteira2)$ ]] && environmentWeblogic="QA"
+                echo "##[debug] Using environment weblogic as: $environmentWeblogic"
+
+                set_library_variable() {
+                  local varName=$1
+                  local outputVarName=$2
+                  local varValue=${!varName}
+
+                  if [ -z "$varValue" ]; then
+                    echo "##[error] '$varName' not found in the library variables."
+                    exit 1
+                  else
+                    echo "##[debug] $outputVarName: $varValue"
+                    echo "##vso[task.setvariable variable=$outputVarName;isOutput=true]$varValue"
+                  fi
+                }
+
+                ##-> WEBLOGIC_USER / WEBLOGIC_PASS
+                set_library_variable "${environmentWeblogic}_WEBLOGIC_USER" "WEBLOGIC_USER"
+
+                case "$environmentWeblogic" in
+                  DEV) weblogicPass=$(DEV_WEBLOGIC_PASS) ;;
+                  QA) weblogicPass=$(QA_WEBLOGIC_PASS) ;;
+                  PRODUCAO) weblogicPass=$(PRODUCAO_WEBLOGIC_PASS) ;;
+                esac
+                if [ -z $weblogicPass ] ; then
+                  echo "##[error] '${environmentWeblogic}_WEBLOGIC_PASS' not found in the library variables."
+                  exit 1;
+                else
+                  echo "##[debug] WEBLOGIC_PASS: $weblogicPass"
+                  echo "##vso[task.setvariable variable=WEBLOGIC_PASS;isOutput=true;isSecret=true]$weblogicPass"
+                fi
+
+                ##-> WEBLOGIC_SSH_USER / WEBLOGIC_SSH_PASS
+                set_library_variable "${environmentWeblogic}_WEBLOGIC_SSH_USER" "WEBLOGIC_SSH_USER"
+
+                case "$environmentWeblogic" in
+                  DEV) weblogicSshPass=$(DEV_WEBLOGIC_SSH_PASS) ;;
+                  QA) weblogicSshPass=$(QA_WEBLOGIC_SSH_PASS) ;;
+                  PRODUCAO) weblogicSshPass=$(PRODUCAO_WEBLOGIC_SSH_PASS) ;;
+                esac
+                if [ -z $weblogicSshPass ] ; then
+                  echo "##[error] '${environmentWeblogic}_WEBLOGIC_SSH_PASS' not found in the library variables."
+                  exit 1;
+                else
+                  echo "##[debug] WEBLOGIC_SSH_PASS: $weblogicSshPass"
+                  echo "##vso[task.setvariable variable=WEBLOGIC_SSH_PASS;isOutput=true;isSecret=true]$weblogicSshPass"
+                fi
+
+          ## -> Set SSH Environment
+          - task: LegacySSH@0
+            displayName: Set SSH Environment
+            name: ssh_environment
+            condition: succeeded()
+            inputs:
+              sshEndpoint: weblogic_${{ parameters.environment }}
+              runOptions: 'inline'
+              readyTimeout: '60000'
+              inline: |
+
+                hostnameArray=($(hostname -i))
+                echo "##[debug] SSH is connected! IP: ${hostnameArray[0]}..."
+                echo "##vso[task.setvariable variable=WEBLOGIC_ADMIN_SERVER_IP;isOutput=true]${hostnameArray[0]}"
+
+                echo "##[debug] Setting up folders..."
+                mkdir -p "$(weblogic_environment.WEBLOGIC_APPLICATIONS_SERVER_PATH)"
+                chmod 775 "$(weblogic_environment.WEBLOGIC_APPLICATIONS_SERVER_PATH)"
+                echo "##[debug] Folder $(weblogic_environment.WEBLOGIC_APPLICATIONS_SERVER_PATH) created!"
+
+                mkdir -p "$(weblogic_environment.WEBLOGIC_SCRIPTS_SERVER_PATH)"
+                chmod 777 "$(weblogic_environment.WEBLOGIC_SCRIPTS_SERVER_PATH)"
+                echo "##[debug] Folder $(weblogic_environment.WEBLOGIC_SCRIPTS_SERVER_PATH) created!"
+
+                echo "##[debug] Create an empty file to add server addresses ... "
+                touch "$(weblogic_environment.WEBLOGIC_SCRIPTS_SERVER_PATH)/weblogic_machines_info.txt"
+                chmod 777 "$(weblogic_environment.WEBLOGIC_SCRIPTS_SERVER_PATH)/weblogic_machines_info.txt"
+                echo "##[debug] File $(weblogic_environment.WEBLOGIC_SCRIPTS_SERVER_PATH)/weblogic_machines_info.txt created!"
+
+          ## -> Use as an option way to transfer files
+          - task: LegacyCopyFilesOverSSH@0
+            displayName: Transfering Package - SSH
+            condition: and(
+              succeeded(),
+              eq(variables['WEBLOGIC_TRANSFER_MODE'], 'ssh'))
+            inputs:
+              sshEndpoint: weblogic_${{ parameters.environment }}
+              sourceFolder: $(Pipeline.Workspace)
+              contents: $(ARTIFACT_FILE)
+              overwrite: true
+              targetFolder: '$(weblogic_environment.WEBLOGIC_APPLICATIONS_SERVER_PATH)'
+              readyTimeout: '60000'
+
+          ## -> Copy Package to Weblogic Admin Server
+          - task: LegacySSH@0
+            displayName: Transfering Package - NEXUS
+            condition: and(
+              succeeded(),
+              or(
+                eq(variables['WEBLOGIC_TRANSFER_MODE'], 'nexus'),
+                ne(variables['WEBLOGIC_TRANSFER_MODE'], 'ssh')
+              ))
+            inputs:
+              sshEndpoint: weblogic_${{ parameters.environment }}
+              runOptions: inline
+              failOnStdErr: true
+              inline: |
+
+                echo "##[debug] Download URL: $(DOWNLOAD_NEXUS_URL)"
+                TARGET_DIR=$(weblogic_environment.WEBLOGIC_APPLICATIONS_SERVER_PATH)/
+                cd "$TARGET_DIR"
+                curl -s -u $(NEXUS_DEPS_USR):$(NEXUS_DEPS_PSW) $(DOWNLOAD_NEXUS_URL) -o "$TARGET_DIR/$(basename $(DOWNLOAD_NEXUS_URL))"
+                chmod 775 $TARGET_DIR/*
+
+          ## -> Use as an option way to transfer files
+          - task: LegacyCopyFilesOverSSH@0
+            displayName: Transfering Scripts - SSH
+            condition: and(
+              succeeded(),
+              eq(variables['WEBLOGIC_TRANSFER_MODE'], 'ssh'))
+            inputs:
+              sshEndpoint: weblogic_${{ parameters.environment }}
+              sourceFolder: '$(Pipeline.Workspace)/weblogic/scripts/'
+              contents: '**'
+              overwrite: true
+              targetFolder: '$(weblogic_environment.WEBLOGIC_SCRIPTS_SERVER_PATH)'
+              readyTimeout: '60000'
+
+          ## -> Fix files permissions
+          - task: SSH@0
+            displayName: Set Directory Permissions to 775
+            condition: and(
+              succeeded(),
+              eq(variables['WEBLOGIC_TRANSFER_MODE'], 'ssh'))
+            inputs:
+              sshEndpoint: weblogic_${{ parameters.environment }}
+              runOptions: 'commands'
+              commands: |
+                chmod -R 775 $(weblogic_environment.WEBLOGIC_APPLICATIONS_SERVER_PATH)
+                chmod -R 777 $(weblogic_environment.WEBLOGIC_SCRIPTS_SERVER_PATH)
+
+          ## -> Copy Scripts to Weblogic Admin Server
+          - task: LegacySSH@0
+            displayName: Transfering Scripts - NEXUS
+            condition: and(
+              succeeded(),
+              or(
+                eq(variables['WEBLOGIC_TRANSFER_MODE'], 'nexus'),
+                ne(variables['WEBLOGIC_TRANSFER_MODE'], 'ssh')
+              ))
+            inputs:
+              sshEndpoint: weblogic_${{ parameters.environment }}
+              runOptions: inline
+              failOnStdErr: true
+              inline: |
+
+                echo "##[debug] Download URL: $(DOWNLOAD_SCRIPTS_URL)"
+                TARGET_DIR=$(weblogic_environment.WEBLOGIC_SCRIPTS_SERVER_PATH)/
+                cd "$TARGET_DIR"
+                curl -s -u $(NEXUS_DEPS_USR):$(NEXUS_DEPS_PSW) $(DOWNLOAD_SCRIPTS_URL) -o "$TARGET_DIR/$(basename $(DOWNLOAD_SCRIPTS_URL))"
+                tar -xvf "$TARGET_DIR/$(basename $(DOWNLOAD_SCRIPTS_URL))" --strip-components=2 ./scripts/python
+                chmod 775 $TARGET_DIR/*
+
+          ## -> Verify Package and Scripts on Target Server
+          - task: LegacySSH@0
+            displayName: Verify Package and Scripts on Target Server
+            condition: succeeded()
+            inputs:
+              sshEndpoint: weblogic_${{ parameters.environment }}
+              runOptions: inline
+              failOnStdErr: true
+              inline: |
+
+                echo "##[debug] Starting verification process on machine: $(hostname)"
+
+                ## -> Variables
+                PACKAGE_DIR=$(weblogic_environment.WEBLOGIC_APPLICATIONS_SERVER_PATH)
+                SCRIPTS_DIR=$(weblogic_environment.WEBLOGIC_SCRIPTS_SERVER_PATH)
+                PACKAGE_FILE=$(basename $(DOWNLOAD_NEXUS_URL))
+                SCRIPTS_ARCHIVE=$(basename $(DOWNLOAD_SCRIPTS_URL))
+
+                echo "##[debug] Checking machine name and environment..."
+                MACHINE_NAME=$(hostname)
+                echo "##[debug] Machine Name: $MACHINE_NAME"
+                echo "##[debug] Environment: ${{ parameters.environment }}"
+
+                ## -> Check Scripts Archive
+                echo "##[debug] Verifying package file in $PACKAGE_DIR..."
+                if [ -f "$PACKAGE_DIR/$PACKAGE_FILE" ]; then
+                  echo "##[debug] Package $PACKAGE_FILE found in $PACKAGE_DIR"
+                  echo "##[debug] File details:"
+                  ls -lh "$PACKAGE_DIR/$PACKAGE_FILE"
+                  echo "##[debug] Permissions for $PACKAGE_FILE:"
+                  stat -c "%A %U %G" "$PACKAGE_DIR/$PACKAGE_FILE"
+                else
+                  echo "##[debug] ERROR: Package $PACKAGE_FILE not found in $PACKAGE_DIR"
+                  exit 1
+                fi
+
+                ## -> Check Scripts Archive
+                echo "##[debug] Verifying scripts archive in $SCRIPTS_DIR..."
+                if [ -f "$SCRIPTS_DIR/$SCRIPTS_ARCHIVE" ]; then
+                  echo "##[debug] Scripts archive $SCRIPTS_ARCHIVE found in $SCRIPTS_DIR"
+                  echo "##[debug] Archive details:"
+                  ls -lh "$SCRIPTS_DIR/$SCRIPTS_ARCHIVE"
+                  echo "##[debug] Permissions for $SCRIPTS_ARCHIVE:"
+                  stat -c "%A %U %G" "$SCRIPTS_DIR/$SCRIPTS_ARCHIVE"
+                else
+                  echo "##[debug] ERROR: Scripts archive $SCRIPTS_ARCHIVE not found in $SCRIPTS_DIR"
+                  exit 1
+                fi
+
+          ## -> Start servers as Readinnes Assurance
+          - task: LegacySSH@0
+            displayName: Start Servers - Readiness Assurance
+            condition: succeeded()
+            inputs:
+              sshEndpoint: weblogic_${{ parameters.environment }}
+              runOptions: 'commands'
+              commands: >
+                sudo -u weblogic /opt/web/wl/current/oracle_common/common/bin/wlst.sh
+                $(weblogic_environment.WEBLOGIC_SCRIPTS_SERVER_PATH)/python/StartServers.py
+                $(weblogic_environment.WEBLOGIC_USER)
+                $(weblogic_environment.WEBLOGIC_PASS)
+                $(weblogic_environment.WEBLOGIC_ADMIN_SERVER_URL)
+                $(weblogic_environment.WEBLOGIC_TIMEOUT)
+              readyTimeout: '60000'
+
+          ## -> Remove retired package in Weblogic Admin Server
+          - task: LegacySSH@0
+            displayName: Undeploy/Retiring package
+            condition: succeeded()
+            continueOnError: true
+            inputs:
+              sshEndpoint: weblogic_${{ parameters.environment }}
+              runOptions: 'commands'
+              commands: >
+                sudo -u weblogic /opt/web/wl/current/oracle_common/common/bin/wlst.sh
+                $(weblogic_environment.WEBLOGIC_SCRIPTS_SERVER_PATH)/python/UndeployAppRetired.py
+                $(weblogic_environment.WEBLOGIC_USER)
+                $(weblogic_environment.WEBLOGIC_PASS)
+                $(weblogic_environment.WEBLOGIC_ADMIN_SERVER_URL)
+                $(ARTIFACT_ID)
+              readyTimeout: '60000'
+
+          ## -> Update package in Weblogic Admin Server
+          - task: LegacySSH@0
+            displayName: Update package
+            condition: succeeded()
+            continueOnError: false
+            inputs:
+              sshEndpoint: weblogic_${{ parameters.environment }}
+              runOptions: 'commands'
+              commands: >
+                sudo -u weblogic /opt/web/wl/current/oracle_common/common/bin/wlst.sh
+                $(weblogic_environment.WEBLOGIC_SCRIPTS_SERVER_PATH)/python/HotDeployApp.py
+                $(weblogic_environment.WEBLOGIC_USER)
+                $(weblogic_environment.WEBLOGIC_PASS)
+                $(weblogic_environment.WEBLOGIC_ADMIN_SERVER_URL)
+                $(ARTIFACT_ID)
+                $(weblogic_environment.WEBLOGIC_APPLICATIONS_SERVER_PATH)/$(ARTIFACT_FILE)
+                $(weblogic_environment.WEBLOGIC_CLUSTER)
+                $(weblogic_environment.WEBLOGIC_TIMEOUT)
+              readyTimeout: '60000'
+
+            ## -> Tag Pipeline with the stage status
+          - task: bash@3
+            displayName: Tag Pipeline with its Status
+            condition: always()
+            inputs:
+              targetType: inline
+              script: |
+                succeedStatus="Skipped, SucceededWithIssues, Succeeded"
+
+                echo "##[debug] DEPLOY_JOB_STATUS: $DEPLOY_JOB_STATUS"
+                echo "##[debug] ODD_SERVERS_RESTART_STATUS: $ODD_SERVERS_RESTART_STATUS"
+                echo "##[debug] EVEN_SERVERS_RESTART_STATUS: $EVEN_SERVERS_RESTART_STATUS"
+
+                if [[ "$succeedStatus" == *"$DEPLOY_JOB_STATUS"* && \
+                    "$succeedStatus" == *"$EVEN_SERVERS_RESTART_STATUS"* && \
+                    "$succeedStatus" == *"$ODD_SERVERS_RESTART_STATUS"* && \
+                    "$succeedStatus" == *"$AGENT_JOBSTATUS"* ]]; then
+
+                  echo "##vso[build.addbuildtag]deploy-${{ parameters.environment }}=succeeded"
+                else
+                  echo "##vso[build.addbuildtag]deploy-${{ parameters.environment }}=failed"
+                fi
+
+  ## -> Notifies 'Success on Deploy' on Governance App
+  - job: gov_app
+    displayName: "Notify GovApp"
+    condition: or(
+      eq(dependencies.deploy.result, 'Succeeded'),
+      eq(dependencies.deploy.result, 'SucceededWithIssues'))
+    dependsOn:
+      - deploy
+    steps:
+    - template: /tech_products/oss/templates/gov_app/gov_app.yaml
+      parameters:
+        environment: "${{ parameters.environment }}"
+        operation: 'deploy'
+        version: "$(DEPLOY_VERSION)"
+
+  - job: audit
+    displayName: "Capture Audit Logs"
+    condition: eq(dependencies.deploy.result, 'failed')
+    dependsOn:
+      - deploy
+    steps:
+    - task: CatchLogsToLocalDirectoryFromVivo@4
+      displayName: Dump logs and metas
+      inputs:
+        dumpDir: $(Build.ArtifactStagingDirectory)/audit
+    - task: PublishBuildArtifacts@1
+      displayName: 'Push Logs to Artifacts'
+      inputs:
+        ArtifactName: audit
+        PathtoPublish: $(Build.ArtifactStagingDirectory)/audit
+
+  ## -> Job for stop -> clear cache -> star weblogic servers
+  - ${{ each parity in split(parameters.evenOrOdd,',') }}:
+    - job: ${{ parity }}_servers_restart
+      displayName: ${{ parity }} Servers Restart
+      variables:
+        WEBLOGIC_USER: $[ dependencies.deploy.outputs['deploy.weblogic_environment.WEBLOGIC_USER'] ]
+        WEBLOGIC_PASS: $[ dependencies.deploy.outputs['deploy.weblogic_environment.WEBLOGIC_PASS'] ]
+        WEBLOGIC_TIMEOUT: $[ dependencies.deploy.outputs['deploy.weblogic_environment.WEBLOGIC_TIMEOUT'] ]
+        WEBLOGIC_SSH_USER: $[ dependencies.deploy.outputs['deploy.weblogic_environment.WEBLOGIC_SSH_USER'] ]
+        WEBLOGIC_SSH_PASS: $[ dependencies.deploy.outputs['deploy.weblogic_environment.WEBLOGIC_SSH_PASS'] ]
+        ALL_AVAILABLE_PROPERTIES: $[ dependencies.deploy.outputs['deploy.weblogic_environment.ALL_AVAILABLE_PROPERTIES'] ]
+        WEBLOGIC_ADMIN_SERVER_URL: $[ dependencies.deploy.outputs['deploy.weblogic_environment.WEBLOGIC_ADMIN_SERVER_URL'] ]
+        WEBLOGIC_ADMIN_SERVER_IP: $[ dependencies.deploy.outputs['deploy.ssh_environment.WEBLOGIC_ADMIN_SERVER_IP'] ]
+        WEBLOGIC_SCRIPTS_SERVER_PATH: $[ dependencies.deploy.outputs['deploy.weblogic_environment.WEBLOGIC_SCRIPTS_SERVER_PATH'] ]
+        WEBLOGIC_PROPERTIES_SERVER_FILE: $[ dependencies.deploy.outputs['deploy.weblogic_environment.WEBLOGIC_PROPERTIES_SERVER_FILE'] ]
+        WEBLOGIC_PROPERTIES_SERVER_PATH: $[ dependencies.deploy.outputs['deploy.weblogic_environment.WEBLOGIC_PROPERTIES_SERVER_PATH'] ]
+        WEBLOGIC_APPLICATIONS_SERVER_PATH: $[ dependencies.deploy.outputs['deploy.weblogic_environment.WEBLOGIC_APPLICATIONS_SERVER_PATH'] ]
+      ${{ if eq(parity, 'odd') }}:
+        dependsOn:
+        - deploy
+        condition: and(
+          eq('${{ parameters.skipRestart }}', 'false'),
+          or(
+            eq(dependencies.deploy.result, 'Succeeded'),
+            and(
+              eq(variables['FORCE_STOP_START_WEBLOGIC'], 'true'),
+              eq(dependencies.deploy.result, 'SucceededWithIssues'))))
+      ${{ else }}:
+        dependsOn:
+        - deploy
+        - ODD_servers_restart
+        condition: and(
+          eq('${{ parameters.skipRestart }}', 'false'),
+          or(
+            eq(dependencies.ODD_servers_restart.result, 'Succeeded'),
+            eq(dependencies.ODD_servers_restart.result, 'SucceededWithIssues')))
+      steps:
+        - template: cd_deploy_weblogic_stop_start.yml
+          parameters:
+            environment: ${{ parameters.environment }}
+            parity: ${{ parity }}
+
+  - job: post_weblogic_deploy
+    displayName: "Post Weblogic Deploy"
+    dependsOn:
+    - deploy
+    - ODD_servers_restart
+    - EVEN_servers_restart
+    condition: always()
+    variables:
+      WEBLOGIC_APPLICATIONS_SERVER_PATH: $[ dependencies.deploy.outputs['deploy.weblogic_environment.WEBLOGIC_APPLICATIONS_SERVER_PATH'] ]
+      WEBLOGIC_SCRIPTS_SERVER_PATH: $[ dependencies.deploy.outputs['deploy.weblogic_environment.WEBLOGIC_SCRIPTS_SERVER_PATH'] ]
+      DEPLOY_JOB_STATUS: $[ dependencies.deploy.result ]
+      ODD_SERVERS_RESTART_STATUS: $[ dependencies.ODD_servers_restart.result ]
+      EVEN_SERVERS_RESTART_STATUS: $[ dependencies.EVEN_servers_restart.result ]
+    steps:
+
+      ## -> Skip Checkout
+      - checkout: none
+
+      ## -> Remove Folders from Weblogic Admin Server
+      - task: LegacySSH@0
+        displayName: Remove Folders
+        inputs:
+          sshEndpoint: weblogic_${{ parameters.environment }}
+          runOptions: 'inline'
+          readyTimeout: '60000'
+          inline: |
+
+            validate_and_remove() {
+              local path=$1
+              echo "##[debug] Validating path: $path"
+
+              if [[ "$path" == /opt/web/applications/* && "$path" != /opt/web/applications/ && "$path" == *oss_* ]]; then
+                echo "##[debug] Path $path is valid. Proceeding to remove the folder."
+                echo "##[debug] Removing folder: $path"
+                rm -r "$path"
+                echo "##[debug] Folder $path removed successfully."
+              else
+                echo "##[error] Path $path is not valid. It must start with /opt/web/applications/"
+                echo "##[error] Folder path must have additional subdirectories, and contain 'oss_' in some folder name."
+                exit 1
+              fi
+            }
+
+            echo "##[debug] Starting folder removal process..."
+            validate_and_remove "$(WEBLOGIC_SCRIPTS_SERVER_PATH)"
+            echo "##[debug] Folder removal process completed."
+

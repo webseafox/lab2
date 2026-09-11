@@ -1,0 +1,163 @@
+parameters:
+- name: cenario
+  type: string
+- name: optionals
+  type: string
+- name: docker_image
+  type: string
+- name: test_environment
+  type: string
+- name: framework
+  type: string
+- name: fail_pipeline
+  type: boolean
+- name: project_id
+  type: string
+- name: enable_collect_metric
+  type: boolean
+
+stages:
+- stage: ci_test_execution
+  displayName: "CI - Test Execution"
+  dependsOn:
+    - ci_environment
+
+  variables:
+    - name: NEXUS_DEPS_USR
+      value: $[ stageDependencies.ci_environment.environment.outputs['credentials.NEXUS_DEPS_USR'] ]
+    - name: NEXUS_DEPS_PSW
+      value: $[ stageDependencies.ci_environment.environment.outputs['credentials.NEXUS_DEPS_PSW'] ]
+    - name: SCRIPTS_FOLDER
+      value: $(Agent.BuildDirectory)/checkout_env/Vivo.CodePlay.Pipelines/tech_products/rbqa/test-execution-pipeline/individual/scripts
+    - name: INITIALIZE_FOLDER
+      value: $(Agent.BuildDirectory)/checkout_env/Vivo.CodePlay.Pipelines/tech_products/rbqa/initialize      
+    - name: CONTAINER_IMAGE
+      ${{ if eq(parameters.docker_image, 'selenium') }}:
+        value: acrsharedservices01.azurecr.io/base/qa/selenium-junit/oraclient/runtime:1.0.3
+      ${{ elseif eq(parameters.docker_image, 'selenium-xfcb-chrome') }}:
+        value: acrsharedservices01.azurecr.io/base/qa/selenium-xvfb/chrome/runtime:1.0.2
+      ${{ elseif eq(parameters.docker_image, 'selenium-xfcb-edge') }}:
+        value: acrsharedservices01.azurecr.io/base/qa/selenium-xvfb/edge/runtime:1.0.2
+      ${{ elseif eq(parameters.docker_image, 'selenium-xfcb-firefox') }}:
+        value: acrsharedservices01.azurecr.io/base/qa/selenium-xvfb/firefox/runtime:1.0.2
+      ${{ elseif eq(parameters.docker_image, 'uftdeveloper') }}:
+        value: acrsharedservices01.azurecr.io/base/qa/uftdeveloper/chrome/runtime:1.0.2
+      
+  jobs:
+  - job: ci_test_execution
+    timeoutInMinutes: 480
+    cancelTimeoutInMinutes: 2
+    displayName: "Execução da(s) classe(s) ${{ parameters.cenario }}"
+    pool:
+      name: $(PRIVATE_AGENT_QA)
+      ${{ if eq(variables['Build.Reason'], 'Schedule') }}:
+        demands:
+        - scheduled_pipes
+    steps:
+    - task: Bash@3 
+      displayName: "DEBUG"
+      inputs:
+        targetType: 'inline'
+        script: |
+          echo 'ls INITIALIZE_FOLDER: ' && ls -lha $(INITIALIZE_FOLDER)''
+          echo 'ls SCRIPTS_FOLDER: ' && ls -lha $(SCRIPTS_FOLDER)
+          echo 'ls Build.SourcesDirectory: ' && ls -lha $(Build.SourcesDirectory)
+
+    - checkout: self
+      clean: true
+
+    # Download the checkout_env artifact to get the context.
+    - download: current
+      artifact: 'checkout_env'
+      displayName: Download checkout_env Artifact
+
+    - task: Docker@2
+      displayName: 'Auth for Azure Container Registry'
+      inputs:
+        command: 'login'
+        containerRegistry: ACR-DEVOPS
+        timeoutInMinutes: 90
+
+    - task: Bash@3
+      displayName: "Set execute permissions for scripts"
+      inputs:
+        targetType: 'inline'
+        script: |
+          chmod +x $(SCRIPTS_FOLDER)/*
+          ls -lha $(SCRIPTS_FOLDER)
+
+    - task: Bash@3 
+      displayName: "Clean Maven corrupted metadata"
+      inputs:
+        targetType: 'inline'
+        script: |
+          METADATA_FILE=~/.m2/repository/br/com/vivo/hc-b2x-v1/maven-metadata-local.xml
+          if [ -f "$METADATA_FILE" ]; then
+            rm -f "$METADATA_FILE"
+            echo "Removed corrupted metadata: $METADATA_FILE"
+          else
+            echo "Metadata file not found: $METADATA_FILE"
+          fi
+
+    - task: Bash@3 
+      displayName: "DEBUG"
+      inputs:
+        targetType: 'inline'
+        script: |
+          docker ps
+          docker stats --no-stream
+          echo 'ls Build.SourcesDirectory: ' && ls -lha $(Build.SourcesDirectory)
+          echo "##vso[build.addbuildtag]"${{ parameters.cenario }}
+          echo "##vso[build.addbuildtag]"${{ parameters.test_environment }}
+          
+    - task: Bash@3 
+      displayName: "Executing scenario(s)"
+      inputs:
+        targetType: 'inline'
+        script: exec $(SCRIPTS_FOLDER)/docker_test_execution.sh
+      env:
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+        NEXUS_DEPS_USR: $(NEXUS_DEPS_USR)
+        NEXUS_DEPS_PSW: $(NEXUS_DEPS_PSW)
+        DEFAULT_MAX_MEMORY_BUILD: "$DEFAULT_MAX_MEMORY_BUILD"
+        ENVIRONMENT: ${{ parameters.test_environment }}
+        SCENARIO: ${{ parameters.cenario }}
+        OPTIONALS: ${{ parameters.optionals }}
+        FRAMEWORK: ${{ parameters.framework }}
+        DOCKER_IMAGE: ${{ parameters.docker_image }}
+        CONTAINER_IMAGE: $(CONTAINER_IMAGE)
+        SCRIPTS_FOLDER: $(SCRIPTS_FOLDER)
+        INITIALIZE_FOLDER: $(INITIALIZE_FOLDER)
+        AGENT_TMP_DIRECTORY: $(Agent.TempDirectory)
+        ALM_USER: $(ALM_USER)
+        ALM_PASSWORD: $(ALM_PASSWORD)
+        PROJECT_ID: ${{ parameters.project_id }}
+        ENABLE_COLLECT_METRIC: ${{ parameters.enable_collect_metric }}
+
+    - task: Bash@3 
+      displayName: "DEBUG"
+      inputs:
+        targetType: 'inline'
+        script: |
+          echo 'ls Build.SourcesDirectory: ' && ls -lha $(Build.SourcesDirectory)
+          echo 'ls RunResults: ' && ls -lha $(Build.SourcesDirectory)/RunResults
+
+    - publish: $(Agent.TempDirectory)
+      displayName: Publish logs
+      artifact: logs
+      condition: always()
+
+    - publish: $(Build.SourcesDirectory)/RunResults
+      displayName: Publish RunResults
+      artifact: RunResults
+      condition: always()
+
+    - task: Bash@3 
+      displayName: "Checking for failed tests"
+      condition: ${{ eq(parameters.fail_pipeline, true) }}
+      inputs:
+        targetType: 'targetPath'
+        script: $(SCRIPTS_FOLDER)/check_for_failed_tests.sh
+      env:
+        FAIL_PIPELINE: ${{ parameters.fail_pipeline }}
+        BUILD_SOURCESDIRECTORY: $(Build.SourcesDirectory)

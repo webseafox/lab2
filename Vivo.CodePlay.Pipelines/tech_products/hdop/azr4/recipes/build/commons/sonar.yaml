@@ -1,0 +1,284 @@
+parameters:
+  - name: runSonar
+    type: boolean
+    default: false
+  - name: recipe
+    type: string
+    default: 'maven_docker'  # Defina um valor padrão ou passe o valor da receita desejada.
+
+jobs:
+  - job: job_build
+    pool: GeneralPurposeLinuxAgentsCI
+    displayName: Run Sonar Analysis
+    condition: eq(${{ parameters.runSonar }}, true)
+    continueOnError: true
+    variables:
+      - name: ASDF_JDK_11
+        value: "openjdk-11.0.2"
+      - name: SONARQUBE_PROJECT_NAME
+        value: "$(System.TeamProject)-$(Build.Repository.Name)"
+      - name: BINARIES_DIRECTORIES
+        value: "$(System.ArtifactsDirectory)/**/target/classes"
+      - name: LCOV_REPORT_PATH
+        value: "$(Build.SourcesDirectory)/coverage/lcov.info"
+      - name: SONAR_EXTRA_PROPERTIES
+        value: ''
+
+    steps:
+    - checkout: self
+      fetchDepth: 1
+      persistCredentials: true
+
+
+    - task: DownloadBuildArtifacts@1
+      displayName: 'Download Build Artifacts'
+      inputs:
+        artifactName: drop
+        cleanDestinationFolder: false
+        extractTars: true
+        parallelizationLimit: 8
+        downloadPath: '$(System.ArtifactsDirectory)'
+
+    - script: |
+        mkdir -p ${COVERAGE_REPORT_PATH} || true
+        cp -rf $(System.ArtifactsDirectory)/drop/drop ${COVERAGE_REPORT_PATH}
+        ls -la ${COVERAGE_REPORT_PATH}
+      displayName: 'Copy to working directory'
+      env:
+        COVERAGE_REPORT_PATH: $(COVERAGE_REPORT_PATH)
+
+    - task: AzureKeyVault@2
+      displayName: Secrets from AKV
+      inputs:
+        azureSubscription: 'DevOpsSharedResources'
+        KeyVaultName: 'kv-azdevops-shared'
+        SecretsFilter: 'SONARQUBE-TOKEN'
+
+    - script: |
+        echo "##[group] Secrets for SONARQUBE"
+        echo "##vso[task.setvariable variable=SONARQUBE_TOKEN;isOutput=true;isSecret=true]$(SONARQUBE-TOKEN)"
+        echo "##[endgroup]"
+      displayName: Set Sonarqube Credentials Variables
+
+    - task: YamlParseFromVivo@4
+      displayName: Get Metadata Info
+      name: catalog_info
+      inputs:
+        type: 'file'
+        origin: $(Build.SourcesDirectory)/catalog-info.yaml
+        jpaths: |
+          var CATALOG_YAML_ACRONYM = .metadata.annotations['techarch.governance-app.acronym']
+          var CATALOG_YAML_MODULE = .metadata.annotations['techarch.governance-app.module']
+          var CATALOG_YAML_SONAR_PROJECT_KEY = .metadata.annotations['sonarqube.org/project-key']
+          var CATALOG_YAML_LANGUAGE_VERSION = .metadata.annotations['arqtech.telefonica.com.br/language-version']
+
+    - script: echo "CATALOG_YAML_SONAR_PROJECT_KEY=$(CATALOG_YAML_SONAR_PROJECT_KEY)"
+      displayName: Check SonarQube Project Key
+
+    - task: XmlParseFromVivo@4
+      displayName: Get pom.xml info
+      condition: startsWith('${{ parameters.recipe }}', 'maven_')
+      name: pom_info
+      inputs:
+        type: 'file'
+        origin: $(Build.SourcesDirectory)/pom.xml
+        jpaths: |
+          var POM_XML_VERSION = .project.version._text
+          var POM_XML_ARTIFACT_ID = .project.artifactId._text
+          var POM_XML_GROUP_ID = .project.groupId._text
+
+    - task: ListFilesAndFolders@4
+      displayName: Fetch 'sonar.java.binaries'
+      # condition: startsWith('${{ parameters.recipe }}', 'maven_')
+      inputs:
+        scriptSource: 'text'
+        separator: ','
+        script: |
+          var://BINARIES_DIRECTORIES = $(System.ArtifactsDirectory)/**/target/classes
+
+    - script: echo "BINARIES_DIRECTORIES=$(BINARIES_DIRECTORIES)"
+      displayName: Check BINARIES_DIRECTORIES Value
+
+    - script: |
+        asdf install java $(ASDF_JDK_11)
+        asdf global java $(ASDF_JDK_11)
+      displayName: Ensure Sonarqube Java Version
+
+    - script: |
+        # Definindo condicionalmente as variáveis para sonar.java.binaries e sonar.javascript.lcov.reportPaths
+        if [[ "${{ parameters.recipe }}" == "maven_docker" || "${{ parameters.recipe }}" == "maven_libs" ]]; then
+          echo "sonar.java.binaries=$(BINARIES_DIRECTORIES)" >> $(Build.SourcesDirectory)/sonar-extra-properties.txt
+        fi
+        if [[ "${{ parameters.recipe }}" == "nodejs_docker" ]]; then
+          echo "sonar.javascript.lcov.reportPaths=$(LCOV_REPORT_PATH)" >> $(Build.SourcesDirectory)/sonar-extra-properties.txt
+        fi
+      displayName: Set Conditional Sonar Properties
+
+    - task: SonarQubePrepare@5 
+      displayName: Config Sonar Maven
+      condition: startsWith('${{ parameters.recipe }}', 'maven_')
+      inputs:
+        SonarQube: VIVO_SONARQUBE
+        scannerMode: "CLI"
+        configFile: $(Build.SourcesDirectory)/sonar-project.properties
+        extraPropertiesFile: $(Build.SourcesDirectory)/sonar-extra-properties.txt
+        extraProperties: |
+          sonar.scm.disabled=True
+          sonar.projectBaseDir=$(Build.SourcesDirectory)
+          sonar.projectKey=$(CATALOG_YAML_SONAR_PROJECT_KEY)
+          sonar.projectName=$(SONARQUBE_PROJECT_NAME)
+          sonar.projectVersion=$(new_version.NEW_VERSION)
+          sonar.analysis.repositoryName=$(Build.Repository.Name)
+          sonar.analysis.buildId=$(Build.BuildId)
+          sonar.analysis.repositoryId=$(Build.Repository.ID)
+          sonar.analysis.projectName=$(System.TeamProject)
+          sonar.analysis.projectId=$(System.TeamProjectId)
+          sonar.links.homepage=$(System.TeamFoundationCollectionUri)$(System.TeamProject)
+          sonar.links.ci=$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)&_a=summary
+          sonar.links.issue=$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_workitems
+          sonar.links.scm=$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_git/$(Build.Repository.Name)
+          sonar.scanner.metadataFilePath=$(Agent.TempDirectory)/sonar/$(Build.BuildId)/report-task.txt
+          sonar.qualitygate.wait=true
+          sonar.qualitygate.timeout=300
+          sonar.sources=.
+          sonar.inclusions=**/src/main/java/**/*
+          sonar.java.binaries=$(BINARIES_DIRECTORIES)
+
+    - task: SonarQubePrepare@5
+      displayName: Config Sonar NodeJs
+      condition: startsWith('${{ parameters.recipe }}', 'nodejs_')
+      inputs:
+        SonarQube: VIVO_SONARQUBE
+        scannerMode: "CLI"
+        configFile: $(Build.SourcesDirectory)/sonar-project.properties
+        extraPropertiesFile: $(Build.SourcesDirectory)/sonar-extra-properties.txt
+        extraProperties: |
+          sonar.scm.disabled=True
+          sonar.projectBaseDir=$(Build.SourcesDirectory)
+          sonar.projectKey=$(CATALOG_YAML_SONAR_PROJECT_KEY)
+          sonar.projectName=$(SONARQUBE_PROJECT_NAME)
+          sonar.projectVersion=$(new_version.NEW_VERSION)
+          sonar.analysis.repositoryName=$(Build.Repository.Name)
+          sonar.analysis.buildId=$(Build.BuildId)
+          sonar.analysis.repositoryId=$(Build.Repository.ID)
+          sonar.analysis.projectName=$(System.TeamProject)
+          sonar.analysis.projectId=$(System.TeamProjectId)
+          sonar.links.homepage=$(System.TeamFoundationCollectionUri)$(System.TeamProject)
+          sonar.links.ci=$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)&_a=summary
+          sonar.links.issue=$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_workitems
+          sonar.links.scm=$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_git/$(Build.Repository.Name)
+          sonar.scanner.metadataFilePath=$(Agent.TempDirectory)/sonar/$(Build.BuildId)/report-task.txt
+          sonar.qualitygate.wait=true
+          sonar.qualitygate.timeout=300
+          sonar.sources=.
+          sonar.inclusions=**/*.js,**/*.ts
+          sonar.exclusions=**/node_modules/**,**/dist/**,**/build/**
+          sonar.typescript.tsconfigPath=tsconfig.json
+          sonar.javascript.lcov.reportPaths=$(Build.SourcesDirectory)/coverage/lcov.info
+
+    - task: SonarQubePrepare@5
+      displayName: Config Sonar Python
+      condition: startsWith('${{ parameters.recipe }}', 'python_')
+      inputs:
+        SonarQube: VIVO_SONARQUBE
+        scannerMode: "CLI"
+        configFile: $(Build.SourcesDirectory)/sonar-project.properties
+        extraPropertiesFile: $(Build.SourcesDirectory)/sonar-extra-properties.txt
+        extraProperties: |
+          sonar.scm.disabled=True
+          sonar.projectBaseDir=$(Build.SourcesDirectory)
+          sonar.projectKey=$(CATALOG_YAML_SONAR_PROJECT_KEY)
+          sonar.projectName=$(SONARQUBE_PROJECT_NAME)
+          sonar.projectVersion=$(new_version.NEW_VERSION)
+          sonar.analysis.repositoryName=$(Build.Repository.Name)
+          sonar.analysis.buildId=$(Build.BuildId)
+          sonar.analysis.repositoryId=$(Build.Repository.ID)
+          sonar.analysis.projectName=$(System.TeamProject)
+          sonar.analysis.projectId=$(System.TeamProjectId)
+          sonar.links.homepage=$(System.TeamFoundationCollectionUri)$(System.TeamProject)
+          sonar.links.ci=$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)&_a=summary
+          sonar.links.issue=$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_workitems
+          sonar.links.scm=$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_git/$(Build.Repository.Name)
+          sonar.scanner.metadataFilePath=$(Agent.TempDirectory)/sonar/$(Build.BuildId)/report-task.txt
+          sonar.qualitygate.wait=true
+          sonar.qualitygate.timeout=300
+          sonar.sources=.
+          sonar.inclusions=**/*.py
+          sonar.exclusions=**/__pycache__/**,**/tests/**,**/venv/**,**/build/**
+          sonar.python.coverage.reportPaths=$(Build.SourcesDirectory)/coverage.xml
+
+    - task: SonarQubePrepare@5
+      displayName: Config Sonar PHP
+      condition: startsWith('${{ parameters.recipe }}', 'php_')
+      inputs:
+        SonarQube: VIVO_SONARQUBE
+        scannerMode: "CLI"
+        configFile: $(Build.SourcesDirectory)/sonar-project.properties
+        extraPropertiesFile: $(Build.SourcesDirectory)/sonar-extra-properties.txt
+        extraProperties: |
+          sonar.scm.disabled=True
+          sonar.projectBaseDir=$(Build.SourcesDirectory)
+          sonar.projectKey=$(CATALOG_YAML_SONAR_PROJECT_KEY)
+          sonar.projectName=$(SONARQUBE_PROJECT_NAME)
+          sonar.projectVersion=$(new_version.NEW_VERSION)
+          sonar.analysis.repositoryName=$(Build.Repository.Name)
+          sonar.analysis.buildId=$(Build.BuildId)
+          sonar.analysis.repositoryId=$(Build.Repository.ID)
+          sonar.analysis.projectName=$(System.TeamProject)
+          sonar.analysis.projectId=$(System.TeamProjectId)
+          sonar.links.homepage=$(System.TeamFoundationCollectionUri)$(System.TeamProject)
+          sonar.links.ci=$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)&_a=summary
+          sonar.links.issue=$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_workitems
+          sonar.links.scm=$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_git/$(Build.Repository.Name)
+          sonar.scanner.metadataFilePath=$(Agent.TempDirectory)/sonar/$(Build.BuildId)/report-task.txt
+          sonar.qualitygate.wait=true
+          sonar.qualitygate.timeout=300
+          sonar.sources=.
+          sonar.inclusions=**/*.php
+          sonar.exclusions=**/vendor/**,**/tests/**,**/cache/**,**/node_modules/**
+          sonar.php.coverage.reportPaths=$(Build.SourcesDirectory)/coverage.xml
+
+    - task: SonarQubePrepare@5
+      displayName: Config Sonar Scala (SBT)
+      condition: startsWith('${{ parameters.recipe }}', 'sbt_')
+      inputs:
+        SonarQube: VIVO_SONARQUBE
+        scannerMode: "CLI"
+        configFile: $(Build.SourcesDirectory)/sonar-project.properties
+        extraPropertiesFile: $(Build.SourcesDirectory)/sonar-extra-properties.txt
+        extraProperties: |
+          sonar.scm.disabled=True
+          sonar.projectBaseDir=$(Build.SourcesDirectory)
+          sonar.projectKey=$(CATALOG_YAML_SONAR_PROJECT_KEY)
+          sonar.projectName=$(SONARQUBE_PROJECT_NAME)
+          sonar.projectVersion=$(new_version.NEW_VERSION)
+          sonar.analysis.repositoryName=$(Build.Repository.Name)
+          sonar.analysis.buildId=$(Build.BuildId)
+          sonar.analysis.repositoryId=$(Build.Repository.ID)
+          sonar.analysis.projectName=$(System.TeamProject)
+          sonar.analysis.projectId=$(System.TeamProjectId)
+          sonar.links.homepage=$(System.TeamFoundationCollectionUri)$(System.TeamProject)
+          sonar.links.ci=$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)&_a=summary
+          sonar.links.issue=$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_workitems
+          sonar.links.scm=$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_git/$(Build.Repository.Name)
+          sonar.scanner.metadataFilePath=$(Agent.TempDirectory)/sonar/$(Build.BuildId)/report-task.txt
+          sonar.qualitygate.wait=true
+          sonar.qualitygate.timeout=300
+          sonar.sources=.
+          sonar.inclusions=**/*.scala
+          sonar.exclusions=**/target/**,**/test/**,**/node_modules/**
+          sonar.scala.scoverage.reportPaths=$(Build.SourcesDirectory)/target/scala-*/scoverage-report/scoverage.xml
+        
+      
+    - task: SonarQubeAnalyze@5
+      displayName: Sonar Scan
+      continueOnError: false
+      env:
+        ASDF_JAVA_VERSION: $(ASDF_JDK_11)
+
+    - script: cat $(Agent.TempDirectory)/sonar/$(Build.BuildId)/report-task.txt
+      displayName: Inspect Sonar Scanner Logs
+
+    - task: SonarQubePublish@5
+      inputs:
+        pollingTimeoutSec: '300'

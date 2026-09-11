@@ -1,0 +1,145 @@
+parameters:
+  - name: condition
+    type: object
+    default: succeeded()
+
+steps:
+  - bash: |
+      echo "##[group] Variáveis de ambiente"
+      echo "##[debug]Para desabilitar essa task, altere a variável VALIDATE_RELEASE_MANAGER para false"
+      echo "##[debug]VALIDATE_RELEASE_MANAGER: ............ ${VALIDATE_RELEASE_MANAGER}"
+      echo "##[debug]BLOCK_ON_RELEASE_MANAGER_FAILURE: .... ${BLOCK_ON_RELEASE_MANAGER_FAILURE}"
+      echo "##[debug]RELEASE_MANAGER_URL: ................. ${RELEASE_MANAGER_URL}"
+
+      handle_release_manager_failure() {
+        local error_message="$1"
+        local warning_message="$2"
+
+        if [[ "${BLOCK_ON_RELEASE_MANAGER_FAILURE}" == "true" ]]; then
+          echo "##[error]${error_message}"
+          echo "##vso[task.complete result=Failed;]"
+          exit 1
+        else
+          echo "##[warning]${warning_message}"
+          exit 0
+        fi
+      }
+
+      if [[ "$(Build.Reason)" == "PullRequest" ]]; then
+        TARGET_BRANCH_RAW="$(System.PullRequest.targetBranchName)"
+        PR_ID="$(System.PullRequest.PullRequestId)"
+
+        # Remover o prefixo refs/heads/ da branch se existir
+        if [[ "$TARGET_BRANCH_RAW" == refs/heads/* ]]; then
+          TARGET_BRANCH="${TARGET_BRANCH_RAW#refs/heads/}"
+        else
+          TARGET_BRANCH="$TARGET_BRANCH_RAW"
+        fi
+
+        echo "##[debug]TARGET BRANCH RAW: ............ $TARGET_BRANCH_RAW"
+        echo "##[debug]TARGET BRANCH: ................ $TARGET_BRANCH"
+        echo "##[debug]PULL REQUEST ID: .............. $PR_ID"
+      echo "##[endgroup]"
+
+        # Verificar se a validação está habilitada
+        if [[ "${VALIDATE_RELEASE_MANAGER}" != "true" ]]; then
+          echo "##[warning]Validação de Release Manager está desabilitada"
+          echo "##[section]Para habilitar, configure a variável VALIDATE_RELEASE_MANAGER=true"
+          exit 0
+        fi
+
+        echo "##[group] Payload para validação"
+        # Preparar payload JSON
+        PAYLOAD=$(jq --null-input \
+                    --arg pullRequestId "$PR_ID" \
+                    --arg targetBranch "$TARGET_BRANCH" \
+                    '{"pullRequestId": $pullRequestId, "targetBranch": $targetBranch}')
+
+        echo "##[debug]Payload para validação:"
+        echo "##[debug]$PAYLOAD"
+
+        # Executar curl com timeout e tratamento de erro
+        RESPONSE=$(curl --max-time 30 \
+                        --silent \
+                        --write-out "HTTPSTATUS:%{http_code}" \
+                        --location "$RELEASE_MANAGER_URL" \
+                        --header 'Content-Type: application/json' \
+                        --data-raw "$PAYLOAD" \
+                        2>&1)
+
+        # Separar HTTP status code do body
+        HTTP_STATUS=$(echo "$RESPONSE" | grep -o "HTTPSTATUS:[0-9]*" | cut -d: -f2)
+        RESPONSE_BODY=$(echo "$RESPONSE" | sed 's/HTTPSTATUS:[0-9]*$//')
+
+        echo "##[debug]HTTP Status Code: $HTTP_STATUS"
+        echo "##[debug]Response Body: $RESPONSE_BODY"
+
+        # Verificar se a requisição foi bem-sucedida
+        if [[ "$HTTP_STATUS" != "200" ]]; then
+          echo "##[warning]Release Manager communication failed."
+          handle_release_manager_failure \
+            "Pipeline bloqueada devido à falha na validação do Release Manager" \
+            "Continuando execução - validação de Release Manager não está configurada para bloquear"
+        fi
+
+        # Verificar se a resposta é um JSON válido
+        if ! echo "$RESPONSE_BODY" | jq empty 2>/dev/null; then
+          echo "##[warning]Release Manager returned an invalid JSON payload."
+          handle_release_manager_failure \
+            "Pipeline bloqueada devido à resposta inválida do Release Manager" \
+            "Continuando execução - resposta inválida mas bloqueio não está habilitado"
+        fi
+
+        # Parsear resposta JSON
+        IS_VALID=$(echo "$RESPONSE_BODY" | jq -r '.isValid // false')
+        MESSAGE=$(echo "$RESPONSE_BODY" | jq -r '.message // "Sem mensagem disponível"')
+        ACTION=$(echo "$RESPONSE_BODY" | jq -r '.action // "Sem ação sugerida pelo Release Manager"')
+        PROJECT_KEY=$(echo "$RESPONSE_BODY" | jq -r '.projectKey // ""')
+
+        echo "##[debug]Valid: $IS_VALID"
+        echo "##[endgroup]"
+
+        echo "=============================================================================="
+        echo "                    RELEASE MANAGER VALIDATION REPORT"
+        echo "=============================================================================="
+        echo
+        echo "PR ID : ${PR_ID}"
+        echo "Target Branch : ${TARGET_BRANCH}"
+        echo "Project Key : ${PROJECT_KEY:-N/A}"
+        echo
+
+        echo "Status"
+        echo "----------------------------------------------------------------------------"
+
+        # Processar resultado
+        if [[ "$IS_VALID" == "true" ]]; then
+          echo "✅ Validação do Release Manager aprovada"
+          exit 0
+        else
+          echo "##vso[task.logissue type=warning]❌ Validação do Release Manager rejeitada"
+          echo
+          echo "Veja o motivo e a ação sugerida abaixo:"
+
+          echo "----------------------------------------------------------------------------"
+          echo
+          echo "Motivo: $MESSAGE"
+          echo
+          echo "Ação necessária: $ACTION"
+          echo
+          echo "----------------------------------------------------------------------------"
+
+          handle_release_manager_failure \
+            "Pipeline bloqueada devido à rejeição do Release Manager" \
+            "Continuando execução - bloqueio do Release Manager não está habilitado"
+        fi
+
+      else
+        echo "##[section]Não é um Pull Request - pulando validação do Release Manager"
+        exit 0
+      fi
+    displayName: "Validate Release Manager"
+    condition: ${{ parameters.condition }}
+    env:
+      RELEASE_MANAGER_URL: $(RELEASE_MANAGER_URL)
+      VALIDATE_RELEASE_MANAGER: $(VALIDATE_RELEASE_MANAGER)
+      BLOCK_ON_RELEASE_MANAGER_FAILURE: $(BLOCK_ON_RELEASE_MANAGER_FAILURE)

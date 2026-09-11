@@ -1,0 +1,142 @@
+parameters:
+- name: envs
+  type: object
+  default:
+    BUILD_POOL: GeneralPurposeLinuxAgentsCI
+- name: branching_strategy
+  type: string
+  default: 'stb'
+
+jobs:
+- job: package
+  ${{ if ne( parameters.envs.BUILD_POOL, '') }}:
+    pool: '${{ parameters.envs.BUILD_POOL }}'
+  ${{ else }}:
+    pool: GeneralPurposeLinuxAgentsCI
+  workspace:
+    clean: all
+  variables:
+    - name: SECURITY_GATE_PASSED
+      value: $[ stageDependencies.gates.security.outputs['VerifySecurityGates.SECURITY_GATE_PASSED'] ]
+    - name: SECURITY_JOB_RESULT
+      value: $[ stageDependencies.gates.security.result ]
+    # Precisa importar de novo, do contrário não funciona
+    - template: ./variables.yaml
+      parameters:
+          envs: ${{ parameters.envs }}
+    - ${{ if and(eq( parameters.branching_strategy, 'gitlabflow'), ne(variables['Build.SourceBranchName'], '')) }}:
+      - template: ./variables/${{ variables['Build.SourceBranchName'] }}.yaml
+        parameters:
+            envs: ${{ parameters.envs }}
+  steps:
+  - template: /tech_products/azr4/templates/steps/validate-sg-execution.yaml
+  - task: DownloadBuildArtifacts@0
+    inputs:
+      buildType: 'current'
+      downloadType: 'single'
+      artifactName: 'build'
+      downloadPath: $(System.DefaultWorkingDirectory)
+  - script: cp -rf $(System.DefaultWorkingDirectory)/build/* $(Build.SourcesDirectory)
+    displayName: Copy build artifacts to sources directory
+
+  - task: DownloadSecureFile@1
+    name: securitysettings
+    displayName: 'Download custom security.xml from secure file'
+    inputs:
+      secureFile: 'settings-security.xml'
+
+  - script: echo "##vso[task.setvariable variable=MAVEN_SETTINGS_SECURITY]$(securitysettings.secureFilePath)"
+    displayName: Set MAVEN_SETTINGS_SECURITY Var
+
+  - task: DownloadSecureFile@1
+    name: CustomSettings
+    displayName: 'Download custom settings.xml from secure file'
+    inputs:
+      secureFile: settings.xml
+  - script: echo "##vso[task.setvariable variable=MAVEN_SETTINGS]$(CustomSettings.secureFilePath)"
+    displayName: Set MAVEN_SETTINGS Var
+    
+  - template: /tech_products/azr4/templates/steps/version_update.yaml
+
+  - task: Cache@2
+    displayName: Cache task
+    inputs:
+      key: 'docker | "$(Agent.OS)" | cache'
+      path: $(Pipeline.Workspace)/docker
+      cacheHitVar: CACHE_RESTORED 
+
+  - script: |
+      docker load -i $(Pipeline.Workspace)/docker/cache.tar
+    displayName: Docker restore
+    condition: and(not(canceled()), eq(variables.CACHE_RESTORED, 'true'))
+  - ${{ if eq(variables['AUTH_4P_NEXUS'], 'true') }}:
+    - task: Docker@2
+      displayName: 'Login to Docker Registry registry-telefonicabigdata'
+      continueOnError: true
+      inputs:
+        containerRegistry: registry-telefonicabigdata
+        displayName: 'Login to Docker Registry '
+        command: 'login'
+  - task: Docker@2
+    displayName: 'Login to Docker Registry'
+    continueOnError: true
+    inputs:
+      containerRegistry: ACR-DEVOPS
+      displayName: 'Login to Docker Registry ACR-DEVOPS'
+      command: 'login'
+  - task: Docker@2
+    displayName: Docker Login ${{ variables.IMAGE_REGISTRY_CONNECTION }}
+    inputs:
+      containerRegistry: ${{ variables.IMAGE_REGISTRY_CONNECTION }}
+      displayName: 'Login to Docker Registry'
+      command: 'login'
+  - script: ls -la
+    displayName: 'List files in the workspace'
+  # ==================================================================
+  # [Compliance] Verifica se o repositório está em conformidade com as políticas de configuração
+  # ==================================================================
+  - task: VivoDevOpsConfigCompliance@1
+    displayName: 'Check DevOps Config Compliance'
+    inputs:
+      workDir: $(Build.SourcesDirectory)
+      policySets: |
+        image-definition-files
+  - task: Docker@2
+    displayName: Docker Build
+    inputs:
+      containerRegistry: ${{ variables.IMAGE_REGISTRY_CONNECTION }}
+      repository: ${{ variables.IMAGE_NAME }}
+      displayName: 'Docker Build with Cache'
+      command: 'build'
+      Dockerfile: ${{ variables.DOCKERFILE_PATH }}
+      tags: $(set_version.version)
+      arguments: '--build-arg BUILDKIT_INLINE_CACHE=1'
+  - script: |
+      FULL_IMAGE_NAME=$(docker images --format '{{.Repository}}:{{.Tag}}' | grep "${IMAGE_NAME}:${IMAGE_TAG}")
+      echo "##[debug] FULL_IMAGE_NAME: $FULL_IMAGE_NAME"
+      echo "##vso[task.setvariable variable=FULL_IMAGE_NAME;isOutput=true]${FULL_IMAGE_NAME}"
+    displayName: 'Extract Docker Image Name to SCA'
+    name: get_image
+    env:
+      IMAGE_NAME: ${{ variables.IMAGE_NAME }}
+      IMAGE_TAG: $(set_version.version)
+
+  - bash: |
+      mkdir -p $(Pipeline.Workspace)/docker
+      docker save -o $(Pipeline.Workspace)/docker/cache.tar ${FULL_IMAGE_NAME}
+    displayName: Docker save
+    condition: and(not(canceled()), not(failed()), ne(variables.CACHE_RESTORED, 'true'))
+    env:
+      FULL_IMAGE_NAME: $(get_image.FULL_IMAGE_NAME)
+
+  - task: Docker@2
+    displayName: Docker Publish
+    inputs:
+      containerRegistry: ${{ variables.IMAGE_REGISTRY_CONNECTION }}
+      repository: ${{ variables.IMAGE_NAME }}
+      displayName: 'Docker Publish'
+      command: 'push'
+      addPipelineData: true
+      addBaseImageData: true
+      Dockerfile: ${{ variables.DOCKERFILE_PATH }}
+      tags: $(set_version.version)

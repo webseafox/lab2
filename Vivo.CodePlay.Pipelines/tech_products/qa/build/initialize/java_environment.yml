@@ -1,0 +1,134 @@
+# tech_products/qa/initialize/java_environment.yml
+stages:
+  - stage: environment_init
+    displayName: "CI - Environment"
+    pool:
+      name: $(PRIVATE_AGENT_DEFAULT)
+ 
+    jobs:
+      - job: environment
+        displayName: Set up environment
+        steps:
+ 
+          # Clean the pipeline workspace and checkout the code
+          - checkout: self
+            displayName: Checkout Code
+            name: checkout_code
+            submodules: true
+            persistCredentials: true
+ 
+          ## Checkout CodePlay repository
+          - checkout: CodePlay
+            displayName: Checkout CodePlay
+            name: checkout_codeplay
+            persistCredentials: true
+ 
+          ## Make scripts executable
+          - task: Bash@3
+            displayName: "Set execute permissions for scripts"
+            inputs:
+              targetType: 'inline'
+              script: |
+                chmod +x $(SCRIPTS_FOLDER_JAVA_ENV)/*.sh
+ 
+          ## Initialize Catalog-Info
+          - task: Bash@3
+            displayName: "Load Catalog-Info"
+            name: catalog_info
+            inputs:
+              targetType: 'tagetPath'
+              script: $(SCRIPTS_FOLDER_JAVA_ENV)/load_catalog_info.sh
+            env:
+              TARGET_DIR: $(Build.Repository.Name)
+ 
+          ## Download NEXUS Credentials
+          - task: AzureKeyVault@2
+            displayName: 'Getting AKV Credentials'
+            timeoutInMinutes: 3
+            retryCountOnTaskFailure: 5
+            inputs:
+              azureSubscription: DevOpsSharedResources
+              KeyVaultName: $(AKV_DEVOPS_NAME)
+              SecretsFilter: 'NEXUS-DEPS-USR, NEXUS-DEPS-PSW, NEXUS-DEFAULT-USR, NEXUS-DEFAULT-PSW'
+
+          
+          - task: Bash@3
+            displayName: 'Set Credentials Variables'
+            name: credentials
+            condition: and(
+              succeeded(),
+              ne(variables['NEXUS-DEPS-USR'], ''), ne(variables['NEXUS-DEPS-PSW'], ''),
+              ne(variables['NEXUS-DEFAULT-USR'], ''), ne(variables['NEXUS-DEFAULT-PSW'], ''))
+            continueOnError: false
+            inputs:
+              targetType: 'inline'
+              script: |          
+                echo "##[group] Variables to DOWNLOAD dependencies from NEXUS"
+                echo "##[debug] NEXUS-DEPS-USR: $(NEXUS-DEPS-USR). Use as >> NEXUS_DEPS_USR."
+                echo "##vso[task.setvariable variable=NEXUS_DEPS_USR;isOutput=true;isSecret=true]$(NEXUS-DEPS-USR)"
+                echo "##[debug] NEXUS-DEPS-PSW: $(NEXUS-DEPS-PSW). Use as >> NEXUS_DEPS_PSW"          
+                echo "##vso[task.setvariable variable=NEXUS_DEPS_PSW;isOutput=true;isSecret=true]$(NEXUS-DEPS-PSW)"
+                echo "##[endgroup]"
+      
+                echo "##[group] Variables to PUBLISH artifacts to NEXUS"          
+                echo "##[debug] NEXUS-DEFAULT-USR: $(NEXUS-DEFAULT-USR). Use as >> NEXUS_DEFAULT_USR"          
+                echo "##vso[task.setvariable variable=NEXUS_DEFAULT_USR;isOutput=true;isSecret=true]$(NEXUS-DEFAULT-USR)"
+                echo "##[debug] NEXUS-DEFAULT-PSW: $(NEXUS-DEFAULT-PSW). Use as >> NEXUS_DEFAULT_PSW"          
+                echo "##vso[task.setvariable variable=NEXUS_DEFAULT_PSW;isOutput=true;isSecret=true]$(NEXUS-DEFAULT-PSW)"
+                echo "##[endgroup]"
+                echo "##[debug] To open and check the information above, click the arrows on the left."
+      
+                echo "##[debug] Secure File Path: $(settings.secureFilePath)"
+              KeyVaultName: $(AKV_DEVOPS_NAME)
+              SecretsFilter: 'NEXUS-DEPS-USR, NEXUS-DEPS-PSW, NEXUS-DEFAULT-USR, NEXUS-DEFAULT-PSW'
+                    
+          # ## Download a Secure File in the 'Azure Agent' as a copy
+          # - task: DownloadSecureFile@1
+          #   displayName: 'Download custom settings.xml from secure file'
+          #   name: settings
+          #   condition: and(succeeded(), ne(variables['MAVEN_CUSTOM_SETTINGS_SECURE_FILE'], ''))
+          #   continueOnError: false
+          #   inputs:
+          #     actionOnNoFiles: 'warn'
+          #     secureFile: '$(MAVEN_CUSTOM_SETTINGS_SECURE_FILE)'
+ 
+          ## Set MAVEN information to variables
+          - task: Bash@3
+            displayName: 'Defining Maven Settings Variables'
+            name: settings_variables
+            condition: succeeded()
+            continueOnError: false
+            inputs:
+              targetType: 'targetPath'
+              script: $(SCRIPTS_FOLDER_JAVA_ENV)/set_maven_settings_variables.sh
+ 
+          ## Replace variables in the downloaded settings.xml
+          - task: qetza.replacetokens.replacetokens-task.replacetokens@5
+            displayName: 'Configuring custom settings.xml'
+            condition: and(succeeded(), ne(variables['MAVEN_CUSTOM_SETTINGS_SECURE_FILE'], ''))
+            continueOnError: false
+            inputs:
+              targetFiles: $(settings_variables.MAVEN_SETTINGS_LOCATION)
+              tokenPattern: 'azpipelines'
+              enableTelemetry: false
+            env:
+              NEXUS_DEPS_USR: $(NEXUS-DEPS-USR)
+              NEXUS_DEPS_PSW: $(NEXUS-DEPS-PSW)
+              SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+ 
+          ## Export custom settings.xml file to a variable
+          - task: CmdLine@2
+            displayName: "Exporting Custom Settings"
+            name: custom_settings
+            condition: and(succeeded(), ne(variables['MAVEN_CUSTOM_SETTINGS_SECURE_FILE'], ''))
+            continueOnError: false
+            inputs:
+              script: $(SCRIPTS_FOLDER_JAVA_ENV)/export_custom_settings.sh
+          
+          ## Publish context to be used in the next stages
+          - publish: $(Build.SourcesDirectory)
+            artifact: checkout_env
+            displayName: 'Publish Checkout Environment'
+            condition: succeeded()
+            continueOnError: false
+ 

@@ -1,0 +1,829 @@
+# ==================================================================
+# Pipeline: Build NodeJS Library - CI/CD para Bibliotecas Node
+# -----------------------------------------------------
+# Pipeline para build, teste, e publicação de bibliotecas NodeJS
+# com suporte à versionamento automático, testes unitários e
+# cobertura de código usando Azure DevOps e npm registry
+# OBS:
+# O .npmrc deve estar presente no repositório configurado conforme documentação
+# O Setup da versão do nodejs é realizado através do asdf (.tools-version)
+# Utilizar o nexus somente para libjs legadas que não foram migradas para o Artifacts
+# ==================================================================
+
+# Dependencies:
+# - .npmrc no repositório (configuração do feed) - Veja documentação e decisão 1 no final do documento
+
+parameters:
+  # ==================================================================
+  # Infraestrutura e Ambiente
+  # ==================================================================
+  - name: agentPool
+    type: string
+    default: GeneralPurposeLinuxAgentsCI
+    displayName: 'Agent Pool para execução'
+
+  - name: useNetworkProxy
+    type: boolean
+    default: false
+    displayName: 'Configurar proxy de rede para acesso externo (se necessário)'
+
+  # ==================================================================
+  # Configurações de NodeJS e Feed
+  # ==================================================================
+  - name: getDependenciesFromNexus
+    type: boolean
+    default: false
+    displayName: 'Usar Nexus para autenticação (true) ou Azure Artifacts (false)'
+  # Observação: Olhar decisão 2 no final do documento sobre o uso do Nexus
+  # A credencial utilizada é readonly, as publicações devem ser feitas no Artifacts apenas.
+  - name: workingDirectory
+    type: string
+    default: $(Build.SourcesDirectory)
+    displayName: 'Diretório do projeto NodeJS'
+  - name: buildArtifactName
+    type: string
+    default: $(Build.Repository.Name)
+    displayName: 'Nome do artefato de build para SCA Scan'
+
+  # ==================================================================
+  # Configurações de Versionamento e Validação
+  # ==================================================================
+  - name: versionFile
+    type: string
+    default: 'package.json'
+    displayName: 'Arquivo de versionamento (package.json)'
+  - name: prValidationOnly
+    type: boolean
+    default: false
+    displayName: 'Executa apenas a validação, não publica nem gera versão'
+
+  - name: branchingStrategy
+    type: string
+    default: 'trunkbased'
+    displayName: 'Estratégia de versionamento'
+    values:
+      - 'trunkbased'
+      - 'vivoflow'
+      - 'releaseflow'
+      - 'gitlabflow'
+      - 'gitlabflow-semantic'
+      - 'custom'
+      - 'monorepo'
+
+  # ==================================================================
+  # Configurações de Capacidades
+  # ==================================================================
+  - name: enableTest
+    type: boolean
+    default: true
+    displayName: 'Habilitar execução de testes'
+
+  # ==================================================================
+  # Configurações de Publicação de Testes e Cobertura
+  # ==================================================================
+  - name: testResultsFormat
+    type: string
+    default: 'JUnit'
+    displayName: 'Formato dos resultados de testes'
+    values:
+      - 'JUnit'
+      - 'NUnit'
+      - 'VSTest'
+      - 'XUnit'
+      - 'CTest'
+
+  - name: testResultsFiles
+    type: string
+    default: 'test-results/junit.xml'
+    displayName: 'Caminho relativo dos arquivos de resultados de testes'
+
+  - name: failTaskOnFailedTests
+    type: boolean
+    default: true
+    displayName: 'Falhar task se houver testes com falha'
+
+  - name: mergeTestResults
+    type: boolean
+    default: true
+    displayName: 'Mesclar resultados de testes'
+
+  - name: coverageSummaryFile
+    type: string
+    default: 'test-results/coverage/clover.xml'
+    displayName: 'Caminho relativo do arquivo de resumo de cobertura'
+
+  - name: failIfCoverageEmpty
+    type: boolean
+    default: false
+    displayName: 'Falhar se não houver resultados de cobertura'
+
+  - name: publishAllureReport
+    type: boolean
+    default: false
+    displayName: 'Publicar relatório Allure (gerado durante npm run test)'
+
+  - name: testAllureResultsDir
+    type: string
+    default: '$(Pipeline.Workspace)/allure-results'
+    displayName: 'Diretório de resultados do Allure (evite Build.SourcesDirectory)'
+
+  - name: enableCache
+    type: boolean
+    default: true
+    displayName: 'Habilitar cache de dependências npm'
+
+  - name: runQualityGate
+    type: boolean
+    default: true
+    displayName: 'Executar Quality Gate (SonarQube)'
+
+  # ==================================================================
+  # Configurações de Publicação de Artefatos
+  # ==================================================================
+  - name: artifactPaths
+    type: string
+    default: |
+      **/*
+      !.git/**/*
+      !.vscode/**/*
+      !.idea/**/*
+    displayName: 'Padrões de arquivos para publicar (glob patterns, um por linha)'
+
+# ==================================================================
+# Configurações de Segurança
+# ==================================================================
+  - name: enableFortifyExclusions
+    displayName: 'Faz checkout do repositório Fortify Exclusions'
+    type: boolean
+    default: false
+
+# ==================================================================
+# Configurações do Sonar
+# ==================================================================
+  - name: useSonarConfigFile
+    type: boolean
+    default: true
+    displayName: 'Usar arquivo de configuração do SonarQube?'
+
+  - name: sonarConfigFilePath
+    type: string
+    default: '.azuredevops/sonar-project.properties'
+    displayName: 'Caminho do arquivo de configuração do SonarQube'
+
+  - name: sonarPollingTimeoutSec
+    type: string
+    default: '300'
+    displayName: 'Timeout do Polling SonarQube (s)'
+
+  - name: sonarJavaVersion
+    type: string
+    default: 'openjdk-17.0.2'
+    displayName: 'Versão do Java para análise SonarQube'
+    values:
+      - 'openjdk-21.0.2'
+      - 'openjdk-17.0.2'
+      - 'openjdk-11.0.2'
+
+  # ==================================================================
+  # Service Connection do SonarQube
+  # Hoje ainda permite referenciar manualmente o Sonar VIP ou comum.
+  # Será depreciado em breve (história futura) para aderir à governança da ADR 0006.
+  # ==================================================================
+  - name: sonarServiceConnection
+    type: string
+    default: 'VIVO_SONARQUBE'
+    displayName: '(DEPRECATED) Service Connection do SonarQube'
+
+  - name: sonarQualityGate
+    type: string
+    default: 'AzureDevOps-Default'
+    displayName: 'Quality Gate do SonarQube'
+
+  - name: sonarScannerMode
+    type: string
+    default: 'cli'
+    displayName: 'Modo do scanner SonarQube'
+    values:
+      - 'cli'
+      - 'dotnet'
+
+  - name: sonarProjectKey
+    type: string
+    default: '$(System.TeamProject)-$(Build.Repository.Name)'
+    displayName: 'Chave do projeto no SonarQube'
+
+  - name: sonarProjectName
+    type: string
+    default: '$(System.TeamProject)-$(Build.Repository.Name)'
+    displayName: 'Nome do projeto no SonarQube'
+
+  - name: useAppConfig
+    type: boolean
+    default: true
+    displayName: 'Usar Azure App Configuration para SonarQube'
+
+# ==================================================================
+# Variáveis Internas do Pipeline
+# ==================================================================
+variables:
+  - name: SIGLA
+    value: $[ lower(split(variables['System.TeamProject'],' ')[0]) ]
+  - name: NODE_CACHE_FOLDER
+    value: $(Pipeline.Workspace)/.npm
+
+ # Configurações de KeyVault para Segurança
+  - name: AKV_DEVOPS_NAME
+    value: 'kv-azdevops-shared'
+
+  # Variables for Proxy
+  - name: PROXY_NSKP_SERVER
+    value: "nskp.redecorp.br:8080"
+  - name: PROXY_SQUID_SERVER
+    value: "10.240.58.39:3128"
+  - name: PROXY_AGENT_HTTP
+    value: "http://$(PROXY_NSKP_SERVER)"
+  - name: PROXY_AGENT_HTTPS
+    value: "http://$(PROXY_NSKP_SERVER)"
+  - name: PROXY_AGENT_NO_PROXY
+    value: "localhost,0.0.0.0,127.0.0.1,10.244.0.0/16,192.168.0.0/16,10.129.178.173,nexus.telefonica.com.br,acrsharedservices01.azurecr.io,appcs-azdevops-shared.azconfig.io,scm.azurewebsites.net"
+
+  # Variáveis utilizadas por templates de Segurança (Fortify/SCA)
+  - name: CACORP_LOCATION
+    value: $(Agent.HomeDirectory)/../../certs/CACORP.pem
+
+  - name: APP_LANGUAGE
+    value: 'nodejs'
+
+  - name: FORTIFY_APP_DEFAULT_VERSION
+    value: DevSecOps
+
+# ==================================================================
+# Estágios do Pipeline
+# ==================================================================
+stages:
+  # Stage 1: NodeBuild - Build, Testes e Publicação da biblioteca NodeJS
+  - stage: NodeBuild
+    displayName: 'Build e Testes NodeJS'
+    condition: succeeded()
+    jobs:
+      - job: NodeBuild
+        displayName: 'Build e Testes'
+        pool: ${{ parameters.agentPool }}
+        steps:
+          # ==================================================================
+          # Configuração Inicial e Checkout
+          # ==================================================================
+          - checkout: self
+
+          # AVISO TEMPORÁRIO: Este bloco será removido após a remoção definitiva do parâmetro 'sonarServiceConnection'.
+          # Exibe warning para quem ainda sobrescreve manualmente o parâmetro.
+          - ${{ if ne(parameters.sonarServiceConnection, 'VIVO_SONARQUBE') }}:
+            - script: |
+                echo "##vso[task.logissue type=warning]O parâmetro 'sonarServiceConnection' está depreciado e será removido após 30/06/2026. Consulte ADR 0006 e ADR 0008 para detalhes. A escolha da instância Sonar será automática via custom task e vip.json. Atualize seu pipeline!"
+                echo "##vso[task.logissue type=warning]ADR 0006: https://dev.azure.com/telefonica-vivo-brasil/DevOps/_git/Vivo.CodePlay.Pipelines?path=/doc/adr/0006-uso-do-sonar.md"
+                echo "##vso[task.logissue type=warning]ADR 0008: https://dev.azure.com/telefonica-vivo-brasil/DevOps/_git/Vivo.CodePlay.Pipelines?path=/framework/docs/adr/0008-sonar-vip-governance.md"
+                echo "##vso[task.complete result=SucceededWithIssues;]"
+              displayName: '⚠️ AVISO: Depreciação do sonarServiceConnection'
+
+          # ==================================================================
+          # Observabilidade e Diagnóstico
+          # ==================================================================
+          - task: VivoUtilsFromVivo@1
+            displayName: 'Show Pipeline Parameters'
+            condition: eq(variables['System.Debug'], 'true')
+            inputs:
+              command: 'show-pipeline-parameters'
+              parameters: '${{ convertToJson(parameters) }}'
+
+          # ==================================================================
+          # Autenticação no Nexus (Para download de libs)
+          # A credencial utilizada é readonly, as publicações devem ser feitas no Artifacts apenas.
+          # ==================================================================
+          - ${{ if eq(parameters.getDependenciesFromNexus, true) }}:
+            - task: AzureKeyVault@2
+              displayName: 'Secrets from AKV'
+              inputs:
+                azureSubscription: "DevOpsSharedResources"
+                KeyVaultName: "kv-azdevops-shared"
+                SecretsFilter: >-
+                  NEXUS-DEPS-USR, NEXUS-DEPS-PSW
+
+          # ==================================================================
+          # Otimização de Performance (Cache)
+          # ==================================================================
+          - ${{ if eq(parameters.enableCache, true) }}:
+            - task: Cache@2
+              displayName: 'Cache Node dependencies'
+              inputs:
+                key: 'node | "$(Agent.OS)" | **/package-lock.json'
+                restoreKeys: |
+                  node | "$(Agent.OS)" | **/package-lock.json
+                path: $(NODE_CACHE_FOLDER)
+
+          # ==================================================================
+          # [Versionamento] Definição da versão (VersionManager)
+          # ==================================================================
+          - task: VersionManagerVivo@8
+            displayName: 'Next version package.json'
+            inputs:
+              command: 'nextVersion'
+              branchingStrategy: ${{ parameters.branchingStrategy }}
+              versionFile: '${{ parameters.workingDirectory }}/${{ parameters.versionFile }}'
+              bumpMethod: 'patch'
+              passthroughVersion: ${{ parameters.prValidationOnly }}
+            name: VersionManagerVivo
+
+          # ==================================================================
+          # Instalação de Dependências
+          # ==================================================================
+          - task: npm@1
+            displayName: 'npm install'
+            inputs:
+              command: 'install'
+              workingDir: ${{ parameters.workingDirectory }}
+              customRegistry: 'useNpmrc'
+              customRegistryFile: '.npmrc'
+            env:
+              NPM_CONFIG_CACHE: $(NODE_CACHE_FOLDER)
+              NEXUS_DEPS_USR: $(NEXUS-DEPS-USR) # A credencial utilizada é readonly, as publicações devem ser feitas no Artifacts apenas.
+              NEXUS_DEPS_PSW: $(NEXUS-DEPS-PSW) # A credencial utilizada é readonly, as publicações devem ser feitas no Artifacts apenas.
+              AZURE_DEVOPS_PAT: $(System.AccessToken) # O Nome é AZURE_DEVOPS_PAT para deixar mais claro como desenvolvedor deve usar o arquivo para build local
+              SYSTEM_ACCESSTOKEN: $(System.AccessToken) # Algumas docs mostram para configurar essa var (ver decisão 3)
+
+          # ==================================================================
+          # Build do Projeto
+          # ==================================================================
+          - task: npm@1
+            displayName: 'npm run build'
+            inputs:
+              command: 'custom'
+              customCommand: 'run build'
+              workingDir: ${{ parameters.workingDirectory }}
+              customRegistry: 'useNpmrc'
+              customRegistryFile: '.npmrc'
+            env:
+              NPM_CONFIG_CACHE: $(NODE_CACHE_FOLDER)
+              VERSION: $(VersionManagerVivo.VERSION)
+
+          # ==================================================================
+          # Testes Unitários e Cobertura de Código
+          # ==================================================================
+          # CAPACIDADE: TESTES UNITÁRIOS + COBERTURA (condicional enableTest)
+          # Descrição: Executa testes unitários e coleta cobertura de código
+          # Documentação: https://dvps.redecorp.azr/portal/codeplay/capacidades/catalog/testes-unitarios
+          # Pré-requisitos: 
+          # Artefatos: relatórios JUnit XML + cobertura HTML/XML
+          # Observação: Veja documentação para configurar o Jest com cobertura
+          - ${{ if eq(parameters.enableTest, true) }}:
+            # Execução de testes
+            - task: npm@1
+              displayName: 'npm test'
+              inputs:
+                command: 'custom'
+                customCommand: 'test'
+                workingDir: ${{ parameters.workingDirectory }}
+                customRegistry: 'useNpmrc'
+                customRegistryFile: '.npmrc'
+              env:
+                NPM_CONFIG_CACHE: $(NODE_CACHE_FOLDER)
+
+            # Publicação dos relatórios de testes
+            - task: PublishTestResults@2
+              displayName: 'Publish Test Results'
+              condition: succeededOrFailed()
+              inputs:
+                testResultsFormat: '${{ parameters.testResultsFormat }}'
+                testResultsFiles: '${{ parameters.workingDirectory }}/${{ parameters.testResultsFiles }}'
+                failTaskOnFailedTests: ${{ parameters.failTaskOnFailedTests }}
+                mergeTestResults: ${{ parameters.mergeTestResults }}
+
+            # Publicação dos relatórios de cobertura
+            - task: PublishCodeCoverageResults@2
+              displayName: 'Publish Code Coverage'
+              condition: succeededOrFailed()
+              inputs:
+                summaryFileLocation: '${{ parameters.workingDirectory }}/${{ parameters.coverageSummaryFile }}'
+                failIfCoverageEmpty: ${{ parameters.failIfCoverageEmpty }}
+
+          - ${{ if eq(parameters.publishAllureReport, true) }}:
+            # ==================================================================
+            # CAPACIDADE: ALLURE REPORT (condicional publishAllureReport)
+            # Pré-requisitos:
+            #   - Os resultados do Allure são gerados durante a execução de 'npm run test'
+            #   - Dependências npm: reporter Allure (ex: jest-allure, mocha-allure-reporter)
+            #   - Extensão Allure instalada na Org (task PublishAllureReport@2)
+            # ==================================================================
+            - task: PublishAllureReport@2.1.4
+              displayName: 'Publish Allure Report'
+              condition: succeededOrFailed()
+              inputs:
+                testResultsDir: '${{ parameters.testAllureResultsDir }}'
+
+  #############################################################################
+  # CAPACIDADE: QUALITY GATE (SONARQUBE)
+  #############################################################################
+  # Descrição: Análise estática de código e quality gate
+  # Documentação: https://dvps.redecorp.azr/portal/codeplay/capacidades/catalog/quality-gate
+  # Pré-requisitos:
+  #   - Service Connection 'SonarQube' configurada
+  #   - Projeto configurado no SonarQube
+  #   - Quality Gate definido no SonarQube
+  # Configuração: Parâmetro 'runQualityGate' = true
+  # Observações: Não executa em Pull Requests
+  #############################################################################
+          - ${{ if eq(parameters.runQualityGate, true) }}:
+            # ==================================================================
+            # [SonarQube] Análise Completa de Qualidade de Código
+            # ==================================================================
+            - task: SonarAnalysisFromVivo@4
+              displayName: 'SonarQube Full Analysis'
+              inputs:
+                command: 'analysis'
+                SonarQubeVip: 'VIVO_SONARQUBE_VIP'
+                SonarQube: 'VIVO_SONARQUBE'
+                scannerMode: ${{ parameters.sonarScannerMode }}
+                ${{ if eq(parameters.useSonarConfigFile, true) }}:
+                  configFile: ${{ parameters.sonarConfigFilePath }}
+                cliProjectKey: ${{ parameters.sonarProjectKey }}
+                cliProjectName: ${{ parameters.sonarProjectName }}
+                cliProjectVersion: $(VersionManagerVivo.VERSION)
+                qualityGate: ${{ parameters.sonarQualityGate }}
+                acronym: $(SIGLA)
+                reportPath: '$(Agent.TempDirectory)/sonar/$(Build.BuildId)/report-task.txt'
+                pollingTimeoutSec: ${{ parameters.sonarPollingTimeoutSec }}
+                useOpaRepository: 'true'
+                codePlayServiceConnection: 'CodePlay'
+                opaProject: 'DVPS - DEVOPS'
+                opaRepository: 'Vivo.OpenPolicy.SonarQube'
+                opaBranch: 'master'
+                useAppConfig: ${{ parameters.useAppConfig }}
+                appConfigurationEndpoint: 'https://appcs-azdevops-shared.azconfig.io'
+                azureSubscription: DevOpsSharedResources
+                sonarUrlPemCertificate: $(Agent.HomeDirectory)/../../certs/CACORP.pem
+                extraProperties: |
+                  sonar.javascript.lcov.reportPaths=${{ parameters.workingDirectory }}/test-results/coverage/lcov.info
+                  sonar.typescript.lcov.reportPaths=${{ parameters.workingDirectory }}/test-results/coverage/lcov.info
+                  sonar.scanner.metadataFilePath=$(Agent.TempDirectory)/sonar/$(Build.BuildId)/report-task.txt
+                  sonar.qualitygate.wait=false
+                  sonar.qualitygate.timeout=${{ parameters.sonarPollingTimeoutSec }}
+                  sonar.exclusions=**/node_modules/**,**/dist/**,**/build/**,**/*.spec.ts,**/*.test.ts,**/*.d.ts
+                  sonar.sources=${{ parameters.workingDirectory }}
+                  sonar.test.inclusions=**/*.spec.ts,**/*.test.ts,**/*.spec.js,**/*.test.js
+                  sonar.test.exclusions=**/*.spec.ts,**/*.test.ts
+                  sonar.verbose=${SYSTEM_DEBUG,,}
+              env:
+                ASDF_JAVA_VERSION: ${{ parameters.sonarJavaVersion }}
+
+          # ==================================================================
+          # [Publicação] Publica artefato compilado para uso em stages seguintes (SCA Scan)
+          # ==================================================================
+          # Usa lista de paths definida no parâmetro artifactPaths
+          #- task: Bash@3
+          #  displayName: 'Prepare Build Artifacts'
+          #  condition: succeeded()
+          #  inputs:
+          #    targetType: 'inline'
+          #    script: |
+          #      rsync -a \
+          #        --exclude='.git/' \
+          #        --exclude='.vscode/' \
+          #        --exclude='.idea/' \
+          #        "${{ parameters.workingDirectory }}/" \
+          #       "$(Build.ArtifactStagingDirectory)/node-lib-context/"
+          - task: Bash@3
+            displayName: 'Resolve Artifact Paths'
+            name: ResolveArtifactPaths
+            condition: succeeded()
+            inputs:
+              targetType: inline
+              script: |
+                set -euo pipefail
+
+                SCRIPT="$(Agent.TempDirectory)/resolve-$(Build.BuildId).js"
+                FILE_LIST="$(Agent.TempDirectory)/artifacts-$(Build.BuildId).txt"
+
+                cat > "$SCRIPT" << 'NODEEOF'
+                const fs = require('fs');
+                const path = require('path');
+
+                const srcDir = path.resolve(process.env.SRC_DIR);
+                const outFile = process.env.OUT_FILE;
+
+                const patterns = (process.env.ARTIFACT_PATTERNS || '**/*')
+                  .split('\n')
+                  .map(l => l.trim())
+                  .filter(l => l && !l.startsWith('#'));
+
+                const includes = patterns
+                  .filter(p => !p.startsWith('!'))
+                  .map(p => p.replace(/\\/g, '/'));
+
+                const excludes = patterns
+                  .filter(p => p.startsWith('!'))
+                  .map(p => p.slice(1).replace(/\\/g, '/'));
+
+                function toRe(glob) {
+                  let r = glob.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+
+                  r = r.replace(/\*\*\//g, '(?:.+/)?');
+                  r = r.replace(/\*\*/g, '.*');
+                  r = r.replace(/\*/g, '[^/]*');
+
+                  return new RegExp('^' + r + '$');
+                }
+
+                function matches(rel, globs) {
+                  return globs.some(g => toRe(g).test(rel));
+                }
+
+                // Prune directories early to avoid descending into
+                // excluded directories such as .git, .vscode, etc.
+                const excludeBases = excludes
+                  .map(g => {
+                    const i = g.indexOf('*');
+
+                    return i > 0
+                      ? g.slice(0, i).replace(/\/$/, '')
+                      : null;
+                  })
+                  .filter(Boolean);
+
+                function prunedDir(rel) {
+                  return excludeBases.some(
+                    b => rel === b || rel.startsWith(b + '/')
+                  );
+                }
+
+                function walk(dir, baseDir, out) {
+                  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+                    const full = path.join(dir, entry.name);
+                    const rel = path
+                      .relative(baseDir, full)
+                      .replace(/\\/g, '/');
+
+                    if (entry.isDirectory()) {
+                      if (!prunedDir(rel)) {
+                        walk(full, baseDir, out);
+                      }
+                    } else if (entry.isFile() || entry.isSymbolicLink()) {
+                      const included =
+                        includes.length === 0 || matches(rel, includes);
+
+                      if (included && !matches(rel, excludes)) {
+                        out.push(rel);
+                      }
+                    }
+                  }
+                }
+
+                const files = [];
+
+                walk(srcDir, srcDir, files);
+
+                fs.writeFileSync(
+                  outFile,
+                  files.length ? files.join('\n') + '\n' : ''
+                );
+
+                console.log(
+                  `[resolve-artifacts] ${files.length} arquivos → ${outFile}`
+                );
+                NODEEOF
+
+                SRC_DIR="${{ parameters.workingDirectory }}" \
+                OUT_FILE="$FILE_LIST" \
+                node "$SCRIPT"
+
+                echo "##vso[task.setvariable variable=ARTIFACT_FILE_LIST]$FILE_LIST"
+            env:
+              ARTIFACT_PATTERNS: |
+                ${{ parameters.artifactPaths }}
+
+          - task: Bash@3
+            displayName: 'Prepare Build Artifacts'
+            condition: succeeded()
+            inputs:
+              targetType: inline
+              script: |
+                set -euo pipefail
+
+                mkdir -p "$(Build.ArtifactStagingDirectory)/node-lib-context"
+
+                rsync -a \
+                  --files-from="$(ARTIFACT_FILE_LIST)" \
+                  "${{ parameters.workingDirectory }}/" \
+                  "$(Build.ArtifactStagingDirectory)/node-lib-context/"
+
+          - task: PublishPipelineArtifact@1
+            displayName: 'Publish Build Artifact for Security Analysis'
+            condition: succeeded()
+            inputs:
+              targetPath: '$(Build.ArtifactStagingDirectory)/node-lib-context'
+              artifactName: '${{ parameters.buildArtifactName }}'
+              publishLocation: 'pipeline'
+
+
+# ==================================================================
+# STAGE: SECURITY ANALYSIS (PARALLEL)
+# ==================================================================
+  - stage: SecurityAnalysis
+    displayName: 'Security Analysis'
+    dependsOn:
+    - NodeBuild
+    condition: succeeded()
+    jobs:
+
+    - job: AppSecConfigKeys
+      displayName: 'Get AppSec Config Keys'
+      pool: ${{ parameters.agentPool }}
+      steps:
+      - template: /security/get_appconfig_keys_framework.yml
+        parameters:
+          azureSubscription: DevOpsSharedResources
+          appConfigurationEndpoint: https://appcs-azdevops-shared.azconfig.io
+          useNetworkProxy: ${{ parameters.useNetworkProxy }}
+
+# ==================================================================
+# CAPACIDADE: FORTIFY SCAN (SAST)
+# ==================================================================
+# Descrição: Análise estática de código (SAST) usando Fortify ScanCentral e SSC, com integração à Conviso e publicação de artefatos.
+# Documentação: https://dvps.redecorp.azr/portal/codeplay/capacidades/catalog/sast
+# Observações: Exporta variáveis e publica artefatos para uso no Security Gate.
+# ==================================================================
+    - job: FortifyScan
+      displayName: 'Fortify Scan (SAST)'
+      dependsOn:
+      -  AppSecConfigKeys
+      variables:
+        USE_FORTIFY: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.USE_FORTIFY'] ]
+        USE_CONVISO: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.USE_CONVISO'] ]
+        SKIP_SECURITY_GATE: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.SKIP_SECURITY_GATE'] ]
+        FORTIFY_LOCAL_SCANCENTRAL_VERSION: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.FORTIFY_LOCAL_SCANCENTRAL_VERSION'] ]
+      condition: and(succeeded(), eq(variables.USE_FORTIFY, true))
+      pool: ${{ parameters.agentPool }}
+      steps:
+
+      - template: /security/define_appsec_app_version.yml
+
+      - template: /security/run_fortify_scan.yml
+        parameters:
+          fortifyExclusionRepository: 'FortifyExclusion'
+          enableFortifyExclusions:  ${{ parameters.enableFortifyExclusions }}
+          appLanguage: 'nodejs'
+          appVersion: "$(FORTIFY_APP_VERSION)" # OBS: A variável FORTIFY_APP_VERSION é definida no template /security/define_appsec_app_version.yml
+
+# ==================================================================
+# CAPACIDADE: SCA SCAN (SCA)
+# ==================================================================
+# Descrição: Análise de composição de software (SCA) usando Dependency Track, com integração à Conviso e publicação de artefatos.
+# Documentação: https://dvps.redecorp.azr/portal/codeplay/capacidades/catalog
+# Observações: Exporta variáveis e publica artefatos para uso no Security Gate.
+# ==================================================================
+
+    - job: SCAScan
+      displayName: 'SCA Scan'
+      dependsOn: 
+      - AppSecConfigKeys
+      variables:
+        USE_DEPENDENCY_TRACK: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.USE_DEPENDENCY_TRACK'] ]
+        USE_DT_DOCKER: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.USE_DT_DOCKER'] ]
+        USE_CONVISO: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.USE_CONVISO'] ]
+        SKIP_SECURITY_GATE_SCA: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.SKIP_SECURITY_GATE_SCA'] ]
+      condition: and(
+                    succeeded(),
+                    eq(variables.USE_DEPENDENCY_TRACK, true)
+                  )
+      pool: ${{ parameters.agentPool }}
+      steps:
+
+      - template: /security/define_appsec_app_version.yml
+
+      - template: /security/run_sca_scan.yml
+        parameters:  
+          appVersion: "$(FORTIFY_APP_VERSION)" # OBS: A variável FORTIFY_APP_VERSION é definida no template /security/define_appsec_app_version.yml
+          buildArtifactName: ${{ parameters.buildArtifactName }}
+
+# ==================================================================
+# STAGE: PUBLISH ARTIFACT
+# ==================================================================
+  - ${{ if eq(parameters.prValidationOnly, false) }}:
+    - stage: PublishArtifact
+      displayName: 'Publish Artifact'
+      dependsOn:
+        - NodeBuild
+        - SecurityAnalysis
+      condition: succeeded()
+      jobs:
+        - job: DeployArtifact
+          displayName: 'Deploy to npm Registry'
+          pool: ${{ parameters.agentPool }}
+          steps:
+            - checkout: self
+
+            # ==================================================================
+            # Download do Artefato Buildado e Testado
+            # ==================================================================
+            - task: DownloadPipelineArtifact@2
+              displayName: 'Download Build Artifacts'
+              inputs:
+                buildType: 'current'
+                artifactName: '${{ parameters.buildArtifactName }}'
+                targetPath: '$(System.ArtifactsDirectory)/node-lib-artifacts'
+
+            # ==================================================================
+            # [Versionamento] Definição da versão (VersionManager)
+            # ==================================================================
+            - task: VersionManagerVivo@8
+              displayName: 'Next version package.json'
+              inputs:
+                command: 'nextVersion'
+                branchingStrategy: ${{ parameters.branchingStrategy }}
+                versionFile: '${{ parameters.workingDirectory }}/${{ parameters.versionFile }}'
+                bumpMethod: 'patch'
+              name: VersionManagerVivo
+
+            # ==================================================================
+            # Restaurar Artefato para Diretório de Trabalho (sem sobrescrever o versionFile)
+            # ==================================================================
+            - task: CopyFiles@2
+              displayName: 'Restore Build Artifacts'
+              inputs:
+                sourceFolder: '$(System.ArtifactsDirectory)/node-lib-artifacts'
+                contents: '**/*'
+                targetFolder: '${{ parameters.workingDirectory }}'
+                flattenFolders: false
+                overWrite: false  # Não vai sobrescrever os arquivos existentes
+
+            # ==================================================================
+            # Autenticação no Nexus (Para download de libs)
+            # A credencial utilizada é readonly, as publicações devem ser feitas no Artifacts apenas.
+            # ==================================================================
+            - ${{ if eq(parameters.getDependenciesFromNexus, true) }}:
+              - task: AzureKeyVault@2
+                displayName: 'Secrets from AKV'
+                inputs:
+                  azureSubscription: "DevOpsSharedResources"
+                  KeyVaultName: "kv-azdevops-shared"
+                  SecretsFilter: >-
+                    NEXUS-DEPS-USR, NEXUS-DEPS-PSW
+
+            # ==================================================================
+            # Publicação do Pacote
+            # ==================================================================
+            - task: npm@1
+              displayName: 'npm publish'
+              inputs:
+                command: 'custom'
+                customCommand: 'publish'
+                workingDir: ${{ parameters.workingDirectory }}
+                customRegistry: 'useNpmrc'
+                customRegistryFile: '.npmrc'
+              env:
+                NPM_CONFIG_CACHE: $(NODE_CACHE_FOLDER)
+                NEXUS_DEPS_USR: $(NEXUS-DEPS-USR) # A credencial utilizada é readonly, as publicações devem ser feitas no Artifacts apenas.
+                NEXUS_DEPS_PSW: $(NEXUS-DEPS-PSW) # A credencial utilizada é readonly, as publicações devem ser feitas no Artifacts apenas.
+                AZURE_DEVOPS_PAT: $(System.AccessToken) # O Nome é AZURE_DEVOPS_PAT para deixar mais claro como desenvolvedor deve usar o arquivo para build local
+                SYSTEM_ACCESSTOKEN: $(System.AccessToken) # Algumas docs mostram para configurar essa var (ver decisão 3)
+
+  # Stage: VersionCommit - Commit da versão no repositório e tagging
+  - ${{ if eq(parameters.prValidationOnly, false) }}:
+    - stage: VersionCommit
+      displayName: 'Commit Version'
+      dependsOn:
+        - NodeBuild
+        - SecurityAnalysis
+        - PublishArtifact
+      condition: succeeded()
+      jobs:
+        - job: CommitVersion
+          displayName: 'Commit Release Version'
+          pool: ${{ parameters.agentPool }}
+          steps:
+            # ==================================================================
+            # Checkout para Commit da Versão
+            # ==================================================================
+            - checkout: self
+              clean: true
+              persistCredentials: true
+              fetchDepth: 0
+
+            # ==================================================================
+            # [Versionamento] Reafirma versão e realiza commit/tag
+            # ==================================================================
+            - task: VersionManagerVivo@8
+              displayName: 'Next version package.json'
+              inputs:
+                command: 'nextVersion'
+                branchingStrategy: ${{ parameters.branchingStrategy }}
+                versionFile: '${{ parameters.workingDirectory }}/${{ parameters.versionFile }}'
+                bumpMethod: 'patch'
+              name: VersionManagerVivo
+
+            - task: VersionManagerVivo@8
+              displayName: 'Commit and Tag Version'
+              inputs:
+                command: 'commitVersion'
+                version: '$(VersionManagerVivo.VERSION)'
+                versionFile: ${{ parameters.workingDirectory }}/${{ parameters.versionFile }}
+                createTag: true
+                pushChanges: true

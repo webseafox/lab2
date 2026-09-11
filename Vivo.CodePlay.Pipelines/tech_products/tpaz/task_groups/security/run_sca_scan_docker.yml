@@ -1,0 +1,290 @@
+parameters:
+- name: skipSecurityGate
+  default: false
+- name: azureSubscription
+  default: "$(APP_CONFIGURATION_AZURE_SUBSCRIPTION)"
+- name: appConfigurationEndpoint
+  default: "$(APP_CONFIGURATIN_ENDPOINT)"
+
+steps:
+
+- bash: |
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    BLUE='\033[0;34m'
+    YELLOW='\033[1;33m'
+    BG_GREEN='\033[42;1;37m'
+
+    echo ' ================================================================================================================================'
+    echo '|                                                      _____             _______                                                 |'
+    echo '|                                    /\               / ____|           |__   __|                                                |'
+    echo '|                                   /  \   _ __  _ __| (___   ___  ___     | | ___  __ _ _ __ ___                                |'
+    echo '|                                  / /\ \ |  _ \|  _ \\___ \ / _ \/ __|    | |/ _ \/ _  |  _   _ \                               |'
+    echo '|                                 / ____ \| |_) | |_) |___) |  __/ (__     | |  __/ (_| | | | | | |                              |'
+    echo '|                                /_/    \_\ .__/| .__/_____/ \___|\___|    |_|\___|\__,_|_| |_| |_|                              |'
+    echo '|                                         | |   | |                                                                              |'
+    echo '|                                         |_|   |_|                                                                              |'
+    echo ' ================================================================================================================================'
+    echo "                                                                                                      powered by Vivo AppSec Team"
+    echo ""
+
+    printf "
+    =================================================================================================================================
+    ${GREEN}                                                 ${STAGENAME_DOCKER} 
+    =================================================================================================================================
+    
+    ${MESSAGE}
+
+    ${YELLOW}O objetivo desse estágio é avaliar se existem vulnerabilidades nas dependências e bibliotecas de terceiros utilizadas em imagens Docker.
+    ${YELLOW}Em caso de dúvidas sobre essa fase do pipeline acesse a documentação https://wikicorp.telefonica.com.br/pages/viewpage.action?pageId=524036659
+
+    =================================================================================================================================
+    "
+  displayName: About Stage
+  condition: eq(variables.USE_DT_DOCKER, 'true')
+
+# Realiza o download do Docker Registry
+
+- task: LoadEndpointDockerRegistryFromVivo@4
+  name: dockerendpoint
+  displayName: 'Loading Docker Registry'  
+  condition: eq(variables.USE_DT_DOCKER, 'true')
+  inputs:
+    endpoint: $(DOCKER_DEFAULT_REGISTRY_SERVICE_CONNECTION_NAME)
+    authParamsFilter: 'REGISTRY'
+
+# Remove o HTTPS:// do Docker registry
+
+- task: NunjucksInline@4
+  condition: eq(variables.USE_DT_DOCKER, 'true')
+  displayName: 'Generating Image Source for SCA Scan' 
+  inputs:
+    sourceType: 'text'
+    source: |
+      var DOCKER_REGISTRY = {{"$(dockerendpoint.AUTH_REGISTRY)" | replace(r/https?:\/\//, '')}}
+
+# Gera o SBOM e realiza o upload para o Dependency-Track
+
+- bash: |
+    echo "##[debug]Getting SYFT Tool..."
+    curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /devops/syft
+
+    echo "##[debug]SYFT Version: "
+    /devops/syft/syft --version
+
+    IMAGE_SOURCE="${DOCKER_REGISTRY}/${DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_TAG}"
+
+    echo "Image Source ${IMAGE_SOURCE}"
+
+    echo "##[debug]Saving image .tar..."
+    docker save -o ./docker-image.tar $IMAGE_SOURCE    
+
+    echo "##[debug]Running syft for docker ..."
+    TMPDIR=$(Agent.TempDirectory) /devops/syft/syft scan ./docker-image.tar --verbose -o cyclonedx-json=raw_cyclonedx_report.json
+
+    jq '.components |= unique_by(.name,.version)' raw_cyclonedx_report.json > cyclonedx_report.json
+
+    if [ -e "cyclonedx_report.json" ]; then
+      echo "##[debug]Scan completed."
+    else
+      echo "##[debug]Scan fail."
+      exit 1
+    fi
+
+    echo "##[debug]Uploading BOM to DT..."
+  
+    BOMCONTENT=$(cat cyclonedx_report.json | base64 -w 0)
+    ODTFILE="bom_payload.json"
+
+    echo "Nome do projeto: ${DT_APP_DEFAULT_NAME}"
+    echo "Versão: ${DT_APP_DEFAULT_VERSION}"
+
+    PAYLOAD='{ "projectName": "'${DT_APP_DEFAULT_NAME}'", "projectVersion": "'${DT_APP_DEFAULT_VERSION}'", "autoCreate": true, "bom": "'${BOMCONTENT}'" }'
+
+    echo -n $PAYLOAD > $ODTFILE
+    
+    RESPONSE=$(curl -s --cacert ${CACORP_LOCATION} \
+                -X PUT "${DT_SCA_ENDPOINT}/v1/bom" \
+                -H "X-API-Key: ${DT_TOKEN}" \
+                -H 'Content-Type: application/json' \
+                -d "@${ODTFILE}")
+    
+    echo "##[debug]Uploaded! Response: ${RESPONSE}"
+
+    sbomToken=$(jq -r '.token' <<< "$RESPONSE")    
+   
+    i="0"
+    retries="25"
+    echo "Aguardando Sincronização finalizar"
+    while [[ $i -lt $retries ]]
+    do
+
+    RESPONSE=$(curl -s --cacert ${CACORP_LOCATION} \
+                 -X GET "${DT_SCA_ENDPOINT}/v1/bom/token/${sbomToken}" \
+                 -H "X-API-Key: ${DT_TOKEN}" \
+                 -H 'Content-Type: application/json')
+
+    echo "##[debug]Status de processamento: ${RESPONSE}"
+
+      if [[ "$(jq -r '.processing' <<< "$RESPONSE")" == "false" ]]
+      then
+          echo "Sincronização finalizada com sucesso"
+
+          DT_APP_DEFAULT_NAME="${DT_APP_DEFAULT_NAME// /%20}"
+
+          echo ${DT_APP_DEFAULT_NAME}
+          
+          RESPONSE=$(curl -s --cacert ${CACORP_LOCATION} \
+                       -X GET "${DT_SCA_ENDPOINT}/v1/project/lookup?name=${DT_APP_DEFAULT_NAME}&version=${DT_APP_DEFAULT_VERSION}" \
+                       -H "X-API-Key: ${DT_TOKEN}" \
+                       -H 'Content-Type: application/json')
+
+          echo "##[debug]Valor do Lookup: ${RESPONSE}"
+
+          DT_PROJECT_ID=$(jq -r '.uuid' <<< "$RESPONSE")
+
+          gateValidation=$(jq -r '.metrics.policyViolationsSecurityUnaudited' <<< "$RESPONSE")
+
+          echo "##[debug]Valor do UUID: ${DT_PROJECT_ID}"
+
+          echo "##[debug]Violações não auditadas: ${gateValidation}"
+
+          if [ "${USE_CONVISO}" = "true" ]; then
+
+           echo "##[debug]Associando projeto do Dependency-Track com a Conviso"
+
+           echo "Company ID: ${CONVISO_COMPANY_ID}"
+
+           sleep 3s
+           i="0"
+           retries="10"    
+           while [[ $i -lt $retries ]]
+           do
+             RESPONSE=$(curl -s -S -g -X POST "${CONVISO_APP_ENDPOINT}/api/v2/integrations/scanners/dependency_track/associate_project" \
+             --proxy "${PROXY_AGENT_HTTPS}" \
+             --header 'Content-Type: application/json' \
+             --header "x-api-key: ${CONVISO_API_KEY}" \
+             --data '{"company_id": '${CONVISO_COMPANY_ID}',"project_id": "'${DT_PROJECT_ID}'"}')
+
+             echo "Response: ${RESPONSE}"
+
+             if [[ ! -z "$RESPONSE" ]]; then      
+               break             
+             fi
+             echo "Algo inesperado aconteceu. Tentando associar o projeto novamente. Aguarde..."
+             sleep 5s
+             i=$[$i+1]
+           done
+
+           ASSOCIATION_ID=$(echo $RESPONSE | jq .data.id)
+           echo "Association_ID: ${ASSOCIATION_ID}"
+
+           if [[ -z "$ASSOCIATION_ID" ]]; then      
+             echo "##vso[task.logissue type=error;] Houve um erro com a sincronização com a Conviso Platform"
+             exit
+           fi
+              
+           ERROR=$(echo $RESPONSE | jq '.error.status_type // empty')
+           if [[ ! -z "$ERROR" ]]; then
+             MESSAGE=$(echo $RESPONSE | jq '.error.details // empty')
+             echo "##vso[task.logissue type=error;] Houve um erro com a sincronização com a Conviso Platform"
+             exit
+           fi
+
+           echo "##[debug]Associação com a Conviso realizada com sucesso"
+
+           echo "##[debug]Sincronizando projeto do Dependency-Track com a Conviso"
+
+           i="0"
+           retries="10"    
+           while [[ $i -lt $retries ]]
+           do
+             RESPONSE=$(curl -s -S -g -X POST "${CONVISO_APP_ENDPOINT}/api/v2/integrations/scanners/dependency_track/synchronize" \
+             --proxy "${PROXY_AGENT_HTTPS}" \
+             --header 'Content-Type: application/json' \
+             --header "x-api-key: ${CONVISO_API_KEY}" \
+             --data '{"company_id": '${CONVISO_COMPANY_ID}',"integration_association_id": "'${ASSOCIATION_ID}'"}')
+
+             echo ${RESPONSE}
+
+             if [[ ! -z "$RESPONSE" ]]; then      
+               break             
+             fi
+             echo "Algo inesperado aconteceu. Tentando realizar a sincronização novamente. Aguarde..."
+             sleep 5s
+             i=$[$i+1]
+           done
+
+           TRACK_KEY=$(echo $RESPONSE | jq -r .data.job.track_key)
+           ASSET_ID=$(echo $RESPONSE | jq -r .data.asset.id)
+
+           echo "Conviso Asset ID: ${ASSET_ID}"
+
+           if [[ -z "$ASSET_ID" ]]; then      
+             echo "##vso[task.logissue type=error;] Houve um erro com a sincronização com a Conviso Platform"
+             exit
+           fi
+          
+           echo "##[debug]Sincronização iniciada com sucesso."
+
+          else
+
+           echo "##[debug]Sincronização com a Conviso desativada."
+          fi
+
+          if [ "$gateValidation" -gt "${SG_SEVERITY}" ]; then
+
+           echo "##vso[task.logissue type=error;]Foram encontradas vulnerabilidades críticas e/ou altas neste projeto. Número de violações identificadas: $gateValidation"
+
+           SG_BLOCK="true"
+
+           echo "##vso[task.setvariable variable=sgBlock]$SG_BLOCK"
+                    
+           exit
+          fi
+
+          exit 0
+      fi
+      i=$[$i+1]
+      sleep 15s
+      done  
+    
+    echo "##vso[task.logissue type=error;]Tempo esgotado - A Sincronização não foi finalizada, tente rodar novamente."
+    echo "##vso[task.complete result=Failed;]"
+    
+  displayName: Run Scan and Send syft report to Dependency Track
+  condition: eq(variables.USE_DT_DOCKER, 'true')
+  env:
+    DT_SCA_ENDPOINT: $(DT_SCA_ENDPOINT)
+    CACORP_LOCATION: $(CACORP_LOCATION)
+    DT_TOKEN: $(DEPENDENCY-TRACK-TOKEN)
+    DT_PROJECT_ID: $(DT_PROJECT_ID)
+    DT_APP_DEFAULT_VERSION: $(DT_APP_DEFAULT_VERSION)
+    DT_APP_DEFAULT_NAME: $(DT_APP_DEFAULT_NAME)
+    CONVISO_APP_ENDPOINT: "$(CONVISO_APP_ENDPOINT)"
+    CONVISO_API_KEY: "$(CONVISO-API-KEY)"
+    CONVISO_COMPANY_ID: "$(CONVISO_COMPANY_ID)"
+    CONVISO_PROJECT_ID_OUT: "CONVISO_PROJECT_ID"
+    CONVISO_ASSOCIATION_ID_OUT: "CONVISO_ASSOCIATION_ID"
+    PROXY_AGENT_HTTPS: "$(PROXY_AGENT_HTTPS)"
+    SG_SEVERITY: "0"
+
+- task: Bash@3
+  displayName: "Evaluate Security Gate"
+  inputs:
+    targetType: 'inline'
+    script: |
+
+      echo "SKIP_SECURITY_GATE_SCA: ${SKIP_SECURITY_GATE_SCA}"
+      echo "SG_BLOCK: ${SG_BLOCK}"
+
+      if [[ "${SG_BLOCK}" =~ ^(T|t)rue$ ]]; then
+        echo "##vso[task.logissue type=error;]O Security Gate falhou pois foram encontradas potenciais vulnerabilidades críticas e altas por nossas ferramentas de segurança em código fonte para este projeto. Para mais informações, acesse a wiki do time de AppSec da Vivo em https://wikicorp.telefonica.com.br/pages/viewpage.action?pageId=524036659"
+        echo "##vso[task.complete result=Failed;]"
+        exit
+      fi
+      echo "##[debug]Não foram encontradas vulnerabilidades críticas e altas que violam as políticas de AppSec. Para mais informações sobre o nosso processo, acesse https://wikicorp.telefonica.com.br/pages/viewpage.action?pageId=524036659"
+  condition: and( eq(variables.SKIP_SECURITY_GATE_SCA, 'false'), eq(variables.USE_DT_DOCKER, 'true'))
+  env:
+    SKIP_SECURITY_GATE_SCA: ${{ parameters.skipSecurityGate }} 
+    SG_BLOCK: "$(sgBlock)"

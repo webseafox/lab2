@@ -1,0 +1,483 @@
+parameters:
+- name: helm_chart_name
+  displayName: Nome do Heml Chart dentro do repositorio 'devops-helm'
+  default: generic-java-microservice
+
+- name: helm_chart_version
+  default: 1.0.27
+
+- name: variable_groups
+  displayName: Lista de Variables Groups para complementar variaveis e segredos.
+  default: []
+  type: object
+
+- name: environment
+  displayName: 'Escolha o ambiente para publicar'
+  type: string
+  default: dev
+  # values:
+  # - dev
+  # - esteira1
+  # - esteira2
+  # - esteira3
+  # - preprod
+  # - production
+  # - prodlike
+
+- name: vivonow_chg
+  displayName: 'Numero CHG do VivoNow, somente para "production"'
+  default: CHG0000001
+
+variables:
+- name: System.debug
+  value: 'true'
+- ${{ each group_name in parameters.variable_groups }}:
+  - group: ${{ group_name }}
+
+stages:
+- stage:
+  displayName: 'VivoNow Gate'
+  pool: GeneralPurposeLinuxAgentsCD
+  jobs:
+  - job:
+    displayName: 'Check on (VivoNow)'
+    condition: eq('${{ parameters.environment }}', 'production')
+    steps:
+
+    - task: AxiosFromVivo@4
+      displayName: 'Fetch CHG'
+      inputs:
+        type: 'text'
+        origin: |
+          var options = {
+            method: 'GET',
+            url: 'http://10.41.252.111:9010/vivonow/viewer/${{ parameters.vivonow_chg }}'
+          };
+        variablePrefix: 'VIVO_NOW_CHG_'
+      env:
+        NODE_EXTRA_CA_CERTS: $(CACORP_LOCATION)
+
+    - task: RegexMatch@4
+      displayName: 'Query CHG'
+      inputs:
+        source: $(VIVO_NOW_CHG_BODY)
+        regex: '/(<title>)(.*)(<\/title>)/ig'
+        outVarPrefix: 'CHG_FOUND_'
+
+    - script: exit 1
+      displayName: 'Check CHG'
+      condition: not(variables['CHG_FOUND_HAS_MATCH'])
+
+- stage:
+  displayName: 'GovApp Gate'
+  pool: GeneralPurposeLinuxAgentsCD
+  jobs:
+  - job:
+    displayName: 'Governance Policies Check'
+    steps:
+    - checkout: self
+
+    - task: XmlParseFromVivo@4
+      displayName: 'Get pom.xml info'
+      inputs:
+        type: 'file'
+        origin: $(Build.SourcesDirectory)/pom.xml
+        jpaths: |
+          var POM_XML_VERSION = .project.version._text
+
+    - task: LoadFile@4
+      inputs:
+        script: |
+          CATALOG_YAML_CONTENT = $(Build.SourcesDirectory)/catalog-info.yaml
+
+    - task: YamlParseFromVivo@4
+      displayName: 'Get Metadata Info'
+      inputs:
+        type: 'file'
+        origin: $(Build.SourcesDirectory)/catalog-info.yaml
+        jpaths: |
+          var CATALOG_YAML_NAME = .metadata.name
+          var CATALOG_YAML_ACRONYM = .metadata.annotations['techarch.governance-app.acronym']
+          var CATALOG_YAML_K8S_NS = .metadata.annotations['vivo.io/kubernetes-k8s-namespace-${{ parameters.environment }}']
+
+    - task: VivoGovernance@1
+      displayName: 'Governance Validate'
+      inputs:
+        breakglass: false
+        serverEndpoint: 'governanceapi'
+        operation: 'validate'
+        component: $(CATALOG_YAML_NAME)
+        version: $(POM_XML_VERSION)
+        cluster: aks-$(CATALOG_YAML_ACRONYM)-${{ parameters.environment }}
+        namespace: $(CATALOG_YAML_K8S_NS)
+        deployment: $(CATALOG_YAML_NAME)
+        environment: ${{ parameters.environment }}
+        catalogInfo: $(CATALOG_YAML_CONTENT)
+
+- stage:
+  displayName: 'Push to Repositories'
+  pool: GeneralPurposeLinuxAgentsCD
+  jobs:
+  - job:
+    condition: eq('${{ parameters.environment }}', 'production')
+    displayName: 'Push to Docker (RELEASE)'
+    steps:
+
+    - checkout: self
+      fetchDepth: 1
+
+    - task: XmlParseFromVivo@4
+      displayName: 'Get Main Info'
+      inputs:
+        type: 'file'
+        origin: 'pom.xml'
+        jpaths: |
+          var POM_XML_VERSION = .project.version._text
+
+    - task: YamlParseFromVivo@4
+      displayName: 'Get Metadata Info'
+      inputs:
+        type: 'file'
+        origin: 'catalog-info.yaml'
+        jpaths: |-
+          var CATALOG_YAML_NAME = .metadata.name
+          var CATALOG_YAML_ACRONYM = .metadata.annotations['techarch.governance-app.acronym']
+
+    - task: Docker@2
+      displayName: 'Docker Pull (SNAPSHOT)'
+      inputs:
+        containerRegistry: 'VCR-DOCKER'
+        command: pull
+        arguments:
+          vcr-docker.nexus.telefonica.com.br/
+          $(CATALOG_YAML_ACRONYM)/$(CATALOG_YAML_NAME)
+          :$(POM_XML_VERSION)-SNAPSHOT
+
+    - task: Docker@2
+      displayName: 'Docker Tag to (RELEASE)'
+      inputs:
+        containerRegistry: 'VCR-DOCKER'
+        command: tag
+        arguments:
+          vcr-docker.nexus.telefonica.com.br
+          /$(CATALOG_YAML_ACRONYM)
+          /$(CATALOG_YAML_NAME)
+          :$(POM_XML_VERSION)-SNAPSHOT
+            
+          vcr-docker.nexus.telefonica.com.br
+          /$(CATALOG_YAML_ACRONYM)
+          /$(CATALOG_YAML_NAME)
+          :$(POM_XML_VERSION)-RELEASE
+
+    - task: Docker@2
+      displayName: 'Push to Docker (RELEASE)'
+      inputs:
+        containerRegistry: 'VCR-DOCKER'
+        command: push
+        arguments:
+          vcr-docker.nexus.telefonica.com.br
+          /$(CATALOG_YAML_ACRONYM)
+          /$(CATALOG_YAML_NAME)
+          :$(POM_XML_VERSION)-RELEASE
+- stage:
+  displayName: 'Deploy on (${{ parameters.environment }})'
+  pool: GeneralPurposeLinuxAgentsCD
+  variables:
+  - name: DOCKER_TAG_SUFIX
+    ${{ if eq('${{ parameters.environment }}', 'production') }}:
+      value: 'RELEASE'
+    ${{ else }}:
+      value: 'SNAPSHOT'
+  jobs:
+  - deployment:
+    displayName: 'Deploy on (${{ parameters.environment }})'
+    # creates an environment if it doesn't exist
+    environment:
+      name: 'deploy-${{ parameters.environment }}'
+    # variables:
+    #   - name: HELM_EXPERIMENTAL_OCI
+    #     value: 1
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+            persistCredentials: true
+            fetchDepth: 1
+
+          # - task: Bash@3
+          #   displayName: 'Force pull branch'
+          #   continueOnError: false
+          #   inputs:
+          #     targetType: inline
+          #     script: |-
+          #       # echo "##[command] git fetch"
+          #       git fetch
+
+          #       # echo "##[command] git checkout $(Build.SourceBranchName) --"
+          #       git checkout $(Build.SourceBranchName) --
+
+          #       # echo "##[command] git pull --rebase origin $(Build.SourceBranchName)"
+          #       git pull --rebase origin $(Build.SourceBranchName)
+
+          - task: XmlParseFromVivo@4
+            displayName: 'Get Main Info'
+            inputs:
+              type: 'file'
+              origin: pom.xml
+              jpaths: |
+                var POM_XML_VERSION = .project.version._text
+
+          - task: YamlParseFromVivo@4
+            displayName: 'Get Metadata Info'
+            inputs:
+              type: 'file'
+              origin: catalog-info.yaml
+              jpaths: |-
+                var CATALOG_YAML_NAME = .metadata.name
+                var CATALOG_YAML_ACRONYM = .metadata.annotations['techarch.governance-app.acronym']
+                var CATALOG_YAML_K8S_NS = .metadata.annotations['vivo.io/kubernetes-k8s-namespace-${{ parameters.environment }}']
+                var CATALOG_YAML_KUBE_ID = .metadata.annotations['backstage.io/kubernetes-id']
+
+          - task: AzureKeyVault@2
+            displayName: 'Getting AKV credentials'
+            timeoutInMinutes: 1
+            retryCountOnTaskFailure: 5
+            inputs:
+              azureSubscription: DevOpsSharedResources
+              KeyVaultName: kv-azdevops-shared
+              SecretsFilter: >-
+                NEXUS-DEPS-USR, NEXUS-DEPS-PSW,
+                DOCKER-REGISTRY-USERNAME, DOCKER-REGISTRY-PASSWORD
+
+          - task: DownloadSecureFile@1
+            # this task must have a name
+            name: kubeconfig
+            displayName: 'Download config from (kube-${{parameters.environment}})'
+            inputs:
+              secureFile: 'kube-${{ parameters.environment }}'
+
+          - task: Bash@3
+            displayName: 'Download Charts'
+            continueOnError: False
+            inputs:
+              targetType: inline
+              # workingDirectory: ./
+              script: |- # shell
+                curl -O --user $(NEXUS-DEPS-USR):$(NEXUS-DEPS-PSW) \
+                  https://nexus.telefonica.com.br/repository/devops-helm/${{ parameters.helm_chart_name }}-${{ parameters.helm_chart_version}}.tgz
+
+                tar -zxvf ${{ parameters.helm_chart_name }}-${{ parameters.helm_chart_version}}.tgz
+                rm ${{ parameters.helm_chart_name }}-${{ parameters.helm_chart_version}}.tgz
+
+          - task: PlaceInFiles@4
+            displayName: "Apply config variables"
+            inputs:
+              globPattern: ".azuredevops/config/${{ parameters.environment }}/*.y*ml"
+              regex: '/\$\(([^\)]+)\)/gmi'
+
+          # - script: >-
+          #     kubectl delete secret acr-devops
+          #     --namespace $(CATALOG_YAML_K8S_NS)
+          #     --kubeconfig="$(kubeconfig.secureFilePath)"
+          #     --insecure-skip-tls-verify
+          #   displayName: DELETE Docker Secret
+
+          - script: |- # shell
+              kubectl get secrets vcr-devops \
+              --namespace $(CATALOG_YAML_K8S_NS) \
+              --kubeconfig="$(kubeconfig.secureFilePath)" \
+              --insecure-skip-tls-verify
+
+              echo "##vso[task.setvariable variable=EXISTING_SECRETS]$?"
+            displayName: Fetch Docker Secret
+
+          - script: >- # shell
+              kubectl create secret docker-registry vcr-devops
+              --docker-server="vcr-docker.nexus.telefonica.com.br" 
+              --docker-username="$(DOCKER-REGISTRY-USERNAME)" 
+              --docker-password="$(DOCKER-REGISTRY-PASSWORD)" 
+              --docker-email='arquiteturati@telefonica.com.br'
+              --namespace $(CATALOG_YAML_K8S_NS)
+              --kubeconfig="$(kubeconfig.secureFilePath)"
+              --insecure-skip-tls-verify
+            condition: eq(variables['EXISTING_SECRETS'], '1')
+            displayName: Create Docker Secret
+
+          - task: Bash@3
+            displayName: 'Helm status on (${{ parameters.environment }})'
+            inputs:
+              targetType: inline
+              script: |-
+                HELM_STATUS=$(helm history "$(CATALOG_YAML_NAME)"  \
+                --namespace "$(CATALOG_YAML_K8S_NS)" \
+                --kubeconfig $(kubeconfig.secureFilePath) \
+                -o json)
+
+                echo "##vso[task.setvariable variable=HELM_STATUS;]$HELM_STATUS";
+
+          - task: JsonParseFromVivo@4
+            displayName: 'Helm revision info'
+            inputs:
+              type: 'var'
+              origin: HELM_STATUS
+              jpaths: |-
+                # last deployed
+                var LAST_STATUS = $[-1:].revision
+                # last failed
+                var LAST_REV = $[-1:].revision
+                # last deployed revision
+                var LAST_DEPLOYED_REV = $[?(@.status=='deployed')].revision
+
+          - task: Bash@3
+            displayName: 'Helm rollback last failure on (dev)'
+            condition:
+              and(
+                not(eq(variables['LAST_STATUS'], 'deployed')),
+                not(eq(variables['LAST_DEPLOYED_REV'], ''))
+              )
+            inputs:
+              targetType: inline
+              script: >-
+                helm rollback "$(CATALOG_YAML_NAME)" $(LAST_DEPLOYED_REV)
+                --namespace "$(CATALOG_YAML_K8S_NS)"
+                --kubeconfig $(kubeconfig.secureFilePath) | true
+
+          - task: TypeScriptRunner@4
+            displayName: 'Helm upgrade on (${{ parameters.environment }})'
+            inputs:
+              script: | # typescript
+                const helmUpgradeCommand = [
+                  'helm upgrade $(CATALOG_YAML_NAME)',
+                  '${{ parameters.helm_chart_name }}',
+                  '--set "nameOverride=$(CATALOG_YAML_NAME)"',
+                  '--set "fullnameOverride=$(CATALOG_YAML_NAME)"',
+                  '--set "containerName=$(CATALOG_YAML_NAME)"',
+                  '--set "image.repository=vcr-docker.nexus.telefonica.com.br/$(CATALOG_YAML_ACRONYM)/$(CATALOG_YAML_NAME)"',
+                  '--set "image.tag=$(POM_XML_VERSION)-$(DOCKER_TAG_SUFIX)"',
+                  '--set "imagePullSecrets[0].name=vcr-devops"',
+                  '-f .azuredevops/config/${{ parameters.environment }}/values.yml',
+                  '-f .azuredevops/config/${{ parameters.environment }}/environments_variables.yml',
+                  '-f .azuredevops/config/${{ parameters.environment }}/secrets.yaml',
+                  '--kubeconfig $(kubeconfig.secureFilePath)',
+                  '--namespace "$(CATALOG_YAML_K8S_NS)"',
+                  '--install',
+                  '--insecure-skip-tls-verify',
+                  '--output table',
+                  '--history-max 5',
+                  '--debug',
+                  '--atomic',
+                  '--wait',
+                  '--timeout 300s',
+                ].join(' ');
+
+                const kubelogs = [
+                  'kubectl logs',
+                  'deployment/$(CATALOG_YAML_NAME)',
+                  '-f',
+                  '--all-containers=true',
+                  '--namespace "$(CATALOG_YAML_K8S_NS)"',
+                  '--kubeconfig $(kubeconfig.secureFilePath)',
+                  '--insecure-skip-tls-verify',
+                ].join(' ')
+
+                const kubeevents = [
+                  'kubectl events',
+                  'deployment/$(CATALOG_YAML_NAME)',
+                  '-w',
+                  '--namespace "$(CATALOG_YAML_K8S_NS)"',
+                  '--kubeconfig $(kubeconfig.secureFilePath)',
+                  '--insecure-skip-tls-verify',
+                ].join(' ')
+
+                const cwd = process.cwd();
+                const pid1out = [];
+                const pid2out = [];
+
+                const pid1 = sh.exec(kubeevents, { cwd, async: true, silent: true });
+                pid1.stdout.on('data', (chunk) => pid1out.push(chunk))
+                pid1.stderr.on('data', (chunk) => pid1out.push(chunk))
+
+                const pid2 = sh.exec(kubelogs, { cwd, async: true, silent: true });
+                pid2.stdout.on('data', (chunk) => pid2out.push(chunk))
+                pid2.stderr.on('data', (chunk) => pid2out.push(chunk))
+
+                const pid = sh.exec(helmUpgradeCommand, { cwd }, (code, stdout, stderr) => {
+                  consola.info('kube events!')
+                  consola.log(pid1out.join('') || 'No events!');
+
+                  consola.info('kube logs!')
+                  consola.box(pid2out.join('') || 'No logs');
+
+                  process.exit(code);
+                });
+
+        on:
+          success:
+            steps:
+            - checkout: self
+              fetchDepth: 1
+
+            - task: XmlParseFromVivo@4
+              displayName: 'Get pom.xml info'
+              inputs:
+                type: 'file'
+                origin: $(Build.SourcesDirectory)/pom.xml
+                jpaths: |
+                  var POM_XML_VERSION = .project.version._text
+
+            - task: LoadFile@4
+              displayName: 'Load catalog-info.yaml'
+              inputs:
+                script: |
+                  CATALOG_YAML_CONTENT = $(Build.SourcesDirectory)/catalog-info.yaml
+
+            - task: YamlParseFromVivo@4
+              displayName: 'Get Metadata Info'
+              inputs:
+                type: 'file'
+                origin: $(Build.SourcesDirectory)/catalog-info.yaml
+                jpaths: |
+                  var CATALOG_YAML_NAME = .metadata.name
+                  var CATALOG_YAML_ACRONYM = .metadata.annotations['techarch.governance-app.acronym']
+                  var CATALOG_YAML_K8S_NS = .metadata.annotations['vivo.io/kubernetes-k8s-namespace-${{ parameters.environment }}']
+
+            - task: CatchLogsToLocalDirectoryFromVivo@4
+              displayName: 'Dump logs and metas'
+              inputs:
+                dumpDir: $(Build.ArtifactStagingDirectory)/audit
+
+            - task: PublishBuildArtifacts@1
+              displayName: 'Push Logs to Artifacts'
+              inputs:
+                ArtifactName: audit
+                PathtoPublish: $(Build.ArtifactStagingDirectory)/audit
+
+            - task: VivoGovernance@1
+              displayName: 'Gov Notify "deploy"'
+              inputs:
+                breakglass: false
+                serverEndpoint: 'governanceapi'
+                operation: 'deploy'
+                component: $(CATALOG_YAML_NAME)
+                version: $(POM_XML_VERSION)
+                cluster: aks-$(CATALOG_YAML_ACRONYM)-${{ parameters.environment }}
+                namespace: $(CATALOG_YAML_K8S_NS)
+                deployment: $(CATALOG_YAML_NAME)
+                environment: ${{ parameters.environment }}
+                catalogInfo: $(CATALOG_YAML_CONTENT)
+
+          failure:
+            steps:
+            - checkout: none
+            - task: CatchLogsToLocalDirectoryFromVivo@4
+              displayName: 'Dump logs and metas'
+              inputs:
+                dumpDir: $(Build.ArtifactStagingDirectory)/audit
+
+            - task: PublishBuildArtifacts@1
+              displayName: 'Push Logs to Artifacts'
+              inputs:
+                ArtifactName: audit
+                PathtoPublish: $(Build.ArtifactStagingDirectory)/audit
+

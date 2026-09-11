@@ -1,0 +1,116 @@
+# This YAML file defines a pipeline task that checks for errors in a log file.
+# It takes two parameters: 'step' and 'outputFile'.
+# The task uses the 'CmdLine' task to execute a bash script that performs the error checking.
+# The script reads the log file, searches for specific error messages, and counts the number of errors, warnings, and skipped logs.
+# Depending on the results, the script logs issues and sets the task result accordingly.
+
+parameters:
+  - name: step # The name of the step to check for errors in the log.
+  - name: outputFile # The path to the log file to be checked.
+  - name: continueOnError
+    default: false # Whether to continue on error during the error checking process.
+
+steps:
+  - task: CmdLine@2
+    displayName: "Check Errors in ${{ parameters.step }} Log"
+    continueOnError: ${{ parameters.continueOnError }}
+    inputs:
+      script: |
+        # The bash script that performs the error checking.
+
+        # Debug information
+        echo "##[debug] STEP..................: ${STEP}"
+        echo "##[debug] OUTPUT_FILE...........: ${OUTPUT_FILE}"
+
+        # LOGS SKIPPED:
+        # "error: timed out waiting for the condition on domains/", 
+        # "processing dependency: perl(error)", // CONFIG-JOBS - NOME DA DEPENDENCIA CONTEM O NOME ERROR
+        # "perl-error", // CONFIG-JOBS - NOME DA DEPENDENCIA CONTEM O NOME ERROR 
+        # "shell is not supported for oci image format, [/bin/bash -o pipefail -c] will be ignored", // WARNING POR ESTAR USANDO PODMAN
+        # 'error from server (notfound): jobs.batch "bcws-domain-job" not found', // ERROR POR O JOB DO BCWS NÃO EXISTIR PARA DELETAR
+        # 'release: not found', // ERROR QUANDO A RELASE JA FOI DELETADA
+        # "error from server (notfound):" // ERROR QUANDO O JOB NÃO EXISTE
+        # "with kind job: job.batch" // ERROR DE PROBLEMAS COM RELEASES PARADA
+        # "done parsing custom ops fields with no error found" // BUILD DO DAT
+
+        # List of error messages to skip
+        array=(
+          "error: timed out waiting for the condition on domains/" 
+          "processing dependency: perl(error)" 
+          "perl-error" 
+          "shell is not supported for oci image format, [/bin/bash -o pipefail -c] will be ignored" 
+          'error from server (notfound): jobs.batch "bcws-domain-job" not found'
+          "release: not found"
+          "error from server (notfound):"
+          "with kind job: job.batch"
+          "done parsing custom ops fields with no error found"
+        )
+
+        # Convert log file to lowercase for case-insensitive matching
+        tr '[:upper:]' '[:lower:]' < ${OUTPUT_FILE} > output_file.txt
+
+        # Initialize counters
+        count_line=0
+        count_error=0
+        count_warning=0
+        count_skip_log=0
+
+        # Read each line of the log file
+        while IFS= read -r line || [[ -n "$line" ]]; do
+          skip_log=false
+
+          if [ -n "$line" ]; then
+            (( count_line++ ))
+            
+            # Check if the line contains any error messages to skip
+            for i in "${array[@]}"; do
+              if [[ $line == *"$i"* ]]; then
+                skip_log=true
+              fi
+            done
+
+            # Process the line based on its content
+            if [[ $skip_log == "true" ]]; then
+              (( count_skip_log++ ))
+              echo ">> [IGNORED LOG ($count_skip_log)] $line"
+            else
+              if [[ $line == *"erro"* ]]; then
+                echo "!! ERROR: [Line: $count_line] $line"
+                echo "##vso[task.logissue type=error;][Line: $count_line] $line"
+                (( count_error++ ))
+              elif [[ $line == *"warning"* ]]; then
+                echo "!! WARNING: [Line: $count_line] $line"
+                (( count_warning++ ))
+              fi
+            fi
+          fi
+        done < output_file.txt 
+
+        # Log the number of lines analyzed
+        echo "##[debug] $count_line lines analyzed"
+
+        echo "##[group]cat output_file.txt"
+        echo "##[command]cat output_file.txt"
+        cat output_file.txt
+        echo "##[endgroup]"
+
+        # Check the results and set the task outcome accordingly
+        if [[ $count_line -gt 0 ]]; then
+          if [[ $count_error -gt 0 ]]; then
+            echo "##vso[task.logissue type=error;][$count_error] Error messages were found in ${STEP}"
+            echo "##vso[task.complete result=Failed;]"
+
+            exit 1 
+          elif [[ $count_warning -gt 0 ]]; then
+            echo "##vso[task.logissue type=warning;][$count_warning] Warning messages were found in ${STEP}"
+          elif [[ $count_skip_log -gt 0 ]]; then
+            echo "##vso[task.logissue type=warning;][$count_skip_log] Ignored Logs were found in ${STEP}"
+          else
+            printf "\n>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> : <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<\n"
+            printf "No Warnings or Errors Found in ${STEP}"
+            printf "\n>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> : <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<"
+          fi
+        fi
+    env:
+      STEP: ${{ parameters.step }}
+      OUTPUT_FILE: ${{ parameters.outputFile }}

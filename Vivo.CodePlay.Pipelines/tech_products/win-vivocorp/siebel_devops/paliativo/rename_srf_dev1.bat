@@ -1,0 +1,1 @@
+ssh supweb@10.129.178.52 /opt/web/siebel/scripts/rename_srf.sh

@@ -1,0 +1,141 @@
+# This YAML file defines the configuration and stages for the provisioning of the API default environment in the BRM Fenix project.
+
+parameters:
+  - name: config
+    type: object
+  - name: flow
+    type: object
+
+variables:
+  - template: ../../global/variables/load.yml
+    parameters:
+      ${{ if eq(variables['Build.SourceBranchName'], 'poc_15') }}:
+        environment: poc
+      ${{ if eq(variables['Build.SourceBranchName'], 'dev01_15') }}:
+        environment: dev01
+      ${{ if eq(variables['Build.SourceBranchName'], 'dev02_15') }}:
+        environment: dev02
+      ${{ if eq(variables['Build.SourceBranchName'], 'dev03_15') }}:
+        environment: dev03
+      ${{ if eq(variables['Build.SourceBranchName'], 'qa01_15') }}:
+        environment: qa01
+      ${{ if eq(variables['Build.SourceBranchName'], 'qa02_15') }}:
+        environment: qa02
+      ${{ if eq(variables['Build.SourceBranchName'], 'bugfix01_15') }}:
+        environment: bugfix01
+      ${{ if eq(variables['Build.SourceBranchName'], 'tpm_15') }}:
+        environment: tpm
+      ${{ if eq(variables['Build.SourceBranchName'], 'preprod_15') }}:
+        environment: preprod
+      ${{ if eq(variables['Build.SourceBranchName'], 'prodlike_15') }}:
+        environment: prodlike
+      ${{ if eq(variables['Build.SourceBranchName'], 'master_15') }}:
+        environment: prod
+  - template: variables/load.yml
+    parameters:
+      config: ${{ parameters.config }}
+      flow: ${{ parameters.flow }}
+
+resources:
+  repositories:
+    - repository: CorePipelines
+      name: DevOps/Vivo.Core.Pipelines
+      type: git
+      ref: refs/heads/master
+      endpoint: CorePipelines
+
+    - repository: CodePlay
+      name: DevOps/Vivo.CodePlay.Pipelines
+      type: git
+      ref: refs/heads/master
+      endpoint: CodePlay
+
+    - repository: FortifyExclusion
+      name: DevOps/Vivo.Fortify.Exclusions
+      type: git
+      ref: refs/heads/master
+      endpoint: CorePipelines
+
+    # NOTA: Repositorios de helm charts de outros apps (oc-cn-helm-chart, oc-cn-ece-helm-chart, 
+    # oc-cn-ocomc-helm-chart, oc-cn-op-job-helm-chart) foram removidos do template base.
+    # Apps Java BRM que precisam desses repositórios devem defini-los no proprio arquivo de pipeline.
+    # Apps com technology: helmCharts devem sobrescrever os resources no proprio pipeline se necessario.
+    
+    # shared-files: Necessario para CI (stage files.yml). CD nao utiliza, mas Azure DevOps resolve todos os repos no inicio.
+    - repository: shared-files
+      name: "CLDM - CLOUD BRM/obrm-shared-files"
+      type: git
+      ref: $(Build.SourceBranchName)
+
+stages:
+  - template: common_stages/preparation.yml # This stage performs the necessary preparations for the provisioning process, using the provided configuration.
+    parameters:
+      config: ${{ parameters.config }}
+      flow: ${{ parameters.flow }}
+  # JCR UPGRADE BRM 15: manter a stage Files apenas no CI. O fluxo de CD nao inclui mais esta stage.
+  # - template: common_stages/files.yml # This stage handles the files required for the provisioning process, based on the provided configuration.
+  #   parameters:
+  #     config: ${{ parameters.config }}
+  #     flow: ${{ parameters.flow }}
+  - ${{ if eq(parameters.flow.flow, 'CI') }}:
+      - template: ci/stages/build_test.yml # stage_files absorvida neste stage: checkout source + shared-files, build, unit-test e publish unificados.
+        parameters:
+          config: ${{ parameters.config }}
+          flow: ${{ parameters.flow }}
+      - template: ci/stages/static_code_analysis.yml # This stage performs static code analysis on the codebase.
+        parameters:
+          config: ${{ parameters.config }}
+      - template: ci/stages/bundle.yml # This stage bundles the necessary components for the provisioning process.
+        parameters:
+          config: ${{ parameters.config }}
+          flow: ${{ parameters.flow }}
+      - template: ci/stages/code_security_analysis.yml # This stage performs code security analysis, using the FortifyExclusion repository.
+        parameters:
+          fortifyExclusionRepository: FortifyExclusion
+          stageSecurityOnly: ${{ parameters.config.stageSecurityOnly }}
+          flow: ${{ parameters.flow }}
+      - template: ci/stages/trigger_cd.yml # This stage triggers the CD process after the CI process is complete.
+  - ${{ if eq(parameters.flow.flow, 'CD') }}:
+      - template: cd/stages/deploy.yml # This stage deploys the bundled components to the target environment, using the provided configuration.
+        parameters:
+          config: ${{ parameters.config }}
+          flow: ${{ parameters.flow }}
+      - stage: stage_eventhub_deploy
+        displayName: "Register Deploy Event"
+        dependsOn:
+          - stage_deploy
+        condition: and(always(), ne(dependencies.stage_deploy.result, 'Skipped'))
+        pool: $(POOL)
+        jobs:
+          - deployment: register_deploy_event
+            displayName: "Register Deploy Event"
+            environment: $(AZURE_ENVIRONMENT)
+            strategy:
+              runOnce:
+                deploy:
+                  steps:
+                    - checkout: none
+                    - task: VivoEventHubTools@3
+                      displayName: "Registro de deploy no Event Hub"
+                      condition: always()
+                      continueOnError: true
+                      inputs:
+                        command: 'deploy'
+                        eventHubConnection: 'EVHCodeProd'
+                        componentVersion: '$(BRM_CORE_RELEASE_VERSION)'
+                        deployArtifactName: '$(APPLICATION_NAME)'
+                        deployArtifactType: 'application'
+                        deployEnvironmentType: 'brm-fenix'
+                        deployEnvironmentName: '$(ENVIRONMENT)'
+                        pipelineType: 'brm-fenix/api-default'
+      - ${{ if and(ne(parameters.flow.cd_params.appVersion, 'LATEST'), ne(parameters.config.technology, 'helmCharts')) }}:
+          - template: ci/stages/update_assets.yml # This stage updates the assets in the target environment, based on the provided configuration.
+            parameters:
+              config: ${{ parameters.config }}
+              flow: ${{ parameters.flow }}
+
+  - template: common_stages/finish.yml # This stage performs the final steps to finish the provisioning process.
+    parameters:
+      config: ${{ parameters.config }}
+      flow: ${{ parameters.flow }}
+      stageSecurityOnly: ${{ parameters.config.stageSecurityOnly }}

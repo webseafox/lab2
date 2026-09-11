@@ -1,0 +1,360 @@
+# ==================================================================
+# Pipeline: Deploy VSIX VSCode Extension - CD para Extensões Visual Studio Code
+# ==================================================================
+#
+# Este pipeline realiza o deploy de uma extensão .vsix já publicada no
+# Azure Artifacts para o Visual Studio Code Marketplace.
+# Espera que o artefato tenha sido gerado pelo pipeline de CI
+# correspondente (build-vsix-vscode-extension).
+#
+# ==================================================================
+# CARACTERÍSTICAS PRINCIPAIS:
+# ==================================================================
+# • Download do .vsix versionado a partir do Azure Artifacts
+# • Deploy para o Visual Studio Code Marketplace
+# • Registro de deploy no Event Hub
+# • Suporte a Trunk-based, GitLabFlow e demais estratégias
+#
+# ==================================================================
+# PRÉ-REQUISITOS:
+# ==================================================================
+# • Artefato .vsix publicado no Azure Artifacts pelo pipeline de CI
+# • Service connection do Visual Studio Marketplace configurada no projeto
+# • Environments configurados no Azure DevOps
+#
+# ==================================================================
+# EXEMPLO DE USO:
+# ==================================================================
+# name: '[$(Date:yyyyMMdd)$(Rev:.r)]'
+#
+# trigger: none
+#
+# parameters:
+#   - name: version
+#     displayName: 'Versão da extensão'
+#     type: string
+#     default: getLatestVersion()
+#
+# resources:
+#   repositories:
+#     - repository: CodePlay
+#       name: DevOps/Vivo.CodePlay.Pipelines
+#       type: git
+#       ref: refs/heads/master
+#
+# extends:
+#   template: /framework/pipelines/cd/deploy-vsix-vscode-extension/pipeline.yaml@CodePlay
+#   parameters:
+#     version: "${{ parameters.version }}"
+#
+# ==================================================================
+
+parameters:
+  # Versão da extensão a ser publicada.
+  # Usa getLatestVersion() por padrão para obter a última versão disponível no feed.
+  - name: version
+    displayName: 'Versão da extensão (ex: 1.2.3)'
+    type: string
+    default: getLatestVersion()
+
+  - name: agentPool
+    type: string
+    default: GeneralPurposeLinuxAgentsCD
+    displayName: 'Agent Pool para execução'
+
+  # ==================================================================
+  # Configuração do Azure Artifacts
+  # ==================================================================
+  # Nome do feed de onde o .vsix será baixado.
+  - name: feedName
+    type: string
+    default: '3d53bc62-8749-4931-ae46-a443b73bc87a'
+    displayName: 'Nome ou ID do feed no Azure Artifacts (Universal Packages)'
+
+  # Nome do pacote no feed (deve corresponder ao packageName configurado no CI).
+  - name: packageName
+    type: string
+    default: '$(Build.Repository.Name)'
+    displayName: 'Nome do pacote no Azure Artifacts'
+
+  # Quando true, o feed tem escopo de projeto; quando false, escopo de organização.
+  # O feed padrão (3d53bc62-...) é de organização — manter false.
+  - name: projectScopedFeed
+    type: boolean
+    default: false
+    displayName: 'Feed com escopo de projeto (true) ou organização (false)'
+
+  # ==================================================================
+  # Metadados da Extensão
+  # ==================================================================
+  # Os metadados são extraídos do package.json (campos: name, displayName, publisher).
+
+variables:
+  SIGLA: $[ lower(split(variables['System.TeamProject'],' ')[0]) ]
+
+# ==================================================================
+# ESTRUTURA DO PIPELINE
+# ==================================================================
+# STAGE 1 - Prepare:
+#   - Resolução da versão (setDeployVersion)
+#   - Download do .vsix do Azure Artifacts
+#   - Extração de metadados da extensão
+#   - Re-publicação do .vsix como pipeline artifact para o stage Deploy
+#   - Exportação de variáveis de saída (versão, metadados)
+#
+# STAGE 2 - Deploy (dependsOn: Prepare, com approval gate):
+#   - Download do pipeline artifact
+#   - Setup Node.js + tfx-cli
+#   - Publicação no VSCode Marketplace
+#   - Resumo do deploy
+#   - Registro de deploy no Event Hub
+# ==================================================================
+# ESTÁGIOS DO PIPELINE
+# ==================================================================
+stages:
+  # ==================================================================
+  # STAGE 1: Prepare
+  # Resolve a versão, baixa o .vsix do Azure Artifacts e extrai
+  # metadados da extensão. Publica o .vsix como pipeline artifact
+  # e expõe variáveis de saída para o stage Deploy.
+  # ==================================================================
+  - stage: Prepare
+    displayName: 'Prepare'
+    jobs:
+      - job: prepare
+        displayName: 'Resolve Version & Download Package'
+        pool: ${{ parameters.agentPool }}
+        steps:
+          - checkout: self
+            fetchDepth: 1
+            persistCredentials: true
+
+          # Categorização do deploy
+          - script: |
+              echo "##vso[build.addbuildtag]vscode"
+              echo "##vso[build.addbuildtag]extension"
+              echo "##vso[build.addbuildtag]cd-framework"
+              echo "##vso[build.addbuildtag]deploy-vsix-vscode-extension"
+              echo "##vso[build.addbuildtag]vsix"
+            displayName: 'Set Pipeline Execution Tags'
+
+          # Resolve a versão a ser deployada (suporta getLatestVersion())
+          - task: VersionManagerVivo@8
+            displayName: 'Set Deploy Version'
+            inputs:
+              command: 'setDeployVersion'
+              version: ${{ parameters.version }}
+            name: VersionManagerVivo
+
+          - script: |
+              echo "##vso[build.updatebuildnumber]deploy-${DEPLOY_VERSION}"
+              echo "##vso[build.addbuildtag]version-${DEPLOY_VERSION}"
+            displayName: 'Set Pipeline Execution Number and Tags'
+            env:
+              DEPLOY_VERSION: $(VersionManagerVivo.DEPLOY_VERSION)
+
+          # Download do .vsix do Azure Artifacts
+          - task: UniversalPackages@0
+            displayName: 'Download VSIX from Azure Artifacts'
+            inputs:
+              command: 'download'
+              downloadDirectory: '$(Pipeline.Workspace)/vsix'
+              feedsToUse: 'internal'
+              ${{ if eq(parameters.projectScopedFeed, true) }}:
+                vstsFeed: '$(System.TeamProject)/${{ parameters.feedName }}'
+              ${{ else }}:
+                vstsFeed: '${{ parameters.feedName }}'
+              vstsFeedPackage: '${{ parameters.packageName }}'
+              vstsPackageVersion: '$(VersionManagerVivo.DEPLOY_VERSION)'
+
+          # Localiza o arquivo .vsix baixado
+          - script: |-
+              ls -laR $ARTIFACTS_PATH
+              VSIX_FILE=$(ls ${ARTIFACTS_PATH}/*.vsix | head -n 1)
+              echo "##[debug] VSIX_FILE: $VSIX_FILE"
+              if [ -z "$VSIX_FILE" ]; then
+                echo "##vso[task.logissue type=error]Nenhum arquivo .vsix encontrado em ${ARTIFACTS_PATH}."
+                exit 1
+              fi
+              echo "##vso[task.setvariable variable=VSIX_FILE]${VSIX_FILE}"
+            displayName: 'Find VSIX File'
+            env:
+              ARTIFACTS_PATH: $(Pipeline.Workspace)/vsix
+
+          # Extração de metadados da extensão (sempre do package.json para VSCode)
+          - task: JsonParseFromVivo@4
+            displayName: 'Get Extension Metadata (package.json)'
+            inputs:
+              type: 'file'
+              origin: './package.json'
+              jpaths: |
+                var VSSEXTENSION_JSON_ID = .name
+                var VSSEXTENSION_JSON_NAME = .displayName
+                var VSSEXTENSION_JSON_PUBLISHER = .publisher
+
+          # Exporta metadados como output variables para o stage Deploy
+          - script: |
+              echo "##vso[task.setvariable variable=EXTENSION_ID;isOutput=true]${VSSEXTENSION_JSON_ID}"
+              echo "##vso[task.setvariable variable=EXTENSION_NAME;isOutput=true]${VSSEXTENSION_JSON_NAME}"
+              echo "##vso[task.setvariable variable=EXTENSION_PUBLISHER;isOutput=true]${VSSEXTENSION_JSON_PUBLISHER}"
+            displayName: 'Export Metadata as Output Variables'
+            name: ExtractMetadata
+            env:
+              VSSEXTENSION_JSON_ID: $(VSSEXTENSION_JSON_ID)
+              VSSEXTENSION_JSON_NAME: $(VSSEXTENSION_JSON_NAME)
+              VSSEXTENSION_JSON_PUBLISHER: $(VSSEXTENSION_JSON_PUBLISHER)
+
+          # Re-publica o .vsix como pipeline artifact para consumo no stage Deploy
+          - task: PublishPipelineArtifact@1
+            displayName: 'Publish VSIX for Deploy Stage'
+            inputs:
+              targetPath: $(VSIX_FILE)
+              artifactName: 'vsix-deploy'
+              publishLocation: 'pipeline'
+
+  # ==================================================================
+  # STAGE 2: Deploy
+  # Consome o .vsix e as variáveis do stage Prepare.
+  # O job de deployment habilita o approval gate configurado no
+  # environment 'deploy-<ambiente>' no Azure DevOps.
+  # ==================================================================
+  - stage: Deploy
+    displayName: 'Deploy to VSCode Marketplace'
+    dependsOn: Prepare
+    condition: succeeded()
+    variables:
+      # Variáveis exportadas pelo stage Prepare
+      DEPLOY_VERSION: $[ stageDependencies.Prepare.prepare.outputs['VersionManagerVivo.DEPLOY_VERSION'] ]
+      EXTENSION_ID: $[ stageDependencies.Prepare.prepare.outputs['ExtractMetadata.EXTENSION_ID'] ]
+      EXTENSION_NAME: $[ stageDependencies.Prepare.prepare.outputs['ExtractMetadata.EXTENSION_NAME'] ]
+      EXTENSION_PUBLISHER: $[ stageDependencies.Prepare.prepare.outputs['ExtractMetadata.EXTENSION_PUBLISHER'] ]
+    jobs:
+      - deployment: 'deployVSIXExtension'
+        displayName: 'Publish to VSCode Marketplace'
+        pool: ${{ parameters.agentPool }}
+        environment:
+          name: deploy-producao # Fixo pois não há outros ambientes de Marketplace
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                # Checkout necessário para leitura do .nvmrc (NodeTool) e .npmrc (TfxInstaller)
+                - checkout: self
+                  fetchDepth: 1
+
+                # Download do .vsix preparado no stage anterior
+                - task: DownloadPipelineArtifact@2
+                  displayName: 'Download VSIX Artifact'
+                  inputs:
+                    artifactName: 'vsix-deploy'
+                    targetPath: '$(Pipeline.Workspace)/vsix'
+
+                # Localiza o .vsix no diretório baixado
+                - script: |-
+                    VSIX_FILE=$(ls $(Pipeline.Workspace)/vsix/*.vsix | head -n 1)
+                    echo "##[debug] VSIX_FILE: $VSIX_FILE"
+                    if [ -z "$VSIX_FILE" ]; then
+                      echo "##vso[task.logissue type=error]Nenhum arquivo .vsix encontrado."
+                      exit 1
+                    fi
+                    echo "##vso[task.setvariable variable=VSIX_FILE]${VSIX_FILE}"
+                  displayName: 'Find VSIX File'
+
+                # Setup Node.js (necessário para tfx-cli)
+                - task: NodeTool@0
+                  displayName: 'Setup Node.js Environment'
+                  inputs:
+                    versionSource: 'fromFile'
+                    versionFilePath: '.nvmrc'
+
+                # TfxInstaller é obrigatório para PublishAzureDevOpsExtension@5
+                # que é utilizada também para publicar extensões VSCode.
+                - task: TfxInstaller@5
+                  displayName: 'Ensure Tfx CLI'
+                  env:
+                    NPM_CONFIG_USERCONFIG: .npmrc
+
+                # Publicação no VSCode Marketplace via PublishAzureDevOpsExtension@5
+                # O Visual Studio Marketplace é compartilhado entre extensões AzDevOps e VSCode.
+                # A mesma service connection e task funcionam para ambos os tipos.
+                - task: PublishAzureDevOpsExtension@5
+                  continueOnError: true
+                  displayName: 'Publish VSCode Extension on Marketplace'
+                  inputs:
+                    connectTo: 'VsTeam'
+                    connectedServiceName: 'vso-telefonica-vivo-brasil'
+                    fileType: 'vsix'
+                    vsixFile: $(VSIX_FILE)
+                    updateTasksVersion: false
+
+                # Validação da extensão publicada
+                - task: IsAzureDevOpsExtensionValid@5
+                  displayName: 'Validate VSCode Extension on Marketplace'
+                  inputs:
+                    connectTo: 'VsTeam'
+                    connectedServiceName: 'vso-telefonica-vivo-brasil'
+                    method: 'vsix'
+                    vsixFile: $(VSIX_FILE)
+
+                # Resumo do deploy
+                - script: |
+                    ACCESS_URL=https://marketplace.visualstudio.com/items?itemName=${EXTENSION_PUBLISHER}.${EXTENSION_ID}
+                    echo "##vso[task.setvariable variable=ACCESS_URL;isOutput=true;issecret=false;]${ACCESS_URL}"
+                    echo ""
+                    echo "##[section]🚀 DEPLOY CONCLUÍDO COM SUCESSO!"
+                    echo "##[command]📦 Nome: ${EXTENSION_NAME}"
+                    echo "##[command]🔗 Marketplace: ${ACCESS_URL}"
+                    echo "##[command]📋 Versão: ${DEPLOY_VERSION}"
+                    echo ""
+                  env:
+                    DEPLOY_VERSION: $(DEPLOY_VERSION)
+                    EXTENSION_ID: $(EXTENSION_ID)
+                    EXTENSION_NAME: $(EXTENSION_NAME)
+                    EXTENSION_PUBLISHER: $(EXTENSION_PUBLISHER)
+                  name: DeploymentSummary
+                  displayName: 'Resumo do Deploy'
+                  condition: always()
+
+                # Registro de deploy no Event Hub (obrigatório em pipelines CD)
+                - task: VivoEventHubTools@3
+                  displayName: 'Registro de deploy no Event Hub'
+                  condition: always()
+                  continueOnError: true
+                  inputs:
+                    command: 'deploy'
+                    eventHubConnection: 'EVHCodeProd'
+                    componentVersion: '$(DEPLOY_VERSION)'
+                    deployArtifactName: $(EXTENSION_ID)
+                    deployArtifactType: 'vscode-extension'
+                    deployEnvironmentType: 'vscode-marketplace'
+                    deployEnvironmentName: 'vscode-marketplace'
+                    deployEnvironmentAccessUrl: '$(DeploymentSummary.ACCESS_URL)'
+                    pipelineType: 'framework/deploy-vsix-vscode-extension'
+
+# ==================================================================
+# TROUBLESHOOTING
+# ==================================================================
+#
+# 1. Erro "Nenhum arquivo .vsix encontrado":
+#    - Confirme que o CI foi executado e publicou no feed
+#    - Verifique se packageName e feedName correspondem ao CI
+#    - Confirme se a versão solicitada existe no feed
+#
+# 2. Falha na publicação (VSCode):
+#    - Verifique se o service connection está configurado corretamente
+#    - Confirme se o environment existe no Azure DevOps
+#    - O publisher no package.json deve corresponder ao publisher do PAT
+#
+# 3. Falha no download do Azure Artifacts:
+#    - Verifique se o feed e o pacote existem
+#    - Confirme se projectScopedFeed está correto
+#    - O pipeline deve ter permissão de leitor no feed
+#
+# CONFIGURAÇÕES NECESSÁRIAS:
+#
+# Service Connections:
+#   - vso-telefonica-vivo-brasil
+# Environments: deploy-vsix-vscode-marketplace
+#
+# Agent Pool: GeneralPurposeLinuxAgentsCD
+# ==================================================================

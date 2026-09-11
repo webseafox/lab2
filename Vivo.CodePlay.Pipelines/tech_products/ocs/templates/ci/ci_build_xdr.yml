@@ -1,0 +1,109 @@
+stages:
+  - stage: build_test
+    displayName: "Build & Test"
+    jobs:
+      - job: build_test
+        displayName: 'Build Job'
+        condition: and(succeeded(), eq(variables.flowIsTagging, false))
+        pool:
+          vmImage: 'ubuntu-latest'
+        variables:
+          - name: MAVEN_OPTS
+            value: '-Xmx3072m'
+          - name: MAVEN_CACHE_FOLDER
+            value: '$(Pipeline.Workspace)/.m2/repository'
+
+        steps:
+          - task: JavaToolInstaller@0
+            displayName: 'Use Java 8'
+            inputs:
+              versionSpec: 8
+              jdkArchitectureOption: x64
+              jdkSourceOption: 'PreInstalled'
+          - task: DownloadPipelineArtifact@2
+            displayName: 'Download Artifacts from Previous Build'
+
+          - script: |
+              echo "Instalando yq localmente..."
+              wget https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -O ./yq
+              chmod +x ./yq
+              ./yq --version
+            displayName: Install yq (local)  
+
+          - script: |
+              echo "Using downloaded artifacts..."
+              mkdir -p ~/.m2/repository/
+              cp -r $(Build.SourcesDirectory)/repository/* ~/.m2/repository
+              echo "Contents of ~/.m2/repository/br:"
+              ls -laR ~/.m2/repository
+            displayName: 'Copy Artifacts to Local Maven Repository (Local Repository)'
+
+          - task: Maven@4
+            inputs:
+              mavenPomFile: 'pom.xml'
+              mavenOptions: '-Xmx3072m'
+              options: '-B -e -X'
+              goals: 'clean install'
+          
+          - task: UseDotNet@2
+            displayName: 'Use .NET Core sdk 7.0.x'
+            inputs:
+              version: 7.0.x
+
+          - task: PublishCodeCoverageResults@2
+            inputs:
+              codeCoverageTool: 'JaCoCo'
+              summaryFileLocation: '$(System.DefaultWorkingDirectory)/**/target/site/jacoco/jacoco.xml'
+              reportDirectory: '$(System.DefaultWorkingDirectory)/**/jacoco'
+              failIfCoverageEmpty: false
+
+          - task: CopyFiles@2
+            displayName: Copy Files Staging Directory              
+            inputs:
+              SourceFolder: '$(build.sourcesdirectory)'
+              Contents: |
+                **/*
+                !**/*.jar
+                !**/assembly/**
+                !**/env-test/**
+                !**/repository/**
+                !*.sh
+                !**/*.txt
+                .azuredevops/sonar-project.properties
+                !.git/**/*
+              TargetFolder: '$(Build.ArtifactStagingDirectory)'
+              CleanTargetFolder: true
+              OverWrite: true
+              flattenFolders: false
+            
+          - script: |
+              echo "Listing contents of the staging directory:"
+              ls -la $(Build.ArtifactStagingDirectory)
+            displayName: 'List Staging Directory Contents'
+            
+          # Publicar para pasta app (será utilizada pelo Sonar)
+          - task: PublishBuildArtifacts@1
+            displayName: Publish Build Artifacts
+            inputs:
+              PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+              ArtifactName: app
+              StoreAsTar: true
+
+          - task: CopyFiles@2
+            displayName: Copy Bundles Files Staging Directory
+            inputs:
+              SourceFolder: '$(build.sourcesdirectory)'
+              Contents: |
+                **/*.jar
+                !$HOME/**/*        
+              TargetFolder: '$(Build.ArtifactStagingDirectory)'
+              CleanTargetFolder: true
+              OverWrite: true
+              flattenFolders: true
+          
+          - task: PublishBuildArtifacts@1
+            displayName: Publish Bundles Artifacts
+            inputs:
+              PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+              ArtifactName: bundles
+              StoreAsTar: true

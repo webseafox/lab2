@@ -1,0 +1,955 @@
+﻿parameters:
+- name: environment 
+  type: string
+- name: model 
+  type: string
+  default: 'deploy'
+
+
+variables:
+- template: /global/variables/pipeline.yml@CorePipelines
+
+- group: PIPELINE_VARIABLES
+- group: DATABASE_VARIABLES
+- group: WINDOWS_SERVER_COMMON_VARIABLES
+- group: SIBEL_SERVER_COMMON_VARIABLES
+- group: BACKUP_PIPELINE_VARIABLES
+- ${{ if eq(parameters.environment, 'dev1') }}:
+  - group: DEV1_VARIABLES
+- ${{ if eq(parameters.environment, 'qa1') }}:
+  - group: QA1_VARIABLES
+- ${{ if eq(parameters.environment, 'qa2') }}:
+  - group: QA2_VARIABLES
+- ${{ if eq(parameters.environment, 'pp') }}:
+  - group: PP_VARIABLES
+- ${{ if eq(parameters.environment, 'ppl') }}:
+  - group: PPL_VARIABLES
+- ${{ if eq(parameters.environment, 'prod_new') }}:
+  - group: PROD_NEW_VARIABLES
+- ${{ if eq(parameters.environment, 'prd') }}:
+  - group: PRD_VARIABLES
+
+extends:
+# This pipeline is used to provision the VivoCorp Siebel server.
+
+  ## Initial stage for 'deploy' model ##
+  ## -------------------------------- ##
+  ${{ if eq(parameters.model, 'deploy') }}:
+    stages:
+    # - template: stages/default/debug.yml
+
+    #- template: stages/default/prepare.yml
+    ## ------------------------------------------------------------- ##
+    ## Initial stage to prepare the environment and create a git tag ##
+    ## ------------------------------------------------------------- ##
+    - stage: prepare
+      displayName: "Prepare"
+      dependsOn: []
+      pool: $(GeneralPurposeLinuxAgentsCD)
+      jobs:
+        - job: prepare
+          displayName: "Prepare"
+          steps:
+            - checkout: self
+              displayName: "Checkout repository"
+              persistCredentials: true
+              fetchDepth: 0
+              fetchTags: false
+              clean: true
+
+            - task: SSH@0
+              condition: true
+              displayName: Change key permissions
+              inputs:
+                sshEndpoint: "BRTLVBGB0055CO"
+                runOptions: "commands"
+                commands: |
+                  copy "C:\cygwin64\home\devops_corp\.ssh\id_rsa" "C:\cygwin64\home\devops_corp\.ssh\id_rsa_azuredevops"
+                  icacls  "C:\cygwin64\home\devops_corp\.ssh\id_rsa_azuredevops" /inheritance:r
+                  icacls  "C:\cygwin64\home\devops_corp\.ssh\id_rsa_azuredevops" /grant:r "%USERNAME%:F"
+                  ls -la C:\cygwin64\home\devops_corp\.ssh\
+                readyTimeout: "20000"
+
+            - task: Bash@3
+              displayName: "Create git tag"
+              name: versioning
+              inputs:
+                targetType: "inline"
+                script: |
+                  # Buscar todas as tags primeiro
+                  git fetch --tags --force
+
+                  # Capturar OLD_VERSION ANTES de criar nova tag
+                  OLD_VERSION=$(git describe --tags --abbrev=0 2>/dev/null || echo "initial")
+                  echo "Previous version (OLD_VERSION): $OLD_VERSION"
+
+                  # Criar nova tag com formato consistente
+                  datetime=$(date +"%Y%m%d%H%M%S")
+
+                  git config user.email "vivo.devops@telefonicati.onmicrosoft.com"
+                  git config user.name "Azure Pipeline Vivo Corp"
+
+                  # Verificar se a tag já existe e incrementar se necessário
+                  original_datetime=$datetime
+                  counter=1
+                  while git rev-parse "refs/tags/$datetime" >/dev/null 2>&1; do
+                      echo "Tag $datetime já existe, tentando com sufixo..."
+                      datetime="${original_datetime}_${counter}"
+                      counter=$((counter + 1))
+                  done
+
+                  echo "Criando tag: $datetime"
+                  git tag -a "$datetime" -m "Versionamento DevOps"
+                  git push origin "$datetime"
+
+                  # Exportar ambas as versões como variáveis de output
+                  echo "##vso[task.setvariable variable=NEW_VERSION;isOutput=true]$datetime"
+                  echo "##vso[task.setvariable variable=OLD_VERSION;isOutput=true]$OLD_VERSION"
+              env:
+                AZURE_DEVOPS_EXT_PAT: $(System.AccessToken)
+
+            - bash: |
+                REPO_DIR=$(Build.SourcesDirectory)
+
+                # Usar as variáveis de output do task anterior
+                OLD_VERSION="$(versioning.OLD_VERSION)"
+                NEW_VERSION="$(versioning.NEW_VERSION)"
+
+                echo "Using OLD_VERSION from previous task: $OLD_VERSION"
+                echo "Using NEW_VERSION from previous task: $NEW_VERSION"
+
+                echo $OLD_VERSION > $REPO_DIR/old_version.log
+                echo "Old version (old_version.log):"
+                cat $REPO_DIR/old_version.log
+
+                echo $NEW_VERSION > $REPO_DIR/new_version.log
+                echo "New version (new_version.log):"
+                cat $REPO_DIR/new_version.log
+
+                # Verificar se as versões são diferentes e gerar lista de arquivos
+                if [ "$OLD_VERSION" = "$NEW_VERSION" ]; then
+                    echo "##vso[task.logissue type=warning;]OLD_VERSION e NEW_VERSION são iguais: $NEW_VERSION"
+                    echo "Criando arquivo vazio para evitar erro no pipeline"
+                    touch $REPO_DIR/new_sifs.log
+                elif [ "$OLD_VERSION" = "initial" ]; then
+                    echo "Primeira execução - listando todos os arquivos"
+                    find . -type f | grep -Ev '^\./.azuredevops/' > $REPO_DIR/new_sifs.log
+                else
+                    echo "Comparando versões $OLD_VERSION e $NEW_VERSION"
+                    git diff $OLD_VERSION $NEW_VERSION --name-only --diff-filter=d | grep -Ev '^\.azuredevops/' > $REPO_DIR/new_sifs.log
+                fi
+
+                echo "Arquivos alterados (new_sifs.log):"
+                cat $REPO_DIR/new_sifs.log
+              displayName: "Generete list of .sif file names with version control"
+
+            - bash: |
+                REPO_DIR=$(Build.SourcesDirectory)
+
+                LOG_FILE="$REPO_DIR/new_sifs.log"
+
+                sed -i 's|/|\\|g' "$LOG_FILE"
+
+                echo "Conteúdo atualizado (new_sifs.log):"
+                cat "$LOG_FILE"
+              displayName: "Perform replace in new_sifs.log file"
+
+            - task: PublishPipelineArtifact@1
+              displayName: "Publish new_sifs.log as pipeline artifact"
+              inputs:
+                targetPath: "$(Build.SourcesDirectory)/new_sifs.log"
+                artifactName: "new_sifs"
+                publishLocation: "pipeline"
+    ## -------------------------------------------------------------------- ##
+    ## End of initial stage to prepare the environment and create a git tag ##
+    ## -------------------------------------------------------------------- ##
+
+
+    # - template: stages/default/import.yml
+    #   parameters:
+    #     environment: ${{parameters.environment}}
+    ## -------------------------------------------------------------------------------- ##
+    ## Stage to import files into the Siebel environment based on the new_sifs.log file ##
+    ## -------------------------------------------------------------------------------- ##
+    - stage: import_files
+      displayName: "Import files"
+      dependsOn: prepare
+      condition: succeeded()
+      pool: $(PollVivoCorpSiebelAgents)
+      jobs:
+      - job: import_files
+        displayName: "Import files"
+        steps:
+          - checkout: self
+            fetchDepth: 0
+            fetchTags: false
+
+          - task: DownloadPipelineArtifact@2
+            displayName: 'Download new_sifs.log pipeline artifact'
+            inputs:
+              artifact: 'new_sifs'
+              path: 'C:/Siebel_Devops/$(environmentNameUpperCase)/ambientes'
+
+          - task: CmdLine@2
+            displayName: 'Show new_sifs.log'
+            inputs:
+              script: |
+                @echo off
+                type C:\Siebel_Devops\$(environmentNameUpperCase)\ambientes\new_sifs.log
+
+          - task: CmdLine@2
+            displayName: 'Copy files listed in new_sifs.log to target directory'
+            inputs:
+              script: |
+                @echo off
+                set LOG_FILE=C:\Siebel_Devops\$(environmentNameUpperCase)\ambientes\new_sifs.log
+                set TARGET_DIR=C:\Siebel_Devops\$(environmentNameUpperCase)\temp
+
+                echo LOG_FILE is set to: %LOG_FILE%
+                echo TARGET_DIR is set to: %TARGET_DIR%
+
+                if not exist "%LOG_FILE%" (
+                  echo "Error: %LOG_FILE% not found!"
+                  exit /b 1
+                )
+
+                for /f %%i in ('findstr /r /v "^$" "%LOG_FILE%"') do set NON_EMPTY=1
+                if not defined NON_EMPTY (
+                  echo "Error: %LOG_FILE% is empty!"
+                  echo ##vso[task.setvariable variable=hasONRFiles;isOutput=true]false
+                  exit /b 1
+                )
+                  for /f "tokens=*" %%a in (%LOG_FILE%) do (
+                  echo Processing file: %%a
+                  echo ##vso[task.setvariable variable=hasONRFiles;isOutput=true]true
+                  echo F|xcopy "$(Build.SourcesDirectory)\%%a" "%TARGET_DIR%\%%a" /Y
+                )
+
+          - task: PowerShell@2
+            displayName: 'Run PowerShell script for replace'
+            inputs:
+              filePath: 'C:\Siebel_Devops\scripts\replace_${{parameters.environment}}.ps1'
+
+          - task: CmdLine@2
+            displayName: 'Check for SIF Files'
+            #continueOnError: true
+            name: checkSifFiles
+            inputs:
+              script: |
+                @echo off
+                if exist C:\Siebel_Devops\$(environmentNameUpperCase)\temp\*.sif (
+                  echo SIF files found.
+                  echo ##vso[task.setvariable variable=hasSifFiles;isOutput=true]true
+                  exit 0
+                ) else (
+                  echo No SIF files found.
+                  echo "file sifs doesn't exist" > C:\Siebel_Devops\$(environmentNameUpperCase)\temp\nao_compilar.txt
+                  echo ##vso[task.setvariable variable=hasSifFiles;isOutput=true]false
+                  exit 0
+                )
+
+          - task: CmdLine@2
+            displayName: 'Execute Siebel Batch Import'
+            condition: succeeded()
+            inputs:
+              workingDirectory: 'C:\Siebel\8.1\Tools_1\BIN'
+              script: |
+                @echo off
+                set datetime=%date:~-4%_%date:~3,2%_%date:~0,2%_%time:~0,2%_%time:~3,2%_%time:~6,2%
+                set "timestamp=%datetime: =0%"
+                echo %timestamp%
+
+                siebdev.exe /c "C:\Siebel\8.1\Tools_1\BIN\ENU\$(environmentNameUpperCase).cfg" /s $(environmentNameUpperCase) /u SIEBEL /p AdmSieb05 /batchimport "Siebel Repository" overwrite "C:\Siebel_Devops\$(environmentNameUpperCase)\temp" C:\Siebel_Devops\log\import_$(environmentNameUpperCase)_%timestamp%.log
+
+                del "C:\Siebel_Devops\$(environmentNameUpperCase)\temp\*" /f /q
+
+                type C:\Siebel_Devops\log\import_$(environmentNameUpperCase)_%timestamp%.log
+    ## --------------------------------------------------------------------------------------- ##
+    ## End of stage to import files into the Siebel environment based on the new_sifs.log file ##
+    ## --------------------------------------------------------------------------------------- ##
+
+    # - template: stages/default/build.yml
+    #   parameters:
+    #     environment: ${{parameters.environment}}
+    ## ------------------------------------------------------------------- ##
+    ## Stage to compile the Siebel environment after importing files       ##
+    ## ------------------------------------------------------------------- ##
+    - stage: compile
+      displayName: "Compile Siebel"
+      condition: succeeded()
+      dependsOn: ['import_files']
+      pool: $(PollVivoCorpSiebelAgents)
+      jobs:
+      - job: ListSiebdevProcesses
+        displayName: "List Siebdev Processes"
+        steps:
+        - checkout: none
+        - task: CmdLine@2
+          displayName: "List Siebdev.exe Processes"
+          inputs:
+            script: |
+              echo Listing all siebdev.exe processes...
+              tasklist /fi "imagename eq siebdev.exe"
+
+      - job: GenerateTimestamp
+        displayName: "Generate Timestamp and Start Log"
+        steps:    
+        - checkout: none
+        - task: CmdLine@2
+          displayName: "Generate Timestamp"
+          inputs:
+            script: |
+              @echo off
+              set datetimei=%date:~-4%_%date:~3,2%_%date:~0,2%_%time:~0,2%_%time:~3,2%_%time:~6,2%
+              set "timestamp=%datetimei: =0%"
+              echo %timestamp% > C:\Siebel_Devops\log\timestamp.txt
+              echo Start Compilation > C:\Siebel_Devops\log\Compile_%timestamp%.log
+              echo [%timestamp%] Timestamp generated for logging. >> C:\Siebel_Devops\log\Compile_%timestamp%.log
+              type  C:\Siebel_Devops\log\Compile_%timestamp%.log
+
+      - job: CheckCompilation
+        displayName: "Check if Compilation Should Proceed"
+        dependsOn: GenerateTimestamp
+        steps:
+        - checkout: none
+        - task: CmdLine@2
+          displayName: "Check nao_compilar.txt"
+          inputs:
+            script: |         
+              for /f %%i in (C:\Siebel_Devops\log\timestamp.txt) do set timestamp=%%i
+              set log_path=C:\Siebel_Devops\log\Compile_%timestamp%.log
+
+              REM Verificar se o arquivo nao_compilar.txt existe
+              if exist C:\Siebel_Devops\$(environmentNameUpperCase)\temp\nao_compilar.txt (
+                  echo [%date% %time%] Não existem objetos para serem compilados. >> %log_path%
+                  echo Limpando o diretório temporário... >> %log_path%
+                  del "C:\Siebel_Devops\$(environmentNameUpperCase)\temp\*" /f /q
+                  del C:\Siebel_Devops\log\timestamp.txt
+                  type %log_path%
+                  exit /b 1
+              ) else (
+                  echo [%date% %time%] Existem objetos para serem compilados. >> %log_path%
+                  type %log_path%
+              )
+
+      - job: MonitorCompilation
+        displayName: "Run Siebel Compilation and Monitor PID"
+        dependsOn: CheckCompilation
+        condition: succeeded()
+        steps:
+          - checkout: none
+          - task: PowerShell@2
+            displayName: "Run Siebel Compilation"
+            inputs:
+              targetType: inline
+              script: |
+                $log_path = "C:\Siebel_Devops\log\Compile_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+
+                # Exibe informações no log do Azure DevOps
+                Write-Host "======================================================================================"
+                Write-Host "=============================== INFORMATIONS ========================================="
+                Write-Host "======================================================================================"
+                Write-Host "=============================== GENERAL INFORMATION ABOUT HOSTS ======================"
+                Write-Host "Siebel Developer Client: $(siebelDeveloperClient)"
+                Write-Host "Configuration file: $(configurationFile)"
+                Write-Host "SRF file path: $(SRFFilePath)"
+                Write-Host "Log path: $log_path"
+                Write-Host "======================================================================================"
+                Write-Host "`n"
+
+                # Log inicio
+                Write-Host "[$(Get-Date)] Starting Siebel process..."
+                Add-Content -Path $log_path -Value "[$(Get-Date)] Starting Siebel process..."
+
+                # Iniciar o processo Siebel usando Start-Process e capturar o PID
+                $process = Start-Process -FilePath $(siebelDeveloperClient) -ArgumentList "/c `"$(configurationFile)`" /s DEV1 /u SIEBEL /p AdmSieb05 /tl PTB /bc 'Siebel Repository' `"$(SRFFilePath)`"" -PassThru -NoNewWindow
+
+                Start-Sleep -Seconds 2
+
+                if ($process -eq $null) {
+                    Write-Host "[$(Get-Date)] Failed to start process."
+                    Add-Content -Path $log_path -Value "[$(Get-Date)] Failed to start process."
+                    exit 1
+                }
+
+                # Registrar o PID no log
+                $processId = $process.Id
+                Write-Host "[$(Get-Date)] Process started with PID $processId."
+                Add-Content -Path $log_path -Value "[$(Get-Date)] Process started with PID $processId."
+
+                # Monitorar o processo pelo PID
+                Write-Host "[$(Get-Date)] Waiting for process PID $processId to finish..."
+                Add-Content -Path $log_path -Value "[$(Get-Date)] Waiting for process PID $processId to finish..."
+
+                # Monitorar o PID
+                do {
+                    $processStatus = Get-Process -Id $processId -ErrorAction SilentlyContinue
+                    if ($processStatus) {
+                        Write-Host "[$(Get-Date)] Process is still running... waiting 3 minutes."
+                        Add-Content -Path $log_path -Value "[$(Get-Date)] Process is still running... waiting 3 minutes."
+                        Start-Sleep -Seconds 180
+                    } else {
+                        Write-Host "[$(Get-Date)] Process no longer running. Exiting loop."
+                        Add-Content -Path $log_path -Value "[$(Get-Date)] Process no longer running. Exiting loop."
+                        break
+                    }
+                } while ($true)
+
+                # Log final
+                Write-Host "[$(Get-Date)] Process PID $processId finished."
+                Add-Content -Path $log_path -Value "[$(Get-Date)] Process PID $processId finished."
+    ## -------------------------------------------------------------------- ##
+    ## End of stage to compile the Siebel environment after importing files ##
+    ## -------------------------------------------------------------------- ##
+
+    # - template: stages/default/upload.yml
+    ## ---------------------------------------------------- ##
+    ## Stage to upload the SRF package to the Siebel server ##
+    ## ---------------------------------------------------- ##
+    - stage: upload_files
+      dependsOn: compile
+      condition: succeeded()
+      displayName: "Upload Pacote (SRF)"
+      pool: $(PollVivoCorpSiebelAgents)
+      jobs:
+      - job: put_files
+        displayName: "Upload Pacote (SRF)"
+        steps:
+          - checkout: none
+          - task: CmdLine@2
+            displayName: "Run SFTP Script"
+            inputs:
+              script: |
+                @echo off
+                sftp -o StrictHostKeyChecking=no -i $(SIEBEL_PRIVATE_KEY) -b "$(batchFile)" $(host) 22
+                exit
+    ## ----------------------------------------------------------- ##
+    ## End of stage to upload the SRF package to the Siebel server ##
+    ## ----------------------------------------------------------- ##
+
+    # - template: stages/default/restart.yml
+    #   parameters:
+    #     environment: ${{parameters.environment}}
+    ## -------------------------------------------------------- ##
+    ## Stage to restart the Siebel server after uploading files ##
+    ## -------------------------------------------------------- ##
+    - stage: restart
+      dependsOn: 
+      - upload_files
+      - import_files
+      # condition: succeeded()
+      displayName: "Restart Server"
+      pool: $(PollVivoCorpSiebelAgents)
+      jobs:
+      - job: put_files
+        displayName: "Restart server"
+        steps:
+          - checkout: none
+          - task: CmdLine@2
+            displayName: "Run Stop Script"
+            inputs:
+              script: |
+                ssh -o StrictHostKeyChecking=no -i "$(SIEBEL_PRIVATE_KEY)" $(host) $(devopsStopScriptName)
+                exit
+
+          - ${{ if eq(parameters.environment, 'dev1') }}:
+            - task: CmdLine@2
+              displayName: Run Rename Script for $(environmentNameUpperCase)
+              inputs:
+                script: |
+                  ssh -o StrictHostKeyChecking=no -i "$(SIEBEL_PRIVATE_KEY)" $(host) $(renameScriptName)
+                  exit
+
+          - ${{ if or(eq(parameters.environment, 'qa1'), eq(parameters.environment, 'qa2'), eq(parameters.environment, 'pp'), eq(parameters.environment, 'ppl'), eq(parameters.environment, 'prod_new')) }}:
+
+            - task: CmdLine@2
+              displayName: Run Rename Script for $(environmentNameUpperCase)
+              inputs:
+                script: |
+                  ssh -o StrictHostKeyChecking=no -i "$(SIEBEL_PRIVATE_KEY)" $(host) $(renameScriptName)
+                  ssh -o StrictHostKeyChecking=no -i "$(SIEBEL_PRIVATE_KEY)" $(host) "chmod 755 /opt/web/siebel/siebel811/siebsrvr/objects/ptb/siebel_sia.srf"
+                  exit
+
+          - task: CmdLine@2
+            displayName: Run Start Script for $(environmentNameUpperCase)
+            inputs:
+              script: |
+                ssh -o StrictHostKeyChecking=no -i "$(SIEBEL_PRIVATE_KEY)"  $(host) "$(devopsStartScriptName)"
+                exit:
+    ## --------------------------------------------------------------- ##
+    ## End of stage to restart the Siebel server after uploading files ##
+    ## --------------------------------------------------------------- ##
+
+    # - template: stages/default/adm.yml
+    #   parameters:
+    #     environment: ${{parameters.environment}}
+    ## -------------------------------------------------------- ##
+    ## Stage to get and import ADMs into the Siebel environment ##
+    ## -------------------------------------------------------- ##
+    - stage: adm
+      displayName: "Adm get e import"
+      dependsOn: restart
+      pool: $(PollVivoCorpSiebelAgents)
+      jobs:
+      - job: put_files
+        displayName: "Adm get e import"
+        steps:
+          - checkout: none
+          - task: PowerShell@2
+            displayName: 'Execute $(admGetScriptName)'
+            inputs:
+              targetType: 'inline'
+              script: |
+                if ("${{ parameters.environment }}" -ne 'dev1') {
+                    . "C:\Siebel_Devops\pipeline_azure\${{ parameters.environment }}\copy_xml_files.ps1"
+
+                    sftp -o StrictHostKeyChecking=no -i "$(SIEBEL_PRIVATE_KEY)" -b $(admGetScriptName) $(host) 22
+                } else {
+                    . "C:\Siebel_Devops\paliativo\copy_xml_files.ps1"
+                  
+                    sftp -o StrictHostKeyChecking=no -i "$(SIEBEL_PRIVATE_KEY)" -b $(admGetScriptName) $(host) 22
+                }
+                
+                exit
+
+          - task: CmdLine@2
+            displayName: 'Execute $(importAdmScriptName)'
+            continueOnError: true
+            inputs:
+              script: |
+                ssh -o StrictHostKeyChecking=no -i "$(SIEBEL_PRIVATE_KEY)" $(host) "$(importAdmScriptName)"
+
+                if exist C:\Siebel_Devops\$(environmentNameUpperCase)\temp\stage_xml\*.xml (
+                    echo ADMs foram importados! Necessário novo restart.
+
+                    dir /b /a-d C:\Siebel_Devops\$(environmentNameUpperCase)\temp\stage_xml\*.xml
+
+                    ssh -o StrictHostKeyChecking=no -i "$(SIEBEL_PRIVATE_KEY)" $(host) $(devopsStopScriptName)
+
+                    echo Iniciando Siebel Server....
+
+                    setlocal enableextensions
+
+                    ssh -o StrictHostKeyChecking=no -i "$(SIEBEL_PRIVATE_KEY)" $(host) "bash -c '$(devopsStartScriptName)'"
+
+                ) else (
+                    echo Nenhum ADM importado. Terminando processo...
+                )
+
+                if exist "C:\Siebel_Devops\$(environmentNameUpperCase)\temp\ADM\*.xml" (
+                    del /s /q "C:\Siebel_Devops\$(environmentNameUpperCase)\temp\ADM\*.xml"
+                ) else (
+                    echo No XML files found to delete.
+                )
+
+                echo "Iniciando transferência de arquivos de batch..."
+                set "SOURCE=C:\Siebel_Devops\$(environmentNameUpperCase)\temp\batch"
+                set "DEST=$(sbleimUser)@$(ipHost):/opt/integracao/predeploy/tags/"
+                set "KEY=C:\cygwin64\home\devops_corp\.ssh\id_rsa_azuredevops"
+                set "REMOTE_DIR=/opt/integracao/predeploy/tags/batch"
+
+                :: Verifica se o diretório de origem existe
+                if exist "%SOURCE%" (
+                    :: Copia os arquivos para o servidor remoto
+                    scp -o StrictHostKeyChecking=no -i "%KEY%" -rp "%SOURCE%" %DEST%
+
+                    :: Converte arquivos para formato Unix
+                    ssh -o StrictHostKeyChecking=no -i "$(SIEBEL_PRIVATE_KEY)" $(sbleimUser)@$(ipHost) ^
+                        "cd %REMOTE_DIR%; find . -type f -print0 | xargs -0 dos2unix"
+
+                    :: Copia os arquivos para o diretório final no servidor
+                    ssh -o StrictHostKeyChecking=no -i "$(SIEBEL_PRIVATE_KEY)" $(sbleimUser)@$(ipHost) ^
+                        "cp -R %REMOTE_DIR%/ /opt/integracao/"
+
+                    :: Remove arquivos temporários no servidor
+                    ssh -o StrictHostKeyChecking=no -i "$(SIEBEL_PRIVATE_KEY)" $(sbleimUser)@$(ipHost) ^
+                        "rm -rf %REMOTE_DIR%/*"
+
+                    :: Remove o diretório local após a execução
+                    RD /S /Q "%SOURCE%"
+                ) else (
+                    echo [ERROR] O diretório "%SOURCE%" não existe.
+                    exit /b 1
+                )            
+
+                exit
+    ## --------------------------------------------------------------- ##
+    ## End of stage to get and import ADMs into the Siebel environment ##
+    ## --------------------------------------------------------------- ##
+
+    # - template: stages/default/security.yml
+    #   parameters:
+    #     fortifyExclusionRepository: FortifyExclusion
+    ## ---------------------------------------------------------- ##
+    ## Stage to run security checks and manage Fortify exclusions ##
+    ## ---------------------------------------------------------- ##
+    - stage: security
+      displayName: "Security"
+      dependsOn: prepare
+      pool: $(GeneralPurposeLinuxAgentsCD)
+      jobs:
+      - job: app_config_keys
+        displayName: "Get AppSec Config Keys"
+        steps:
+        - template: /task_groups/security/get_appconfig_keys.yml@CorePipelines
+
+      - job: fortify_scan
+        dependsOn: app_config_keys
+        variables:
+          USE_FORTIFY: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_FORTIFY'] ]
+          USE_CONVISO: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_CONVISO'] ]
+          SKIP_SECURITY_GATE: $[ dependencies.app_config_keys.outputs['evaluate_flags.SKIP_SECURITY_GATE'] ]
+        condition: and(
+                        succeeded(),
+                        and(
+                          eq(variables.USE_FORTIFY, 'true'),
+                          eq(variables.flowIsToReview, true),
+                          not(startsWith(variables['Build.SourceBranch'], 'refs/tags/'))
+                        )
+                      )
+        displayName: "Fortify Scan"
+        steps:
+        - template: /task_groups/security/run_fortify_scan.yml@CorePipelines
+          parameters:
+            isGitFlow: true
+            gateCondition: and(
+                            succeeded(),
+                            ne(variables.skip_fortify_gate, true),
+                            ne(variables.USE_CONVISO, 'true')
+                          )
+            fortifyExclusionRepository: ${{ parameters.fortifyExclusionRepository }}
+            skipSecurityGate: $(SKIP_SECURITY_GATE)
+        - template: /tasks/telemetry/telemetry.yml@CorePipelines
+    ## ----------------------------------------------------------------- ##
+    ## End of stage to run security checks and manage Fortify exclusions ##
+    ## ----------------------------------------------------------------- ##
+
+    # - template: stages/default/quality_gates.yml
+    ## ------------------------------------------- ##
+    ## Stage to manage quality gates and approvals ##
+    ## ------------------------------------------- ##
+    - stage: quality_gates
+      displayName: "Quality Gates"
+      dependsOn: prepare
+      variables:
+        NEW_VERSION: $[ stageDependencies.prepare.prepare.outputs['versioning.NEW_VERSION'] ]
+      pool: $(GeneralPurposeLinuxAgentsCD)
+      jobs:
+      - job: run_sonar_scanner
+        displayName: "Running Sonar Scanner"
+        steps:
+        - task: SonarQubePrepare@7
+          displayName: 'Prepare analysis on SonarQube'
+          inputs:
+            SonarQube: '$(SONARQUBE_SERVICE_CONNECTION_NAME)'
+            scannerMode: CLI
+            cliVersion: '$(SONARQUBE_CLI_VERSION)'
+            configFile: '$(Build.SourcesDirectory)/.azuredevops/sonar-project.properties'
+            extraProperties: |
+              sonar.scm.disabled=True
+              sonar.projectBaseDir=$(Build.SourcesDirectory)
+              sonar.projectKey=$(SONAR_PROJECT_KEY)
+              sonar.projectName=$(System.TeamProject)-$(Build.Repository.Name)
+              sonar.projectVersion=$(NEW_VERSION)
+              sonar.analysis.repositoryName=$(Build.Repository.Name)
+              sonar.analysis.buildId=$(Build.BuildId)
+              sonar.analysis.repositoryId=$(Build.Repository.ID)
+              sonar.analysis.projectName=$(System.TeamProject)
+              sonar.analysis.projectId=$(System.TeamProjectId)
+              sonar.links.homepage=$(System.TeamFoundationCollectionUri)$(System.TeamProject)
+              sonar.links.ci=$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)&_a=summary
+              sonar.links.issue=$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_workitems
+              sonar.links.scm=$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_git/$(Build.Repository.Name)
+              sonar.scanner.metadataFilePath=$(Agent.TempDirectory)/sonar/$(Build.BuildId)/report-task.txt
+              sonar.qualitygate.wait=true
+              sonar.qualitygate.timeout=300
+              sonar.lang.patterns.xml="**/*.xml"
+              sonar.exclusion="**/*.log, **/*.tmp, **/*.bak"
+              sonar.branch.name=$(Build.SourceBranchName)
+          env:
+            NODE_EXTRA_CA_CERTS: $(CACORP_LOCATION)
+
+        - task: SonarQubeAnalyze@7
+          displayName: 'Run Code Analysis'
+          continueOnError: true
+          env:
+            ASDF_JAVA_VERSION: 'openjdk-11.0.2'
+
+        - task: SonarQubePublish@7
+          displayName: 'Publish Quality Gate Result'
+          continueOnError: true
+          env:
+            NODE_EXTRA_CA_CERTS: $(CACORP_LOCATION)
+    ## -------------------------------------------------- ##
+    ## End of stage to manage quality gates and approvals ##
+    ## -------------------------------------------------- ##
+
+    # - template: stages/default/active.yml
+    #   parameters:
+    #     host: $(host)
+    ## --------------------------------------------------------- ##
+    ## Stage to activate the Siebel environment after deployment ##
+    ## --------------------------------------------------------- ##
+    - stage: active
+      displayName: "Active WF, RS e Task"
+      dependsOn: adm
+      pool: GeneralPurposeLinuxAgentsCD
+      jobs:
+      - job: put_files
+        displayName: "Ativações Objetos App"
+        steps:
+          - checkout: none  
+          - task: SSH@0
+            condition: true
+            displayName: 'Active WF'
+            inputs:
+              sshEndpoint: 'BRTLVBGB0055CO'
+              runOptions: 'commands'
+              commands: |
+                ssh -o StrictHostKeyChecking=no -i "$(SIEBEL_PRIVATE_KEY)"  ${{parameters.host}} /opt/web/siebel/siebelfs/scripts/active_wf.sh
+                exit
+              readyTimeout: '20000'
+            env:
+              HTTPS_PROXY: $(PROXY_NSKP_HTTPS)
+              HTTP_PROXY: $(PROXY_NSKP_HTTP)
+              NO_PROXY: $(PROXY_NSKP_NO_PROXY)
+
+          - task: SSH@0
+            condition: true
+            continueOnError: true
+            displayName: 'Active ruleset'
+            inputs:
+              sshEndpoint: 'BRTLVBGB0055CO'
+              runOptions: 'commands'
+              commands: |
+                ssh -o StrictHostKeyChecking=no -i "$(SIEBEL_PRIVATE_KEY)"  ${{parameters.host}} /opt/web/siebel/siebelfs/scripts/active_ruleset.sh
+                exit
+              readyTimeout: '20000'
+            env:
+              HTTPS_PROXY: $(PROXY_NSKP_HTTPS)
+              HTTP_PROXY: $(PROXY_NSKP_HTTP)
+              NO_PROXY: $(PROXY_NSKP_NO_PROXY)
+
+          - task: SSH@0
+            condition: true
+            continueOnError: true
+            displayName: 'Active task'
+            inputs:
+              sshEndpoint: 'BRTLVBGB0055CO'
+              runOptions: 'commands'
+              commands: |
+                ssh -o StrictHostKeyChecking=no -i "$(SIEBEL_PRIVATE_KEY)"  ${{parameters.host}} /opt/web/siebel/siebelfs/scripts/active_task.sh
+                exit
+              readyTimeout: '20000'
+            env:
+              HTTPS_PROXY: $(PROXY_NSKP_HTTPS)
+              HTTP_PROXY: $(PROXY_NSKP_HTTP)
+              NO_PROXY: $(PROXY_NSKP_NO_PROXY)
+    ## ---------------------------------------------------------------- ##
+    ## End of stage to activate the Siebel environment after deployment ##
+    ## ---------------------------------------------------------------- ##
+
+  ## ---------------------------------------------------------------- ##
+  ## End of stage to activate the Siebel environment after deployment ##
+  ## ---------------------------------------------------------------- ##
+
+  ## ------------------------------------------------------------------------------ ##
+  ## Initial stage to backup the VivoCorp Siebel server and prepare the environment ##
+  ## ------------------------------------------------------------------------------ ##
+# This pipeline is used to provision the VivoCorp Siebel server.
+  ${{ if eq(parameters.model, 'backup') }}:
+    stages:
+    # - template: stages/backup/identification.yml
+    ## ----------------------------------------------------------------- ##
+    ## Stage to identify integration objects and prepare the environment ##
+    ## ----------------------------------------------------------------- ##
+    - stage: identification
+      displayName: "Indentificação dos objetos de integração"
+      dependsOn: []
+      pool: $(GeneralPurposeLinuxAgentsCD)
+      variables:
+      - name: ALL_SESSION_IDS
+        value: ''	
+      jobs:
+        - job: "object_identification"
+          displayName: "Identificação dos objetos"
+          steps:
+            - checkout: self
+
+            - task: PowerShell@2
+              displayName: 'Gerar nome do artefato'
+              inputs:
+                targetType: 'inline'
+                script: |
+                  $dateTime = Get-Date -Format "yyyyMMdd-HHmmss"
+                  $artifactName = "ADM-backup-$dateTime"
+                  
+                  Write-Host "##vso[task.setvariable variable=artifactName]$artifactName"
+                
+            - task: PublishBuildArtifacts@1
+              displayName: 'Publicar diretório ADM'
+              inputs:
+                pathToPublish: '$(Build.SourcesDirectory)/ADM'
+                artifactName: '$(artifactName)'
+                publishLocation: 'Container'
+
+            - task: PowerShell@2
+              displayName: "Extrair SessionId do XML"
+              name: "extrair_session_ids"
+              inputs:
+                targetType: "inline"
+                script: |
+                  $allSessionIds = @()
+
+                  # Caminho do arquivo de log
+                  $logFilePath = "$(Build.ArtifactStagingDirectory)\logfile.txt"
+
+                  # Encontrar todos os arquivos XML dentro do diretório ADM (incluindo subpastas)
+                  $xmlFiles = Get-ChildItem -Path "$(Build.SourcesDirectory)\ADM" -Recurse -Filter "*.xml"
+
+                  foreach ($xmlFile in $xmlFiles) {
+                      # Carregar o conteúdo do XML
+                      try {
+                          [xml]$xmlContent = Get-Content -Path $xmlFile.FullName -ErrorAction Stop
+                      } catch {
+                          $errorMessage = "Erro ao carregar o XML: $($xmlFile.FullName). Detalhes: $_"
+                          Write-Host $errorMessage
+                          $errorMessage | Out-File -FilePath $logFilePath -Append
+                          continue
+                      }
+
+                      $sessionId = $null
+
+                      # Usando XPath para encontrar a tag <SessionId>
+                      $sessionIdNode = $xmlContent.SelectSingleNode("//SessionId")
+                      
+                      if ($sessionIdNode -ne $null) {
+                          $sessionId = $sessionIdNode.InnerText
+                      }
+
+                      # Exibir o resultado e adicionar ao array se encontrado
+                      if ($sessionId) {
+                          Write-Host "SessionId: $sessionId"
+                          $allSessionIds += $sessionId
+                      } else {
+                          $message = "SessionId não encontrado no XML: $($xmlFile.FullName)"
+                          Write-Host $message
+                          $message | Out-File -FilePath $logFilePath -Append
+                      }
+                  }
+
+                  # Converter os SessionIds para uma string separada por vírgulas
+                  $sessionIdsString = $allSessionIds -join ","
+
+                  Write-Host "Todos os SessionIds: $sessionIdsString"
+
+                  # Definir a variável de pipeline com todos os SessionIds
+                  Write-Host "##vso[task.setvariable variable=ALL_SESSION_IDS;isOutput=true]$sessionIdsString"
+
+    # - template: stages/backup/register.yml
+    ## ---------------------------------------------------------- ##
+    ## Stage to register the backup in the VivoCorp Siebel server ##
+    ## ---------------------------------------------------------- ##
+    - stage: register
+      displayName: "Registro"
+      dependsOn: ['identification']
+      pool: $(PollVivoCorpSiebelAgents)
+      variables:
+      - name: ALL_SESSION_IDS
+        value: $[ stageDependencies.identification.object_identification.outputs['extrair_session_ids.ALL_SESSION_IDS'] ]
+      jobs:
+        - job: "registro_objetos"
+          displayName: "Registro de objetos"
+          steps:
+            - checkout: self
+              fetchDepth: 0
+              fetchTags: false
+            - checkout: CodePlayPipelines
+              fetchDepth: 0
+              fetchTags: false
+
+            - task: PowerShell@2
+              displayName: 'Registro de objetos'
+              inputs:
+                targetType: 'filePath'
+                filePath: '$(Build.SourcesDirectory)\Vivo.CodePlay.Pipelines\tech_products\win-vivocorp\backup.ps1'
+                failOnStderr: true
+                executable: 'C:\Windows\SysWow64\WindowsPowerShell\v1.0\powershell.exe'
+              env:
+                ALL_SESSION_IDS: $(ALL_SESSION_IDS)
+                ORACLE_HOST_PORT: $(ORACLE_HOST_PORT)
+                ORACLE_HOST_SERVICE_NAME: $(ORACLE_HOST_SERVICE_NAME)
+                ORACLE_HOST_USER: $(ORACLE_HOST_USER)
+                ORACLE_HOST_PASS: $(ORACLE_HOST_PASS)
+                FIRST_ORACLE_SERVER: $(ORACLE_HOST_DEV3)
+                SECOND_ORACLE_SERVER: $(ORACLE_HOST_DEV1)
+                THIRD_ORACLE_SERVER: $(ORACLE_HOST_DEV2)
+                TARGET_ORACLE_SERVER: $(ORACLE_PRD_HOST)
+                TARGET_ORACLE_HOST_USER: $(ORACLE_PRD_HOST_USER)
+                TARGET_ORACLE_HOST_PASS: $(ORACLE_PRD_HOST_PASS)
+                TARGET_ORACLE_HOST_SERVICE_NAME: $(ORACLE_PRD_HOST_SERVICE_NAME)
+                LOG_PATH: $(Build.ArtifactStagingDirectory)
+
+            - task: PublishBuildArtifacts@1
+              displayName: 'Publicar log artefato'
+              inputs:
+                pathToPublish: '$(Build.ArtifactStagingDirectory)\logfile.log'
+                artifactName: 'register.log'
+                publishLocation: 'Container'
+    ## ----------------------------------------------------------------- ##
+    ## End of stage to register the backup in the VivoCorp Siebel server ##
+    ## ----------------------------------------------------------------- ##
+
+    # - template: stages/backup/export_adm.yml
+    ## ---------------------------------------------------- ##
+    ## Stage to export ADMs from the VivoCorp Siebel server ##
+    ## ---------------------------------------------------- ##
+    - stage: export_adm
+      displayName: "Exportação do ADM"
+      dependsOn: ['register']
+      pool: $(PollVivoCorpSiebelAgents)
+      jobs:
+        - job: "exportacao_objetos"
+          displayName: "Exportação do ADM"
+          steps:
+            - checkout: none
+
+            - task: PowerShell@2
+              displayName: 'Realizar exportação'
+              inputs:
+                targetType: 'inline'
+                script: |
+                  $command = "ssh -o StrictHostKeyChecking=no -i $(SIEBEL_PRIVATE_KEY) $(SIEBEL_USER)@$(SIEBEL_HOST) '$(PATH_SCRIPT_EXPORT_ADM)'"
+
+                  Write-Host "Executando o script no servidor $(SIEBEL_HOST)"
+                  Invoke-Expression $command
+
+                  exit
+
+            - task: PowerShell@2
+              displayName: 'Arquivos exportados'
+              inputs:
+                targetType: 'inline'
+                script: |
+                  # /home/superb/backup directory
+                  Write-Host "=========================================================================="
+                  Write-Host "========================= INFORMATIONS ==================================="
+                  Write-Host "=========================================================================="
+                  Write-Host "Destino: /home/superb/backup"
+                  Write-Host "=========================================================================="
+
+                  $tempDirectory = "/home/supweb/bkp"
+
+                  $lsCommand = "ssh -o StrictHostKeyChecking=no -i $(SIEBEL_PRIVATE_KEY) $(SIEBEL_USER)@$(SIEBEL_HOST) 'ls -l $tempDirectory'"
+                  
+                  Write-Host "Listando arquivos no diretório $tempDirectory"
+                  Invoke-Expression $lsCommand
+
+                  exit
+    ## ----------------------------------------------------------- ##
+    ## End of stage to export ADMs from the VivoCorp Siebel server ##
+    ## ----------------------------------------------------------- ##
+
+  ## ------------------------------------------------------------------------------------- ##
+  ## End of initial stage to backup the VivoCorp Siebel server and prepare the environment ##
+  ### ------------------------------------------------------------------------------------ ##

@@ -1,0 +1,199 @@
+
+trigger: none
+
+resources:
+  repositories:
+    - repository: WeblogicScripts
+      name: MIGR-Novoportalgf/deploy.deploy-portal-pof-spring
+      type: git
+      ref: refs/heads/master
+
+parameters:  
+- name: environment
+  displayName: Escolha a esteira para deploy
+  type: string
+  default: DEV
+  values:
+  - DEV
+  - TEST_1
+  - TEST_2
+
+#Incluir Variaveis da Library
+variables:
+  - group: WL_DEN_WAR.WeblogicCreds.${{ parameters.environment }}
+  - name: System.debug
+    value: "true"
+
+stages:
+- stage: deploy
+  displayName: Deploy
+  pool: GeneralPurposeLinuxAgentsCD
+
+  jobs:
+  - deployment: deploy_on_weblogic
+    displayName: Deploy on WebLogic
+    workspace:
+      clean: all
+    environment:
+      name: ${{ parameters.environment }}
+
+    strategy:
+      runOnce:
+
+        preDeploy:
+          steps:  
+          - task: Bash@3
+            inputs:
+              targetType: 'inline'
+              script: |
+                echo "##[debug] SERVICE CONNECTION=WL_POF_WAR_${{parameters.environment}}"
+                echo "##[debug] ARTIFACT_TARGETFOLDER=$(ARTIFACT_TARGETFOLDER)"
+                echo "##[debug] NOME_APP=$(NOME_APP)"
+                echo "##[debug] SCRIPTS_TARGETFOLDER=$(SCRIPTS_TARGETFOLDER)"
+                echo "##[debug] WEBLOGIC_USER=$(WEBLOGIC_USER)"
+                echo "##[debug] WEBLOGIC_PASS=$(WEBLOGIC_PASS) # Não deve ser exibido!"
+                echo "##[debug] WEBLOGIC_ADMIN_SERVER_URL=$(WEBLOGIC_ADMIN_SERVER_URL)"
+                echo "##[debug] WEBLOGIC_CLUSTER=$(WEBLOGIC_CLUSTER)"
+                echo "##[debug] WLST_SCRIPT=$(WLST_SCRIPT)"
+            displayName: Verify Variables
+          
+          - task: SSH@0
+            displayName: Check SSH connection
+            inputs:
+              sshEndpoint: 'WL_POF_WAR_${{parameters.environment}}'
+              runOptions: 'inline'
+              inline: >-
+                echo "Conectado com sucesso via Service Connection WL_POF_WAR_${{parameters.environment}}"
+                ls -lha $(SCRIPTS_TARGETFOLDER)
+              readyTimeout: '20000'
+          
+          ## -> Checkout no repositório que tem os scripts Weblogic
+          - checkout: WeblogicScripts
+            fetchDepth: 1
+          
+          ## -> Transfere os scripts pro servidor
+          - task: CopyFilesOverSSH@0
+            displayName: Transfering Weblogic Scripts
+            inputs:
+              sshEndpoint: 'WL_POF_WAR_${{parameters.environment}}'
+              sourceFolder: $(Build.SourcesDirectory)/scripts
+              contents: '*'
+              targetFolder: '$(SCRIPTS_TARGETFOLDER)'
+              readyTimeout: '20000'
+        
+        deploy:
+          steps:
+          - checkout: self
+            clean: true
+            fetchDepth: 1
+
+          - task: XmlParseFromVivo@4
+            displayName: Get pom.xml version
+            name: pom_info
+            inputs:
+              sourceType: 'file'
+              source: pom.xml
+              queries: |
+                var POM_XML_VERSION = .project.version._text
+
+          - task: AzureKeyVault@2
+            inputs:
+              azureSubscription: 'DevOpsSharedResources'
+              KeyVaultName: 'kv-azdevops-shared'
+              SecretsFilter: 'NEXUS-DEPS-USR, NEXUS-DEPS-PSW'
+              RunAsPreJob: true
+          
+          - task: Bash@3
+            name: download_wizard
+#            condition: ${{ eq(parameters.deploymentName, 'wizard') }}
+            inputs:
+              targetType: 'inline'
+              script: >-
+                curl
+                -L
+                -u $(NEXUS-DEPS-USR):$(NEXUS-DEPS-PSW) 
+                'https://nexus.telefonica.com.br/repository/novoportalgf-mvn/br/com/vivo/pof/$(NOME_APP)/$(POM_XML_VERSION)/$(NOME_APP)-$(POM_XML_VERSION).war'
+                -o $(System.ArtifactsDirectory)/$(NOME_APP)-$(POM_XML_VERSION).war
+                -v
+            displayName: Download den from Nexus
+
+          - script: ls -lha $(System.ArtifactsDirectory)
+
+          - task: CopyFilesOverSSH@0
+#            condition: ${{ eq(parameters.deploymentName, 'wizard') }}
+            displayName: Transfering den to temp
+            inputs:
+              sshEndpoint: 'WL_POF_WAR_${{parameters.environment}}'
+              sourceFolder: $(System.ArtifactsDirectory)
+              contents: $(NOME_APP)*.war
+              targetFolder: $(ARTIFACT_TARGETFOLDER)
+              readyTimeout: '20000'
+
+          - task: SSH@0
+#            condition: ${{ eq(parameters.deploymentName, 'wizard') }}
+            displayName: Undeploy/Retiring DEN
+            inputs:
+              sshEndpoint: 'WL_POF_WAR_${{parameters.environment}}'
+              runOptions: 'commands'
+              commands: >
+                $(WLST_SCRIPT)
+                $(SCRIPTS_TARGETFOLDER)/UndeployAppRetired.py
+                $(WEBLOGIC_USER)
+                $(WEBLOGIC_PASS)
+                $(WEBLOGIC_ADMIN_SERVER_URL)
+                $(NOME_APP)
+              readyTimeout: '20000'
+
+          - task: SSH@0
+#            condition: ${{ eq(parameters.deploymentName, 'wizard') }}
+            displayName: Update den script
+            inputs:
+              sshEndpoint: 'WL_POF_WAR_${{parameters.environment}}'
+              runOptions: 'commands'
+              commands: >
+                $(WLST_SCRIPT)
+                $(SCRIPTS_TARGETFOLDER)/HotDeployApp.py
+                $(WEBLOGIC_USER)
+                $(WEBLOGIC_PASS)
+                $(WEBLOGIC_ADMIN_SERVER_URL)
+                $(NOME_APP)
+                $(ARTIFACT_TARGETFOLDER)/$(NOME_APP)-$(POM_XML_VERSION).war
+                $(WEBLOGIC_CLUSTER)
+              readyTimeout: '20000'
+          
+        on:
+          success:
+            steps:
+            - task: Bash@3
+              displayName: Deploy on WebLogic Success
+              name: t_success_message
+              inputs:
+                targetType: inline
+                script: |
+                  echo "##[section]================================================================================================================================="
+                  echo "##[section]                                                 SUCCESS WEBLOGIC DEPLOY"
+                  echo "##[section]================================================================================================================================="
+                  echo "##[section]Parabéns o artefato foi publicado com sucesso no Weblogic"
+                  echo "##[section]"
+                  echo "##[section]================================================================================================================================="
+
+          failure:
+            steps:
+            - task: Bash@3
+              displayName: Deploy on WebLogic Failure
+              name: t_failure_message
+              inputs:
+                targetType: inline
+                script: |
+                  echo "##[error] ================================================================================================================================="
+                  echo "##[error]                                                  FAILURE WEBLOGIC DEPLOY"
+                  echo "##[error] ================================================================================================================================="
+                  echo "##[error] Se está vendo essa mensagem é porque aconteceu algo erro durante o deploy do artefato."
+                  echo "##[error] "
+                  echo "##[error] Segue abaixo umas dicas para o Troubleshooting:"
+                  echo "##[error] Consulte o log do estágio de publicação do artefato."
+                  echo "##[error] Verifique se a versão corrente da biblioteca já existe no repositório (sobrescrita não é permitido)."
+                  echo "##[error] Confira se as informações do repositório e credenciais de acesso estão corretas."
+                  echo "##[error] "
+                  echo "##[error] ================================================================================================================================="
+

@@ -1,0 +1,119 @@
+﻿stages:
+- stage: prepare
+  displayName: "Prepare"
+  dependsOn: []
+  pool: $(GeneralPurposeLinuxAgentsCD)
+  jobs:
+    - job: prepare
+      displayName: "Prepare"
+      steps:
+        - checkout: self
+          displayName: "Checkout repository"
+          persistCredentials: true
+          fetchDepth: 0
+          fetchTags: false
+          clean: true
+
+        # - task: SSH@0
+        #   condition: true
+        #   displayName: Change key permissions
+        #   inputs:
+        #     sshEndpoint: "BRTLVBGB0055CO"
+        #     runOptions: "commands"
+        #     commands: |
+        #       copy "C:\cygwin64\home\devops_corp\.ssh\id_rsa" "C:\cygwin64\home\devops_corp\.ssh\id_rsa_azuredevops"
+        #       icacls  "C:\cygwin64\home\devops_corp\.ssh\id_rsa_azuredevops" /inheritance:r
+        #       icacls  "C:\cygwin64\home\devops_corp\.ssh\id_rsa_azuredevops" /grant:r "%USERNAME%:F"
+        #       ls -la C:\cygwin64\home\devops_corp\.ssh\
+        #     readyTimeout: "20000"
+
+        - task: Bash@3
+          displayName: "Create git tag"
+          name: versioning
+          inputs:
+            targetType: "inline"
+            script: |
+              # Buscar todas as tags primeiro
+              git fetch --tags --force
+
+              # Capturar OLD_VERSION ANTES de criar nova tag
+              OLD_VERSION=$(git describe --tags --abbrev=0 2>/dev/null || echo "initial")
+              echo "Previous version (OLD_VERSION): $OLD_VERSION"
+
+              # Criar nova tag com formato consistente
+              datetime=$(date +"%Y%m%d%H%M%S")
+
+              git config user.email "vivo.devops@telefonicati.onmicrosoft.com"
+              git config user.name "Azure Pipeline Vivo Corp"
+
+              # Verificar se a tag já existe e incrementar se necessário
+              original_datetime=$datetime
+              counter=1
+              while git rev-parse "refs/tags/$datetime" >/dev/null 2>&1; do
+                  echo "Tag $datetime já existe, tentando com sufixo..."
+                  datetime="${original_datetime}_${counter}"
+                  counter=$((counter + 1))
+              done
+
+              echo "Criando tag: $datetime"
+              git tag -a "$datetime" -m "Versionamento DevOps"
+              git push origin "$datetime"
+
+              # Exportar ambas as versões como variáveis de output
+              echo "##vso[task.setvariable variable=NEW_VERSION;isOutput=true]$datetime"
+              echo "##vso[task.setvariable variable=OLD_VERSION;isOutput=true]$OLD_VERSION"
+          env:
+            AZURE_DEVOPS_EXT_PAT: $(System.AccessToken)
+
+        - bash: |
+            REPO_DIR=$(Build.SourcesDirectory)
+
+            # Usar as variáveis de output do task anterior
+            OLD_VERSION="$(versioning.OLD_VERSION)"
+            NEW_VERSION="$(versioning.NEW_VERSION)"
+
+            echo "Using OLD_VERSION from previous task: $OLD_VERSION"
+            echo "Using NEW_VERSION from previous task: $NEW_VERSION"
+
+            echo $OLD_VERSION > $REPO_DIR/old_version.log
+            echo "Old version (old_version.log):"
+            cat $REPO_DIR/old_version.log
+
+            echo $NEW_VERSION > $REPO_DIR/new_version.log
+            echo "New version (new_version.log):"
+            cat $REPO_DIR/new_version.log
+
+            # Verificar se as versões são diferentes e gerar lista de arquivos
+            if [ "$OLD_VERSION" = "$NEW_VERSION" ]; then
+                echo "##vso[task.logissue type=warning;]OLD_VERSION e NEW_VERSION são iguais: $NEW_VERSION"
+                echo "Criando arquivo vazio para evitar erro no pipeline"
+                touch $REPO_DIR/new_sifs.log
+            elif [ "$OLD_VERSION" = "initial" ]; then
+                echo "Primeira execução - listando todos os arquivos"
+                find . -type f | grep -Ev '^\./.azuredevops/' > $REPO_DIR/new_sifs.log
+            else
+                echo "Comparando versões $OLD_VERSION e $NEW_VERSION"
+                git diff $OLD_VERSION $NEW_VERSION --name-only --diff-filter=d | grep -Ev '^\.azuredevops/' > $REPO_DIR/new_sifs.log
+            fi
+
+            echo "Arquivos alterados (new_sifs.log):"
+            cat $REPO_DIR/new_sifs.log
+          displayName: "Generete list of .sif file names with version control"
+
+        - bash: |
+            REPO_DIR=$(Build.SourcesDirectory)
+
+            LOG_FILE="$REPO_DIR/new_sifs.log"
+
+            sed -i 's|/|\\|g' "$LOG_FILE"
+
+            echo "Conteúdo atualizado (new_sifs.log):"
+            cat "$LOG_FILE"
+          displayName: "Perform replace in new_sifs.log file"
+
+        - task: PublishPipelineArtifact@1
+          displayName: "Publish new_sifs.log as pipeline artifact"
+          inputs:
+            targetPath: "$(Build.SourcesDirectory)/new_sifs.log"
+            artifactName: "new_sifs"
+            publishLocation: "pipeline"

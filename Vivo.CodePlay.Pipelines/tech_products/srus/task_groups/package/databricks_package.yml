@@ -1,0 +1,193 @@
+parameters:
+- name: pythonVersion
+  type: string
+- name: unityCatalog
+  type: boolean
+- name: diretorio
+  type: string
+- name: environment
+  type: string
+
+steps:
+- bash: |
+    REPO_NAME=$(Build.Repository.Name)
+    if [[ "$REPO_NAME" == nt-telecom-* ]]; then
+        echo "##vso[task.setvariable variable=projectType]databricks"
+        echo "Projeto telecom, pulando passos referentes à lib-telecom-negocio..."
+    elif [[ "$REPO_NAME" == *"nt-mercadoria-orquestrador"* || "$REPO_NAME" == *"lib-telecom-negocio"* || "$REPO_NAME" == *"nt-exemplo-databricks"* || "$REPO_NAME" == *"lib-servico-negocio"* || "$REPO_NAME" == *"nt-james-webb"* ]]; then
+        echo "##vso[task.setvariable variable=projectType]mercadoria"
+        echo "Projeto mercadoria, pulando passos referentes à lib-telecom-negocio..."
+    elif [[ "$REPO_NAME" == *"nt-lakehouse"* ]]; then
+        echo "##vso[task.setvariable variable=projectType]lakehouse"
+        echo "Projeto lakehouse, pulando passos referentes à lib-telecom-negocio..."
+    elif [[ "$REPO_NAME" == nt-servico-* ]]; then
+        echo "##vso[task.setvariable variable=projectType]databricks"
+        echo "Projeto nota de serviço, pulando passos referentes à lib-telecom-negocio..."
+    else
+        echo "Unknown project type"
+        exit 1
+    fi
+  displayName: 'Set project type based on repository name'
+
+- checkout: git://SRUS - SIRIUS/lib-telecom-negocio
+  displayName: 'Checkout lib-telecom-negocio repository'
+  persistCredentials: true
+  condition: eq(variables['projectType'], 'telecom')
+
+- bash: |
+    if [[ "$(projectType)" == "telecom" ]]; then
+      cd $(Build.SourcesDirectory)/lib-telecom-negocio
+      git config pull.rebase true
+      git fetch -f --depth 1 origin master:master
+      git checkout -f master
+    fi
+  displayName: "Preparation for telecom"
+  condition: eq(variables['projectType'], 'telecom')
+
+- bash: |
+    if [[ "$(projectType)" == "telecom" ]]; then
+      cd $(Build.SourcesDirectory)/lib-telecom-negocio
+      if [ -f setup.py ]; then
+          LIB_VERSION=$(grep 'version=' setup.py | head -n1 | cut -d '"' -f2)
+          echo "##vso[task.setvariable variable=LIB_VERSION]$LIB_VERSION"
+          echo "Extracted version: $LIB_VERSION"
+      else
+          echo "setup.py not found."
+          exit 1
+      fi
+    fi
+  displayName: 'Extract library version from lib-telecom-negocio'
+  condition: eq(variables['projectType'], 'telecom')
+
+- checkout: self
+  displayName: 'Checkout repository'
+  persistCredentials: true
+
+- bash: |
+    cd $(Build.SourcesDirectory)/$(Build.Repository.Name)
+    git config pull.rebase true
+    git fetch -f --depth 1 origin $(Build.SourceBranchName):$(Build.SourceBranchName)
+    git checkout -f $(Build.SourceBranchName)
+  displayName: "Preparation for all projects"
+
+- bash: |
+    echo "Current directory: $(pwd)"
+    
+    if [[ "$(Build.SourceBranch)" =~ refs/tags/* ]]; then
+      echo "Running from a tag. Using version from requirements.artifacts."
+      cd $(Build.SourcesDirectory)/$(Build.Repository.Name)
+      
+      if [ -f requirements.artifacts ]; then
+          LIB_VERSION=$(grep 'sirius==' requirements.artifacts | cut -d '=' -f3)
+          echo "Using version from requirements.artifacts: $LIB_VERSION"
+          echo "##vso[task.setvariable variable=LIB_VERSION]$LIB_VERSION"
+      else
+          echo "requirements.artifacts not found. Exiting."
+          exit 1
+      fi
+    else
+      echo "Running from a branch (likely master). Checking setup.py for possible updates."
+      cd $(Build.SourcesDirectory)/$(Build.Repository.Name)
+      
+      if [ -f requirements.artifacts ]; then
+          CURRENT_LIB_VERSION=$(grep 'sirius==' requirements.artifacts | cut -d '=' -f3)
+          echo "Current version in requirements.artifacts: $CURRENT_LIB_VERSION"
+          echo "Using previously extracted version: $LIB_VERSION"
+          
+          if [ "$LIB_VERSION" != "$CURRENT_LIB_VERSION" ]; then
+              echo "Versions differ. Updating requirements.artifacts with version $LIB_VERSION"
+              sed -i "s/sirius==[0-9]*\.[0-9]*\.[0-9]*/sirius==$LIB_VERSION/" requirements.artifacts
+              git add requirements.artifacts
+              git commit -m "[CI SKIP] Atualização automática da versão do Sirius para ${LIB_VERSION}" requirements.artifacts
+              git push origin $(Build.SourceBranchName)
+          else
+              echo "Versions are the same. No update necessary."
+          fi
+      else
+          echo "requirements.artifacts not found. Exiting."
+      fi
+    fi
+  displayName: 'Compare and update requirements.artifacts if needed'
+  condition: eq(variables['projectType'], 'telecom')
+
+
+
+
+- template: /tech_products/srus/tasks/python/run_bash_on_docker_databricks.yml
+  parameters:
+    pythonVersion: "${{ parameters.pythonVersion }}"
+    scriptNameOrCmd: |
+      cd /app/$(Build.Repository.Name)
+      if [ -f requirements.artifacts ]; then
+          echo "requirements.artifacts found."
+      else
+          echo "requirements.artifacts not found."
+          exit 1
+      fi
+      pip download --no-deps -r requirements.artifacts -d libraries
+    displayName: Download WHL libraries
+
+- bash: |
+    if [[ "$(projectType)" == "telecom" ]]; then
+      mkdir -p $(Build.BinariesDirectory)/libraries/
+      
+      cp $(Build.SourcesDirectory)/$(Build.Repository.Name)/libraries/*.* $(Build.BinariesDirectory)/libraries/
+      
+      cp $(Build.SourcesDirectory)/$(Build.Repository.Name)/requirements.artifacts $(Build.BinariesDirectory)
+    fi
+
+    # CLEAN NOTEBOOKS DIRECTORY
+    if [ -d $(Build.BinariesDirectory)/notebooks ]; then
+      rm -r $(Build.BinariesDirectory)/notebooks
+    fi
+
+    # COPY NOTEBOOKS (com exclusão de pastas por nome)
+    mkdir -p $(Build.BinariesDirectory)/notebooks/$(Build.Repository.Name)
+
+    # Lê nomes de pastas a serem ignoradas
+    IFS=',' read -ra EXCLUDES <<< "$EXCLUDE_NOTEBOOK_DIR"
+
+    find $(Build.SourcesDirectory)/$(Build.Repository.Name) \
+      -type f \( -name "*.py" -o -name "*.txt" -o -name "*.png" -o -name "*.ipynb" -o -name "*.csv" -o -name "*.xlsx" -o -name "*.cfg" -o -name "*.properties" -o -name "*.sql" -o -name "*.json" \) | while read file; do
+      
+      skip_file=false
+      for exclude in "${EXCLUDES[@]}"; do
+        if [[ "$file" == *"/$exclude/"* ]]; then
+          skip_file=true
+          break
+        fi
+      done
+
+      if [ "$skip_file" = false ]; then
+        relative_path=$(dirname "${file#$(Build.SourcesDirectory)/$(Build.Repository.Name)/}")
+        mkdir -p "$(Build.BinariesDirectory)/notebooks/$(Build.Repository.Name)/$relative_path"
+        cp "$file" "$(Build.BinariesDirectory)/notebooks/$(Build.Repository.Name)/$relative_path"
+      fi
+    done
+  displayName: Packaging
+  env:
+    EXCLUDE_NOTEBOOK_DIR: $(EXCLUDE_NOTEBOOK_DIR)
+
+- bash: |
+    echo "##[debug]Criando o arquivo configuracoes.cfg..."
+
+    if [ "${{ parameters.environment }}" = "bsim" ]; then
+      ESTEIRA_PARAM="bsim"
+    else
+      ESTEIRA_PARAM=""
+    fi
+
+    echo "[parms]" > $(Build.BinariesDirectory)/notebooks/$(Build.Repository.Name)/configuracoes.cfg
+    echo "esteira                               = $ESTEIRA_PARAM" >> $(Build.BinariesDirectory)/notebooks/$(Build.Repository.Name)/configuracoes.cfg
+    echo "unity                                 = ${{ parameters.unityCatalog }}" >> $(Build.BinariesDirectory)/notebooks/$(Build.Repository.Name)/configuracoes.cfg
+    echo "repositorio_classes                   = /Workspace/Shared/${{ parameters.diretorio }}/lib-telecom-negocio" >> $(Build.BinariesDirectory)/notebooks/$(Build.Repository.Name)/configuracoes.cfg
+
+    echo "Parâmetro esteira: $ESTEIRA_PARAM"
+    echo "Parâmetro unity: ${{ parameters.unityCatalog }}"
+    echo "Parâmetro diretorio: ${{ parameters.diretorio }}"
+  displayName: Criando o arquivo configurações.cfg
+
+- template: /tech_products/srus/tasks/artifacts/publish_pipeline.yml
+  parameters:
+    artifactName: databricksPackage
+    targetPath: $(Build.BinariesDirectory)

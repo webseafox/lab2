@@ -1,0 +1,588 @@
+
+parameters:
+- name: environment
+  displayName: 'Escolha o ambiente para publicar'
+  type: string
+  default: dev
+  values:
+  - dev
+  - preprod
+  - prod
+
+variables:
+- name: System.debug
+  value: "true"
+
+stages:
+- stage: stage_build
+  displayName: 'Build'
+  pool: GeneralPurposeLinuxAgentsCI
+  jobs:
+  - job: job_build
+    displayName: 'Build, Unit Test and Pack'
+    variables:
+    - name: ASDF_JDK_8
+      value: "adoptopenjdk-8.0.352+8"
+    - name: ASDF_JDK_11
+      value: "openjdk-11.0.2"
+    - name: ASDF_JDK_17
+      value: "openjdk-17.0.2"
+    - name: ASDF_JDK_21
+      value: "adoptopenjdk-21.0.4+7.0.LTS"
+
+    - name: ASDF_JDK_SAP17
+      value: "sapmachine-17.0.10"
+
+    - name: SONARQUBE_PROJECT_NAME
+      value: "$(System.TeamProject)-$(Build.Repository.Name)"
+
+    steps:
+    - checkout: self
+      fetchDepth: 1
+      persistCredentials: true
+
+    - task: AzureKeyVault@2
+      displayName: 'Secrets from AKV'
+      inputs:
+        RunAsPreJob: true
+        azureSubscription: "DevOpsSharedResources"
+        KeyVaultName: "kv-azdevops-shared"
+        SecretsFilter: >-
+          NEXUS-DEPS-USR,
+          NEXUS-DEPS-PSW,
+          SONARQUBE-TOKEN
+
+    # - task: DownloadSecureFile@1
+    #   displayName: "Download settings.xml from secure file"
+    #   name: settings
+    #   inputs:
+    #     secureFile: "custom-settings-with-cache.xml"
+    - task: XmlParseFromVivo@4
+      displayName: 'Get pom.xml info'
+      inputs:
+        type: 'file'
+        origin: $(Build.SourcesDirectory)/pom.xml
+        jpaths: |
+          var POM_XML_VERSION = .project.version._text
+          var POM_XML_ARTIFACT_ID = .project.artifactId._text
+          var POM_XML_GROUP_ID = .project.groupId._text
+
+    - task: YamlParseFromVivo@4
+      displayName: 'Get Metadata Info'
+      inputs:
+        type: 'file'
+        origin: $(Build.SourcesDirectory)/catalog-info.yaml
+        jpaths: |
+          var CATALOG_YAML_ACRONYM = .metadata.annotations['techarch.governance-app.acronym']
+          var CATALOG_YAML_MODULE = .metadata.annotations['techarch.governance-app.module']
+          var CATALOG_YAML_SONAR_PROJECT_KEY = .metadata.annotations['sonarqube.org/project-key']
+          var CATALOG_YAML_JAVA_LANGUAGE_VERSION = .metadata.annotations['arqtech.telefonica.com.br/language-version']
+
+    - task: NunjucksInline@4
+      displayName: 'Bind "ASDF_JAVA_VERSION"'
+      inputs:
+        sourceType: "text"
+        source: |
+          var ASDF_JAVA_VERSION = {{ ASDF_JDK_$(CATALOG_YAML_JAVA_LANGUAGE_VERSION) }}
+
+    # - script: asdf list all java
+    - script: asdf install java $(ASDF_JAVA_VERSION)
+      displayName: 'Check Java Version'
+
+    - task: SemverIncrementCustomFromVivo@5
+      displayName: 'Semver Increment "patch"'
+      name: new_version
+      continueOnError: false
+      inputs:
+        currentversion: $(POM_XML_VERSION)
+        outputVariableName: "NEW_VERSION"
+        releaseType: "patch"
+        template: "${NEW_COERCED_VERSION}"
+
+    - task: Maven@3
+      displayName: "Maven versions:set"
+      env:
+        ASDF_JAVA_VERSION: $(ASDF_JAVA_VERSION)
+        NEXUS_DEPS_USR: $(NEXUS-DEPS-USR)
+        NEXUS_DEPS_PSW: $(NEXUS-DEPS-PSW)
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+
+      inputs:
+        options: >
+          -s /home/svc_devopscorp/.m2/settings.xml
+          -Dmaven.test.skip=true 
+          -DnewVersion=$(new_version.NEW_VERSION)
+          -DprocessAllModules
+          -DgenerateBackupPoms=false
+          -N versions:update-child-modules
+        mavenPomFile: $(Build.SourcesDirectory)/pom.xml
+        mavenOptions: "-Xmx3072m"
+        javaHomeOption: "JDKVersion"
+        goals: "versions:set"
+
+    - task: XmlParseFromVivo@4
+      displayName: 'Get New pom.xml info'
+      inputs:
+        type: 'file'
+        origin: $(Build.SourcesDirectory)/pom.xml
+        jpaths: |
+          var POM_XML_VERSION = .project.version._text
+
+    - task: Maven@3
+      displayName: 'Maven Build, Test & Package'
+      continueOnError: False
+      env:
+        ASDF_JAVA_VERSION: $(ASDF_JAVA_VERSION)
+        NEXUS_DEPS_USR: $(NEXUS-DEPS-USR)
+        NEXUS_DEPS_PSW: $(NEXUS-DEPS-PSW)
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+      inputs:
+        options: >-
+          -s /home/svc_devopscorp/.m2/settings.xml
+      # -U
+        mavenPomFile: $(Build.SourcesDirectory)/pom.xml
+        mavenOptions: "-Xmx3072m"
+        javaHomeOption: "JDKVersion"
+        publishJUnitResults: false
+        testResultsFiles: $(Build.SourcesDirectory)/**/surefire-reports/TEST-*.xml
+        goals: "clean dependency:purge-local-repository install test"
+
+    - task: PublishTestResults@2
+      inputs:
+        testResultsFormat: "JUnit"
+        testResultsFiles: "**/surefire-reports/TEST-*.xml"
+        mergeTestResults: true
+
+    - task: CopyFiles@2
+      displayName: "Staging Artifacts"
+      condition: succeeded()
+      continueOnError: false
+      inputs:
+        SourceFolder: "$(build.sourcesdirectory)"
+        TargetFolder: "$(Build.ArtifactStagingDirectory)"
+        Contents: |
+          **/target/classes/**
+          **/target/*.*ar
+          **/target/*.ejb
+          **/surefire-reports/TEST-*.xml
+          **/pom.xml
+          .azuredevops/**/*
+          .azuredevops/*
+          catalog-info.y*ml
+          pom.xml
+        CleanTargetFolder: true
+        OverWrite: true
+        flattenFolders: false
+
+    - task: PublishBuildArtifacts@1
+      displayName: "Push Artifacts"
+      condition: succeeded()
+      continueOnError: false
+      inputs:
+        ArtifactName: bin
+
+    - task: ListFilesAndFolders@4
+      displayName: 'Find "sonar.java.binaries"'
+      inputs:
+        scriptSource: 'text'
+        separator: ','
+        script: |
+          var://BINARIES_DIRECTORIES = **/target/classes
+
+    - task: SonarQubePrepare@5
+      displayName: 'Config Sonar'
+      inputs:
+        SonarQube: VIVO_SONARQUBE
+        scannerMode: "CLI"
+        # configFile Não funciona no scannerMode Other, apenas CLI (https://learn.microsoft.com/pt-br/azure/devops/pipelines/tasks/reference/sonar-qube-prepare-v5?view=azure-pipelines)
+        configFile: $(Build.SourcesDirectory)/sonar-project.properties
+        extraProperties: |
+          sonar.scm.disabled=True
+          sonar.projectBaseDir=$(Build.SourcesDirectory)
+          sonar.projectKey=$(CATALOG_YAML_SONAR_PROJECT_KEY)
+          sonar.projectName=$(SONARQUBE_PROJECT_NAME)
+          sonar.projectVersion=$(new_version.NEW_VERSION)
+          sonar.analysis.repositoryName=$(Build.Repository.Name)
+          sonar.analysis.buildId=$(Build.BuildId)
+          sonar.analysis.repositoryId=$(Build.Repository.ID)
+          sonar.analysis.projectName=$(System.TeamProject)
+          sonar.analysis.projectId=$(System.TeamProjectId)
+          sonar.links.homepage=$(System.TeamFoundationCollectionUri)$(System.TeamProject)
+          sonar.links.ci=$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)&_a=summary
+          sonar.links.issue=$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_workitems
+          sonar.links.scm=$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_git/$(Build.Repository.Name)
+          sonar.scanner.metadataFilePath=$(Agent.TempDirectory)/sonar/$(Build.BuildId)/report-task.txt
+          sonar.qualitygate.wait=true
+          sonar.qualitygate.timeout=300
+          sonar.sources=.
+          sonar.inclusions=**/src/main/java/**/*
+          sonar.java.binaries=$(BINARIES_DIRECTORIES)
+
+    # - task: SonarQubeAnalyze@5
+    #   displayName: 'Sonar Scan'
+    #   continueOnError: true
+    #   env:
+    #     ASDF_JAVA_VERSION: $(ASDF_JAVA_VERSION)
+
+    - task: Bash@3
+      displayName: 'Commit new version'
+      continueOnError: false
+      inputs:
+        targetType: inline
+        script: |-
+          git stash save pom.xml
+          git clean -fdX
+
+          # export TAG="${POM_XML_VERSION:4}+$(date -u +"%Y%m%d%H%M")-${BUILD_SOURCEBRANCHNAME}-${BUILD_BUILDID}"
+
+          export TAG="${POM_XML_VERSION}"
+
+          echo "##[command] git checkout ${BUILD_SOURCEBRANCHNAME} --"
+          git fetch
+          git checkout ${BUILD_SOURCEBRANCHNAME} --
+          git pull --rebase origin ${BUILD_SOURCEBRANCHNAME}
+          git stash pop
+
+          echo "##[command] git commit"
+          git add pom.xml
+          git commit -m "[skip ci] CodePlay bump version ${TAG}"
+
+          echo "##[command]git tag ${TAG}"
+          git tag ${TAG} -m "Version has been updated to ${TAG}"
+
+          echo "##[command] git push origin ${BUILD_SOURCEBRANCHNAME}"
+          git push origin --tags ${BUILD_SOURCEBRANCHNAME}
+
+# - stage: stage_fortify_gate
+#   displayName: 'Fortify Gate'
+#   variables:
+#   # fortfy
+#   - name: CACORP_LOCATION
+#     value: "$(Agent.HomeDirectory)/../../certs/CACORP.pem"
+
+#   - name: ASDF_JDK_11
+#     value: "openjdk-11.0.2"
+
+#   - name: FORTIFY_VERSION_NAME
+#     value: DevSecOps-${{ split(variables['Build.SourceBranch'], 'refs/heads/')[1] }}
+
+#   - name: FORTIFY_PROJECT_NAME
+#     value: "$(System.TeamProject)-$(Build.Repository.Name)"
+
+#   - name: FORTIFY_EXCLUSIONS
+#     value: >-
+#       -targs "-exclude '**/*test*'"
+#       -targs "-exclude '**/*spec*/**/*'"
+#       -targs "-exclude '**/*xsd*/**/*'"
+#       -targs "-exclude '**/*xsd*'"
+#       -targs "-exclude '**/*groovy*'"
+#       -targs "-exclude '**/*groovy*/**/*'"
+#       -targs "-exclude '**/*stryker*'"
+#       -targs "-exclude '**/*stryker*/**/*'"
+#       -targs "-exclude '**/*html*'"
+#       -targs "-exclude '**/*html*/**/*'"
+#       -targs "-exclude '**/*json*'"
+#       -targs "-exclude '**/*json*/**/*'"
+#       -targs "-exclude '**/*Dockerfile*'"
+#       -targs "-exclude '**/*Dockerfile*/**/*'"
+#       -targs "-exclude '**/*config*'"
+#       -targs "-exclude '**/*config*/**/*'"
+#       -targs "-exclude '**/*platform*'"
+#       -targs "-exclude '**/*platform*/**/*'"
+#       -targs "-exclude '**/*pipeline*'"
+#       -targs "-exclude '**/*pipeline*/**/*'"
+#       -targs "-exclude '**/*router*'"
+#       -targs "-exclude '**/*router*/**/*'"
+#       -targs "-exclude '**/*lib*'"
+#       -targs "-exclude '**/*lib*/**/*'"
+#       -targs "-exclude '**/*certs*'"
+#       -targs "-exclude '**/*certs*/**/*'"
+#       -targs "-exclude '**/*dist*'"
+#       -targs "-exclude '**/*dist*/**/*'"
+#       -targs "-exclude '**/*yaml*'"
+#       -targs "-exclude '**/*yaml*/**/*'"
+#       -targs "-exclude '**/*docker*'"
+#       -targs "-exclude '**/*docker*/**/*'"
+#       -targs "-exclude '**/*.yml*'"
+#       -targs "-exclude '**/*.yml*/**/*'"
+
+#   jobs:
+#   - job: job_fortify
+#     displayName: 'Fortify Scan'
+#     steps:
+#     - checkout: self
+#       fetchDepth: 1
+
+#     - task: AzureKeyVault@2
+#       displayName: 'Getting AKV credentials'
+#       timeoutInMinutes: 1
+#       retryCountOnTaskFailure: 5
+#       inputs:
+#         azureSubscription: 'DevOpsSharedResources'
+#         KeyVaultName: 'kv-azdevops-shared'
+#         SecretsFilter: 'FORTIFY-SSC-CLI-TOKEN, FORTIFY-SCANCENTRAL-CLIENT-TOKEN'
+
+#     - task: Base64FromVivo@4
+#       displayName:
+#       inputs:
+#         content: $(FORTIFY-SSC-CLI-TOKEN)
+#         outputVariable: FORTIFY_SSC_CLI_TOKEN_64
+#         isSecret: true
+
+#     # Busca o ID do projeto/versão no FORTIFY
+#     - task: AxiosFromVivo@4
+#       name: fortifyExists
+#       displayName: 'Check Project Exists'
+#       inputs:
+#         sourceType: 'text'
+#         source: |
+#           var options = {
+#             method: 'GET',
+#             url: 'https://ssc-fortify.redecorp.br/ssc/api/v1/projectVersions',
+#             params: {fields: 'id,name,project', q: 'project.name:$(FORTIFY_PROJECT_NAME)'},
+#             headers: {Authorization: 'FortifyToken $(FORTIFY_SSC_CLI_TOKEN_64)'}
+#           };
+#         variablePrefix: 'FORTIFY_EXISTS_'
+#       env:
+#         NODE_EXTRA_CA_CERTS: $(CACORP_LOCATION)
+
+#     - task: JsonParseFromVivo@4
+#       displayName: 'Get existing info'
+#       inputs:
+#         source: $(FORTIFY_EXISTS_BODY)
+#         sourceType: 'text'
+#         queries: |
+#           var FORTIFY_PROJECT_ID = $.data[?(@.project.name.match(/$(FORTIFY_PROJECT_NAME)/i))].project.id
+#           var FORTIFY_PROJECT_VERSION_ID = $.data[?(@.project.name.match(/$(FORTIFY_PROJECT_NAME)/i))].id
+
+#     - task: AxiosFromVivo@4
+#       displayName: "Create Fortify Project/Project Version"
+#       condition: not(variables['FORTIFY_PROJECT_VERSION_ID'])
+#       inputs:
+#         type: 'text'
+#         origin: |
+#           var options = {
+#             method: 'POST',
+#             url: 'https://ssc-fortify.redecorp.br/ssc/api/v1/projectVersions',
+#             headers: {Authorization: 'FortifyToken $(FORTIFY_SSC_CLI_TOKEN_64)'},
+#             data: {
+#               "name": "$(FORTIFY_VERSION_NAME)",
+#               "issueTemplateId": "Prioritized-HighRisk-Project-Template",
+#               "project": {
+#                 "name": "$(FORTIFY_PROJECT_NAME)",
+#                 "issueTemplateId": "Prioritized-HighRisk-Project-Template"
+#               }
+#             },
+#           };
+#         variablePrefix: 'FORTIFY_CREATE_'
+#       env:
+#         NODE_EXTRA_CA_CERTS: $(CACORP_LOCATION)
+
+#     - task: JsonParseFromVivo@4
+#       displayName: 'Get created info'
+#       condition: not(variables['FORTIFY_PROJECT_VERSION_ID'])
+#       inputs:
+#         source: $(FORTIFY_CREATE_BODY)
+#         queries: |
+#           var FORTIFY_PROJECT_ID = $.data.project.id
+#           var FORTIFY_PROJECT_VERSION_ID = $.data.id
+
+#     - task: AxiosFromVivo@4
+#       displayName: 'Updating project metadata'
+#       inputs:
+#         type: 'text'
+#         origin: |
+#           var options = {
+#             method: 'PUT',
+#             url: 'https://ssc-fortify.redecorp.br/ssc/api/v1/projectVersions/$(FORTIFY_PROJECT_VERSION_ID)/attributes',
+#             headers: {Authorization: 'FortifyToken $(FORTIFY_SSC_CLI_TOKEN_64)'},
+#             data: [
+#               {
+#                 "attributeDefinitionId":"1",
+#                 "values":[ { "guid": "High", "name": "High", "description": "High Business Risk. This application is critical to the primary business goals of the organization.", "inUse": true } ],
+#                 "guid": "BusinessRisk"
+#               },
+#               {
+#                 "attributeDefinitionId": 2,
+#                 "values": [ { "guid": "NONE", "name": "None", "description": "There are no known legal compliance obligations", "inUse": true } ],
+#                 "guid": "Compliance"
+#               },
+#               {
+#                 "attributeDefinitionId": 3,
+#                 "values": [ { "guid": "Unknown", "name": "Unknown Data", "description": "Interacts with data of an unknown classification type. Data of this type should be assumed to at least be Restricted. ", "inUse": true } ],
+#                 "guid": "InfoClassification"
+#               },
+#               {
+#                 "attributeDefinitionId": 4,
+#                 "values": [
+#                   { "guid": "Pro", "name": "Product", "description": "Product delivery and confirmation", "inUse": true },
+#                   { "guid": "Sales", "name": "Sales", "description": "Customer relationship management and transaction processing", "inUse": true },
+#                   { "guid": "Services", "name": "Services", "description": "Customer support and service delivery improvement systems", "inUse": true }
+#                 ],
+#                 "guid": "ProjectClassification"
+#               },
+#               {
+#                 "attributeDefinitionId": 5,
+#                 "values": [ { "guid": "New", "name": "New", "description": "This application has just begun development and has not had a production release.", "inUse": true } ],
+#                 "guid": "DevPhase"
+#               },
+#               {
+#                 "attributeDefinitionId": 6,
+#                 "values": [ { "guid": "Partial", "name": "Partially Outsourced", "description": "Development duties partially outsourced. Design, management, development, and support duties are split between internal employees and an outsourced resource.", "inUse": true } ],
+#                 "guid": "DevStrategy"
+#               },
+#               {
+#                 "attributeDefinitionId": 7,
+#                 "values": [ { "guid": "externalpublicnetwork", "name": "External Public Network Access Required", "description": "Interaction can occur from an untrusted public network (e.g. the public internet).", "inUse": true } ],
+#                 "guid": "Accessibility"
+#               },
+#               {
+#                 "attributeDefinitionId": 8,
+#                 "values": [ { "guid": "ApplicationComponent", "name": "Application Component", "description": "A module which performs a business function that is not a self contained application", "inUse": true } ],
+#                 "guid": "ProjectType"
+#               },
+#               {
+#                 "attributeDefinitionId": 9,
+#                 "values": [ { "guid": "NA", "name": "Platform Neutral", "description": "Application does not rely on any operating system", "inUse": true } ],
+#                 "guid": "TargetPlatform"
+#               },
+#               {
+#                 "attributeDefinitionId": 10,
+#                 "values": [ { "guid": "API", "name": "Programmatic API", "description": "Logic is only available through programmatic API access.", "inUse": true } ],
+#                 "guid": "Interfaces"
+#               },
+#               {
+#                 "attributeDefinitionId": 12,
+#                 "values": [ { "guid": "Custom", "name": "Custom", "description": "", "inUse": true } ],
+#                 "guid": "AuthenticationSystem"
+#               },
+#               {
+#                 "attributeDefinitionId": 14,
+#                 "values": [ { "guid": "Operations", "name": "Operations", "description": "Operations business unit", "inUse": true } ],
+#                 "guid": "BusinessUnit"
+#               },
+#               {
+#                 "attributeDefinitionId": 15,
+#                 "values": [ { "guid": "Retail", "name": "Retail", "description": "Retail industry", "inUse": true } ],
+#                 "guid": "Industry"
+#               },
+#               {
+#                 "attributeDefinitionId": 16,
+#                 "values": [ { "guid": "Americas", "name": "Americas", "description": "The Americas region", "inUse": true } ],
+#                 "guid": "Region"
+#               }
+#             ]
+#           };
+#         variablePrefix: 'FORTIFY_ATTR_'
+#       env:
+#         NODE_EXTRA_CA_CERTS: $(CACORP_LOCATION)
+
+#     - task: AxiosFromVivo@4
+#       displayName: 'Commiting project version'
+#       inputs:
+#         type: 'text'
+#         origin: |
+#           var options = {
+#             method: 'PUT',
+#             url: 'https://ssc-fortify.redecorp.br/ssc/api/v1/projectVersions/$(FORTIFY_PROJECT_VERSION_ID)',
+#             headers: {Authorization: 'FortifyToken $(FORTIFY_SSC_CLI_TOKEN_64)'},
+#             data: {"committed": true},
+#           };
+#         variablePrefix: 'FORTIFY_COMMIT_'
+#       env:
+#         NODE_EXTRA_CA_CERTS: $(CACORP_LOCATION)
+
+#     - task: FortifyScanCentralSAST@7
+#       displayName: "Fortify SAST Scan"
+#       inputs:
+#         scanCentralCtrlUrl: https://scancentral-sast.redecorp.br/scancentral-ctrl
+#         scanCentralClientToken: $(FORTIFY-SCANCENTRAL-CLIENT-TOKEN)
+#         sscUrl: https://ssc-fortify.redecorp.br/ssc/
+#         sscCiToken: $(FORTIFY-SSC-CLI-TOKEN)
+#         uploadToSSC: true
+#         buildFailureCriteria: "[fortify priority order]:critical"
+#         applicationName: $(FORTIFY_PROJECT_NAME)
+#         applicationVersion: $(FORTIFY_VERSION_NAME)
+#         buildTool: none # must be 'none' for skipBuild
+#         buildCommand: "$(FORTIFY_EXCLUSIONS)"
+#         block: true
+#         skipBuild: true # this param doesn't matter
+#         outputFile: $(FORTIFY_PROJECT_NAME)-fortify.fpr
+#         logFile: $(FORTIFY_PROJECT_NAME)-fortify.log
+#         overwrite: true
+#       env:
+#         NODE_EXTRA_CA_CERTS: $(CACORP_LOCATION)
+#         ASDF_JAVA_VERSION: $(ASDF_JDK_11)
+
+#     - task: CopyFiles@2
+#       displayName: 'Staging Results'
+#       condition: succeeded()
+#       continueOnError: false
+#       inputs:
+#         SourceFolder: $(build.sourcesdirectory)
+#         TargetFolder: $(Build.ArtifactStagingDirectory)
+#         Contents: |
+#           *-fortify.*
+#         CleanTargetFolder: true
+#         OverWrite: true
+#         flattenFolders: false
+
+#     - task: PublishPipelineArtifact@1
+#       displayName: "Push Results"
+#       inputs:
+#         targetPath: $(Build.ArtifactStagingDirectory)
+#         artifactName: "fortify"
+
+- stage:
+  displayName: 'Push to Repositories'
+  pool: GeneralPurposeLinuxAgentsCI
+  jobs:
+  - job:
+    # variables:
+    # - group: "${{ variables['Build.Repository.Name'] }}"
+
+    displayName: 'Push Nexus (Maven)'
+    steps:
+    - checkout: none
+    - task: DownloadBuildArtifacts@1
+      displayName: 'Get new pom.xml'
+      inputs:
+        buildType: "current"
+        downloadPath: "$(System.ArtifactsDirectory)"
+
+    - task: XmlParseFromVivo@4
+      displayName: 'Get Main Info'
+      name: pom_info
+      inputs:
+        type: 'file'
+        origin: $(System.ArtifactsDirectory)/bin/pom.xml
+        jpaths: |
+          var POM_XML_VERSION = .project.version._text
+          var POM_XML_ARTIFACT_ID = .project.artifactId._text
+          var POM_XML_GROUP_ID = .project.groupId._text
+
+    - task: YamlParseFromVivo@4
+      displayName: 'Get Metadata Info'
+      name: catalog_info
+      inputs:
+        type: 'file'
+        origin: $(System.ArtifactsDirectory)/bin/catalog-info.yaml
+        jpaths: |
+          var CATALOG_YAML_ACRONYM = .metadata.annotations['techarch.governance-app.acronym']
+
+    - task: NunjucksInline@4
+      displayName: 'Bind Variables'
+      inputs:
+        sourceType: 'text'
+        source: |
+          var MAVEN_REPO_NAME = {{ '$(NEXUS_REPO_LIB_MVN)' or '$(CATALOG_YAML_ACRONYM)-mvn' }}
+
+    - task: NexusUploadAllMvnFromVivo@5
+      displayName: 'Push to Nexus'
+      inputs:
+        nexusEndpoint: 'Nexus Asis'
+        nexusRepoMaven: $(MAVEN_REPO_NAME)
+        publishInfoFile: publishInfo.md
+        mainPomDirectory: $(System.ArtifactsDirectory)/bin
+
+

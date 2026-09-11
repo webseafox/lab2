@@ -1,0 +1,163 @@
+parameters:
+  - name: environment
+  - name: packageVersion
+  - name: kubernetesServiceConnectionEnabled
+    default: false
+steps:
+  - checkout: self
+    persistCredentials: true
+    clean: true
+
+  - task: qetza.replacetokens.replacetokens-task.replacetokens@5
+    displayName: "Replace Secrets"
+    inputs:
+      targetFiles: "$(Build.SourcesDirectory)/.azuredevops/config/${{ parameters.environment }}/secrets.yaml"
+      tokenPattern: custom
+      tokenPrefix: "$("
+      tokenSuffix: ")"
+      verbosity: detailed
+      keepToken: true
+      actionOnNoFiles: warn
+
+  - task: Bash@3
+    name: info
+    displayName: "Get Version and Show Info"
+    condition: succeeded()
+    inputs:
+      targetType: inline
+      script: |
+        ENVIRONMENT="${{ parameters.environment }}"
+
+        if [[ "$ENVIRONMENT" == "esteira1" || "$ENVIRONMENT" == "esteira2" || "$ENVIRONMENT" == "preprod" || "$ENVIRONMENT" == "prodlike" ]]; then
+          INFRA="test"
+        elif [[ "$ENVIRONMENT" == "producao" ]]; then
+          INFRA="prod"
+          ENVIRONMENT="prod"
+        else
+          INFRA="dev"
+        fi
+
+        BRANCH_NAME='$(Build.SourceBranchName)'
+        IMAGE_TAG="${{ parameters.packageVersion }}"
+        RESOURCE_GROUP="rg-archdcp-brsouth-${INFRA}"
+        CLUSTER="aks-archdcp-${INFRA}"
+        SUBSCRIPTION_ENDPOINT="aks-archdcp-${INFRA}"
+        NAMESPACE="$(GOV_APP_ACRONYM)-${ENVIRONMENT}"
+        HELM_RELEASE=$(APP_NAME)
+
+        echo ""
+        echo "##[debug] AKV_DEVOPS_NAME...........: ${AKV_DEVOPS_NAME}"
+        echo "##[debug] HELM_CHART_DIRECTORY......: ${HELM_CHART_DIRECTORY}"
+        echo "##[debug] HELM_CHART_NAME...........: ${HELM_CHART_NAME}"
+        echo "##[debug] HELM_CHART_URL............: ${HELM_CHART_URL}"
+        echo "##[debug] HELM_CHART_VERSION........: ${HELM_CHART_VERSION}"
+        echo "##[debug] HELM_RELEASE..............: ${HELM_RELEASE}"
+        echo "##[debug] SUBSCRIPTION_ENDPOINT.....: ${SUBSCRIPTION_ENDPOINT}"
+        echo "##[debug] RESOURCE_GROUP............: ${RESOURCE_GROUP}"
+        echo "##[debug] CLUSTER...................: ${CLUSTER}"
+        echo "##[debug] NAMESPACE.................: ${NAMESPACE}"
+        echo "##[debug] IMAGE_TAG.................: ${IMAGE_TAG}"
+        echo "##[debug] BRANCH_NAME...............: ${BRANCH_NAME}"
+        echo "##[debug] ENVIRONMENT...............: ${ENVIRONMENT}"
+
+        echo "##vso[task.setvariable variable=VAR_RESOURCE_GROUP;]$RESOURCE_GROUP"
+        echo "##vso[task.setvariable variable=VAR_CLUSTER;]$CLUSTER"
+        echo "##vso[task.setvariable variable=VAR_NAMESPACE;]$NAMESPACE"
+        echo "##vso[task.setvariable variable=VAR_IMAGE_TAG;]$IMAGE_TAG"
+        echo "##vso[task.setvariable variable=VAR_SUBSCRIPTION_ENDPOINT;]$SUBSCRIPTION_ENDPOINT"
+        echo "##vso[task.setvariable variable=VAR_HELM_RELEASE;]$HELM_RELEASE"
+        echo "##vso[task.setvariable variable=VAR_HELM_CHART_URL;]$HELM_CHART_URL"
+        echo "##vso[task.setvariable variable=VAR_HELM_CHART_VERSION;]$HELM_CHART_VERSION"
+        echo "##vso[task.setvariable variable=VAR_RESOURCE_GROUP;]$RESOURCE_GROUP"
+        echo "##vso[task.setvariable variable=VAR_BRANCH_NAME;]$BRANCH_NAME"
+        ECHO "##vso[task.setvariable variable=VAR_INFRA;]$INFRA"
+        echo "##vso[task.setvariable variable=VAR_ENVIRONMENT;]$ENVIRONMENT"
+
+  - task: Bash@3
+    displayName: "Deploy Validation"
+    name: deploy_validation
+    condition: succeeded()
+    inputs:
+      targetType: inline
+      script: |
+        echo "##[debug] ENVIRONMENT...............: ${{ parameters.environment }}"
+        echo "##[debug] BRANCH....................: $(VAR_BRANCH_NAME)"
+
+        if [[ ${{ parameters.environment }} == "producao" ]]; then
+          if [[ "$VAR_BRANCH_NAME" != "master" && "$VAR_BRANCH_NAME" != "main" ]]; then
+            echo "##[error] Deploy em produção apenas permitido via branches master ou main!"
+            exit 1
+          else
+            echo "##[success] Validação bem-sucedida para deploy em produção via branch: $(VAR_BRANCH_NAME)"
+          fi
+        else
+          echo "##[info] Ambiente não produtivo sendo configurado para deploy."
+        fi
+
+  - task: AzureKeyVault@2
+    displayName: "Get credentials for ACR Helm from AKV"
+    timeoutInMinutes: 1
+    retryCountOnTaskFailure: 5
+    inputs:
+      azureSubscription: DevOpsSharedResources
+      KeyVaultName: $(AKV_DEVOPS_NAME)
+      SecretsFilter: "HELM-REGISTRY-ACR-USERNAME, HELM-REGISTRY-ACR-PASSWORD"
+
+  - task: Bash@3
+    displayName: "Login on Helm Registry"
+    name: helm_registry_login
+    condition: succeeded()
+    inputs:
+      targetType: inline
+      script: |
+        helm registry login ${HOST} \
+          --username ${USERNAME} \
+          --password "${PASSWORD}"
+    env:
+      HOST: $(HELM_REGISTRY)
+      USERNAME: $(HELM-REGISTRY-ACR-USERNAME)
+      PASSWORD: $(HELM-REGISTRY-ACR-PASSWORD)
+
+  - task: Bash@3
+    displayName: "Helm Repo Update"
+    inputs:
+      targetType: inline
+      script: |
+        helm repo update
+        helm repo list
+
+  - task: HelmDeploy@1
+    displayName: Deploy-${{ parameters.environment }}
+    inputs:
+      ${{ if eq(parameters.kubernetesServiceConnectionEnabled, true) }}:
+        connectionType: "Kubernetes Service Connection"
+        kubernetesServiceConnection: "$(K8S_SERVICE_CONNECTION_${{ upper(parameters.environment) }})"
+      ${{ else }}:
+        connectionType: "Azure Resource Manager"
+        azureSubscription: "aks-archdcp-$(serviceConnectionDeploySuffix)"
+        azureResourceGroup: "rg-archdcp-brsouth-$(serviceConnectionDeploySuffix)"
+        kubernetesCluster: "aks-archdcp-$(serviceConnectionDeploySuffix)"
+      command: "upgrade"
+      chartName: "devops-helm/generic-java-microservice"
+      chartVersion: "$(VAR_HELM_CHART_VERSION)"
+      releaseName: "$(VAR_HELM_RELEASE)"
+      valueFile: ".azuredevops/config/${{ parameters.environment }}/values.yml"
+      namespace: "$(VAR_NAMESPACE)"
+      arguments: >-
+        --atomic
+        --wait 
+        --insecure-skip-tls-verify
+        -f "$(Build.SourcesDirectory)/.azuredevops/config/${{ parameters.environment }}/environments_variables.yml"
+        -f "$(Build.SourcesDirectory)/.azuredevops/config/${{ parameters.environment }}/secrets.yaml"
+        --history-max 2
+        --debug
+        --output table
+      publishPipelineMetadata: false
+      overrideValues: |
+        image.repository=$(REGISTRY_NAME)/$(GOV_APP_ACRONYM)/$(Build.Repository.Name)
+        image.tag=$(VAR_IMAGE_TAG)
+        imagePullSecrets[0].name=acr-devops
+      install: true
+      wait: true
+      timeout: 600s
+      failOnStderr: false

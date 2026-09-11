@@ -1,0 +1,3031 @@
+# ==================================================================
+# Pipeline: Deploy de Helm Chart em Kubernetes
+# -----------------------------------------------------
+# Este pipeline realiza o deploy de um Helm Chart em um cluster Kubernetes,
+# suportando múltiplos ambientes, formas de login, helm repos e versionamento.
+# Custom Task: K8sUtilsFromVivo@3 -> https://dev.azure.com/telefonica-vivo-brasil/DVPS%20-%20DEVOPS/_git/azdo-task-kubernetes-utils
+# Helm Chart Padrão: generic-microservice -> https://dev.azure.com/telefonica-vivo-brasil/DevOps/_git/Vivo.Helm.Generic.Microservice
+# ==================================================================
+parameters:
+# ==================================================================
+# Parâmetros Gerais de Execução
+# ==================================================================
+- name: environment
+  displayName: 'Ambiente para publicar'
+  type: string
+  default: dev
+- name: version
+  displayName: 'Versão da aplicação'
+  type: string
+  default: getLatestVersion() # Padrão para obter a última versão gerada para o repositório
+- name: agentPool
+  displayName: 'Pool de execução do pipeline'
+  type: string
+  default: GeneralPurposeLinuxAgentsCD
+- name: branchingStrategy
+  type: string
+  default: 'trunkbased'
+  displayName: 'Estratégia de versionamento'
+  values:
+    - 'trunkbased'
+    - 'vivoflow'
+    - 'releaseflow'
+    - 'gitlabflow'
+    - 'gitlabflow-semantic'
+    - 'custom'
+    - 'monorepo'
+# ==================================================================
+# Configuração do Helm Chart
+# ==================================================================
+- name: helmReleaseName
+  displayName: 'Nome da Release Helm'
+  type: string
+  default: $(Build.Repository.Name)
+- name: helmValuesFile
+  displayName: 'Arquivo de valores para o Helm'
+  type: object
+  default: 
+    dev: .azuredevops/config/dev/values.yml
+    esteira1: .azuredevops/config/esteira1/values.yml
+    esteira2: .azuredevops/config/esteira2/values.yml
+    preprod: .azuredevops/config/preprod/values.yml
+    prodlike: .azuredevops/config/prodlike/values.yml
+    prod: .azuredevops/config/prod/values.yml
+
+# ==================================================================
+# Configuração de Múltiplos Arquivos Values
+# ==================================================================
+# Esta funcionalidade permite usar um arquivo values adicional que sobrescreve
+# o values.yaml principal, útil para:
+# - Valores específicos por ambiente (dev/preprod/prod)
+# - Configurações dinâmicas com substituição de tokens/placeholders
+# - Separação de valores base vs. customizados
+#
+# Ordem de precedência do Helm (último sobrescreve):
+# 1. helmValuesFile (values.yaml base)
+# 2. placeholdersHelmValuesFile (sobrescreve valores do base)
+# 3. imageTag do pipeline (sobrescreve image.tag em ambos)
+#
+# ATENÇÃO para secrets: Para dados sensíveis, use Azure Key Vault:
+# https://wikicorp.telefonica.com.br/spaces/AC/pages/495251243/Azure+Key+Vault+-+Autentica%C3%A7%C3%A3o+via+service+principal
+- name: usePlaceholdersHelmValuesFile
+  displayName: 'Usar arquivo de valores adicional (sobrescreve values.yaml)'
+  type: boolean
+  default: false
+- name: placeholdersHelmValuesFile
+  displayName: 'Caminho do arquivo values adicional por ambiente'
+  type: object
+  default: 
+    dev: .azuredevops/config/dev/placeholders-values.yml
+    esteira1: .azuredevops/config/esteira1/placeholders-values.yml
+    esteira2: .azuredevops/config/esteira2/placeholders-values.yml
+    preprod: .azuredevops/config/preprod/placeholders-values.yml
+    prodlike: .azuredevops/config/prodlike/placeholders-values.yml
+    prod: .azuredevops/config/prod/placeholders-values.yml
+- name: placeholderVariableGroupName
+  displayName: 'Nome do Variable Group com valores para substituição de tokens'
+  type: string
+  default: ''
+- name: placeholderPrefix
+  displayName: 'Prefixo dos tokens para substituição (ex: $()'
+  type: string
+  default: '$('
+- name: placeholderSuffix
+  displayName: 'Sufixo dos tokens para substituição (ex: ))'
+  type: string
+  default: ')'
+
+
+# Permite carregar o conteúdo de arquivos do repositório em valores do Helm.
+# Útil para popular ConfigMaps com arquivos externos (ex: arquivos de configuração,
+# templates, scripts, JSON, XML, etc.) sem precisar duplicar o conteúdo no values.yml.
+
+- name: helmSetFiles
+  displayName: 'Lista de arquivos para --set-file do Helm'
+  type: object
+  default: []
+
+# ==================================================================
+# Repositório Helm e Chart
+# ==================================================================
+# Repositório Helm padrão: ACR corporativo
+- name: useHelmRepoFromNexus
+  displayName: 'Usar repositório Helm do Nexus'
+  type: boolean
+  default: false
+- name: helmRepoUrlNexus
+  displayName: 'URL do repositório Helm do Nexus'
+  type: string
+  default: https://nexus.telefonica.com.br/repository
+- name: helmRepoUrlACR
+  displayName: 'URL do repositório Helm do ACR'
+  type: string
+  default: acrsharedservices01.azurecr.io
+- name: helmRepoName
+  displayName: 'Nome do repositório Helm'
+  type: string
+  default: helm/devops # devops-helm se for Nexus
+# Informações do Chart Helm
+# generic-microservice -> https://dev.azure.com/telefonica-vivo-brasil/DevOps/_git/Vivo.Helm.Generic.Microservice
+- name: helmChartName
+  displayName: 'Nome do Chart Helm'
+  type: string
+  default: generic-microservice
+- name: helmChartVersion
+  displayName: 'Versão do Chart Helm'
+  type: string
+  default: 1.0.37
+## Informações do Helm Upgrade
+- name: helmTimeout
+  displayName: 'Timeout do Helm (e.g., 300s)'
+  type: string
+  default: '300s'
+# IMPORTANTE: Para Blue/Green e Canary com Argo Rollouts, helm --wait deve ser
+# desabilitado pois o Rollout entra em estado Paused (por design), impedindo
+# que o Helm considere os recursos como "ready". A verificação de readiness
+# é feita pelo step 'argo-wait-paused' que executa após o helm upgrade.
+- name: helmNoWait
+  displayName: 'Desabilitar --wait no Helm upgrade (obrigatório para Blue/Green e Canary)'
+  type: boolean
+  default: false
+
+# ==================================================================
+# Configuração AKS (Azure Kubernetes Service)
+# ==================================================================
+# Conexão e detalhes do recurso AKS para cada ambiente
+- name: useAKSManagedIdentity
+  displayName: 'Usar Managed Identity do AKS'
+  type: boolean
+  default: true
+- name: aksServiceConnection
+  displayName: 'Service Connection Azure para AKS'
+  type: object
+  default: 
+    dev: "aks-$(SIGLA)-brsouth-dev"
+    preprod: "aks-$(SIGLA)-brsouth-preprod"
+    prod: "aks-$(SIGLA)-brsouth-prod"
+- name: aksResourceGroup
+  displayName: 'Resource Group do AKS'
+  type: object
+  default: 
+    dev: "rg-aks-$(SIGLA)-brsouth-dev"
+    preprod: "rg-aks-$(SIGLA)-brsouth-preprod"
+    prod: "rg-aks-$(SIGLA)-brsouth-prod"
+- name: aksClusterName
+  displayName: 'Nome do Cluster AKS'
+  type: object
+  default: 
+    dev: "aks-$(SIGLA)-brsouth-dev"
+    preprod: "aks-$(SIGLA)-brsouth-preprod"
+    prod: "aks-$(SIGLA)-brsouth-prod"
+
+# ==================================================================
+# Configuração Kubeconfig (Service Connection)
+# ==================================================================
+- name: useKubeconfig
+  displayName: 'Usar Kubeconfig do Kubernetes'
+  type: boolean
+  default: false
+- name: kubeconfigServiceConnection
+  displayName: 'Service Connection Kubernetes com Kubeconfig'
+  type: object
+  default: 
+    dev: "$(SIGLA)-dev"
+    preprod: "$(SIGLA)-preprod"
+    prod: "$(SIGLA)-prod"
+
+# ==================================================================
+# Configuração de Secret Docker (apenas para clusters on-premise)
+# ==================================================================
+# Este secret é criado APENAS quando useKubeconfig=true (clusters on-premise)
+# AKS já possui integração nativa com ACR via Managed Identity
+- name: createDockerConfigSecret
+  displayName: 'Criar Secret para Pull de Imagens (apenas on-premise)'
+  type: string
+  default: 'none'
+  values:
+    - none    # Não criar (já existe no cluster ou AKS com Managed Identity)
+    - nexus   # Criar para Nexus
+    - acr     # Criar para ACR
+
+# ==================================================================
+# Configuração de Docker Registry (para pull de imagens)
+# ==================================================================
+- name: dockerRegistryACR
+  displayName: 'URL do Docker Registry ACR'
+  type: string
+  default: 'acrsharedservices01.azurecr.io'
+- name: dockerRegistryNexus
+  displayName: 'URL do Docker Registry Nexus'
+  type: string
+  default: 'vcr-docker.nexus.telefonica.com.br'
+- name: dockerRegistryEmail
+  displayName: 'Email para o Docker Registry'
+  type: string
+  default: 'arquiteturati@telefonica.com.br'
+
+# ==================================================================
+# Kubernetes Namespace
+# ==================================================================
+# NOTA: Para clusters OpenShift, utilize useKubeconfig=true com Service Connection apropriada
+- name: k8sNamespace
+  displayName: 'Namespace do Kubernetes'
+  type: object
+  default: 
+    dev: "$(SIGLA)-dev"
+    preprod: "$(SIGLA)-preprod"
+    prod: "$(SIGLA)-prod"
+
+# ==================================================================
+# Capacidades Adicionais
+# ==================================================================
+- name: enableAutomaticRollback
+  displayName: 'Habilitar rollback automático'
+  type: boolean
+  default: true
+
+# ==================================================================
+# Estratégia de Deploy (Argo Rollouts)
+# ==================================================================
+# Escolha a estratégia de deploy:
+# - RollingUpdate: Deploy padrão do Kubernetes (sem Argo Rollouts)
+# - BlueGreen: Deploy Blue/Green com Argo Rollouts
+# - Canary: Deploy Canary progressivo com Argo Rollouts
+- name: deployStrategy
+  displayName: 'Estratégia de Deploy'
+  type: string
+  default: RollingUpdate
+  values:
+  - RollingUpdate
+  - BlueGreen
+  - Canary
+
+# Versão mínima do Argo Rollouts controller no cluster
+- name: argoRolloutsMinVersion
+  displayName: 'Versão mínima do Argo Rollouts controller'
+  type: string
+  default: '1.8.3'
+
+# Versão mínima do Helm Chart para suportar Argo Rollouts
+# Aplica-se somente quando helmChartName = generic-microservice
+- name: helmChartMinVersion
+  displayName: 'Versão mínima do Helm Chart para Argo Rollouts'
+  type: string
+  default: '1.0.20'
+
+# ==================================================================
+# Blue/Green Deployment com Argo Rollouts
+# ==================================================================
+# DEPRECATED: Use deployStrategy: BlueGreen ao invés deste parâmetro.
+# Mantido para retrocompatibilidade. Será removido em versão futura.
+- name: enableBlueGreenDeployment
+  displayName: '(DEPRECATED) Habilitar Blue/Green Deployment - Use deployStrategy'
+  type: boolean
+  default: false
+
+- name: blueGreenAutoPromote
+  displayName: 'Auto-promoção após deploy (sem aprovação manual)'
+  type: boolean
+  default: false
+
+- name: blueGreenAutoPromoteDelaySeconds
+  displayName: 'Delay antes da auto-promoção (segundos)'
+  type: number
+  default: 60
+
+- name: blueGreenRolloutTimeout
+  displayName: 'Timeout para operações de Rollout'
+  type: string
+  default: '300s'
+
+- name: blueGreenRolloutStatusCheckInterval
+  displayName: 'Intervalo entre verificações de status do Rollout'
+  type: number
+  default: 5
+
+- name: blueGreenPrePromoteValidation
+  displayName: 'Executar validação antes de promover'
+  type: boolean
+  default: false
+
+- name: blueGreenPrePromoteScript
+  displayName: 'Script de validação pré-promoção'
+  type: string
+  default: ''
+
+# ==================================================================
+# Canary Deployment com Argo Rollouts
+# ==================================================================
+# DEPRECATED: Use deployStrategy: Canary ao invés deste parâmetro.
+# Mantido para retrocompatibilidade. Será removido em versão futura.
+- name: enableCanaryDeployment
+  displayName: '(DEPRECATED) Habilitar Canary Deployment - Use deployStrategy'
+  type: boolean
+  default: false
+
+- name: canaryAutoPromote
+  displayName: 'Auto-promoção após deploy (sem aprovação manual)'
+  type: boolean
+  default: false
+
+- name: canaryAutoPromoteDelaySeconds
+  displayName: 'Delay antes da auto-promoção (segundos)'
+  type: number
+  default: 60
+
+- name: canaryRolloutTimeout
+  displayName: 'Timeout para operações de Rollout'
+  type: string
+  default: '300s'
+
+- name: canaryRolloutStatusCheckInterval
+  displayName: 'Intervalo entre verificações de status do Rollout'
+  type: number
+  default: 5
+
+- name: canaryPrePromoteValidation
+  displayName: 'Executar validação antes de promover'
+  type: boolean
+  default: false
+
+- name: canaryPrePromoteScript
+  displayName: 'Script de validação pré-promoção'
+  type: string
+  default: ''
+
+- name: bypassDiffCheck
+  displayName: 'Forçar verificação de diferenças (ignorar mudanças de imagem)'
+  type: boolean
+  default: true
+
+# ==================================================================
+# Dry-Run (Simulação do Deploy)
+# ==================================================================
+# Executa o pipeline em modo simulado, sem aplicar mudanças no cluster.
+- name: enableDryRun
+  displayName: 'Habilitar Dry-Run (simulação do deploy)'
+  type: boolean
+  default: false
+# ==================================================================
+# Variáveis Internas do Pipeline
+# ==================================================================
+#
+# Resolução de Estratégia:
+# O parâmetro deployStrategy tem prioridade sobre os booleans deprecated.
+# Se deployStrategy=RollingUpdate E enableBlueGreenDeployment=true → BlueGreen (retrocompat)
+# Se deployStrategy=RollingUpdate E enableCanaryDeployment=true → Canary (retrocompat)
+# Se deployStrategy=BlueGreen/Canary → usa deployStrategy (ignora booleans)
+#
+variables:
+- ${{ if and(eq(parameters.usePlaceholdersHelmValuesFile, true), ne(parameters.placeholderVariableGroupName, '')) }}:
+  - group: ${{ parameters.placeholderVariableGroupName }}
+- name: SIGLA
+  value: $[ lower(split(variables['System.TeamProject'],' ')[0]) ]
+- name: ENVIRONMENT
+  value: ${{ parameters.environment }}
+- name: TEMPLATES_FILE
+  value: $(Agent.TempDirectory)/templates.yaml
+- name: HELM_SET_FILES_ARGS
+  value: ""
+- ${{ if eq(parameters.useHelmRepoFromNexus, true) }}:
+  - name: HELM_CHART_PATH
+    value: ${{ parameters.helmRepoName }}/${{ parameters.helmChartName }}
+- ${{ else }}:
+  - name: HELM_CHART_PATH
+    value: oci://${{ parameters.helmRepoUrlACR }}/${{ parameters.helmRepoName }}/${{ parameters.helmChartName }}
+- name: VALUES_PATH
+  value: $(Build.SourcesDirectory)/${{ parameters.helmValuesFile[parameters.environment] }}
+- ${{ if eq(parameters.usePlaceholdersHelmValuesFile, true) }}:
+  - name: PLACEHOLDERS_VALUES_PATH
+    value: $(Build.SourcesDirectory)/${{ parameters.placeholdersHelmValuesFile[parameters.environment] }}
+  - name: REPLACED_PLACEHOLDERS_VALUES_TEMP_PATH
+    value: $(Agent.TempDirectory)/replaced_placeholders_values.yml
+- ${{ if eq(parameters.enableDryRun, true) }}:
+  - name: DRY_RUN_LABEL
+    value: '[DRY RUN ATIVADO]'
+- ${{ if eq(parameters.enableDryRun, false) }}:
+  - name: DRY_RUN_LABEL
+    value: ''
+# ==================================================================
+# Estágios do Pipeline
+# ==================================================================
+stages:
+  # Stage Preparatório: Configura tags, faz checkout e prepara templates Helm
+  - stage: Preparation
+    displayName: 'Preparação - Exibir Templates e Diffs (${{ parameters.environment }})'
+    pool: ${{ parameters.agentPool }}
+    jobs:
+    - job: Preparation
+      displayName: 'Mostrar Templates e Diffs'
+      continueOnError: ${{ parameters.bypassDiffCheck }}
+      steps:
+        # Exibe parâmetros do pipeline para debug quando System.Debug=true (Utilize somente o modo UI)
+        - task: VivoUtilsFromVivo@1
+          displayName: 'Show Pipeline Parameters'
+          condition: eq(variables['System.Debug'], 'true')
+          inputs:
+            command: 'show-pipeline-parameters'
+            parameters: '${{ convertToJson(parameters) }}'
+
+        - ${{ if or( eq(parameters.enableCanaryDeployment, true ), eq(parameters.enableBlueGreenDeployment, true)) }}:
+          - script: |         
+              echo "##vso[task.logissue type=warning]Parâmetros deprecados detectados neste pipeline"
+              echo ""
+              echo "##[warning] - enableBlueGreenDeployment está deprecado. Use deployStrategy: BlueGreen"
+              echo "##[warning] - enableCanaryDeployment está deprecado. Use deployStrategy: Canary"
+              echo ""
+              echo "##[warning] Os parâmetros 'deprecated' serão removidos em versão futura do pipeline."
+
+              echo "##vso[task.complete result=Failed;]"
+            continueOnError: true
+            displayName: 'Validar Parâmetros de Pipeline'
+
+        # Previne que utilize valores de prod em ambientes de non-prod
+        - task: VivoUtilsFromVivo@1
+          displayName: 'Validar Parâmetros de Ambiente'
+          inputs:
+            command: 'validate-environment-parameters'
+            parameters: '${{ convertToJson(parameters) }}'
+            environment: '${{ parameters.environment }}'
+
+        # Adiciona tags customizadas para categorização de build
+        - script: |
+            echo "##vso[build.addbuildtag]helm"
+            echo "##vso[build.addbuildtag]kubernetes"
+            echo "##vso[build.addbuildtag]deploy-helm"
+          displayName: 'Definir tags'
+        
+        # Realiza checkout do repositório (profundidade mínima)
+        - checkout: self
+          fetchDepth: 1
+
+        - task: VersionManagerVivo@8
+          inputs:
+            command: 'setDeployVersion'
+            version: ${{ parameters.version }}
+            branchingStrategy: ${{ parameters.branchingStrategy }}
+          displayName: 'Definir Versão do Deploy'
+          name: VersionManagerVivo
+
+        - script: |         
+            echo "##vso[build.updatebuildnumber]deploy-${VERSION}-${ENVIRONMENT}"
+            echo "##vso[build.addbuildtag]version-${VERSION}"
+            echo "##vso[build.addbuildtag]environment-${ENVIRONMENT}"
+            echo "Version to be used: ${VERSION}"
+          displayName: 'Definir Número da Execução da Pipeline e Tags'
+          env:
+            VERSION: $(VersionManagerVivo.DEPLOY_VERSION)
+            ENVIRONMENT: ${{ parameters.environment }}
+
+        # Validação de Approvers nos Environments (apenas se Blue/Green habilitado)
+        - ${{ if or(eq(parameters.deployStrategy, 'BlueGreen'), and(eq(parameters.deployStrategy, 'RollingUpdate'), eq(parameters.enableBlueGreenDeployment, true))) }}:
+          - task: VivoUtilsFromVivo@1
+            displayName: 'Validar Approvers nos Environments Blue/Green'
+            inputs:
+              command: 'validate-environment-approvers'
+              environmentBaseName: 'deploy-${{ parameters.environment }}'
+            env:
+              SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+
+        # Validação de Approvers nos Environments (apenas se Canary habilitado)
+        - ${{ if or(eq(parameters.deployStrategy, 'Canary'), and(eq(parameters.deployStrategy, 'RollingUpdate'), eq(parameters.enableCanaryDeployment, true))) }}:
+          - task: Bash@3
+            displayName: 'Validar Approvers nos Environments Canary'
+            inputs:
+              targetType: 'inline'
+              script: |
+                echo "Validando Approvers para Canary Deployment"
+
+                # Verifica ambiente promote
+                ENVIRONMENT_PROMOTE_RESPONSE=$(curl -s -u ":${TOKEN}" \
+                    -H "Accept: application/json" \
+                    -w "%{http_code}" \
+                    -o temp_promote_response.json \
+                    "${ORG_URL}${PROJECT_ID}/_apis/pipelines/environments?name=$ENVIRONMENT_NAME-promote")
+
+                PROMOTE_BODY_RESPONSE=$(cat temp_promote_response.json)
+
+                # Verifica ambiente rollback
+                ENVIRONMENT_ROLLBACK_RESPONSE=$(curl -s -u ":${TOKEN}" \
+                    -H "Accept: application/json" \
+                    -w "%{http_code}" \
+                    -o temp_rollback_response.json \
+                    "${ORG_URL}${PROJECT_ID}/_apis/pipelines/environments?name=$ENVIRONMENT_NAME-rollback")
+
+                ROLLBACK_BODY_RESPONSE=$(cat temp_rollback_response.json)
+
+                # Validação do ambiente promote
+                if [[ "$PROMOTE_BODY_RESPONSE" == '{"count":0,"value":[]}' ]]; then
+                    echo -e "\033[31m##############################################################################"
+                    echo -e "\033[31m#                  ERROR: No Promote Environment Found                        #"
+                    echo -e "\033[31m#         Verify that the user '<project> Build Service (organization)'      #"
+                    echo -e "\033[31m#        has read permissions for the Promote environment.                   #"
+                    echo -e "\033[31m##############################################################################"
+                    exit 1
+                fi
+
+                # Validação do ambiente rollback
+                if [[ "$ROLLBACK_BODY_RESPONSE" == '{"count":0,"value":[]}' ]]; then
+                    echo -e "\033[31m##############################################################################"
+                    echo -e "\033[31m#                  ERROR: No Rollback Environment Found                       #"
+                    echo -e "\033[31m#         Verify that the user '<project> Build Service (organization)'      #"
+                    echo -e "\033[31m#        has read permissions for the Rollback environment.                  #"
+                    echo -e "\033[31m##############################################################################"
+                    exit 1
+                fi
+
+                # Obter IDs dos environments
+                PROMOTE_ENV_ID=$(echo "$PROMOTE_BODY_RESPONSE" | jq -r --arg ENVIRONMENT_NAME "$ENVIRONMENT_NAME" '.value[] | select(.name == ($ENVIRONMENT_NAME + "-promote")) | .id')
+                ROLLBACK_ENV_ID=$(echo "$ROLLBACK_BODY_RESPONSE" | jq -r --arg ENVIRONMENT_NAME "$ENVIRONMENT_NAME" '.value[] | select(.name == ($ENVIRONMENT_NAME + "-rollback")) | .id')
+
+                echo "Environment IDs: Promote=$PROMOTE_ENV_ID, Rollback=$ROLLBACK_ENV_ID"
+
+                # Verificar approvers no ambiente promote
+                CHECKERS_RESPONSE_PROMOTE=$(curl -s -u ":${TOKEN}" \
+                    -H "Accept: application/json" \
+                    "${ORG_URL}${PROJECT_ID}/_apis/pipelines/checks/configurations/?api-version=7.1-preview.1&resourceType=environment&resourceId=$PROMOTE_ENV_ID")
+
+                APPROVAL_COUNT_PROMOTE=$(echo "$CHECKERS_RESPONSE_PROMOTE" | jq '[.value[] | select(.type.name == "Approval")] | length')
+
+                # Verificar approvers no ambiente rollback
+                CHECKERS_RESPONSE_ROLLBACK=$(curl -s -u ":${TOKEN}" \
+                    -H "Accept: application/json" \
+                    "${ORG_URL}${PROJECT_ID}/_apis/pipelines/checks/configurations/?api-version=7.1-preview.1&resourceType=environment&resourceId=$ROLLBACK_ENV_ID")
+
+                APPROVAL_COUNT_ROLLBACK=$(echo "$CHECKERS_RESPONSE_ROLLBACK" | jq '[.value[] | select(.type.name == "Approval")] | length')
+
+                if [ "$APPROVAL_COUNT_PROMOTE" -gt 0 ] && [ "$APPROVAL_COUNT_ROLLBACK" -gt 0 ]; then
+                  echo -e "\033[32m##############################################################################"
+                  echo -e "\033[32m#                                 PASSED:                                    #"
+                  echo -e "\033[32m#  Approvers exist in Promote and Rollback Environments.                     #"
+                  echo -e "\033[32m##############################################################################"
+                elif [ "$APPROVAL_COUNT_PROMOTE" -lt 1 ]; then
+                  echo -e "\033[31m##############################################################################"
+                  echo -e "\033[31m#                          ERROR: No Approvers Found                         #"
+                  echo -e "\033[31m#                  No approvers found for Promote environment                #"
+                  echo -e "\033[31m##############################################################################"
+                  exit 1
+                elif [ "$APPROVAL_COUNT_ROLLBACK" -lt 1 ]; then
+                  echo -e "\033[31m##############################################################################"
+                  echo -e "\033[31m#                          ERROR: No Approvers Found                         #"
+                  echo -e "\033[31m#                  No approvers found for Rollback environment               #"
+                  echo -e "\033[31m##############################################################################"
+                  exit 1
+                else
+                  echo -e "\033[31m##############################################################################"
+                  echo -e "\033[31m#                                 ERROR:                                     #"
+                  echo -e "\033[31m#          An unexpected error occurred while verifying approvers            #"
+                  echo -e "\033[31m##############################################################################"
+                  exit 1
+                fi
+            env:
+              ORG_URL: $(System.CollectionUri)
+              PROJECT_ID: $(System.TeamProjectId)
+              ENVIRONMENT_NAME: deploy-${{ parameters.environment }}
+              TOKEN: $(System.AccessToken)
+        - ${{ if eq(parameters.useAKSManagedIdentity, true) }}:
+          - task: Kubernetes@1
+            displayName: 'Login no AKS'
+            inputs:
+              connectionType: 'Azure Resource Manager'
+              azureSubscriptionEndpoint: ${{ parameters.aksServiceConnection[parameters.environment] }}
+              azureResourceGroup: ${{ parameters.aksResourceGroup[parameters.environment] }}
+              kubernetesCluster: ${{ parameters.aksClusterName[parameters.environment] }}
+              namespace: ${{ parameters.k8sNamespace[parameters.environment] }}
+              command: 'login'
+
+        - ${{ if eq(parameters.useKubeconfig, true) }}:
+          - task: Kubernetes@1
+            displayName: 'Login no Kubernetes via Kubeconfig'
+            inputs:
+              connectionType: 'Kubernetes Service Connection'
+              kubernetesServiceEndpoint: ${{ parameters.kubeconfigServiceConnection[parameters.environment] }}
+              namespace: ${{ parameters.k8sNamespace[parameters.environment] }}
+              command: 'login'
+        
+        # Validação de infraestrutura Argo Rollouts (CRD + versão do controller)
+        # Executa quando deployStrategy != RollingUpdate OU booleans deprecated estão ativos
+        - ${{ if or(ne(parameters.deployStrategy, 'RollingUpdate'), eq(parameters.enableBlueGreenDeployment, true), eq(parameters.enableCanaryDeployment, true)) }}:
+          - task: K8sUtilsFromVivo@3
+            displayName: 'Validar Argo Rollouts instalado no cluster'
+            inputs:
+              command: 'validate-argo-rollouts-installed'
+
+          - task: Bash@3
+            displayName: 'Validar versão do Argo Rollouts controller'
+            continueOnError: true
+            inputs:
+              targetType: 'inline'
+              script: |
+                set -euo pipefail
+
+                echo "##[section]Validando versão do Argo Rollouts controller..."
+
+                REQUIRED_VERSION="${ARGO_MIN_VERSION}"
+
+                # Verifica se kubectl-argo-rollouts está disponível
+                if ! command -v kubectl-argo-rollouts &> /dev/null; then
+                  echo "##[error] kubectl-argo-rollouts CLI não encontrado. Instale-o no agent."
+                  exit 1
+                fi
+
+                # Obtém versão do controller no cluster
+                CONTROLLER_VERSION=$(kubectl-argo-rollouts version 2>/dev/null | grep 'argo-rollouts' | head -1 | sed -E 's/.*v([0-9]+\.[0-9]+\.[0-9]+).*/\1/' || echo "")
+
+                if [[ -z "$CONTROLLER_VERSION" ]]; then
+                  echo "##[warning] Não foi possível obter a versão do Argo Rollouts controller"
+                  echo "##[warning] Continuando sem validação de versão..."
+                  exit 0
+                fi
+
+                echo "##[debug] Versão do controller: ${CONTROLLER_VERSION}"
+                echo "##[debug] Versão mínima requerida: ${REQUIRED_VERSION}"
+
+                # Comparação de versão semântica
+                version_ge() {
+                  [ "$1" = "$2" ] && return 0
+                  local IFS=.
+                  local i ver1=($1) ver2=($2)
+                  for ((i=0; i<${#ver2[@]}; i++)); do
+                    if [[ -z ${ver1[i]+x} ]]; then
+                      return 1
+                    fi
+                    if ((10#${ver1[i]} > 10#${ver2[i]})); then
+                      return 0
+                    fi
+                    if ((10#${ver1[i]} < 10#${ver2[i]})); then
+                      return 1
+                    fi
+                  done
+                  return 0
+                }
+
+                if version_ge "$CONTROLLER_VERSION" "$REQUIRED_VERSION"; then
+                  echo -e "\033[32m##############################################################################"
+                  echo -e "\033[32m#                                 PASSED:                                    #"
+                  echo -e "\033[32m#       Argo Rollouts controller v${CONTROLLER_VERSION} >= v${REQUIRED_VERSION}                   #"
+                  echo -e "\033[32m##############################################################################"
+                else
+                  echo -e "\033[31m##############################################################################"
+                  echo -e "\033[31m#                                  ERROR:                                    #"
+                  echo -e "\033[31m#       Argo Rollouts controller v${CONTROLLER_VERSION} < v${REQUIRED_VERSION} (mínimo)            #"
+                  echo -e "\033[31m#       Atualize o Argo Rollouts controller no cluster.                     #"
+                  echo -e "\033[31m##############################################################################"
+                  exit 1
+                fi
+            env:
+              ARGO_MIN_VERSION: ${{ parameters.argoRolloutsMinVersion }}
+
+          # Validação de versão mínima do Helm Chart (apenas para generic-microservice)
+          - ${{ if eq(parameters.helmChartName, 'generic-microservice') }}:
+            - task: Bash@3
+              displayName: 'Validar versão mínima do Helm Chart para Argo Rollouts'
+              inputs:
+                targetType: 'inline'
+                script: |
+                  set -euo pipefail
+
+                  echo "##[section]Validando versão do Helm Chart..."
+                  
+                  CHART_VERSION="${CHART_VERSION}"
+                  MIN_VERSION="${MIN_VERSION}"
+
+                  echo "##[debug] Chart: generic-microservice v${CHART_VERSION}"
+                  echo "##[debug] Versão mínima requerida: v${MIN_VERSION}"
+
+                  # Comparação de versão semântica
+                  version_ge() {
+                    [ "$1" = "$2" ] && return 0
+                    local IFS=.
+                    local i ver1=($1) ver2=($2)
+                    for ((i=0; i<${#ver2[@]}; i++)); do
+                      if [[ -z ${ver1[i]+x} ]]; then
+                        return 1
+                      fi
+                      if ((10#${ver1[i]} > 10#${ver2[i]})); then
+                        return 0
+                      fi
+                      if ((10#${ver1[i]} < 10#${ver2[i]})); then
+                        return 1
+                      fi
+                    done
+                    return 0
+                  }
+
+                  if version_ge "$CHART_VERSION" "$MIN_VERSION"; then
+                    echo -e "\033[32m##############################################################################"
+                    echo -e "\033[32m#                                 PASSED:                                    #"
+                    echo -e "\033[32m#     generic-microservice v${CHART_VERSION} >= v${MIN_VERSION} (mínimo)                  #"
+                    echo -e "\033[32m##############################################################################"
+                  else
+                    echo "##[error] Helm Chart generic-microservice v${CHART_VERSION} < v${MIN_VERSION} (mínimo para Argo Rollouts)"
+                    echo "##[error] Atualize o parâmetro helmChartVersion para >= ${MIN_VERSION}"
+                    exit 1
+                  fi
+              env:
+                CHART_VERSION: ${{ parameters.helmChartVersion }}
+                MIN_VERSION: ${{ parameters.helmChartMinVersion }}
+
+        # Obtém segredos do Azure Key Vault compartilhado
+        - task: AzureKeyVault@2
+          displayName: 'Obter credenciais do Helm Registry'
+          timeoutInMinutes: 1
+          retryCountOnTaskFailure: 5
+          inputs:
+            azureSubscription: DevOpsSharedResources
+            KeyVaultName: kv-azdevops-shared
+            ${{ if eq(parameters.useHelmRepoFromNexus, true) }}:
+              SecretsFilter: HELM-REGISTRY-NEXUS-USERNAME, HELM-REGISTRY-NEXUS-PASSWORD
+            ${{ else }}:
+              SecretsFilter: HELM-REGISTRY-ACR-USERNAME, HELM-REGISTRY-ACR-PASSWORD
+
+        # Obtém credenciais do Docker Registry (apenas para clusters on-premise)
+        - ${{ if eq(parameters.useKubeconfig, true) }}:
+          - ${{ if ne(parameters.createDockerConfigSecret, 'none') }}:
+            - task: AzureKeyVault@2
+              displayName: 'Obter credenciais do Registry'
+              timeoutInMinutes: 1
+              retryCountOnTaskFailure: 5
+              inputs:
+                azureSubscription: DevOpsSharedResources
+                KeyVaultName: kv-azdevops-shared
+                SecretsFilter: DOCKER-REGISTRY-USERNAME, DOCKER-REGISTRY-PASSWORD
+
+        # Configura repositório Helm Nexus
+        - ${{ if eq(parameters.useHelmRepoFromNexus, true) }}:
+          - task: K8sUtilsFromVivo@3
+            displayName: 'Registrar repositório Helm ${{ parameters.helmRepoName }}'
+            inputs:
+              command: 'helm-registry-login'
+              helmRegistryUrl: ${{ parameters.helmRepoUrlNexus }}
+              helmRegistryName: ${{ parameters.helmRepoName }}
+              helmUsername: $(HELM-REGISTRY-NEXUS-USERNAME)
+              helmPassword: $(HELM-REGISTRY-NEXUS-PASSWORD)
+              helmInsecureSkipTlsVerify: true
+        # Configura repositório Helm ACR
+        - ${{ if eq(parameters.useHelmRepoFromNexus, false) }}:
+          - task: K8sUtilsFromVivo@3
+            displayName: 'Registrar repositório Helm ${{ parameters.helmRepoUrlACR }}'
+            inputs:
+              command: 'helm-registry-login'
+              helmRegistryUrl: ${{ parameters.helmRepoUrlACR }}
+              helmUsername: $(HELM-REGISTRY-ACR-USERNAME)
+              helmPassword: $(HELM-REGISTRY-ACR-PASSWORD)
+
+        # Preparar arquivo values adicional com substituição de tokens (opcional)
+        # A substituição é feita em um arquivo temporário por segurança
+        # (evita commit acidental de valores substituídos no repositório)
+        - ${{ if eq(parameters.usePlaceholdersHelmValuesFile, true) }}:
+          - task: Bash@3
+            displayName: 'Copiar arquivo Values adicional para substituição'
+            inputs:
+              targetType: 'inline'
+              script: |
+                set -euo pipefail
+
+                echo "##[debug] Criando cópia temporária do arquivo values adicional"
+                echo "##[debug] Origem: ${PLACEHOLDERS_VALUES_PATH}"
+                echo "##[debug] Destino: ${REPLACED_PLACEHOLDERS_VALUES_TEMP_PATH}"
+                cp ${PLACEHOLDERS_VALUES_PATH} ${REPLACED_PLACEHOLDERS_VALUES_TEMP_PATH}
+            env:
+              PLACEHOLDERS_VALUES_PATH: "$(PLACEHOLDERS_VALUES_PATH)"
+              REPLACED_PLACEHOLDERS_VALUES_TEMP_PATH: "$(REPLACED_PLACEHOLDERS_VALUES_TEMP_PATH)"
+
+          - task: replacetokens@6
+            displayName: 'Substituir tokens no arquivo Values adicional'
+            inputs:
+              targetFiles: '$(REPLACED_PLACEHOLDERS_VALUES_TEMP_PATH)'
+              tokenPattern: 'custom'
+              tokenPrefix: '${{ parameters.placeholderPrefix }}'
+              tokenSuffix: '${{ parameters.placeholderSuffix }}'
+              verbosity: detailed
+              actionOnNoFiles: warn
+
+        # ==================================================================
+        # Construir argumentos --set-file do Helm
+        # ==================================================================
+        # Permite carregar conteúdo de arquivos do repositório em valores do Helm.
+        # Cada item deve estar no formato key=path/to/file.
+        # A variável HELM_SET_FILES_ARGS é aplicada nos comandos helm template e helm upgrade.
+        - ${{ if ne(length(parameters.helmSetFiles), 0) }}:
+          - task: Bash@3
+            displayName: 'Construir argumentos --set-file do Helm'
+            inputs:
+              targetType: 'inline'
+              script: |
+                set -euo pipefail
+
+                HELM_SET_FILES_JSON='${{ convertToJson(parameters.helmSetFiles) }}'
+                HELM_SET_FILES_ARGS=""
+
+                if [[ -n "$HELM_SET_FILES_JSON" && "$HELM_SET_FILES_JSON" != "[]" ]]; then
+                  HELM_SET_FILES_ARGS=$(echo "$HELM_SET_FILES_JSON" | jq -r '
+                    if type == "array" then
+                      .[] | if startswith("--set-file ") then . else "--set-file " + . end
+                    elif type == "string" then
+                      if startswith("--set-file ") then . else "--set-file " + . end
+                    else
+                      empty
+                    end
+                  ' | xargs -I {} echo -n "{} ")
+                fi
+
+                echo "##[debug] HELM_SET_FILES_ARGS: ${HELM_SET_FILES_ARGS}"
+                echo "##vso[task.setvariable variable=HELM_SET_FILES_ARGS]${HELM_SET_FILES_ARGS}"
+
+        # Gera templates Kubernetes a partir do Helm Chart
+        # Suporta múltiplos arquivos values: principal + adicional (sobrescreve)
+        - task: K8sUtilsFromVivo@3
+          displayName: 'Gerar templates Helm'
+          inputs:
+            command: 'helm-generate-templates'
+            helmReleaseName: ${{ parameters.helmReleaseName }}
+            helmChartPath: $(HELM_CHART_PATH)
+            helmChartVersion: ${{ parameters.helmChartVersion }}
+            namespace: ${{ parameters.k8sNamespace[parameters.environment] }}
+            helmValuesPath: $(VALUES_PATH)
+            ${{ if eq(parameters.usePlaceholdersHelmValuesFile, true) }}:
+              helmPlaceholdersValuesPath: $(REPLACED_PLACEHOLDERS_VALUES_TEMP_PATH)
+            helmImageTag: $(VersionManagerVivo.DEPLOY_VERSION)
+            helmAdditionalArgs: '$(HELM_SET_FILES_ARGS)'
+            helmOutputPath: $(TEMPLATES_FILE)
+
+        - task: K8sUtilsFromVivo@3
+          displayName: 'Debug templates Helm'
+          condition: always()
+          inputs:
+            command: 'debug-k8s-manifests'
+            debugK8sManifestPath: $(TEMPLATES_FILE)
+        
+        # Extrai imagens Docker referenciadas nos templates para envio ao Event Hub
+        - task: K8sUtilsFromVivo@3
+          name: ExtractImages 
+          inputs:
+            command: 'list-k8s-images'
+            templatesPath: $(TEMPLATES_FILE)
+            imagesVariableName: 'K8S_IMAGES'
+        # Extrai URLs de acesso referenciadas nos templates para envio ao Event Hub
+        - task: K8sUtilsFromVivo@3
+          name: ExtractUrls
+          inputs:
+            command: 'extract-k8s-url'
+            templatesPath: $(TEMPLATES_FILE)
+
+        # Exibe diferenças de recurso via kubectl diff
+        - task: K8sUtilsFromVivo@3
+          displayName: 'Comparar diffs do Helm'
+          inputs:
+            command: 'kubectl-diff'
+            manifestPath: $(TEMPLATES_FILE)
+            namespace: ${{ parameters.k8sNamespace[parameters.environment] }}
+
+        # Criar Secret para Pull de Imagens (apenas para clusters on-premise via Kubeconfig)
+        - ${{ if eq(parameters.useKubeconfig, true) }}:
+          - ${{ if ne(parameters.createDockerConfigSecret, 'none') }}:
+            - task: K8sUtilsFromVivo@3
+              displayName: 'Criar Secret para Pull de Imagens'
+              inputs:
+                command: 'create-secret-k8s-pull'
+                enableSecretCreation: true
+                ${{ if eq(parameters.createDockerConfigSecret, 'nexus') }}:
+                  registryType: 'nexus'
+                  dockerUsername: $(DOCKER-REGISTRY-USERNAME)
+                  dockerPassword: $(DOCKER-REGISTRY-PASSWORD)
+                  dockerServer: ${{ parameters.dockerRegistryNexus }}
+                  dockerEmail: ${{ parameters.dockerRegistryEmail }}
+                ${{ if eq(parameters.createDockerConfigSecret, 'acr') }}:
+                  registryType: 'acr'
+                  dockerUsername: $(DOCKER-REGISTRY-USERNAME)
+                  dockerPassword: $(DOCKER-REGISTRY-PASSWORD)
+                  dockerServer: ${{ parameters.dockerRegistryACR }}
+                  dockerEmail: ${{ parameters.dockerRegistryEmail }}
+                namespace: ${{ parameters.k8sNamespace[parameters.environment] }}
+
+        # Validação de requisitos Blue/Green
+        - ${{ if or(eq(parameters.deployStrategy, 'BlueGreen'), and(eq(parameters.deployStrategy, 'RollingUpdate'), eq(parameters.enableBlueGreenDeployment, true))) }}:        
+          - task: K8sUtilsFromVivo@3
+            name: ValidateBlueGreen
+            displayName: 'Validar requisitos Blue/Green Deployment'
+            inputs:
+              command: 'validate-bluegreen-requirements'
+              templatesPath: $(TEMPLATES_FILE)
+              helmValuesPath: $(VALUES_PATH)
+              namespace: ${{ parameters.k8sNamespace[parameters.environment] }}
+
+        # ==================================================================
+        # Set deploymentStrategy em values.yml
+        # ==================================================================
+        # Garante que o values.yml reflete a estratégia escolhida pelo parâmetro.
+        # Se a estratégia no values.yml difere do parâmetro, sobrescreve ambos os campos:
+        # deployment.strategy e deploymentStrategy.type
+        - ${{ if or(ne(parameters.deployStrategy, 'RollingUpdate'), eq(parameters.enableBlueGreenDeployment, true), eq(parameters.enableCanaryDeployment, true)) }}:
+          - task: Bash@3
+            displayName: 'Set deploymentStrategy no values.yml'
+            name: set_deploy_strategy
+            inputs:
+              targetType: 'inline'
+              script: |
+                set -euo pipefail
+
+                echo "##[section]Configurando deploymentStrategy no values.yml"
+
+                FILE_PATH="$(VALUES_PATH)"
+
+                if [ ! -f "$FILE_PATH" ]; then
+                  echo "##[error] Arquivo $FILE_PATH não encontrado."
+                  exit 1
+                fi
+
+                # Resolve estratégia final: deployStrategy param tem prioridade
+                # Se deployStrategy=RollingUpdate, verifica booleans deprecated
+                DESIRED_STRATEGY="${DEPLOY_STRATEGY}"
+                if [[ "$DESIRED_STRATEGY" == "RollingUpdate" ]]; then
+                  if [[ "${ENABLE_BLUEGREEN}" == "True" ]]; then
+                    DESIRED_STRATEGY="BlueGreen"
+                    echo "##[warning] Parâmetro enableBlueGreenDeployment (deprecated) detectado. Use deployStrategy: BlueGreen"
+                  elif [[ "${ENABLE_CANARY}" == "True" ]]; then
+                    DESIRED_STRATEGY="Canary"
+                    echo "##[warning] Parâmetro enableCanaryDeployment (deprecated) detectado. Use deployStrategy: Canary"
+                  fi
+                fi
+
+                # Lê estratégia atual do values.yml
+                CURRENT_STRATEGY=$(yq eval '.deployment.strategy' "$FILE_PATH")
+                if [[ -z "$CURRENT_STRATEGY" || "$CURRENT_STRATEGY" == "null" ]]; then
+                  CURRENT_STRATEGY=$(yq eval '.deploymentStrategy.type' "$FILE_PATH")
+                fi
+
+                echo "##[debug] Estratégia atual no values.yml: '${CURRENT_STRATEGY}'"
+                echo "##[debug] Estratégia desejada: '${DESIRED_STRATEGY}'"
+
+                if [[ "$CURRENT_STRATEGY" != "$DESIRED_STRATEGY" ]]; then
+                  echo "##[section]Atualizando estratégia de '${CURRENT_STRATEGY}' para '${DESIRED_STRATEGY}'"
+                  yq eval ".deployment.strategy = \"${DESIRED_STRATEGY}\" | .deploymentStrategy.type = \"${DESIRED_STRATEGY}\"" -i "$FILE_PATH"
+                  echo "##[section]✅ Arquivo values.yml atualizado com estratégia '${DESIRED_STRATEGY}'"
+                else
+                  echo "##[section]✅ Nenhuma alteração necessária — estratégia já é '${CURRENT_STRATEGY}'"
+                fi
+
+                # Exporta estratégia resolvida como variável para outros steps
+                echo "##vso[task.setvariable variable=RESOLVED_DEPLOY_STRATEGY;isOutput=true]${DESIRED_STRATEGY}"
+              workingDirectory: '$(Build.SourcesDirectory)'
+            env:
+              DEPLOY_STRATEGY: ${{ parameters.deployStrategy }}
+              ENABLE_BLUEGREEN: ${{ parameters.enableBlueGreenDeployment }}
+              ENABLE_CANARY: ${{ parameters.enableCanaryDeployment }}
+
+        # ==================================================================
+        # Check DeployType - Validar consistência da estratégia
+        # ==================================================================
+        # Valida que o values.yml contém a estratégia correta após ajuste.
+        # Detecta mismatches entre parâmetro e values.yml.
+        - ${{ if or(ne(parameters.deployStrategy, 'RollingUpdate'), eq(parameters.enableBlueGreenDeployment, true), eq(parameters.enableCanaryDeployment, true)) }}:
+          - task: Bash@3
+            displayName: 'Check DeployType - Validar estratégia no values.yml'
+            name: check_deploy_type
+            inputs:
+              targetType: 'inline'
+              script: |
+                set -euo pipefail
+
+                echo "##[debug] Checking deploy type"
+
+                FILE_PATH="$(VALUES_PATH)"
+
+                if [ ! -f "$FILE_PATH" ]; then
+                  echo "##[error] File $FILE_PATH not found."
+                  exit 1
+                fi
+
+                # Extrai a estratégia do values.yml
+                DEPLOYMENT_STRATEGY=$(yq eval '.deployment.strategy' "$FILE_PATH")
+                if [[ -z "$DEPLOYMENT_STRATEGY" || "$DEPLOYMENT_STRATEGY" == "null" ]]; then
+                  DEPLOYMENT_STRATEGY=$(yq eval '.deploymentStrategy.type' "$FILE_PATH")
+                fi
+
+                echo ""
+                echo "##[debug] DEPLOYMENT_STRATEGY = $DEPLOYMENT_STRATEGY"
+                echo "##[debug] DEPLOY_STRATEGY_PARAM = $DEPLOY_STRATEGY"
+                echo ""
+
+                # Resolve estratégia esperada
+                EXPECTED_STRATEGY="$DEPLOY_STRATEGY"
+                if [[ "$EXPECTED_STRATEGY" == "RollingUpdate" ]]; then
+                  if [[ "${ENABLE_BLUEGREEN}" == "True" ]]; then
+                    EXPECTED_STRATEGY="BlueGreen"
+                  elif [[ "${ENABLE_CANARY}" == "True" ]]; then
+                    EXPECTED_STRATEGY="Canary"
+                  fi
+                fi
+
+                # Validação de consistência
+                if [[ "$DEPLOYMENT_STRATEGY" == "$EXPECTED_STRATEGY" ]]; then
+                  echo -e "\033[32m##############################################################################"
+                  echo -e "\033[32m#                                 PASSED:                                    #"
+                  echo -e "\033[32m#         DeployType validation (${DEPLOYMENT_STRATEGY})                     #"
+                  echo -e "\033[32m##############################################################################"
+                elif [[ "$DEPLOYMENT_STRATEGY" == "RollingUpdate" ]]; then
+                  echo -e "\033[31m##############################################################################"
+                  echo -e "\033[31m#                          NOT APPROVED: RollingUpdate                       #"
+                  echo -e "\033[31m#   values.yml has RollingUpdate but pipeline expects ${EXPECTED_STRATEGY}!  #"
+                  echo -e "\033[31m#   O step 'Set deploymentStrategy' deveria ter corrigido isto.              #"
+                  echo -e "\033[31m##############################################################################"
+                  exit 1
+                else
+                  echo -e "\033[31m##############################################################################"
+                  echo -e "\033[31m#                          ERROR: Strategy Mismatch                          #"
+                  echo -e "\033[31m#   values.yml: ${DEPLOYMENT_STRATEGY} | pipeline: ${EXPECTED_STRATEGY}      #"
+                  echo -e "\033[31m##############################################################################"
+                  exit 1
+                fi
+              workingDirectory: '$(Build.SourcesDirectory)'
+            env:
+              DEPLOY_STRATEGY: ${{ parameters.deployStrategy }}
+              ENABLE_BLUEGREEN: ${{ parameters.enableBlueGreenDeployment }}
+              ENABLE_CANARY: ${{ parameters.enableCanaryDeployment }}
+
+        # Validação de requisitos Canary
+        - ${{ if or(eq(parameters.deployStrategy, 'Canary'), and(eq(parameters.deployStrategy, 'RollingUpdate'), eq(parameters.enableCanaryDeployment, true))) }}:
+          - task: Bash@3
+            name: ValidateCanary
+            displayName: 'Validar requisitos Canary Deployment'
+            inputs:
+              targetType: 'inline'
+              script: |
+                echo "##[debug] Validando requisitos para Canary Deployment"
+                echo "##[section] Verificando configuração Canary no values.yml"
+
+                FILE_PATH="$(VALUES_PATH)"
+
+                if [ ! -f "$FILE_PATH" ]; then
+                  echo "File $FILE_PATH not found."
+                  exit 1
+                fi
+
+                # Verifica se existe configuração de canary no values
+                CANARY_CONFIG=$(yq eval '.deployment.canary // .deploymentStrategy.canary' "$FILE_PATH")
+
+                if [[ -z "$CANARY_CONFIG" || "$CANARY_CONFIG" == "null" ]]; then
+                  echo -e "\033[33m##############################################################################"
+                  echo -e "\033[33m#                               WARNING:                                     #"
+                  echo -e "\033[33m#       No Canary configuration found in values.yml                          #"
+                  echo -e "\033[33m#       Using default Canary strategy from Helm Chart                        #"
+                  echo -e "\033[33m##############################################################################"
+                else
+                  echo -e "\033[32m##############################################################################"
+                  echo -e "\033[32m#                                 PASSED:                                    #"
+                  echo -e "\033[32m#            Canary configuration found in values.yml                        #"
+                  echo -e "\033[32m##############################################################################"
+                fi
+              workingDirectory: '$(Build.SourcesDirectory)'
+
+
+  - stage: Deploy
+    displayName: 'Deploy - Aplicar Helm Chart em ${{ parameters.environment }}'
+    pool: ${{ parameters.agentPool }}
+    jobs:
+    - deployment: 'helmDeployment'
+      displayName: Deploy em ${{ parameters.environment }}
+      environment:
+        name: deploy-${{ parameters.environment }}
+      variables:
+        - name: K8S_IMAGES
+          value: $[ stageDependencies.Preparation.Preparation.outputs['ExtractImages.K8S_IMAGES'] ]
+        - name: K8S_APP_URL_LIST
+          value: $[ stageDependencies.Preparation.Preparation.outputs['ExtractUrls.K8S_APP_URL_LIST'] ]
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+              - checkout: self
+                fetchDepth: 1
+
+              - task: VersionManagerVivo@8
+                inputs:
+                  command: 'setDeployVersion'
+                  branchingStrategy: ${{ parameters.branchingStrategy }}
+                  version: ${{ parameters.version }}
+                displayName: 'Definir Versão do Deploy'
+                name: VersionManagerVivo
+
+              - script: |         
+                  echo "##vso[build.updatebuildnumber]deploy-${VERSION}-${ENVIRONMENT}"
+                  echo "##vso[build.addbuildtag]version-${VERSION}"
+                  echo "##vso[build.addbuildtag]environment-${ENVIRONMENT}"
+                  echo "Version to be used: ${VERSION}"
+                displayName: 'Definir Número da Execução da Pipeline e Tags'
+                env:
+                  VERSION: $(VersionManagerVivo.DEPLOY_VERSION)
+                  ENVIRONMENT: ${{ parameters.environment }}
+
+
+              - ${{ if eq(parameters.useAKSManagedIdentity, true) }}:
+                - task: Kubernetes@1
+                  displayName: 'Login no AKS ${{ parameters.environment }} via Managed Identity'
+                  inputs:
+                    connectionType: 'Azure Resource Manager'
+                    azureSubscriptionEndpoint: ${{ parameters.aksServiceConnection[parameters.environment] }}
+                    azureResourceGroup: ${{ parameters.aksResourceGroup[parameters.environment] }}
+                    kubernetesCluster: ${{ parameters.aksClusterName[parameters.environment] }}
+                    namespace: ${{ parameters.k8sNamespace[parameters.environment] }}
+                    command: 'login'
+
+              - ${{ if eq(parameters.useKubeconfig, true) }}:
+                - task: Kubernetes@1
+                  displayName: 'Login no Kubernetes ${{ parameters.environment }} via Kubeconfig'
+                  inputs:
+                    connectionType: 'Kubernetes Service Connection'
+                    kubernetesServiceEndpoint: ${{ parameters.kubeconfigServiceConnection[parameters.environment] }}
+                    namespace: ${{ parameters.k8sNamespace[parameters.environment] }}
+                    command: 'login'
+
+              # Obtém segredos do Azure Key Vault compartilhado
+              - task: AzureKeyVault@2
+                displayName: 'Obter credenciais do Helm Registry'
+                timeoutInMinutes: 1
+                retryCountOnTaskFailure: 5
+                inputs:
+                  azureSubscription: DevOpsSharedResources
+                  KeyVaultName: kv-azdevops-shared
+                  ${{ if eq(parameters.useHelmRepoFromNexus, true) }}:
+                    SecretsFilter: HELM-REGISTRY-NEXUS-USERNAME, HELM-REGISTRY-NEXUS-PASSWORD
+                  ${{ else }}:
+                    SecretsFilter: HELM-REGISTRY-ACR-USERNAME, HELM-REGISTRY-ACR-PASSWORD
+
+              # Configura repositório Helm Nexus
+              - ${{ if eq(parameters.useHelmRepoFromNexus, true) }}:
+                - task: K8sUtilsFromVivo@3
+                  displayName: 'Registrar repositório Helm ${{ parameters.helmRepoName }}'
+                  inputs:
+                    command: 'helm-registry-login'
+                    helmRegistryUrl: ${{ parameters.helmRepoUrlNexus }}
+                    helmRegistryName: ${{ parameters.helmRepoName }}
+                    helmUsername: $(HELM-REGISTRY-NEXUS-USERNAME)
+                    helmPassword: $(HELM-REGISTRY-NEXUS-PASSWORD)
+                    helmInsecureSkipTlsVerify: true
+
+              # Configura repositório Helm ACR
+              - ${{ if eq(parameters.useHelmRepoFromNexus, false) }}:
+                - task: K8sUtilsFromVivo@3
+                  displayName: 'Registrar repositório Helm ${{ parameters.helmRepoUrlACR }}'
+                  inputs:
+                    command: 'helm-registry-login'
+                    helmRegistryUrl: ${{ parameters.helmRepoUrlACR }}
+                    helmUsername: $(HELM-REGISTRY-ACR-USERNAME)
+                    helmPassword: $(HELM-REGISTRY-ACR-PASSWORD)
+
+              # Preparar arquivo values adicional com substituição de tokens (opcional)
+              # A substituição é feita em um arquivo temporário por segurança
+              # (evita commit acidental de valores substituídos no repositório)
+              - ${{ if eq(parameters.usePlaceholdersHelmValuesFile, true) }}:
+                - task: Bash@3
+                  displayName: 'Copiar arquivo Values adicional para substituição'
+                  inputs:
+                    targetType: 'inline'
+                    script: |
+                      set -euo pipefail
+
+                      echo "##[debug] Criando cópia temporária do arquivo values adicional"
+                      echo "##[debug] Origem: ${PLACEHOLDERS_VALUES_PATH}"
+                      echo "##[debug] Destino: ${REPLACED_PLACEHOLDERS_VALUES_TEMP_PATH}"
+                      cp ${PLACEHOLDERS_VALUES_PATH} ${REPLACED_PLACEHOLDERS_VALUES_TEMP_PATH}
+                  env:
+                    PLACEHOLDERS_VALUES_PATH: "$(PLACEHOLDERS_VALUES_PATH)"
+                    REPLACED_PLACEHOLDERS_VALUES_TEMP_PATH: "$(REPLACED_PLACEHOLDERS_VALUES_TEMP_PATH)"
+
+                # Substituir tokens no arquivo values adicional (se habilitado)
+                # Este arquivo sobrescreverá valores do values.yaml principal
+                - task: replacetokens@6
+                  displayName: 'Substituir tokens no arquivo Values adicional'
+                  inputs:
+                    targetFiles: '$(REPLACED_PLACEHOLDERS_VALUES_TEMP_PATH)'
+                    tokenPattern: 'custom'
+                    tokenPrefix: '${{ parameters.placeholderPrefix }}'
+                    tokenSuffix: '${{ parameters.placeholderSuffix }}'
+                    verbosity: detailed
+                    actionOnNoFiles: warn
+
+              # ==================================================================
+              # Set deploymentStrategy no values.yml (Deploy stage)
+              # ==================================================================
+              # Necessário repetir no Deploy porque o checkout: self traz código limpo.
+              # Garante que o values.yml reflete a estratégia escolhida pelo parâmetro.
+              - ${{ if or(ne(parameters.deployStrategy, 'RollingUpdate'), eq(parameters.enableBlueGreenDeployment, true), eq(parameters.enableCanaryDeployment, true)) }}:
+                - task: Bash@3
+                  displayName: 'Set deploymentStrategy no values.yml'
+                  inputs:
+                    targetType: 'inline'
+                    script: |
+                      set -euo pipefail
+
+                      echo "##[section]Configurando deploymentStrategy no values.yml"
+
+                      FILE_PATH="$(VALUES_PATH)"
+
+                      if [ ! -f "$FILE_PATH" ]; then
+                        echo "##[error] Arquivo $FILE_PATH não encontrado."
+                        exit 1
+                      fi
+
+                      # Resolve estratégia final: deployStrategy param tem prioridade
+                      DESIRED_STRATEGY="${DEPLOY_STRATEGY}"
+                      if [[ "$DESIRED_STRATEGY" == "RollingUpdate" ]]; then
+                        if [[ "${ENABLE_BLUEGREEN}" == "True" ]]; then
+                          DESIRED_STRATEGY="BlueGreen"
+                          echo "##[warning] Parâmetro enableBlueGreenDeployment (deprecated) detectado. Use deployStrategy: BlueGreen"
+                        elif [[ "${ENABLE_CANARY}" == "True" ]]; then
+                          DESIRED_STRATEGY="Canary"
+                          echo "##[warning] Parâmetro enableCanaryDeployment (deprecated) detectado. Use deployStrategy: Canary"
+                        fi
+                      fi
+
+                      CURRENT_STRATEGY=$(yq eval '.deployment.strategy' "$FILE_PATH")
+                      if [[ -z "$CURRENT_STRATEGY" || "$CURRENT_STRATEGY" == "null" ]]; then
+                        CURRENT_STRATEGY=$(yq eval '.deploymentStrategy.type' "$FILE_PATH")
+                      fi
+
+                      echo "##[debug] Estratégia atual no values.yml: '${CURRENT_STRATEGY}'"
+                      echo "##[debug] Estratégia desejada: '${DESIRED_STRATEGY}'"
+
+                      if [[ "$CURRENT_STRATEGY" != "$DESIRED_STRATEGY" ]]; then
+                        echo "##[section]Atualizando estratégia de '${CURRENT_STRATEGY}' para '${DESIRED_STRATEGY}'"
+                        yq eval ".deployment.strategy = \"${DESIRED_STRATEGY}\" | .deploymentStrategy.type = \"${DESIRED_STRATEGY}\"" -i "$FILE_PATH"
+                        echo "##[section]✅ Arquivo values.yml atualizado com estratégia '${DESIRED_STRATEGY}'"
+                      else
+                        echo "##[section]✅ Nenhuma alteração necessária — estratégia já é '${CURRENT_STRATEGY}'"
+                      fi
+                    workingDirectory: '$(Build.SourcesDirectory)'
+                  env:
+                    DEPLOY_STRATEGY: ${{ parameters.deployStrategy }}
+                    ENABLE_BLUEGREEN: ${{ parameters.enableBlueGreenDeployment }}
+                    ENABLE_CANARY: ${{ parameters.enableCanaryDeployment }}
+
+              # ==================================================================
+              # Construir argumentos --set-file do Helm
+              # ==================================================================
+              # Permite carregar conteúdo de arquivos do repositório em valores do Helm.
+              # Cada item deve estar no formato key=path/to/file.
+              # A variável HELM_SET_FILES_ARGS é aplicada nos comandos helm upgrade.
+              - ${{ if ne(length(parameters.helmSetFiles), 0) }}:
+                - task: Bash@3
+                  displayName: 'Construir argumentos --set-file do Helm'
+                  name: buildHelmSetFilesArgs
+                  inputs:
+                    targetType: 'inline'
+                    script: |
+                      set -euo pipefail
+
+                      HELM_SET_FILES_JSON='${{ convertToJson(parameters.helmSetFiles) }}'
+                      HELM_SET_FILES_ARGS=""
+
+                      if [[ -n "$HELM_SET_FILES_JSON" && "$HELM_SET_FILES_JSON" != "[]" ]]; then
+                        HELM_SET_FILES_ARGS=$(echo "$HELM_SET_FILES_JSON" | jq -r '
+                          if type == "array" then
+                            .[] | if startswith("--set-file ") then . else "--set-file " + . end
+                          elif type == "string" then
+                            if startswith("--set-file ") then . else "--set-file " + . end
+                          else
+                            empty
+                          end
+                        ' | xargs -I {} echo -n "{} ")
+                      fi
+
+                      echo "##[debug] HELM_SET_FILES_ARGS: ${HELM_SET_FILES_ARGS}"
+                      echo "##vso[task.setvariable variable=HELM_SET_FILES_ARGS]${HELM_SET_FILES_ARGS}"
+
+              # ==================================================================
+              # Detecção de Rollout existente e Migração
+              # ==================================================================
+              # Verifica se existe um Rollout no cluster e detecta a estratégia atual.
+              # Também detecta se precisa migrar de Deployment para Rollout.
+              - ${{ if or(ne(parameters.deployStrategy, 'RollingUpdate'), eq(parameters.enableBlueGreenDeployment, true), eq(parameters.enableCanaryDeployment, true)) }}:
+                - task: Bash@3
+                  displayName: 'Detectar Rollout existente e estratégia atual'
+                  name: detectRollout
+                  inputs:
+                    targetType: 'inline'
+                    script: |
+                      set -euo pipefail
+
+                      echo "##[section]Detectando Rollout existente para '${ROLLOUT_NAME}' em '${NAMESPACE}'"
+
+                      # Resolve estratégia desejada
+                      DESIRED="${DEPLOY_STRATEGY}"
+                      if [[ "$DESIRED" == "RollingUpdate" ]]; then
+                        if [[ "${ENABLE_BLUEGREEN}" == "True" ]]; then
+                          DESIRED="BlueGreen"
+                        elif [[ "${ENABLE_CANARY}" == "True" ]]; then
+                          DESIRED="Canary"
+                        fi
+                      fi
+
+                      # Inicializa variáveis
+                      CURRENT_ROLLOUT_STRATEGY="none"
+                      NEEDS_STRATEGY_CHANGE="false"
+                      IS_MIGRATION="false"
+
+                      # Verifica se Rollout existe (usa API group explícito)
+                      if kubectl get rollout.argoproj.io "${ROLLOUT_NAME}" -n "${NAMESPACE}" --no-headers >/dev/null 2>&1; then
+                        echo "##[debug] Rollout '${ROLLOUT_NAME}' existe no cluster"
+
+                        # Detecta estratégia atual
+                        BG_STRATEGY=$(kubectl get rollout.argoproj.io "${ROLLOUT_NAME}" -n "${NAMESPACE}" -o jsonpath='{.spec.strategy.blueGreen}' 2>/dev/null || echo "")
+                        CANARY_STRATEGY=$(kubectl get rollout.argoproj.io "${ROLLOUT_NAME}" -n "${NAMESPACE}" -o jsonpath='{.spec.strategy.canary}' 2>/dev/null || echo "")
+
+                        if [[ -n "$BG_STRATEGY" && "$BG_STRATEGY" != "null" && "$BG_STRATEGY" != "{}" ]]; then
+                          CURRENT_ROLLOUT_STRATEGY="BlueGreen"
+                        elif [[ -n "$CANARY_STRATEGY" && "$CANARY_STRATEGY" != "null" && "$CANARY_STRATEGY" != "{}" ]]; then
+                          CURRENT_ROLLOUT_STRATEGY="Canary"
+                        else
+                          CURRENT_ROLLOUT_STRATEGY="RollingUpdate"
+                        fi
+
+                        echo "##[debug] Estratégia atual do Rollout: ${CURRENT_ROLLOUT_STRATEGY}"
+
+                        # Verifica se precisa mudar estratégia RollingUpdate → RollingUpdateRollout
+                        if [[ "$CURRENT_ROLLOUT_STRATEGY" == "RollingUpdate" && "$DESIRED" != "RollingUpdate" ]]; then
+                          NEEDS_STRATEGY_CHANGE="true"
+                          echo "##[warning] Rollout existe com RollingUpdate mas estratégia desejada é ${DESIRED}"
+                        fi
+                      else
+                        echo "##[debug] Rollout '${ROLLOUT_NAME}' NÃO existe no cluster"
+
+                        # Verifica se existe um Helm release (possível Deployment que precisa migrar para Rollout)
+                        RELEASE_EXISTS=$(helm list -n "${NAMESPACE}" -f "^${ROLLOUT_NAME}$" -q 2>/dev/null | wc -l)
+                        if [[ "$RELEASE_EXISTS" -gt 0 ]]; then
+                          echo "##[debug] Helm release '${ROLLOUT_NAME}' encontrado — verificando se é Deployment..."
+
+                          # Verifica se existe um Deployment (não Rollout) com este nome
+                          if kubectl get deployment "${ROLLOUT_NAME}" -n "${NAMESPACE}" --no-headers >/dev/null 2>&1; then
+                            IS_MIGRATION="true"
+                            echo "##[warning] Deployment encontrado sem Rollout — migração Deployment → Rollout será executada"
+                            echo "##vso[task.logissue type=warning]Migration required: O recurso será migrado de Deployment para Argo Rollout. Sem downtime esperado."
+                          else
+                            echo "##[debug] Helm release existe mas não é um Deployment. Deploy normal."
+                          fi
+                        else
+                          echo "##[debug] Nenhum Helm release anterior encontrado — deploy novo."
+                        fi
+                      fi
+
+                      echo "##vso[task.setvariable variable=CURRENT_ROLLOUT_STRATEGY;isOutput=true]${CURRENT_ROLLOUT_STRATEGY}"
+                      echo "##vso[task.setvariable variable=NEEDS_STRATEGY_CHANGE;isOutput=true]${NEEDS_STRATEGY_CHANGE}"
+                      echo "##vso[task.setvariable variable=IS_MIGRATION;isOutput=true]${IS_MIGRATION}"
+                      echo "##vso[task.setvariable variable=DESIRED_STRATEGY;isOutput=true]${DESIRED}"
+
+                      echo "##[section]Resultado: Strategy=${CURRENT_ROLLOUT_STRATEGY} | NeedsChange=${NEEDS_STRATEGY_CHANGE} | Migration=${IS_MIGRATION} | Desired=${DESIRED}"
+                  env:
+                    ROLLOUT_NAME: ${{ parameters.helmReleaseName }}
+                    NAMESPACE: ${{ parameters.k8sNamespace[parameters.environment] }}
+                    DEPLOY_STRATEGY: ${{ parameters.deployStrategy }}
+                    ENABLE_BLUEGREEN: ${{ parameters.enableBlueGreenDeployment }}
+                    ENABLE_CANARY: ${{ parameters.enableCanaryDeployment }}
+
+                # Atualizar values.yml para RollingUpdateRollout quando Rollout existe com RollingUpdate
+                - task: Bash@3
+                  displayName: 'Atualizar estratégia para RollingUpdateRollout'
+                  condition: and(succeeded(), eq(variables['detectRollout.NEEDS_STRATEGY_CHANGE'], 'true'))
+                  inputs:
+                    targetType: 'inline'
+                    script: |
+                      set -euo pipefail
+                      echo "##[section]Atualizando deploy strategy para RollingUpdateRollout no values.yml"
+                      
+                      FILE_PATH="$(VALUES_PATH)"
+                      yq eval '.deploymentStrategy.type = "RollingUpdateRollout"' -i "$FILE_PATH"
+                      
+                      echo "##[section]✅ Strategy atualizada para RollingUpdateRollout"
+                    workingDirectory: '$(Build.SourcesDirectory)'
+
+                # ==================================================================
+                # Migração Deployment → Rollout
+                # ==================================================================
+                # Quando detectado um Deployment existente que precisa virar Rollout,
+                # faz um helm upgrade intermediário com a imagem atual para criar o Rollout
+                # sem alterar a versão em execução.
+                - task: Bash@3
+                  displayName: 'Capturar imagem atual do Deployment para migração'
+                  condition: and(succeeded(), eq(variables['detectRollout.IS_MIGRATION'], 'true'))
+                  name: captureImage
+                  inputs:
+                    targetType: 'inline'
+                    script: |
+                      set -euo pipefail
+
+                      echo "##[section]Capturando imagem atual do Deployment '${ROLLOUT_NAME}'"
+
+                      CURRENT_IMAGE=$(kubectl get deployment "${ROLLOUT_NAME}" -n "${NAMESPACE}" \
+                        -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || echo "")
+                      
+                      if [[ -z "$CURRENT_IMAGE" ]]; then
+                        echo "##[error] Não foi possível obter imagem do Deployment ${ROLLOUT_NAME}"
+                        exit 1
+                      fi
+
+                      # Separar repo e tag
+                      if [[ "$CURRENT_IMAGE" == *:* ]]; then
+                        CURRENT_TAG="${CURRENT_IMAGE##*:}"
+                        CURRENT_REPO="${CURRENT_IMAGE%:*}"
+                      else
+                        CURRENT_TAG="latest"
+                        CURRENT_REPO="$CURRENT_IMAGE"
+                      fi
+
+                      echo "##[debug] Imagem atual: ${CURRENT_IMAGE}"
+                      echo "##[debug] Repo: ${CURRENT_REPO} | Tag: ${CURRENT_TAG}"
+
+                      # Capturar values atuais do Helm
+                      helm get values "${ROLLOUT_NAME}" -n "${NAMESPACE}" -o yaml > "$(Agent.TempDirectory)/migration_current_values.yaml" 2>/dev/null || true
+
+                      echo "##vso[task.setvariable variable=MIGRATION_IMAGE_REPO;isOutput=true]${CURRENT_REPO}"
+                      echo "##vso[task.setvariable variable=MIGRATION_IMAGE_TAG;isOutput=true]${CURRENT_TAG}"
+                      echo "##vso[task.setvariable variable=MIGRATION_VALUES_FILE;isOutput=true]$(Agent.TempDirectory)/migration_current_values.yaml"
+                  env:
+                    ROLLOUT_NAME: ${{ parameters.helmReleaseName }}
+                    NAMESPACE: ${{ parameters.k8sNamespace[parameters.environment] }}
+
+                # Helm Upgrade de Migração — cria Rollout mantendo imagem atual
+                - task: K8sUtilsFromVivo@3
+                  displayName: 'Helm Upgrade - Migração Deployment → Rollout $(DRY_RUN_LABEL)'
+                  condition: and(succeeded(), eq(variables['detectRollout.IS_MIGRATION'], 'true'))
+                  inputs:
+                    command: 'helm-upgrade'
+                    helmReleaseName: ${{ parameters.helmReleaseName }}
+                    helmChartPath: $(HELM_CHART_PATH)
+                    helmChartVersion: ${{ parameters.helmChartVersion }}
+                    namespace: ${{ parameters.k8sNamespace[parameters.environment] }}
+                    helmValuesPath: $(VALUES_PATH)
+                    helmImageTag: $(captureImage.MIGRATION_IMAGE_TAG)
+                    helmUpgradeTimeout: ${{ parameters.helmTimeout }}
+                    helmUpgradeWait: false
+                    helmAdditionalArgs: '--set deploymentStrategy.migration.enabled=true --set deploymentStrategy.type=$(detectRollout.DESIRED_STRATEGY) $(HELM_SET_FILES_ARGS)'
+                    helmDryRun: ${{ parameters.enableDryRun }}
+
+                - ${{ if eq(parameters.enableDryRun, false) }}:
+                  # Aguardar migração ficar Healthy
+                  - task: Bash@3
+                    displayName: 'Aguardar migração Deployment → Rollout ficar Healthy'
+                    condition: and(succeeded(), eq(variables['detectRollout.IS_MIGRATION'], 'true'))
+                    inputs:
+                      targetType: 'inline'
+                      script: |
+                        set -euo pipefail
+
+                        echo "##[section]Aguardando Rollout '${ROLLOUT_NAME}' ficar Healthy após migração..."
+
+                        for i in $(seq 1 60); do
+                          PHASE=$(kubectl get rollout.argoproj.io "${ROLLOUT_NAME}" -n "${NAMESPACE}" -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown")
+                          echo "##[debug] Tentativa ${i}/60: Phase=${PHASE}"
+
+                          if [[ "$PHASE" == "Healthy" ]]; then
+                            echo "##[section]✅ Rollout Healthy após migração!"
+                            exit 0
+                          fi
+
+                          sleep 10
+                        done
+
+                        echo "##[error] Timeout: Rollout não ficou Healthy após migração (600s)"
+                        kubectl-argo-rollouts get rollout "${ROLLOUT_NAME}" -n "${NAMESPACE}" || true
+                        exit 1
+                    env:
+                      ROLLOUT_NAME: ${{ parameters.helmReleaseName }}
+                      NAMESPACE: ${{ parameters.k8sNamespace[parameters.environment] }}
+
+              # ==================================================================
+              # Helm Upgrade - Deploy da aplicação
+              # ==================================================================
+              # Suporta múltiplos arquivos values com ordem de precedência:
+              # 1. valuesPath (base) → 2. placeholdersValuesPath (sobrescreve) → 3. imageTag (sobrescreve image.tag)
+              - task: K8sUtilsFromVivo@3
+                displayName: 'Helm upgrade - ${{ parameters.environment }} $(DRY_RUN_LABEL)'
+                inputs:
+                  command: 'helm-upgrade'
+                  helmReleaseName: ${{ parameters.helmReleaseName }}
+                  helmChartPath: $(HELM_CHART_PATH)
+                  helmChartVersion: ${{ parameters.helmChartVersion }}
+                  namespace: ${{ parameters.k8sNamespace[parameters.environment] }}
+                  helmValuesPath: $(VALUES_PATH)
+                  ${{ if eq(parameters.usePlaceholdersHelmValuesFile, true) }}:
+                    helmPlaceholdersValuesPath: '$(REPLACED_PLACEHOLDERS_VALUES_TEMP_PATH)'
+                  helmImageTag: $(VersionManagerVivo.DEPLOY_VERSION)
+                  helmUpgradeTimeout: ${{ parameters.helmTimeout }}
+                  ${{ if or(eq(parameters.deployStrategy, 'BlueGreen'), eq(parameters.enableBlueGreenDeployment, true)) }}:
+                    helmEnableBlueGreen: true
+                    helmUpgradeWait: true
+                  ${{ elseif or(eq(parameters.deployStrategy, 'Canary'), eq(parameters.enableCanaryDeployment, true)) }}:
+                    helmEnableCanary: true
+                    helmUpgradeWait: true
+                  ${{ else }}:
+                    helmUpgradeWait: ${{ not(eq(parameters.helmNoWait, true)) }}
+                  helmDryRun: ${{ parameters.enableDryRun }}
+                  ${{ if ne(length(parameters.helmSetFiles), 0) }}:
+                    helmAdditionalArgs: '$(HELM_SET_FILES_ARGS)'
+
+              # Aguardar Rollout entrar em estado Paused (apenas para Blue/Green)
+              - ${{ if and(eq(parameters.enableDryRun, false), or(eq(parameters.deployStrategy, 'BlueGreen'), and(eq(parameters.deployStrategy, 'RollingUpdate'), eq(parameters.enableBlueGreenDeployment, true)))) }}:
+                - task: K8sUtilsFromVivo@3              
+                  displayName: 'Aguardar Rollout em Dark Environment (Paused)'
+                  inputs:
+                    command: 'argo-wait-paused'
+                    argoRolloutName: ${{ parameters.helmReleaseName }}
+                    namespace: ${{ parameters.k8sNamespace[parameters.environment] }}
+                    argoTimeout: ${{ parameters.blueGreenRolloutTimeout }}
+                    argoCheckInterval: ${{ parameters.blueGreenRolloutStatusCheckInterval }}
+
+              # Aguardar Rollout entrar em estado Paused (apenas para Canary)
+              - ${{ if and(eq(parameters.enableDryRun, false), or(eq(parameters.deployStrategy, 'Canary'), and(eq(parameters.deployStrategy, 'RollingUpdate'), eq(parameters.enableCanaryDeployment, true)))) }}:
+                - task: K8sUtilsFromVivo@3
+                  displayName: 'Aguardar Rollout Canary em estado Paused (Step 1)'
+                  inputs:
+                    command: 'argo-wait-paused'
+                    argoRolloutName: ${{ parameters.helmReleaseName }}
+                    namespace: ${{ parameters.k8sNamespace[parameters.environment] }}
+                    argoTimeout: ${{ parameters.canaryRolloutTimeout }}
+                    argoCheckInterval: ${{ parameters.canaryRolloutStatusCheckInterval }}
+
+              # ==================================================================
+              # Anotar migração de estratégia (Canary → BlueGreen ou BlueGreen → Canary)
+              # ==================================================================
+              # Quando o Rollout existia com uma estratégia e está sendo alterado para outra,
+              # adiciona annotation para que o stage Promote faça cleanup dos ReplicaSets antigos.
+              - ${{ if and(eq(parameters.enableDryRun, false), or(ne(parameters.deployStrategy, 'RollingUpdate'), eq(parameters.enableBlueGreenDeployment, true), eq(parameters.enableCanaryDeployment, true))) }}:
+                - task: Bash@3
+                  displayName: 'Anotar migração de estratégia (se necessário)'
+                  condition: and(succeeded(), ne(variables['detectRollout.CURRENT_ROLLOUT_STRATEGY'], 'none'))
+                  inputs:
+                    targetType: 'inline'
+                    script: |
+                      set -euo pipefail
+
+                      CURRENT="${CURRENT_STRATEGY}"
+                      DESIRED="${DESIRED_STRATEGY}"
+
+                      echo "##[debug] Estratégia atual: ${CURRENT} | Desejada: ${DESIRED}"
+
+                      # Verifica se houve mudança de estratégia que requer cleanup
+                      if [[ "$CURRENT" == "Canary" && "$DESIRED" == "BlueGreen" ]]; then
+                        echo "##[section]Anotando migração Canary → BlueGreen no Rollout"
+                        kubectl annotate rollout.argoproj.io "${ROLLOUT_NAME}" -n "${NAMESPACE}" \
+                          migration.argorollouts.vivo/migration="canary-to-bluegreen" --overwrite
+                        echo "##[section]✅ Annotation adicionada"
+                      elif [[ "$CURRENT" == "BlueGreen" && "$DESIRED" == "Canary" ]]; then
+                        echo "##[section]Anotando migração BlueGreen → Canary no Rollout"
+                        kubectl annotate rollout.argoproj.io "${ROLLOUT_NAME}" -n "${NAMESPACE}" \
+                          migration.argorollouts.vivo/migration="bluegreen-to-canary" --overwrite
+                        echo "##[section]✅ Annotation adicionada"
+                      else
+                        echo "##[debug] Sem mudança de estratégia que requeira annotation (${CURRENT} → ${DESIRED})"
+                      fi
+                  env:
+                    ROLLOUT_NAME: ${{ parameters.helmReleaseName }}
+                    NAMESPACE: ${{ parameters.k8sNamespace[parameters.environment] }}
+                    CURRENT_STRATEGY: $(detectRollout.CURRENT_ROLLOUT_STRATEGY)
+                    DESIRED_STRATEGY: $(detectRollout.DESIRED_STRATEGY)
+
+              - ${{ if eq(parameters.enableDryRun, false) }}:
+                - task: VivoEventHubTools@3
+                  displayName: 'Registro de deploy no Event Hub'
+                  condition: always() # A task passa o status do deploy
+                  continueOnError: true
+                  inputs:
+                    command: 'deploy'
+                    eventHubConnection: 'EVHCodeProd'
+                    componentVersion: '$(VersionManagerVivo.DEPLOY_VERSION)'
+                    deployArtifactName: $(K8S_IMAGES)
+                    deployArtifactType: 'container'
+                    deployEnvironmentType: 'kubernetes'
+                    deployEnvironmentName: '${{ parameters.environment }}'
+                    deployEnvironmentCluster: ${{ parameters.aksClusterName[parameters.environment] }}
+                    deployEnvironmentNamespace: ${{ parameters.k8sNamespace[parameters.environment] }}
+                    deployEnvironmentAccessUrl: '$(K8S_APP_URL_LIST)'
+                    annotations: 'helm-chart=${{ parameters.helmChartName }},helm-release=${{ parameters.helmReleaseName }},helm-chart-version=${{ parameters.helmChartVersion }}'
+                    pipelineType: 'framework/deploy-helm'
+                    ${{ if or(eq(parameters.deployStrategy, 'BlueGreen'), eq(parameters.enableBlueGreenDeployment, true)) }}:
+                      deployStrategy: 'BlueGreen'
+                    ${{ elseif or(eq(parameters.deployStrategy, 'Canary'), eq(parameters.enableCanaryDeployment, true)) }}:
+                      deployStrategy: 'Canary'
+                    ${{ else }}:
+                      deployStrategy: 'RollingUpdate'
+                  
+          on:
+            failure:
+              steps:
+                - script: |
+                    echo "##vso[task.logissue type=error]Falha no deploy do Helm Chart em ${ENVIRONMENT}"
+                  displayName: 'Registrar falha no deploy'
+                  env:
+                    ENVIRONMENT: ${{ parameters.environment }}
+
+                # Autentica no cluster AKS para operações kubectl
+                - ${{ if eq(parameters.useAKSManagedIdentity, true) }}:
+                  - task: Kubernetes@1
+                    displayName: 'Login no AKS'
+                    inputs:
+                      connectionType: 'Azure Resource Manager'
+                      azureSubscriptionEndpoint: ${{ parameters.aksServiceConnection[parameters.environment] }}
+                      azureResourceGroup: ${{ parameters.aksResourceGroup[parameters.environment] }}
+                      kubernetesCluster: ${{ parameters.aksClusterName[parameters.environment] }}
+                      namespace: ${{ parameters.k8sNamespace[parameters.environment] }}
+                      command: 'login'
+
+                - ${{ if eq(parameters.useKubeconfig, true) }}:
+                  - task: Kubernetes@1
+                    displayName: 'Login no Kubernetes via Kubeconfig para Debug'
+                    inputs:
+                      connectionType: 'Kubernetes Service Connection'
+                      kubernetesServiceEndpoint: ${{ parameters.kubeconfigServiceConnection[parameters.environment] }}
+                      namespace: ${{ parameters.k8sNamespace[parameters.environment] }}
+                      command: 'login'
+
+                - task: K8sUtilsFromVivo@3
+                  displayName: 'Debug do Helm e Kubernetes'
+                  continueOnError: true
+                  inputs:
+                    command: 'debug-helm-kubernetes'
+                    helmReleaseName: ${{ parameters.helmReleaseName }}
+                    namespace: ${{ parameters.k8sNamespace[parameters.environment] }}
+
+                - ${{ if and(eq(parameters.enableAutomaticRollback, true), eq(parameters.enableDryRun, false)) }}:
+                  - task: Bash@3
+                    displayName: 'Helm rollback - ${ENVIRONMENT}'
+                    inputs:
+                      targetType: 'inline'
+                      script: |
+                        set -euo pipefail
+                        echo "##[debug] $(date -u) Iniciando Helm rollback para ${ENVIRONMENT}"
+                        helm rollback ${RELEASE_NAME} \
+                          --namespace ${NAMESPACE} \
+                          --cleanup-on-fail --timeout 300s
+                        echo "##[debug] $(date -u) Helm rollback concluído"
+                    env:
+                      ENVIRONMENT: ${{ parameters.environment }}
+                      RELEASE_NAME: ${{ parameters.helmReleaseName }}
+                      NAMESPACE: ${{ parameters.k8sNamespace[parameters.environment] }}
+
+  # ==================================================================
+  # Stage: Auto-Promote (apenas se deployStrategy = BlueGreen e blueGreenAutoPromote = true)
+  # ==================================================================
+  - ${{ if and(or(eq(parameters.deployStrategy, 'BlueGreen'), and(eq(parameters.deployStrategy, 'RollingUpdate'), eq(parameters.enableBlueGreenDeployment, true))), eq(parameters.blueGreenAutoPromote, true)) }}:
+    - stage: AutoPromote
+      displayName: 'Auto-Promote - Promoção Automática (${{ parameters.environment }})'
+      dependsOn: Deploy
+      condition: succeeded()
+      pool: ${{ parameters.agentPool }}
+      jobs:
+      - job: AutoPromoteJob
+        displayName: 'Executar Auto-Promoção'
+        steps:
+          - checkout: none
+
+          # Login no AKS
+          - ${{ if eq(parameters.useAKSManagedIdentity, true) }}:
+            - task: Kubernetes@1
+              displayName: 'Login no AKS'
+              inputs:
+                connectionType: 'Azure Resource Manager'
+                azureSubscriptionEndpoint: ${{ parameters.aksServiceConnection[parameters.environment] }}
+                azureResourceGroup: ${{ parameters.aksResourceGroup[parameters.environment] }}
+                kubernetesCluster: ${{ parameters.aksClusterName[parameters.environment] }}
+                namespace: ${{ parameters.k8sNamespace[parameters.environment] }}
+                command: 'login'
+
+          - ${{ if eq(parameters.useKubeconfig, true) }}:
+            - task: Kubernetes@1
+              displayName: 'Login no Kubernetes via Kubeconfig'
+              inputs:
+                connectionType: 'Kubernetes Service Connection'
+                kubernetesServiceEndpoint: ${{ parameters.kubeconfigServiceConnection[parameters.environment] }}
+                namespace: ${{ parameters.k8sNamespace[parameters.environment] }}
+                command: 'login'
+
+          - ${{ if eq(parameters.enableDryRun, false) }}:
+            # Delay antes da promoção
+            - task: Bash@3
+              displayName: 'Aguardar delay antes da promoção'
+              inputs:
+                targetType: 'inline'
+                script: |
+                  echo "##[section]Aguardando ${DELAY_SECONDS} segundos antes da auto-promoção..."
+                  sleep ${DELAY_SECONDS}
+                  echo "##[section]✅ Delay concluído"
+              env:
+                DELAY_SECONDS: ${{ parameters.blueGreenAutoPromoteDelaySeconds }}
+
+          # Validação pré-promoção (opcional)
+          - ${{ if and(eq(parameters.blueGreenPrePromoteValidation, true), eq(parameters.enableDryRun, false)) }}:
+            - task: Bash@3
+              displayName: 'Executar validação pré-promoção'
+              inputs:
+                targetType: 'inline'
+                script: |
+                  set -euo pipefail
+
+                  echo "##[section]Executando validação pré-promoção customizada"
+                  ${PRE_PROMOTE_SCRIPT}
+                  echo "##[section]✅ Validação pré-promoção concluída com sucesso"
+              env:
+                PRE_PROMOTE_SCRIPT: ${{ parameters.blueGreenPrePromoteScript }}
+
+          # Promover para Stable Environment
+          - task: K8sUtilsFromVivo@3
+            displayName: 'Promover do Dark Environment para Stable Environment $(DRY_RUN_LABEL)'
+            inputs:
+              command: 'argo-promote'
+              argoRolloutName: ${{ parameters.helmReleaseName }}
+              namespace: ${{ parameters.k8sNamespace[parameters.environment] }}
+              argoTimeout: ${{ parameters.blueGreenRolloutTimeout }}
+              argoCheckInterval: ${{ parameters.blueGreenRolloutStatusCheckInterval }}
+              argoPromoteDryRun: ${{ parameters.enableDryRun }}
+
+          - ${{ if eq(parameters.enableDryRun, false) }}:
+            # Cleanup de migração de estratégia (Canary → BlueGreen ou BlueGreen → Canary)
+            # Scale down ReplicaSets antigos que ficam órfãos após mudança de estratégia
+            - task: Bash@3
+              displayName: 'Cleanup pós-migração de estratégia (se necessário)'
+              condition: succeeded()
+              inputs:
+                targetType: 'inline'
+                script: |
+                  set -euo pipefail
+
+                  ANNOTATION=$(kubectl get rollout.argoproj.io "${ROLLOUT_NAME}" -n "${NAMESPACE}" \
+                    -o jsonpath='{.metadata.annotations.migration\.argorollouts\.vivo/migration}' 2>/dev/null || echo "")
+
+                  if [[ -z "$ANNOTATION" || "$ANNOTATION" == "null" ]]; then
+                    echo "##[debug] Sem annotation de migração — nenhum cleanup necessário"
+                    exit 0
+                  fi
+
+                  echo "##[section]Migração detectada: ${ANNOTATION} — executando cleanup de ReplicaSets antigos"
+
+                  # Aguardar Rollout ficar Healthy após promote
+                  echo "##[debug] Aguardando Rollout ficar Healthy..."
+                  for i in $(seq 1 30); do
+                    PHASE=$(kubectl get rollout.argoproj.io "${ROLLOUT_NAME}" -n "${NAMESPACE}" -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown")
+                    if [[ "$PHASE" == "Healthy" ]]; then
+                      echo "##[debug] Rollout Healthy!"
+                      break
+                    fi
+                    echo "##[debug] Phase=${PHASE}, aguardando... (${i}/30)"
+                    sleep 10
+                  done
+
+                  # Obter hash do pod template ativo
+                  ACTIVE_HASH=$(kubectl get rollout.argoproj.io "${ROLLOUT_NAME}" -n "${NAMESPACE}" \
+                    -o jsonpath='{.status.blueGreen.activeSelector}' 2>/dev/null || echo "")
+                  
+                  if [[ -z "$ACTIVE_HASH" || "$ACTIVE_HASH" == "null" ]]; then
+                    # Fallback para Canary stable hash
+                    ACTIVE_HASH=$(kubectl get rollout.argoproj.io "${ROLLOUT_NAME}" -n "${NAMESPACE}" \
+                      -o jsonpath='{.status.stableRS}' 2>/dev/null || echo "")
+                  fi
+
+                  if [[ -z "$ACTIVE_HASH" || "$ACTIVE_HASH" == "null" ]]; then
+                    echo "##[warning] Não foi possível obter hash ativo — pulando scale down"
+                  else
+                    echo "##[debug] Hash ativo: ${ACTIVE_HASH}"
+
+                    # Listar ReplicaSets do rollout e escalar para 0 os não-ativos
+                    RS_LIST=$(kubectl get replicasets -n "${NAMESPACE}" -l "rollouts-pod-template-hash" \
+                      --field-selector "metadata.name!=${ROLLOUT_NAME}-${ACTIVE_HASH}" \
+                      -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || echo "")
+
+                    if [[ -n "$RS_LIST" ]]; then
+                      echo "$RS_LIST" | while read -r RS_NAME; do
+                        if [[ -n "$RS_NAME" ]]; then
+                          CURRENT_REPLICAS=$(kubectl get replicaset "${RS_NAME}" -n "${NAMESPACE}" \
+                            -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "0")
+                          if [[ "$CURRENT_REPLICAS" != "0" ]]; then
+                            echo "##[section]Escalando ReplicaSet '${RS_NAME}' para 0 (era ${CURRENT_REPLICAS})"
+                            kubectl scale replicaset "${RS_NAME}" -n "${NAMESPACE}" --replicas=0
+                          fi
+                        fi
+                      done
+                      echo "##[section]✅ Scale down de ReplicaSets antigos concluído"
+                    else
+                      echo "##[debug] Nenhum ReplicaSet antigo encontrado para scale down"
+                    fi
+                  fi
+
+                  # Remover annotation de migração
+                  echo "##[debug] Removendo annotation de migração..."
+                  kubectl annotate rollout.argoproj.io "${ROLLOUT_NAME}" -n "${NAMESPACE}" \
+                    migration.argorollouts.vivo/migration- || true
+                  echo "##[section]✅ Cleanup de migração concluído"
+              env:
+                ROLLOUT_NAME: ${{ parameters.helmReleaseName }}
+                NAMESPACE: ${{ parameters.k8sNamespace[parameters.environment] }}
+
+  # ==================================================================
+  # Stage: Promote Manual (apenas se deployStrategy = BlueGreen e blueGreenAutoPromote = false)
+  # ==================================================================
+  - ${{ if and(or(eq(parameters.deployStrategy, 'BlueGreen'), and(eq(parameters.deployStrategy, 'RollingUpdate'), eq(parameters.enableBlueGreenDeployment, true))), eq(parameters.blueGreenAutoPromote, false)) }}:
+    - stage: PromoteManual
+      displayName: 'Promote - Promoção Manual (${{ parameters.environment }})'
+      dependsOn: Deploy
+      condition: succeeded()
+      pool: ${{ parameters.agentPool }}
+      jobs:
+      - deployment: PromoteDeployment
+        displayName: 'Promover Green para Stable Environment'
+        environment:
+          name: deploy-${{ parameters.environment }}-promote
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: none
+
+                # Login no AKS
+                - ${{ if eq(parameters.useAKSManagedIdentity, true) }}:
+                  - task: Kubernetes@1
+                    displayName: 'Login no AKS'
+                    inputs:
+                      connectionType: 'Azure Resource Manager'
+                      azureSubscriptionEndpoint: ${{ parameters.aksServiceConnection[parameters.environment] }}
+                      azureResourceGroup: ${{ parameters.aksResourceGroup[parameters.environment] }}
+                      kubernetesCluster: ${{ parameters.aksClusterName[parameters.environment] }}
+                      namespace: ${{ parameters.k8sNamespace[parameters.environment] }}
+                      command: 'login'
+
+                - ${{ if eq(parameters.useKubeconfig, true) }}:
+                  - task: Kubernetes@1
+                    displayName: 'Login no Kubernetes via Kubeconfig'
+                    inputs:
+                      connectionType: 'Kubernetes Service Connection'
+                      kubernetesServiceEndpoint: ${{ parameters.kubeconfigServiceConnection[parameters.environment] }}
+                      namespace: ${{ parameters.k8sNamespace[parameters.environment] }}
+                      command: 'login'
+
+                - ${{ if eq(parameters.enableDryRun, false) }}:
+                  # Exibir status atual do Rollout
+                  - task: Bash@3
+                    displayName: 'Exibir status atual do Rollout'
+                    inputs:
+                      targetType: 'inline'
+                      script: |
+                        set -euo pipefail
+
+                        echo "##[section]Status atual do Rollout antes da promoção:"
+                        kubectl-argo-rollouts get rollout ${ROLLOUT_NAME} -n ${NAMESPACE}
+                    env:
+                      ROLLOUT_NAME: ${{ parameters.helmReleaseName }}
+                      NAMESPACE: ${{ parameters.k8sNamespace[parameters.environment] }}
+
+                # Validação pré-promoção (opcional)
+                - ${{ if and(eq(parameters.blueGreenPrePromoteValidation, true), eq(parameters.enableDryRun, false)) }}:
+                  - task: Bash@3
+                    displayName: 'Executar validação pré-promoção'
+                    inputs:
+                      targetType: 'inline'
+                      script: |
+                        set -euo pipefail
+
+                        echo "##[section]Executando validação pré-promoção customizada"
+                        ${PRE_PROMOTE_SCRIPT}
+                        echo "##[section]✅ Validação pré-promoção concluída com sucesso"
+                    env:
+                      PRE_PROMOTE_SCRIPT: ${{ parameters.blueGreenPrePromoteScript }}
+
+                # Promover para Stable Environment
+                - task: K8sUtilsFromVivo@3
+                  displayName: 'Promover do Dark Environment para Stable Environment $(DRY_RUN_LABEL)'
+                  inputs:
+                    command: 'argo-promote'
+                    argoRolloutName: ${{ parameters.helmReleaseName }}
+                    namespace: ${{ parameters.k8sNamespace[parameters.environment] }}
+                    argoTimeout: ${{ parameters.blueGreenRolloutTimeout }}
+                    argoCheckInterval: ${{ parameters.blueGreenRolloutStatusCheckInterval }}
+                    argoPromoteDryRun: ${{ parameters.enableDryRun }}
+
+                - ${{ if eq(parameters.enableDryRun, false) }}:
+                  # Cleanup de migração de estratégia (Canary → BlueGreen ou BlueGreen → Canary)
+                  - task: Bash@3
+                    displayName: 'Cleanup pós-migração de estratégia (se necessário)'
+                    condition: succeeded()
+                    inputs:
+                      targetType: 'inline'
+                      script: |
+                        set -euo pipefail
+
+                        ANNOTATION=$(kubectl get rollout.argoproj.io "${ROLLOUT_NAME}" -n "${NAMESPACE}" \
+                          -o jsonpath='{.metadata.annotations.migration\.argorollouts\.vivo/migration}' 2>/dev/null || echo "")
+
+                        if [[ -z "$ANNOTATION" || "$ANNOTATION" == "null" ]]; then
+                          echo "##[debug] Sem annotation de migração — nenhum cleanup necessário"
+                          exit 0
+                        fi
+
+                        echo "##[section]Migração detectada: ${ANNOTATION} — executando cleanup de ReplicaSets antigos"
+
+                        # Aguardar Rollout ficar Healthy após promote
+                        for i in $(seq 1 30); do
+                          PHASE=$(kubectl get rollout.argoproj.io "${ROLLOUT_NAME}" -n "${NAMESPACE}" -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown")
+                          if [[ "$PHASE" == "Healthy" ]]; then break; fi
+                          echo "##[debug] Phase=${PHASE}, aguardando... (${i}/30)"
+                          sleep 10
+                        done
+
+                        # Obter hash ativo
+                        ACTIVE_HASH=$(kubectl get rollout.argoproj.io "${ROLLOUT_NAME}" -n "${NAMESPACE}" \
+                          -o jsonpath='{.status.blueGreen.activeSelector}' 2>/dev/null || echo "")
+                        if [[ -z "$ACTIVE_HASH" || "$ACTIVE_HASH" == "null" ]]; then
+                          ACTIVE_HASH=$(kubectl get rollout.argoproj.io "${ROLLOUT_NAME}" -n "${NAMESPACE}" \
+                            -o jsonpath='{.status.stableRS}' 2>/dev/null || echo "")
+                        fi
+
+                        if [[ -n "$ACTIVE_HASH" && "$ACTIVE_HASH" != "null" ]]; then
+                          RS_LIST=$(kubectl get replicasets -n "${NAMESPACE}" -l "rollouts-pod-template-hash" \
+                            --field-selector "metadata.name!=${ROLLOUT_NAME}-${ACTIVE_HASH}" \
+                            -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || echo "")
+                          if [[ -n "$RS_LIST" ]]; then
+                            echo "$RS_LIST" | while read -r RS_NAME; do
+                              if [[ -n "$RS_NAME" ]]; then
+                                CURRENT_REPLICAS=$(kubectl get replicaset "${RS_NAME}" -n "${NAMESPACE}" \
+                                  -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "0")
+                                if [[ "$CURRENT_REPLICAS" != "0" ]]; then
+                                  echo "##[section]Escalando RS '${RS_NAME}' para 0 (era ${CURRENT_REPLICAS})"
+                                  kubectl scale replicaset "${RS_NAME}" -n "${NAMESPACE}" --replicas=0
+                                fi
+                              fi
+                            done
+                            echo "##[section]✅ Scale down de ReplicaSets antigos concluído"
+                          fi
+                        fi
+
+                        kubectl annotate rollout.argoproj.io "${ROLLOUT_NAME}" -n "${NAMESPACE}" \
+                          migration.argorollouts.vivo/migration- || true
+                        echo "##[section]✅ Cleanup de migração concluído"
+                    env:
+                      ROLLOUT_NAME: ${{ parameters.helmReleaseName }}
+                      NAMESPACE: ${{ parameters.k8sNamespace[parameters.environment] }}
+
+  # ==================================================================
+  # Stage: Rollback Blue/Green pré-promote (apenas se deployStrategy = BlueGreen)
+  # Cenário: Deploy feito mas NÃO promovido — app está no Dark Environment
+  # ==================================================================
+  - ${{ if and(eq(parameters.enableDryRun, false), or(eq(parameters.deployStrategy, 'BlueGreen'), and(eq(parameters.deployStrategy, 'RollingUpdate'), eq(parameters.enableBlueGreenDeployment, true)))) }}:
+    - stage: RollbackBlueGreen
+      displayName: 'Rollback - Reverter Dark Environment (${{ parameters.environment }})'
+      dependsOn: Deploy
+      condition: succeeded()
+      pool: ${{ parameters.agentPool }}
+      jobs:
+      - deployment: RollbackDeployment
+        displayName: 'Executar Rollback Blue/Green (Pré-Promote)'
+        environment:
+          name: deploy-${{ parameters.environment }}-rollback
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: none
+
+                # Login no AKS
+                - ${{ if eq(parameters.useAKSManagedIdentity, true) }}:
+                  - task: Kubernetes@1
+                    displayName: 'Login no AKS'
+                    inputs:
+                      connectionType: 'Azure Resource Manager'
+                      azureSubscriptionEndpoint: ${{ parameters.aksServiceConnection[parameters.environment] }}
+                      azureResourceGroup: ${{ parameters.aksResourceGroup[parameters.environment] }}
+                      kubernetesCluster: ${{ parameters.aksClusterName[parameters.environment] }}
+                      namespace: ${{ parameters.k8sNamespace[parameters.environment] }}
+                      command: 'login'
+
+                - ${{ if eq(parameters.useKubeconfig, true) }}:
+                  - task: Kubernetes@1
+                    displayName: 'Login no Kubernetes via Kubeconfig'
+                    inputs:
+                      connectionType: 'Kubernetes Service Connection'
+                      kubernetesServiceEndpoint: ${{ parameters.kubeconfigServiceConnection[parameters.environment] }}
+                      namespace: ${{ parameters.k8sNamespace[parameters.environment] }}
+                      command: 'login'
+
+                # Detectar cenário de rollback antes de executar
+                - task: K8sUtilsFromVivo@3
+                  displayName: 'Detectar Cenário de Rollback'
+                  inputs:
+                    command: 'argo-detect-rollback-scenario'
+                    argoRolloutName: ${{ parameters.helmReleaseName }}
+                    namespace: ${{ parameters.k8sNamespace[parameters.environment] }}
+
+                # Executar Rollback (undo + promote)
+                # A task K8sUtilsFromVivo@3 detecta automaticamente o cenário e executa o rollback apropriado
+                - task: K8sUtilsFromVivo@3
+                  displayName: 'Rollback Blue/Green (Undo + Promote)'
+                  inputs:
+                    command: 'argo-rollback'
+                    argoRolloutName: ${{ parameters.helmReleaseName }}
+                    namespace: ${{ parameters.k8sNamespace[parameters.environment] }}
+                    argoTimeout: ${{ parameters.blueGreenRolloutTimeout }}
+                    argoCheckInterval: ${{ parameters.blueGreenRolloutStatusCheckInterval }}
+
+  # ==================================================================
+  # Stage: Auto-Promote Canary (apenas se deployStrategy = Canary e canaryAutoPromote = true)
+  # ==================================================================
+  - ${{ if and(or(eq(parameters.deployStrategy, 'Canary'), and(eq(parameters.deployStrategy, 'RollingUpdate'), eq(parameters.enableCanaryDeployment, true))), eq(parameters.canaryAutoPromote, true)) }}:
+    - stage: AutoPromoteCanary
+      displayName: 'Auto-Promote Canary - Promoção Automática (${{ parameters.environment }})'
+      dependsOn: Deploy
+      condition: succeeded()
+      pool: ${{ parameters.agentPool }}
+      jobs:
+      - job: AutoPromoteCanaryJob
+        displayName: 'Executar Auto-Promoção Canary'
+        steps:
+          - checkout: none
+
+          # Login no AKS
+          - ${{ if eq(parameters.useAKSManagedIdentity, true) }}:
+            - task: Kubernetes@1
+              displayName: 'Login no AKS'
+              inputs:
+                connectionType: 'Azure Resource Manager'
+                azureSubscriptionEndpoint: ${{ parameters.aksServiceConnection[parameters.environment] }}
+                azureResourceGroup: ${{ parameters.aksResourceGroup[parameters.environment] }}
+                kubernetesCluster: ${{ parameters.aksClusterName[parameters.environment] }}
+                namespace: ${{ parameters.k8sNamespace[parameters.environment] }}
+                command: 'login'
+
+          - ${{ if eq(parameters.useKubeconfig, true) }}:
+            - task: Kubernetes@1
+              displayName: 'Login no Kubernetes via Kubeconfig'
+              inputs:
+                connectionType: 'Kubernetes Service Connection'
+                kubernetesServiceEndpoint: ${{ parameters.kubeconfigServiceConnection[parameters.environment] }}
+                namespace: ${{ parameters.k8sNamespace[parameters.environment] }}
+                command: 'login'
+
+          # Delay antes da promoção
+          - task: Bash@3
+            displayName: 'Aguardar delay antes da promoção'
+            inputs:
+              targetType: 'inline'
+              script: |
+                echo "##[section]Aguardando ${DELAY_SECONDS} segundos antes da auto-promoção Canary..."
+                sleep ${DELAY_SECONDS}
+                echo "##[section]✅ Delay concluído"
+            env:
+              DELAY_SECONDS: ${{ parameters.canaryAutoPromoteDelaySeconds }}
+
+          # Validação pré-promoção (opcional)
+          - ${{ if eq(parameters.canaryPrePromoteValidation, true) }}:
+            - task: Bash@3
+              displayName: 'Executar validação pré-promoção'
+              inputs:
+                targetType: 'inline'
+                script: |
+                  set -euo pipefail
+
+                  echo "##[section]Executando validação pré-promoção customizada"
+                  ${PRE_PROMOTE_SCRIPT}
+                  echo "##[section]✅ Validação pré-promoção concluída com sucesso"
+              env:
+                PRE_PROMOTE_SCRIPT: ${{ parameters.canaryPrePromoteScript }}
+
+          # Promover Canary progressivamente
+          # Respeita pause: {duration: N} (gerenciado pelo controller) e promove apenas pause: {} (indefinido)
+          - task: Bash@3
+            displayName: 'Promover Canary Progressivamente'
+            inputs:
+              targetType: 'inline'
+              script: |
+                set -euo pipefail
+
+                echo "##[section]Iniciando promoção do Rollout Canary '${ROLLOUT_NAME}'"
+
+                TIMEOUT_SECONDS=$(echo "$TIMEOUT" | sed 's/s$//')
+                ELAPSED=0
+                LAST_PROMOTED_STEP=-1
+
+                # Função para obter informações do rollout via JSON
+                # Usa API group explícito (rollout.argoproj.io) para evitar ambiguidade
+                # com outros CRDs que possam ter o shortname 'rollout'
+                get_rollout_json() {
+                  local JSON
+                  JSON=$(kubectl get rollout.argoproj.io ${ROLLOUT_NAME} -n ${NAMESPACE} -o json 2>&1) || {
+                    echo "##[warning] Falha ao obter rollout via kubectl: ${JSON}" >&2
+                    echo '{}'
+                    return 1
+                  }
+                  echo "$JSON"
+                }
+
+                # Promote inicial para avançar do primeiro pause
+                echo "##[command] kubectl-argo-rollouts promote ${ROLLOUT_NAME} -n ${NAMESPACE}"
+                kubectl-argo-rollouts promote ${ROLLOUT_NAME} -n ${NAMESPACE}
+                LAST_PROMOTED_STEP=0
+
+                echo "##[section]Aguardando Rollout completar (timeout: ${TIMEOUT_SECONDS}s)..."
+
+                while [[ $ELAPSED -lt $TIMEOUT_SECONDS ]]; do
+                  ROLLOUT_JSON=$(get_rollout_json)
+                  PHASE=$(echo "$ROLLOUT_JSON" | jq -r '.status.phase // "Unknown"')
+                  CURRENT_STEP=$(echo "$ROLLOUT_JSON" | jq -r '.status.currentStepIndex // 0')
+                  TOTAL_STEPS=$(echo "$ROLLOUT_JSON" | jq -r '[.spec.strategy.canary.steps[]?] | length')
+                  CANARY_WEIGHT=$(echo "$ROLLOUT_JSON" | jq -r '.status.canary.weights.canary.weight // 0')
+
+                  echo "##[debug] Phase=${PHASE} | Step=${CURRENT_STEP}/${TOTAL_STEPS} | Weight=${CANARY_WEIGHT}% | Elapsed=${ELAPSED}s/${TIMEOUT_SECONDS}s"
+
+                  case "$PHASE" in
+                    Healthy)
+                      echo "##[section]✅ Rollout Canary promovido com sucesso! (100% do tráfego)"
+                      exit 0
+                      ;;
+                    Paused)
+                      # Verificar se é uma pausa indefinida (pause: {}) ou temporizada (pause: {duration: N})
+                      # Pausas temporizadas são gerenciadas automaticamente pelo Argo Rollouts controller
+                      PAUSE_DURATION=$(echo "$ROLLOUT_JSON" | jq -r ".spec.strategy.canary.steps[$CURRENT_STEP].pause.duration // empty")
+
+                      if [[ -z "$PAUSE_DURATION" || "$PAUSE_DURATION" == "null" ]]; then
+                        # Pausa indefinida (pause: {}) — requer promote manual
+                        if [[ $CURRENT_STEP -ne $LAST_PROMOTED_STEP ]]; then
+                          echo "##[section]📊 Canary em ${CANARY_WEIGHT}% (step ${CURRENT_STEP}) — pausa indefinida, promovendo..."
+                          echo "##[command] kubectl-argo-rollouts promote ${ROLLOUT_NAME} -n ${NAMESPACE}"
+                          kubectl-argo-rollouts promote ${ROLLOUT_NAME} -n ${NAMESPACE}
+                          LAST_PROMOTED_STEP=$CURRENT_STEP
+                        else
+                          echo "##[debug] Aguardando promoção do step ${CURRENT_STEP} ser processada..."
+                        fi
+                      else
+                        echo "##[debug] Canary em ${CANARY_WEIGHT}% (step ${CURRENT_STEP}) — pausa temporizada (${PAUSE_DURATION}), aguardando controller..."
+                      fi
+                      ;;
+                    Progressing)
+                      echo "##[debug] Canary progredindo em ${CANARY_WEIGHT}% (step ${CURRENT_STEP})..."
+                      ;;
+                    Degraded|Error|Aborted)
+                      echo "##[error] Rollout Canary em estado '${PHASE}'!"
+                      echo "##[section]Status detalhado:"
+                      kubectl-argo-rollouts get rollout ${ROLLOUT_NAME} -n ${NAMESPACE} || true
+                      exit 1
+                      ;;
+                    *)
+                      echo "##[debug] Rollout em estado '${PHASE}', aguardando..."
+                      ;;
+                  esac
+
+                  sleep $CHECK_INTERVAL
+                  ELAPSED=$((ELAPSED + CHECK_INTERVAL))
+                done
+
+                echo "##[error] Timeout: Rollout Canary não completou após ${TIMEOUT_SECONDS}s"
+                echo "##[section]Status final:"
+                kubectl-argo-rollouts get rollout ${ROLLOUT_NAME} -n ${NAMESPACE} || true
+                exit 1
+            env:
+              ROLLOUT_NAME: ${{ parameters.helmReleaseName }}
+              NAMESPACE: ${{ parameters.k8sNamespace[parameters.environment] }}
+              TIMEOUT: ${{ parameters.canaryRolloutTimeout }}
+              CHECK_INTERVAL: ${{ parameters.canaryRolloutStatusCheckInterval }}
+
+          # Cleanup de migração de estratégia (se necessário)
+          - task: Bash@3
+            displayName: 'Cleanup pós-migração de estratégia (se necessário)'
+            condition: succeeded()
+            inputs:
+              targetType: 'inline'
+              script: |
+                set -euo pipefail
+
+                ANNOTATION=$(kubectl get rollout.argoproj.io "${ROLLOUT_NAME}" -n "${NAMESPACE}" \
+                  -o jsonpath='{.metadata.annotations.migration\.argorollouts\.vivo/migration}' 2>/dev/null || echo "")
+
+                if [[ -z "$ANNOTATION" || "$ANNOTATION" == "null" ]]; then
+                  echo "##[debug] Sem annotation de migração — nenhum cleanup necessário"
+                  exit 0
+                fi
+
+                echo "##[section]Migração detectada: ${ANNOTATION} — executando cleanup de ReplicaSets antigos"
+
+                ACTIVE_HASH=$(kubectl get rollout.argoproj.io "${ROLLOUT_NAME}" -n "${NAMESPACE}" \
+                  -o jsonpath='{.status.stableRS}' 2>/dev/null || echo "")
+
+                if [[ -n "$ACTIVE_HASH" && "$ACTIVE_HASH" != "null" ]]; then
+                  RS_LIST=$(kubectl get replicasets -n "${NAMESPACE}" -l "rollouts-pod-template-hash" \
+                    --field-selector "metadata.name!=${ROLLOUT_NAME}-${ACTIVE_HASH}" \
+                    -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || echo "")
+                  if [[ -n "$RS_LIST" ]]; then
+                    echo "$RS_LIST" | while read -r RS_NAME; do
+                      if [[ -n "$RS_NAME" ]]; then
+                        CURRENT_REPLICAS=$(kubectl get replicaset "${RS_NAME}" -n "${NAMESPACE}" \
+                          -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "0")
+                        if [[ "$CURRENT_REPLICAS" != "0" ]]; then
+                          echo "##[section]Escalando RS '${RS_NAME}' para 0 (era ${CURRENT_REPLICAS})"
+                          kubectl scale replicaset "${RS_NAME}" -n "${NAMESPACE}" --replicas=0
+                        fi
+                      fi
+                    done
+                    echo "##[section]✅ Scale down de ReplicaSets antigos concluído"
+                  fi
+                fi
+
+                kubectl annotate rollout.argoproj.io "${ROLLOUT_NAME}" -n "${NAMESPACE}" \
+                  migration.argorollouts.vivo/migration- || true
+                echo "##[section]✅ Cleanup de migração concluído"
+            env:
+              ROLLOUT_NAME: ${{ parameters.helmReleaseName }}
+              NAMESPACE: ${{ parameters.k8sNamespace[parameters.environment] }}
+
+  # ==================================================================
+  # Stage: Promote Manual Canary (apenas se deployStrategy = Canary e canaryAutoPromote = false)
+  # ==================================================================
+  - ${{ if and(or(eq(parameters.deployStrategy, 'Canary'), and(eq(parameters.deployStrategy, 'RollingUpdate'), eq(parameters.enableCanaryDeployment, true))), eq(parameters.canaryAutoPromote, false)) }}:
+    - stage: PromoteManualCanary
+      displayName: 'Promote Canary - Promoção Manual (${{ parameters.environment }})'
+      dependsOn: Deploy
+      condition: succeeded()
+      pool: ${{ parameters.agentPool }}
+      jobs:
+      - deployment: PromoteCanaryDeployment
+        displayName: 'Promover Canary para Stable'
+        environment:
+          name: deploy-${{ parameters.environment }}-promote
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: none
+
+                # Login no AKS
+                - ${{ if eq(parameters.useAKSManagedIdentity, true) }}:
+                  - task: Kubernetes@1
+                    displayName: 'Login no AKS'
+                    inputs:
+                      connectionType: 'Azure Resource Manager'
+                      azureSubscriptionEndpoint: ${{ parameters.aksServiceConnection[parameters.environment] }}
+                      azureResourceGroup: ${{ parameters.aksResourceGroup[parameters.environment] }}
+                      kubernetesCluster: ${{ parameters.aksClusterName[parameters.environment] }}
+                      namespace: ${{ parameters.k8sNamespace[parameters.environment] }}
+                      command: 'login'
+
+                - ${{ if eq(parameters.useKubeconfig, true) }}:
+                  - task: Kubernetes@1
+                    displayName: 'Login no Kubernetes via Kubeconfig'
+                    inputs:
+                      connectionType: 'Kubernetes Service Connection'
+                      kubernetesServiceEndpoint: ${{ parameters.kubeconfigServiceConnection[parameters.environment] }}
+                      namespace: ${{ parameters.k8sNamespace[parameters.environment] }}
+                      command: 'login'
+
+                # Exibir status atual do Rollout
+                - task: Bash@3
+                  displayName: 'Exibir status atual do Rollout Canary'
+                  inputs:
+                    targetType: 'inline'
+                    script: |
+                      set -euo pipefail
+
+                      echo "##[section]Status atual do Rollout Canary antes da promoção:"
+                      kubectl-argo-rollouts get rollout ${ROLLOUT_NAME} -n ${NAMESPACE}
+                  env:
+                    ROLLOUT_NAME: ${{ parameters.helmReleaseName }}
+                    NAMESPACE: ${{ parameters.k8sNamespace[parameters.environment] }}
+
+                # Validação pré-promoção (opcional)
+                - ${{ if eq(parameters.canaryPrePromoteValidation, true) }}:
+                  - task: Bash@3
+                    displayName: 'Executar validação pré-promoção'
+                    inputs:
+                      targetType: 'inline'
+                      script: |
+                        set -euo pipefail
+
+                        echo "##[section]Executando validação pré-promoção customizada"
+                        ${PRE_PROMOTE_SCRIPT}
+                        echo "##[section]✅ Validação pré-promoção concluída com sucesso"
+                    env:
+                      PRE_PROMOTE_SCRIPT: ${{ parameters.canaryPrePromoteScript }}
+
+                # Promover Canary progressivamente
+                # Respeita pause: {duration: N} (gerenciado pelo controller) e promove apenas pause: {} (indefinido)
+                - task: Bash@3
+                  displayName: 'Promover Canary Progressivamente'
+                  inputs:
+                    targetType: 'inline'
+                    script: |
+                      set -euo pipefail
+
+                      echo "##[section]Iniciando promoção do Rollout Canary '${ROLLOUT_NAME}'"
+
+                      TIMEOUT_SECONDS=$(echo "$TIMEOUT" | sed 's/s$//')
+                      ELAPSED=0
+                      LAST_PROMOTED_STEP=-1
+
+                      # Função para obter informações do rollout via JSON
+                      # Usa API group explícito (rollout.argoproj.io) para evitar ambiguidade
+                      # com outros CRDs que possam ter o shortname 'rollout'
+                      get_rollout_json() {
+                        local JSON
+                        JSON=$(kubectl get rollout.argoproj.io ${ROLLOUT_NAME} -n ${NAMESPACE} -o json 2>&1) || {
+                          echo "##[warning] Falha ao obter rollout via kubectl: ${JSON}" >&2
+                          echo '{}'
+                          return 1
+                        }
+                        echo "$JSON"
+                      }
+
+                      # Promote inicial para avançar do primeiro pause
+                      echo "##[command] kubectl-argo-rollouts promote ${ROLLOUT_NAME} -n ${NAMESPACE}"
+                      kubectl-argo-rollouts promote ${ROLLOUT_NAME} -n ${NAMESPACE}
+                      LAST_PROMOTED_STEP=0
+
+                      echo "##[section]Aguardando Rollout completar (timeout: ${TIMEOUT_SECONDS}s)..."
+
+                      while [[ $ELAPSED -lt $TIMEOUT_SECONDS ]]; do
+                        ROLLOUT_JSON=$(get_rollout_json)
+                        PHASE=$(echo "$ROLLOUT_JSON" | jq -r '.status.phase // "Unknown"')
+                        CURRENT_STEP=$(echo "$ROLLOUT_JSON" | jq -r '.status.currentStepIndex // 0')
+                        TOTAL_STEPS=$(echo "$ROLLOUT_JSON" | jq -r '[.spec.strategy.canary.steps[]?] | length')
+                        CANARY_WEIGHT=$(echo "$ROLLOUT_JSON" | jq -r '.status.canary.weights.canary.weight // 0')
+
+                        echo "##[debug] Phase=${PHASE} | Step=${CURRENT_STEP}/${TOTAL_STEPS} | Weight=${CANARY_WEIGHT}% | Elapsed=${ELAPSED}s/${TIMEOUT_SECONDS}s"
+
+                        case "$PHASE" in
+                          Healthy)
+                            echo "##[section]✅ Rollout Canary promovido com sucesso! (100% do tráfego)"
+                            exit 0
+                            ;;
+                          Paused)
+                            # Verificar se é uma pausa indefinida (pause: {}) ou temporizada (pause: {duration: N})
+                            # Pausas temporizadas são gerenciadas automaticamente pelo Argo Rollouts controller
+                            PAUSE_DURATION=$(echo "$ROLLOUT_JSON" | jq -r ".spec.strategy.canary.steps[$CURRENT_STEP].pause.duration // empty")
+
+                            if [[ -z "$PAUSE_DURATION" || "$PAUSE_DURATION" == "null" ]]; then
+                              # Pausa indefinida (pause: {}) — requer promote manual
+                              if [[ $CURRENT_STEP -ne $LAST_PROMOTED_STEP ]]; then
+                                echo "##[section]📊 Canary em ${CANARY_WEIGHT}% (step ${CURRENT_STEP}) — pausa indefinida, promovendo..."
+                                echo "##[command] kubectl-argo-rollouts promote ${ROLLOUT_NAME} -n ${NAMESPACE}"
+                                kubectl-argo-rollouts promote ${ROLLOUT_NAME} -n ${NAMESPACE}
+                                LAST_PROMOTED_STEP=$CURRENT_STEP
+                              else
+                                echo "##[debug] Aguardando promoção do step ${CURRENT_STEP} ser processada..."
+                              fi
+                            else
+                              echo "##[debug] Canary em ${CANARY_WEIGHT}% (step ${CURRENT_STEP}) — pausa temporizada (${PAUSE_DURATION}), aguardando controller..."
+                            fi
+                            ;;
+                          Progressing)
+                            echo "##[debug] Canary progredindo em ${CANARY_WEIGHT}% (step ${CURRENT_STEP})..."
+                            ;;
+                          Degraded|Error|Aborted)
+                            echo "##[error] Rollout Canary em estado '${PHASE}'!"
+                            echo "##[section]Status detalhado:"
+                            kubectl-argo-rollouts get rollout ${ROLLOUT_NAME} -n ${NAMESPACE} || true
+                            exit 1
+                            ;;
+                          *)
+                            echo "##[debug] Rollout em estado '${PHASE}', aguardando..."
+                            ;;
+                        esac
+
+                        sleep $CHECK_INTERVAL
+                        ELAPSED=$((ELAPSED + CHECK_INTERVAL))
+                      done
+
+                      echo "##[error] Timeout: Rollout Canary não completou após ${TIMEOUT_SECONDS}s"
+                      echo "##[section]Status final:"
+                      kubectl-argo-rollouts get rollout ${ROLLOUT_NAME} -n ${NAMESPACE} || true
+                      exit 1
+                  env:
+                    ROLLOUT_NAME: ${{ parameters.helmReleaseName }}
+                    NAMESPACE: ${{ parameters.k8sNamespace[parameters.environment] }}
+                    TIMEOUT: ${{ parameters.canaryRolloutTimeout }}
+                    CHECK_INTERVAL: ${{ parameters.canaryRolloutStatusCheckInterval }}
+
+                # Cleanup de migração de estratégia (se necessário)
+                - task: Bash@3
+                  displayName: 'Cleanup pós-migração de estratégia (se necessário)'
+                  condition: succeeded()
+                  inputs:
+                    targetType: 'inline'
+                    script: |
+                      set -euo pipefail
+
+                      ANNOTATION=$(kubectl get rollout.argoproj.io "${ROLLOUT_NAME}" -n "${NAMESPACE}" \
+                        -o jsonpath='{.metadata.annotations.migration\.argorollouts\.vivo/migration}' 2>/dev/null || echo "")
+
+                      if [[ -z "$ANNOTATION" || "$ANNOTATION" == "null" ]]; then
+                        echo "##[debug] Sem annotation de migração — nenhum cleanup necessário"
+                        exit 0
+                      fi
+
+                      echo "##[section]Migração detectada: ${ANNOTATION} — executando cleanup de ReplicaSets antigos"
+
+                      ACTIVE_HASH=$(kubectl get rollout.argoproj.io "${ROLLOUT_NAME}" -n "${NAMESPACE}" \
+                        -o jsonpath='{.status.stableRS}' 2>/dev/null || echo "")
+
+                      if [[ -n "$ACTIVE_HASH" && "$ACTIVE_HASH" != "null" ]]; then
+                        RS_LIST=$(kubectl get replicasets -n "${NAMESPACE}" -l "rollouts-pod-template-hash" \
+                          --field-selector "metadata.name!=${ROLLOUT_NAME}-${ACTIVE_HASH}" \
+                          -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || echo "")
+                        if [[ -n "$RS_LIST" ]]; then
+                          echo "$RS_LIST" | while read -r RS_NAME; do
+                            if [[ -n "$RS_NAME" ]]; then
+                              CURRENT_REPLICAS=$(kubectl get replicaset "${RS_NAME}" -n "${NAMESPACE}" \
+                                -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "0")
+                              if [[ "$CURRENT_REPLICAS" != "0" ]]; then
+                                echo "##[section]Escalando RS '${RS_NAME}' para 0 (era ${CURRENT_REPLICAS})"
+                                kubectl scale replicaset "${RS_NAME}" -n "${NAMESPACE}" --replicas=0
+                              fi
+                            fi
+                          done
+                          echo "##[section]✅ Scale down de ReplicaSets antigos concluído"
+                        fi
+                      fi
+
+                      kubectl annotate rollout.argoproj.io "${ROLLOUT_NAME}" -n "${NAMESPACE}" \
+                        migration.argorollouts.vivo/migration- || true
+                      echo "##[section]✅ Cleanup de migração concluído"
+                  env:
+                    ROLLOUT_NAME: ${{ parameters.helmReleaseName }}
+                    NAMESPACE: ${{ parameters.k8sNamespace[parameters.environment] }}
+
+  # ==================================================================
+  # Stage: Rollback Canary pré-promote (apenas se deployStrategy = Canary)
+  # Cenário: Canary deployado mas NÃO promovido — aborta o rollout canary em andamento
+  # e reverte para a versão stable anterior (tráfego volta 100% para stable)
+  # ==================================================================
+  - ${{ if or(eq(parameters.deployStrategy, 'Canary'), and(eq(parameters.deployStrategy, 'RollingUpdate'), eq(parameters.enableCanaryDeployment, true))) }}:
+    - stage: RollbackCanary
+      displayName: 'Rollback Canary - Abortar Canary em Andamento (${{ parameters.environment }})'
+      dependsOn: Deploy
+      condition: succeeded()
+      pool: ${{ parameters.agentPool }}
+      jobs:
+      - deployment: RollbackCanaryDeployment
+        displayName: 'Executar Rollback Canary (Abort)'
+        environment:
+          name: deploy-${{ parameters.environment }}-rollback
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: none
+
+                # Login no AKS
+                - ${{ if eq(parameters.useAKSManagedIdentity, true) }}:
+                  - task: Kubernetes@1
+                    displayName: 'Login no AKS'
+                    inputs:
+                      connectionType: 'Azure Resource Manager'
+                      azureSubscriptionEndpoint: ${{ parameters.aksServiceConnection[parameters.environment] }}
+                      azureResourceGroup: ${{ parameters.aksResourceGroup[parameters.environment] }}
+                      kubernetesCluster: ${{ parameters.aksClusterName[parameters.environment] }}
+                      namespace: ${{ parameters.k8sNamespace[parameters.environment] }}
+                      command: 'login'
+
+                - ${{ if eq(parameters.useKubeconfig, true) }}:
+                  - task: Kubernetes@1
+                    displayName: 'Login no Kubernetes via Kubeconfig'
+                    inputs:
+                      connectionType: 'Kubernetes Service Connection'
+                      kubernetesServiceEndpoint: ${{ parameters.kubeconfigServiceConnection[parameters.environment] }}
+                      namespace: ${{ parameters.k8sNamespace[parameters.environment] }}
+                      command: 'login'
+
+                # Exibir status atual antes do rollback
+                - task: Bash@3
+                  displayName: 'Exibir status do Rollout antes do Rollback'
+                  inputs:
+                    targetType: 'inline'
+                    script: |
+                      set -euo pipefail
+
+                      echo "##[section]Status atual do Rollout Canary antes do rollback:"
+                      kubectl-argo-rollouts get rollout ${ROLLOUT_NAME} -n ${NAMESPACE}
+                  env:
+                    ROLLOUT_NAME: ${{ parameters.helmReleaseName }}
+                    NAMESPACE: ${{ parameters.k8sNamespace[parameters.environment] }}
+
+                # Abort do Canary em andamento
+                # O abort cancela a operação canary e reverte todo o tráfego para stable
+                - task: Bash@3
+                  displayName: 'Abort Canary com kubectl-argo-rollouts'
+                  inputs:
+                    targetType: 'inline'
+                    script: |
+                      set -euo pipefail
+
+                      echo "##[section]Iniciando abort do Rollout Canary '${ROLLOUT_NAME}'"
+
+                      TIMEOUT_SECONDS=$(echo "$TIMEOUT" | sed 's/s$//')
+                      ELAPSED=0
+
+                      # Função para obter informações do rollout via JSON
+                      get_rollout_json() {
+                        local JSON
+                        JSON=$(kubectl get rollout.argoproj.io ${ROLLOUT_NAME} -n ${NAMESPACE} -o json 2>&1) || {
+                          echo "##[warning] Falha ao obter rollout via kubectl: ${JSON}" >&2
+                          echo '{}'
+                          return 1
+                        }
+                        echo "$JSON"
+                      }
+
+                      # Capturar estado antes do abort
+                      PRE_JSON=$(get_rollout_json)
+                      PRE_PHASE=$(echo "$PRE_JSON" | jq -r '.status.phase // "Unknown"')
+                      echo "##[debug] Phase antes do abort: ${PRE_PHASE}"
+
+                      # Se já estiver Healthy, o canary já foi promovido — informar que deve usar o rollback pós-promote
+                      if [[ "$PRE_PHASE" == "Healthy" ]]; then
+                        echo "##[warning] Rollout já está Healthy (canary já foi promovido)"
+                        echo "##[warning] Para reverter após promoção, use o stage 'Rollback Pós-Promote'"
+                        echo "##[section]Nenhuma ação necessária neste stage — canary não está em andamento"
+                        kubectl-argo-rollouts get rollout ${ROLLOUT_NAME} -n ${NAMESPACE} || true
+                        exit 0
+                      fi
+
+                      # Executar abort para cancelar o canary em andamento
+                      echo "##[command] kubectl-argo-rollouts abort ${ROLLOUT_NAME} -n ${NAMESPACE}"
+                      ABORT_OUTPUT=$(kubectl-argo-rollouts abort ${ROLLOUT_NAME} -n ${NAMESPACE} 2>&1) || {
+                        echo "##[warning] Abort retornou erro (pode ser esperado se rollout não está em progresso): ${ABORT_OUTPUT}"
+                      }
+                      echo "${ABORT_OUTPUT}"
+
+                      echo "##[section]Aguardando rollout reverter para stable..."
+
+                      # Aguardar o rollout voltar para Degraded (resultado do abort) e então estabilizar 
+                      # O abort coloca o rollout em estado Degraded e faz scale down dos pods canary
+                      # Após abort, precisamos fazer undo para limpar o estado Degraded e voltar para Healthy
+                      sleep 5
+
+                      ROLLOUT_JSON=$(get_rollout_json)
+                      PHASE=$(echo "$ROLLOUT_JSON" | jq -r '.status.phase // "Unknown"')
+                      echo "##[debug] Phase após abort: ${PHASE}"
+
+                      if [[ "$PHASE" == "Degraded" ]]; then
+                        echo "##[section]Rollout em estado Degraded após abort (esperado)"
+                        echo "##[section]Executando undo para restaurar para última versão stable..."
+
+                        echo "##[command] kubectl-argo-rollouts undo ${ROLLOUT_NAME} -n ${NAMESPACE}"
+                        kubectl-argo-rollouts undo ${ROLLOUT_NAME} -n ${NAMESPACE}
+
+                        sleep 3
+
+                        # Aguardar Healthy
+                        while [[ $ELAPSED -lt $TIMEOUT_SECONDS ]]; do
+                          ROLLOUT_JSON=$(get_rollout_json)
+                          PHASE=$(echo "$ROLLOUT_JSON" | jq -r '.status.phase // "Unknown"')
+                          CANARY_WEIGHT=$(echo "$ROLLOUT_JSON" | jq -r '.status.canary.weights.canary.weight // 0')
+
+                          echo "##[debug] Phase=${PHASE} | Weight=${CANARY_WEIGHT}% | Elapsed=${ELAPSED}s/${TIMEOUT_SECONDS}s"
+
+                          if [[ "$PHASE" == "Healthy" ]]; then
+                            echo "##[section]✅ Rollback Canary (abort) concluído com sucesso!"
+                            kubectl-argo-rollouts get rollout ${ROLLOUT_NAME} -n ${NAMESPACE} || true
+                            exit 0
+                          fi
+
+                          if [[ "$PHASE" == "Error" ]]; then
+                            echo "##[error] Rollout em estado Error após abort + undo!"
+                            kubectl-argo-rollouts get rollout ${ROLLOUT_NAME} -n ${NAMESPACE} || true
+                            exit 1
+                          fi
+
+                          sleep $CHECK_INTERVAL
+                          ELAPSED=$((ELAPSED + CHECK_INTERVAL))
+                        done
+                      elif [[ "$PHASE" == "Healthy" ]]; then
+                        echo "##[section]✅ Rollout já voltou para Healthy após abort!"
+                        kubectl-argo-rollouts get rollout ${ROLLOUT_NAME} -n ${NAMESPACE} || true
+                        exit 0
+                      fi
+
+                      echo "##[error] Timeout: Rollback Canary (abort) não completou após ${TIMEOUT_SECONDS}s"
+                      echo "##[section]Status final:"
+                      kubectl-argo-rollouts get rollout ${ROLLOUT_NAME} -n ${NAMESPACE} || true
+                      exit 1
+                  env:
+                    ROLLOUT_NAME: ${{ parameters.helmReleaseName }}
+                    NAMESPACE: ${{ parameters.k8sNamespace[parameters.environment] }}
+                    TIMEOUT: ${{ parameters.canaryRolloutTimeout }}
+                    CHECK_INTERVAL: ${{ parameters.canaryRolloutStatusCheckInterval }}
+
+  # ==================================================================
+  # Stage: Rollback Canary pós-promote (apenas se enableCanaryDeployment = true)
+  # Cenário: Canary já foi PROMOVIDO (100%, Healthy) — executa undo para
+  # reverter o spec do Rollout para a revisão anterior e restaurar versão estável
+  # dependsOn é dinâmico: depende do stage de promote (auto ou manual)
+  # ==================================================================
+  - ${{ if and(or(eq(parameters.deployStrategy, 'Canary'), and(eq(parameters.deployStrategy, 'RollingUpdate'), eq(parameters.enableCanaryDeployment, true))), eq(parameters.canaryAutoPromote, true)) }}:
+    - stage: RollbackAfterPromoteCanary
+      displayName: 'Rollback Pós-Promote - Reverter para Versão Anterior (${{ parameters.environment }})'
+      dependsOn: AutoPromoteCanary
+      condition: succeeded()
+      pool: ${{ parameters.agentPool }}
+      jobs:
+      - deployment: RollbackAfterPromoteCanaryDeployment
+        displayName: 'Executar Rollback Canary Pós-Promote (Undo)'
+        environment:
+          name: deploy-${{ parameters.environment }}-rollback
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: none
+
+                # Login no AKS
+                - ${{ if eq(parameters.useAKSManagedIdentity, true) }}:
+                  - task: Kubernetes@1
+                    displayName: 'Login no AKS'
+                    inputs:
+                      connectionType: 'Azure Resource Manager'
+                      azureSubscriptionEndpoint: ${{ parameters.aksServiceConnection[parameters.environment] }}
+                      azureResourceGroup: ${{ parameters.aksResourceGroup[parameters.environment] }}
+                      kubernetesCluster: ${{ parameters.aksClusterName[parameters.environment] }}
+                      namespace: ${{ parameters.k8sNamespace[parameters.environment] }}
+                      command: 'login'
+
+                - ${{ if eq(parameters.useKubeconfig, true) }}:
+                  - task: Kubernetes@1
+                    displayName: 'Login no Kubernetes via Kubeconfig'
+                    inputs:
+                      connectionType: 'Kubernetes Service Connection'
+                      kubernetesServiceEndpoint: ${{ parameters.kubeconfigServiceConnection[parameters.environment] }}
+                      namespace: ${{ parameters.k8sNamespace[parameters.environment] }}
+                      command: 'login'
+
+                # Exibir status atual antes do rollback
+                - task: Bash@3
+                  displayName: 'Exibir status do Rollout antes do Rollback'
+                  inputs:
+                    targetType: 'inline'
+                    script: |
+                      set -euo pipefail
+
+                      echo "##[section]Status atual do Rollout Canary antes do rollback pós-promote:"
+                      kubectl-argo-rollouts get rollout ${ROLLOUT_NAME} -n ${NAMESPACE}
+                  env:
+                    ROLLOUT_NAME: ${{ parameters.helmReleaseName }}
+                    NAMESPACE: ${{ parameters.k8sNamespace[parameters.environment] }}
+
+                # Executar Undo para reverter spec para revisão anterior
+                - task: Bash@3
+                  displayName: 'Rollback Canary pós-promote com kubectl-argo-rollouts undo'
+                  inputs:
+                    targetType: 'inline'
+                    script: |
+                      set -euo pipefail
+
+                      echo "##[section]Iniciando rollback pós-promote do Rollout Canary '${ROLLOUT_NAME}'"
+
+                      TIMEOUT_SECONDS=$(echo "$TIMEOUT" | sed 's/s$//')
+                      ELAPSED=0
+
+                      get_rollout_json() {
+                        local JSON
+                        JSON=$(kubectl get rollout.argoproj.io ${ROLLOUT_NAME} -n ${NAMESPACE} -o json 2>&1) || {
+                          echo "##[warning] Falha ao obter rollout via kubectl: ${JSON}" >&2
+                          echo '{}'
+                          return 1
+                        }
+                        echo "$JSON"
+                      }
+
+                      # Capturar estado antes do undo
+                      PRE_ROLLOUT_JSON=$(get_rollout_json)
+                      PRE_SPEC_GENERATION=$(echo "$PRE_ROLLOUT_JSON" | jq -r '.metadata.generation // 0')
+                      PRE_PHASE=$(echo "$PRE_ROLLOUT_JSON" | jq -r '.status.phase // "Unknown"')
+                      PRE_REVISION=$(echo "$PRE_ROLLOUT_JSON" | jq -r '.status.currentPodHash // "unknown"')
+                      echo "##[debug] Antes do undo: generation=${PRE_SPEC_GENERATION}, phase=${PRE_PHASE}, revision=${PRE_REVISION}"
+
+                      # Executar undo
+                      echo "##[command] kubectl-argo-rollouts undo ${ROLLOUT_NAME} -n ${NAMESPACE}"
+                      UNDO_OUTPUT=$(kubectl-argo-rollouts undo ${ROLLOUT_NAME} -n ${NAMESPACE} 2>&1) || {
+                        echo "##[error] Falha ao executar undo: ${UNDO_OUTPUT}"
+                        exit 1
+                      }
+                      echo "${UNDO_OUTPUT}"
+
+                      sleep 3
+
+                      # Verificar se undo teve efeito usando 3 indicadores:
+                      # 1) generation mudou  2) phase mudou  3) currentPodHash (revision) mudou
+                      POST_UNDO_JSON=$(get_rollout_json)
+                      POST_SPEC_GENERATION=$(echo "$POST_UNDO_JSON" | jq -r '.metadata.generation // 0')
+                      POST_PHASE=$(echo "$POST_UNDO_JSON" | jq -r '.status.phase // "Unknown"')
+                      POST_REVISION=$(echo "$POST_UNDO_JSON" | jq -r '.status.currentPodHash // "unknown"')
+
+                      echo "##[debug] Após undo: generation=${POST_SPEC_GENERATION}, phase=${POST_PHASE}, revision=${POST_REVISION}"
+
+                      GENERATION_CHANGED=false
+                      PHASE_CHANGED=false
+                      REVISION_CHANGED=false
+
+                      [[ $POST_SPEC_GENERATION -ne $PRE_SPEC_GENERATION ]] && GENERATION_CHANGED=true
+                      [[ "$POST_PHASE" != "$PRE_PHASE" ]] && PHASE_CHANGED=true
+                      [[ "$POST_REVISION" != "$PRE_REVISION" ]] && REVISION_CHANGED=true
+
+                      echo "##[debug] Mudanças detectadas: generation=${GENERATION_CHANGED}, phase=${PHASE_CHANGED}, revision=${REVISION_CHANGED}"
+
+                      # Se nada mudou, é um no-op
+                      if [[ "$GENERATION_CHANGED" == "false" && "$PHASE_CHANGED" == "false" && "$REVISION_CHANGED" == "false" ]]; then
+                        if [[ "$POST_PHASE" == "Healthy" ]]; then
+                          echo "##[section]Rollout está Healthy — template anterior é idêntico ao atual"
+                          echo "##[section]Nenhuma reversão é possível pois não há diferença entre revisões"
+                          kubectl-argo-rollouts get rollout ${ROLLOUT_NAME} -n ${NAMESPACE} || true
+                          exit 0
+                        fi
+
+                        echo "##[error] Undo não teve efeito e rollout não está Healthy (phase=${POST_PHASE})"
+                        kubectl-argo-rollouts get rollout ${ROLLOUT_NAME} -n ${NAMESPACE} || true
+                        exit 1
+                      fi
+
+                      echo "##[section]Undo teve efeito — aguardando rollout ficar pronto para promote --full..."
+
+                      # Aguardar o rollout sair do estado transitório para Paused ou Progressing estável
+                      while [[ $ELAPSED -lt $TIMEOUT_SECONDS ]]; do
+                        ROLLOUT_JSON=$(get_rollout_json)
+                        PHASE=$(echo "$ROLLOUT_JSON" | jq -r '.status.phase // "Unknown"')
+
+                        echo "##[debug] Aguardando controller... phase=${PHASE} (${ELAPSED}s/${TIMEOUT_SECONDS}s)"
+
+                        # Se já ficou Paused, podemos promover imediatamente
+                        if [[ "$PHASE" == "Paused" ]]; then
+                          echo "##[debug] Rollout em estado Paused — pronto para promote --full"
+                          break
+                        fi
+
+                        # Se ficou Healthy sem nosso promote, o controller resolveu sozinho
+                        if [[ "$PHASE" == "Healthy" ]]; then
+                          echo "##[section]✅ Rollback Canary pós-promote concluído (rollout voltou a Healthy)"
+                          kubectl-argo-rollouts get rollout ${ROLLOUT_NAME} -n ${NAMESPACE} || true
+                          exit 0
+                        fi
+
+                        if [[ "$PHASE" == "Degraded" || "$PHASE" == "Error" ]]; then
+                          echo "##[error] Rollout em estado '${PHASE}' após undo!"
+                          kubectl-argo-rollouts get rollout ${ROLLOUT_NAME} -n ${NAMESPACE} || true
+                          exit 1
+                        fi
+
+                        sleep $CHECK_INTERVAL
+                        ELAPSED=$((ELAPSED + CHECK_INTERVAL))
+                      done
+
+                      if [[ $ELAPSED -ge $TIMEOUT_SECONDS ]]; then
+                        echo "##[error] Timeout aguardando rollout ficar pronto após undo (${TIMEOUT_SECONDS}s)"
+                        kubectl-argo-rollouts get rollout ${ROLLOUT_NAME} -n ${NAMESPACE} || true
+                        exit 1
+                      fi
+
+                      # Promover com --full para completar o rollback sem passar pelos steps canary
+                      echo "##[command] kubectl-argo-rollouts promote ${ROLLOUT_NAME} -n ${NAMESPACE} --full"
+                      kubectl-argo-rollouts promote ${ROLLOUT_NAME} -n ${NAMESPACE} --full
+
+                      ELAPSED=0
+                      while [[ $ELAPSED -lt $TIMEOUT_SECONDS ]]; do
+                        ROLLOUT_JSON=$(get_rollout_json)
+                        PHASE=$(echo "$ROLLOUT_JSON" | jq -r '.status.phase // "Unknown"')
+                        CANARY_WEIGHT=$(echo "$ROLLOUT_JSON" | jq -r '.status.canary.weights.canary.weight // 0')
+
+                        echo "##[debug] Phase=${PHASE} | Weight=${CANARY_WEIGHT}% | Elapsed=${ELAPSED}s/${TIMEOUT_SECONDS}s"
+
+                        case "$PHASE" in
+                          Healthy)
+                            echo "##[section]✅ Rollback Canary pós-promote concluído com sucesso!"
+                            kubectl-argo-rollouts get rollout ${ROLLOUT_NAME} -n ${NAMESPACE} || true
+                            exit 0
+                            ;;
+                          Paused)
+                            echo "##[debug] Rollout pausado durante rollback, promovendo com --full..."
+                            kubectl-argo-rollouts promote ${ROLLOUT_NAME} -n ${NAMESPACE} --full
+                            ;;
+                          Progressing)
+                            echo "##[debug] Rollback progredindo..."
+                            ;;
+                          Degraded|Error|Aborted)
+                            echo "##[error] Rollout em estado '${PHASE}' durante rollback!"
+                            kubectl-argo-rollouts get rollout ${ROLLOUT_NAME} -n ${NAMESPACE} || true
+                            exit 1
+                            ;;
+                        esac
+
+                        sleep $CHECK_INTERVAL
+                        ELAPSED=$((ELAPSED + CHECK_INTERVAL))
+                      done
+
+                      echo "##[error] Timeout: Rollback pós-promote não completou após ${TIMEOUT_SECONDS}s"
+                      echo "##[section]Status final:"
+                      kubectl-argo-rollouts get rollout ${ROLLOUT_NAME} -n ${NAMESPACE} || true
+                      exit 1
+                  env:
+                    ROLLOUT_NAME: ${{ parameters.helmReleaseName }}
+                    NAMESPACE: ${{ parameters.k8sNamespace[parameters.environment] }}
+                    TIMEOUT: ${{ parameters.canaryRolloutTimeout }}
+                    CHECK_INTERVAL: ${{ parameters.canaryRolloutStatusCheckInterval }}
+
+  - ${{ if and(or(eq(parameters.deployStrategy, 'Canary'), and(eq(parameters.deployStrategy, 'RollingUpdate'), eq(parameters.enableCanaryDeployment, true))), eq(parameters.canaryAutoPromote, false)) }}:
+    - stage: RollbackAfterPromoteCanaryManual
+      displayName: 'Rollback Pós-Promote - Reverter para Versão Anterior (${{ parameters.environment }})'
+      dependsOn: PromoteManualCanary
+      condition: succeeded()
+      pool: ${{ parameters.agentPool }}
+      jobs:
+      - deployment: RollbackAfterPromoteCanaryManualDeployment
+        displayName: 'Executar Rollback Canary Pós-Promote (Undo)'
+        environment:
+          name: deploy-${{ parameters.environment }}-rollback
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: none
+
+                # Login no AKS
+                - ${{ if eq(parameters.useAKSManagedIdentity, true) }}:
+                  - task: Kubernetes@1
+                    displayName: 'Login no AKS'
+                    inputs:
+                      connectionType: 'Azure Resource Manager'
+                      azureSubscriptionEndpoint: ${{ parameters.aksServiceConnection[parameters.environment] }}
+                      azureResourceGroup: ${{ parameters.aksResourceGroup[parameters.environment] }}
+                      kubernetesCluster: ${{ parameters.aksClusterName[parameters.environment] }}
+                      namespace: ${{ parameters.k8sNamespace[parameters.environment] }}
+                      command: 'login'
+
+                - ${{ if eq(parameters.useKubeconfig, true) }}:
+                  - task: Kubernetes@1
+                    displayName: 'Login no Kubernetes via Kubeconfig'
+                    inputs:
+                      connectionType: 'Kubernetes Service Connection'
+                      kubernetesServiceEndpoint: ${{ parameters.kubeconfigServiceConnection[parameters.environment] }}
+                      namespace: ${{ parameters.k8sNamespace[parameters.environment] }}
+                      command: 'login'
+
+                # Exibir status atual antes do rollback
+                - task: Bash@3
+                  displayName: 'Exibir status do Rollout antes do Rollback'
+                  inputs:
+                    targetType: 'inline'
+                    script: |
+                      set -euo pipefail
+
+                      echo "##[section]Status atual do Rollout Canary antes do rollback pós-promote:"
+                      kubectl-argo-rollouts get rollout ${ROLLOUT_NAME} -n ${NAMESPACE}
+                  env:
+                    ROLLOUT_NAME: ${{ parameters.helmReleaseName }}
+                    NAMESPACE: ${{ parameters.k8sNamespace[parameters.environment] }}
+
+                # Executar Undo para reverter spec para revisão anterior
+                - task: Bash@3
+                  displayName: 'Rollback Canary pós-promote com kubectl-argo-rollouts undo'
+                  inputs:
+                    targetType: 'inline'
+                    script: |
+                      set -euo pipefail
+
+                      echo "##[section]Iniciando rollback pós-promote do Rollout Canary '${ROLLOUT_NAME}'"
+
+                      TIMEOUT_SECONDS=$(echo "$TIMEOUT" | sed 's/s$//')
+                      ELAPSED=0
+
+                      get_rollout_json() {
+                        local JSON
+                        JSON=$(kubectl get rollout.argoproj.io ${ROLLOUT_NAME} -n ${NAMESPACE} -o json 2>&1) || {
+                          echo "##[warning] Falha ao obter rollout via kubectl: ${JSON}" >&2
+                          echo '{}'
+                          return 1
+                        }
+                        echo "$JSON"
+                      }
+
+                      # Capturar estado antes do undo
+                      PRE_ROLLOUT_JSON=$(get_rollout_json)
+                      PRE_SPEC_GENERATION=$(echo "$PRE_ROLLOUT_JSON" | jq -r '.metadata.generation // 0')
+                      PRE_PHASE=$(echo "$PRE_ROLLOUT_JSON" | jq -r '.status.phase // "Unknown"')
+                      PRE_REVISION=$(echo "$PRE_ROLLOUT_JSON" | jq -r '.status.currentPodHash // "unknown"')
+                      echo "##[debug] Antes do undo: generation=${PRE_SPEC_GENERATION}, phase=${PRE_PHASE}, revision=${PRE_REVISION}"
+
+                      # Executar undo
+                      echo "##[command] kubectl-argo-rollouts undo ${ROLLOUT_NAME} -n ${NAMESPACE}"
+                      UNDO_OUTPUT=$(kubectl-argo-rollouts undo ${ROLLOUT_NAME} -n ${NAMESPACE} 2>&1) || {
+                        echo "##[error] Falha ao executar undo: ${UNDO_OUTPUT}"
+                        exit 1
+                      }
+                      echo "${UNDO_OUTPUT}"
+
+                      sleep 3
+
+                      # Verificar se undo teve efeito usando 3 indicadores:
+                      # 1) generation mudou  2) phase mudou  3) currentPodHash (revision) mudou
+                      POST_UNDO_JSON=$(get_rollout_json)
+                      POST_SPEC_GENERATION=$(echo "$POST_UNDO_JSON" | jq -r '.metadata.generation // 0')
+                      POST_PHASE=$(echo "$POST_UNDO_JSON" | jq -r '.status.phase // "Unknown"')
+                      POST_REVISION=$(echo "$POST_UNDO_JSON" | jq -r '.status.currentPodHash // "unknown"')
+
+                      echo "##[debug] Após undo: generation=${POST_SPEC_GENERATION}, phase=${POST_PHASE}, revision=${POST_REVISION}"
+
+                      GENERATION_CHANGED=false
+                      PHASE_CHANGED=false
+                      REVISION_CHANGED=false
+
+                      [[ $POST_SPEC_GENERATION -ne $PRE_SPEC_GENERATION ]] && GENERATION_CHANGED=true
+                      [[ "$POST_PHASE" != "$PRE_PHASE" ]] && PHASE_CHANGED=true
+                      [[ "$POST_REVISION" != "$PRE_REVISION" ]] && REVISION_CHANGED=true
+
+                      echo "##[debug] Mudanças detectadas: generation=${GENERATION_CHANGED}, phase=${PHASE_CHANGED}, revision=${REVISION_CHANGED}"
+
+                      # Se nada mudou, é um no-op
+                      if [[ "$GENERATION_CHANGED" == "false" && "$PHASE_CHANGED" == "false" && "$REVISION_CHANGED" == "false" ]]; then
+                        if [[ "$POST_PHASE" == "Healthy" ]]; then
+                          echo "##[section]Rollout está Healthy — template anterior é idêntico ao atual"
+                          echo "##[section]Nenhuma reversão é possível pois não há diferença entre revisões"
+                          kubectl-argo-rollouts get rollout ${ROLLOUT_NAME} -n ${NAMESPACE} || true
+                          exit 0
+                        fi
+
+                        echo "##[error] Undo não teve efeito e rollout não está Healthy (phase=${POST_PHASE})"
+                        kubectl-argo-rollouts get rollout ${ROLLOUT_NAME} -n ${NAMESPACE} || true
+                        exit 1
+                      fi
+
+                      echo "##[section]Undo teve efeito — aguardando rollout ficar pronto para promote --full..."
+
+                      # Aguardar o rollout sair do estado transitório para Paused ou Progressing estável
+                      while [[ $ELAPSED -lt $TIMEOUT_SECONDS ]]; do
+                        ROLLOUT_JSON=$(get_rollout_json)
+                        PHASE=$(echo "$ROLLOUT_JSON" | jq -r '.status.phase // "Unknown"')
+
+                        echo "##[debug] Aguardando controller... phase=${PHASE} (${ELAPSED}s/${TIMEOUT_SECONDS}s)"
+
+                        # Se já ficou Paused, podemos promover imediatamente
+                        if [[ "$PHASE" == "Paused" ]]; then
+                          echo "##[debug] Rollout em estado Paused — pronto para promote --full"
+                          break
+                        fi
+
+                        # Se ficou Healthy sem nosso promote, o controller resolveu sozinho
+                        if [[ "$PHASE" == "Healthy" ]]; then
+                          echo "##[section]✅ Rollback Canary pós-promote concluído (rollout voltou a Healthy)"
+                          kubectl-argo-rollouts get rollout ${ROLLOUT_NAME} -n ${NAMESPACE} || true
+                          exit 0
+                        fi
+
+                        if [[ "$PHASE" == "Degraded" || "$PHASE" == "Error" ]]; then
+                          echo "##[error] Rollout em estado '${PHASE}' após undo!"
+                          kubectl-argo-rollouts get rollout ${ROLLOUT_NAME} -n ${NAMESPACE} || true
+                          exit 1
+                        fi
+
+                        sleep $CHECK_INTERVAL
+                        ELAPSED=$((ELAPSED + CHECK_INTERVAL))
+                      done
+
+                      if [[ $ELAPSED -ge $TIMEOUT_SECONDS ]]; then
+                        echo "##[error] Timeout aguardando rollout ficar pronto após undo (${TIMEOUT_SECONDS}s)"
+                        kubectl-argo-rollouts get rollout ${ROLLOUT_NAME} -n ${NAMESPACE} || true
+                        exit 1
+                      fi
+
+                      # Promover com --full para completar o rollback sem passar pelos steps canary
+                      echo "##[command] kubectl-argo-rollouts promote ${ROLLOUT_NAME} -n ${NAMESPACE} --full"
+                      kubectl-argo-rollouts promote ${ROLLOUT_NAME} -n ${NAMESPACE} --full
+
+                      ELAPSED=0
+                      while [[ $ELAPSED -lt $TIMEOUT_SECONDS ]]; do
+                        ROLLOUT_JSON=$(get_rollout_json)
+                        PHASE=$(echo "$ROLLOUT_JSON" | jq -r '.status.phase // "Unknown"')
+                        CANARY_WEIGHT=$(echo "$ROLLOUT_JSON" | jq -r '.status.canary.weights.canary.weight // 0')
+
+                        echo "##[debug] Phase=${PHASE} | Weight=${CANARY_WEIGHT}% | Elapsed=${ELAPSED}s/${TIMEOUT_SECONDS}s"
+
+                        case "$PHASE" in
+                          Healthy)
+                            echo "##[section]✅ Rollback Canary pós-promote concluído com sucesso!"
+                            kubectl-argo-rollouts get rollout ${ROLLOUT_NAME} -n ${NAMESPACE} || true
+                            exit 0
+                            ;;
+                          Paused)
+                            echo "##[debug] Rollout pausado durante rollback, promovendo com --full..."
+                            kubectl-argo-rollouts promote ${ROLLOUT_NAME} -n ${NAMESPACE} --full
+                            ;;
+                          Progressing)
+                            echo "##[debug] Rollback progredindo..."
+                            ;;
+                          Degraded|Error|Aborted)
+                            echo "##[error] Rollout em estado '${PHASE}' durante rollback!"
+                            kubectl-argo-rollouts get rollout ${ROLLOUT_NAME} -n ${NAMESPACE} || true
+                            exit 1
+                            ;;
+                        esac
+
+                        sleep $CHECK_INTERVAL
+                        ELAPSED=$((ELAPSED + CHECK_INTERVAL))
+                      done
+
+                      echo "##[error] Timeout: Rollback pós-promote não completou após ${TIMEOUT_SECONDS}s"
+                      echo "##[section]Status final:"
+                      kubectl-argo-rollouts get rollout ${ROLLOUT_NAME} -n ${NAMESPACE} || true
+                      exit 1
+                  env:
+                    ROLLOUT_NAME: ${{ parameters.helmReleaseName }}
+                    NAMESPACE: ${{ parameters.k8sNamespace[parameters.environment] }}
+                    TIMEOUT: ${{ parameters.canaryRolloutTimeout }}
+                    CHECK_INTERVAL: ${{ parameters.canaryRolloutStatusCheckInterval }}
+

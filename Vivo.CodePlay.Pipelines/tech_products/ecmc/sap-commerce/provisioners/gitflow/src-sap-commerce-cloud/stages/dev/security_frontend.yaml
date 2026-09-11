@@ -1,0 +1,90 @@
+parameters:
+- name: fortifyExclusionRepository
+- name: dependsOn
+  type: object
+- name: branchName
+  type: string
+
+stages:
+- stage: security_frontend
+  displayName: "Security Frontend"
+  dependsOn: "${{ parameters.dependsOn }}"
+  isSkippable: false
+  condition: not(or(failed(), canceled()))
+  pool: $(PRIVATE_AGENT_DEFAULT)
+  jobs:
+  - job: app_config_keys
+    workspace:
+      clean: all
+    displayName: "Get AppSec Config Keys"
+    condition: succeeded()
+    steps:
+    - template: /tasks/bash/welcome.yml@CorePipelines
+    - template: /security/get_appconfig_keys.yml
+      parameters:
+        repositoryName: "src-sap-commerce-js-store-front-ng"
+        repositoryId: "e2087895-b798-4b2e-85b5-995ae6325721"
+
+  - job: sast_scan
+    dependsOn: app_config_keys
+    workspace:
+      clean: all
+    variables:
+      USE_FORTIFY: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_FORTIFY'] ]
+      USE_CONVISO: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_CONVISO'] ]
+      SKIP_SECURITY_GATE: $[ dependencies.app_config_keys.outputs['evaluate_flags.SKIP_SECURITY_GATE'] ]
+    condition: and(
+                    succeeded(),
+                    and(
+                      eq(variables.USE_FORTIFY, 'true'),
+                      eq(variables.flowIsToReview, true),
+                      not(startsWith(variables['Build.SourceBranch'], 'refs/tags/'))
+                    )
+                  )
+    displayName: "SAST Scan"
+    steps:
+    - template: /security/run_fortify_scan.yml
+      parameters:
+        fortifyExclusionRepository: ${{ parameters.fortifyExclusionRepository }}
+        fortifyArtifactName: "fortify-log-frontend-$(System.JobAttempt)"
+        fortifyArtifactNameToPublish: "fortify-vulnerabilities-report-jsstorefront-$(System.JobAttempt)"
+        appVersion: "DevSecOps-development"
+        repositoryAlias: "JsStoreFront"
+        repositoryName: "src-sap-commerce-js-store-front-ng"
+        branchName: ${{ parameters.branchName }}
+
+    - template: /tasks/telemetry/telemetry.yml@CorePipelines
+
+  - job: sca_scan
+    dependsOn: app_config_keys
+    displayName: "SCA Scan"
+    variables:
+      USE_DEPENDENCY_TRACK: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_DEPENDENCY_TRACK'] ]
+      USE_DT_DOCKER: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_DT_DOCKER'] ]
+      USE_CONVISO: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_CONVISO'] ]
+      SKIP_SECURITY_GATE_SCA: $[ dependencies.app_config_keys.outputs['evaluate_flags.SKIP_SECURITY_GATE_SCA'] ]
+    condition: and(
+                  succeeded(),
+                  eq(variables.USE_DEPENDENCY_TRACK, true),
+                  eq(variables.USE_DT_DOCKER, false)
+                )
+    steps:
+    - checkout: JsStoreFront
+      clean: true
+      fetchDepth: 1
+      fetchTags: false
+      persistCredentials: true
+
+    - bash: |
+        echo "##[section]Stage para preparação do build e testes do Core Customize"
+        git fetch --no-tags origin "$BRANCH_NAME:$BRANCH_NAME" -f --depth 1
+        git checkout "$BRANCH_NAME"
+        git log
+      displayName: "Reset branch JsStoreFront to ${{parameters.branchName }}"
+      env:
+        BRANCH_NAME: ${{parameters.branchName}}
+
+    - template: /security/run_sca_scan.yml
+      parameters:
+        appVersion: "DevSecOps-development"
+        repositoryName: "src-sap-commerce-js-store-front-ng"

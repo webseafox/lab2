@@ -1,0 +1,380 @@
+parameters:
+- name: variable_groups
+  displayName: Lista de Variables Groups para complementar variaveis e segredos.
+  default: []
+  type: object
+
+- name: environment
+  displayName: 'Escolha o ambiente para publicar'
+  type: string
+  default: dev
+  values:
+  - dev
+  - esteira1
+  - esteira2
+  - esteira3
+  - preprod
+  - production
+  - prodlike
+
+- name: vivonow_chg
+  displayName: 'Numero CHG do VivoNow, somente para "production"'
+  default: CHG0000001
+
+- name: website_physical_path
+  displayName: 'Endereco de implantacao (IISWebAppManagementOnMachineGroup > WebsitePhysicalPath)'
+  default: '' # S:\Sistema_Web
+
+- name: website_name
+  displayName: 'Nome do Web Site (IISWebAppManagementOnMachineGroup > [WebsiteName, ParentWebsiteNameForVD, AppPoolName, StartStopRecycleAppPoolName, VirtualApplication])'
+  default: 'default' # TiSimplesProjeto
+
+variables:
+- name: System.debug
+  value: 'true'
+- ${{ each group_name in parameters.variable_groups }}:
+  - group: ${{ group_name }}
+
+stages:
+- stage:
+  displayName: "Ensure config files"
+  pool: GeneralPurposeLinuxAgentsCI
+  jobs:
+  - job: 
+    displayName: "Ensure files"
+    steps:
+    - checkout: self
+      fetchDepth: 1
+
+    - task: UseDotNet@2
+      inputs:
+        packageType: 'sdk'
+        version: '3.x'
+
+    - task: Bash@3
+      inputs:
+        targetType: 'inline'
+        script: | # shell
+          
+          dotnet new tool-manifest
+          dotnet tool install dotnet-setversion --version 2.6.0
+      displayName: 'Ensure dotnet-setversion'
+      
+
+    - task: Bash@3
+      inputs:
+        targetType: 'inline'
+        script: | #shell
+          SLN_PROJ=$(ls *.sln *.csproj 2>/dev/null | head -n1)
+          dotnet msbuild $SLN_PROJ -nologo -v:diag > dotnet-project-info.txt | true
+          cat dotnet-project-info.txt
+      displayName: 'Dump project info'
+
+    - task: RegexInline@4
+      displayName: 'Get Project info'
+      inputs:
+        source: file://./dotnet-project-info.txt
+        regexes: |
+          var CSPROJ_PACKAGE_VERSION = /( PackageVersion )= ([^\n]+)/gm
+
+    - task: SemverIncrementCustomFromVivo@5
+      displayName: 'Semver Increment "patch"'
+      name: new_version
+      inputs:
+        currentversion: $(CSPROJ_PACKAGE_VERSION_GROUP_2)
+        outputVariableName: "NEW_VERSION"
+        releaseType: "patch"
+        template: "${NEW_COERCED_VERSION}"
+
+
+    - task: Bash@3
+      inputs:
+        targetType: 'inline'
+        script: dotnet tool run setversion $(new_version.NEW_VERSION)
+      displayName: "dotnet-setversion"
+
+    - task: Bash@3
+      inputs:
+        targetType: 'inline'
+        script: | #shell
+          rm -rf dotnet-project-info.txt
+          SLN_PROJ=$(ls *.sln *.csproj 2>/dev/null | head -n1)
+          dotnet msbuild $SLN_PROJ -nologo -v:diag > dotnet-project-info.txt | true
+          cat dotnet-project-info.txt
+      displayName: 'Dump project info'
+
+
+    - task: CopyFiles@2
+      displayName: 'Staging Artifacts'
+      inputs:
+        SourceFolder: $(Build.SourcesDirectory)
+        TargetFolder: $(Build.ArtifactStagingDirectory)
+        Contents: |
+          **/*.csproj
+          *.csproj
+          dotnet-project-info.txt
+        CleanTargetFolder: true
+        OverWrite: true
+        flattenFolders: false
+
+    - task: PublishBuildArtifacts@1
+      displayName: "Push Artifacts"
+      inputs:
+        ArtifactName: 'generated-sources'
+        PathtoPublish: $(Build.ArtifactStagingDirectory)
+- stage:
+  displayName: 'VivoNow Gate'
+  pool: GeneralPurposeLinuxAgentsCD
+  jobs:
+  - job:
+    displayName: 'Check on (VivoNow)'
+    condition: eq('${{ parameters.environment }}', 'production')
+    steps:
+
+    - task: AxiosFromVivo@4
+      displayName: 'Fetch CHG'
+      inputs:
+        type: 'text'
+        origin: |
+          var options = {
+            method: 'GET',
+            url: 'http://10.41.252.111:9010/vivonow/viewer/${{ parameters.vivonow_chg }}'
+          };
+        variablePrefix: 'VIVO_NOW_CHG_'
+      env:
+        NODE_EXTRA_CA_CERTS: $(CACORP_LOCATION)
+
+    - task: RegexMatch@4
+      displayName: 'Query CHG'
+      inputs:
+        source: $(VIVO_NOW_CHG_BODY)
+        regex: '/(<title>)(.*)(<\/title>)/ig'
+        outVarPrefix: 'CHG_FOUND_'
+
+    - script: exit 1
+      displayName: 'Check CHG'
+      condition: not(variables['CHG_FOUND_HAS_MATCH'])
+
+- stage:
+  displayName: 'GovApp Gate'
+  pool: GeneralPurposeLinuxAgentsCD
+  jobs:
+  - job:
+    displayName: 'Governance Policies Check'
+    steps:
+    - checkout: self
+
+    - task: JsonParseFromVivo@4
+      displayName: 'Get package.json info'
+      inputs:
+        type: 'file'
+        origin: $(Build.SourcesDirectory)/package.json
+        jpaths: |
+          var PACKAGE_JSON_VERSION = .version
+
+    - task: LoadFile@4
+      inputs:
+        script: |
+          CATALOG_YAML_CONTENT = $(Build.SourcesDirectory)/catalog-info.yaml
+
+    - task: YamlParseFromVivo@4
+      displayName: 'Get Metadata Info'
+      inputs:
+        type: 'file'
+        origin: $(Build.SourcesDirectory)/catalog-info.yaml
+        jpaths: |
+          var CATALOG_YAML_NAME = .metadata.name
+          var CATALOG_YAML_MODULE = .metadata.annotations['techarch.governance-app.module']
+          var CATALOG_YAML_K8S_NS = .metadata.annotations['vivo.io/kubernetes-k8s-namespace-${{ parameters.environment }}']
+
+    - task: VivoGovernance@1
+      continueOnError: true
+      displayName: 'Governance Validate'
+      inputs:
+        breakglass: false
+        serverEndpoint: 'governanceapi'
+        operation: 'validate'
+        component: $(CATALOG_YAML_NAME)
+        version: $(POM_XML_VERSION)
+        cluster: ${{ parameters.kubernetes_connection }}
+        namespace: $(CATALOG_YAML_K8S_NS)
+        deployment: $(CATALOG_YAML_NAME)
+        environment: ${{ parameters.environment }}
+        catalogInfo: $(CATALOG_YAML_CONTENT)
+
+- stage:
+  displayName: 'Deploy on (${{ parameters.environment }})'
+  pool: GeneralPurposeLinuxAgentsCI
+  variables:
+  - name: System.debug
+    value: "true"
+  - name: ARTIFACT_SUFIX
+    ${{ if eq('${{ parameters.environment }}', 'production') }}:
+      value: 'rc'
+    ${{ else }}:
+      value: 'alpha'
+  jobs:
+  - deployment:
+    displayName: 'Deploy on (${{ parameters.environment }})'
+    # creates an environment if it doesn't exist
+    environment:
+      name: 'deploy-${{ parameters.environment }}'
+      # resourceName: BRTLVBGS0447PL
+
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+            persistCredentials: true
+            fetchDepth: 1
+
+          - task: DownloadBuildArtifacts@1
+            displayName: 'Download generated files'
+            inputs:
+              buildType: 'current'
+              downloadType: 'single'
+              artifactName: 'generated-sources'
+              downloadPath: $(Build.ArtifactStagingDirectory)
+
+          - task: RegexInline@4
+            displayName: 'Get Project info'
+            inputs:
+              source: file://$(Build.ArtifactStagingDirectory)/generated-sources/dotnet-project-info.txt
+              regexes: |
+                var CSPROJ_PACKAGE_VERSION = /( PackageVersion )= ([^\n]+)/gm
+          
+          - task: CopyFiles@2
+            displayName: Overwrite generated sources
+            inputs:
+              SourceFolder: $(System.ArtifactsDirectory)/generated-sources
+              Contents: '**'
+              TargetFolder: './'
+              OverWrite: true
+
+          - task: YamlParseFromVivo@4
+            displayName: 'Get Metadata Info'
+            inputs:
+              type: 'file'
+              origin: $(Build.SourcesDirectory)/catalog-info.yaml
+              jpaths: |
+                var CATALOG_YAML_NAME = .metadata.name
+                var CATALOG_YAML_ACRONYM = .metadata.annotations['techarch.governance-app.acronym']
+                var CATALOG_YAML_MODULE = .metadata.annotations['techarch.governance-app.module']
+                var CATALOG_YAML_SONAR_PROJECT_KEY = .metadata.annotations['sonarqube.org/project-key']
+
+          - task: UniversalPackages@0
+            displayName: Download a Universal Package
+            condition: succeeded()
+            continueOnError: false
+            inputs:
+              command: download
+              vstsFeed: "3d53bc62-8749-4931-ae46-a443b73bc87a"
+              vstsFeedPackage: $(CATALOG_YAML_NAME)
+              vstsPackageVersion: $(CSPROJ_PACKAGE_VERSION_GROUP_2)-$(ARTIFACT_SUFIX)
+              downloadDirectory: "$(Pipeline.Workspace)"
+          
+
+          - task: IISWebAppManagementOnMachineGroup@0
+            displayName: Ensure IIS Site
+            inputs:
+              IISDeploymentType: 'IISWebsite'
+              ActionIISWebsite: 'CreateOrUpdateWebsite'
+              WebsiteName: '${{ parameters.website_name }}'
+              WebsitePhysicalPath: '${{ parameters.website_physical_path }}'
+              WebsitePhysicalPathAuth: 'WebsiteUserPassThrough'
+              AddBinding: false
+              ParentWebsiteNameForVD: '${{ parameters.website_name }}'
+              ParentWebsiteNameForApplication: 'Dasboard'
+              AppPoolName: '${{ parameters.website_name }}'
+
+          - task: IISWebAppManagementOnMachineGroup@0
+            displayName: Stop IIS Site
+            inputs:
+              IISDeploymentType: 'IISApplicationPool'
+              ActionIISApplicationPool: 'StopAppPool'
+              StartStopRecycleAppPoolName: '${{ parameters.website_name }}'
+
+          - task: IISWebAppDeploymentOnMachineGroup@0
+            displayName: Update IIS Site
+            inputs:
+              WebSiteName: 'Dasboard'
+              VirtualApplication: '${{ parameters.website_name }}'
+              Package: '$(Build.ArtifactStagingDirectory)/app.zip'
+              TakeAppOfflineFlag: true
+
+          - task: IISWebAppManagementOnMachineGroup@0
+            displayName: Start IIS Site
+            inputs: 
+              IISDeploymentType: 'IISApplicationPool'
+              ActionIISApplicationPool: 'StartAppPool'
+              StartStopRecycleAppPoolName: '${{ parameters.website_name }}'
+        on:
+          success:
+            steps:
+            - checkout: self
+              fetchDepth: 1
+
+            - task: JsonParseFromVivo@4
+              displayName: 'Get package.json info'
+              inputs:
+                type: 'file'
+                origin: $(Build.SourcesDirectory)/package.json
+                jpaths: |
+                  var PACKAGE_JSON_VERSION = .version
+
+            - task: LoadFile@4
+              displayName: 'Load catalog-info.yaml'
+              inputs:
+                script: |
+                  CATALOG_YAML_CONTENT = $(Build.SourcesDirectory)/catalog-info.yaml
+
+            - task: YamlParseFromVivo@4
+              displayName: 'Get Metadata Info'
+              inputs:
+                type: 'file'
+                origin: $(Build.SourcesDirectory)/catalog-info.yaml
+                jpaths: |
+                  var CATALOG_YAML_NAME = .metadata.name
+                  var CATALOG_YAML_K8S_NS = .metadata.annotations['vivo.io/kubernetes-k8s-namespace-${{ parameters.environment }}']
+
+            - task: CatchLogsToLocalDirectoryFromVivo@4
+              displayName: 'Dump logs and metas'
+              inputs:
+                dumpDir: $(Build.ArtifactStagingDirectory)/audit
+
+            - task: PublishBuildArtifacts@1
+              displayName: 'Push Logs to Artifacts'
+              inputs:
+                ArtifactName: audit
+                PathtoPublish: $(Build.ArtifactStagingDirectory)/audit
+
+            - task: VivoGovernance@1
+              displayName: 'Gov Notify "deploy"'
+              inputs:
+                breakglass: false
+                serverEndpoint: 'governanceapi'
+                operation: 'deploy'
+                component: $(CATALOG_YAML_NAME)
+                version: $(PACKAGE_JSON_VERSION)
+                cluster: 'NA' # ${{ parameters.kubernetes_connection }}
+                namespace: $(CATALOG_YAML_K8S_NS)
+                deployment: $(CATALOG_YAML_NAME)
+                environment: ${{ parameters.environment }}
+                catalogInfo: $(CATALOG_YAML_CONTENT)
+
+          failure:
+            steps:
+            - checkout: none
+
+            - task: CatchLogsToLocalDirectoryFromVivo@4
+              displayName: 'Dump logs and metas'
+              inputs:
+                dumpDir: $(Build.ArtifactStagingDirectory)/audit
+
+            - task: PublishBuildArtifacts@1
+              displayName: 'Push Logs to Artifacts'
+              inputs:
+                ArtifactName: audit
+                PathtoPublish: $(Build.ArtifactStagingDirectory)/audit
+

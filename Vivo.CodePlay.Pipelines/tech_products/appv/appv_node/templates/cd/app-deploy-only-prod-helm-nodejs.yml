@@ -1,0 +1,304 @@
+stages:
+- stage: cd_deploy_prod
+  displayName: "CD - Deploy"  
+  pool:
+    name: GeneralPurposeLinuxAgentsCD
+  dependsOn:   
+   - environment_init
+   - deploy_environment_prod
+  condition: succeeded()
+
+  ## -> Loads variables from other stages.
+  variables:    
+
+  - name: ARTIFACT_NAME
+    value: $[ stageDependencies.ci_build.build.outputs['artifact_name.ARTIFACT_NAME'] ]
+
+  - name: DOCKER_REGISTRY_USERNAME
+    value: $[ stageDependencies.deploy_environment_init.environment.outputs['credentials.DOCKER_REGISTRY_USERNAME'] ]    
+  - name: DOCKER_REGISTRY_PASSWORD
+    value: $[ stageDependencies.deploy_environment_init.environment.outputs['credentials.DOCKER_REGISTRY_PASSWORD'] ] 
+  - name: NEXUS_DEPS_USR
+    value: $[ stageDependencies.nodejs_environment_init.environment.outputs['credentials.NEXUS_DEPS_USR'] ]
+  - name: NEXUS_DEPS_PSW
+    value: $[ stageDependencies.nodejs_environment_init.environment.outputs['credentials.NEXUS_DEPS_PSW'] ]
+  - name: NEXUS_DEFAULT_USR
+    value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEFAULT_USR'] ]    
+  - name: NEXUS_DEFAULT_PSW
+    value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEFAULT_PSW'] ]
+  - name: setVersion
+    value: $(echo "${{ parameters.setVersion }}" | xargs)
+  - name: setTimeout
+    value: $(echo "${{ parameters.setTimeout }}" | xargs)
+
+
+  - template: /tech_products/appv/global/initialize/catalog-info-environment.yml
+  - template: /tech_products/appv/global/initialize/variables-global.yml
+
+  jobs:
+
+  - deployment: deploy
+    displayName: 'Deploy'
+    condition: succeeded()
+    environment:
+      name: $(DEPLOY_ENVIRONMENT_PROD)
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+
+          ## -> Download Artifacts
+          - download: none
+        
+          ## -> Clean the pipeline workspace and checkout the code.
+          ## -> 6d15af64-176c-496d-b583-fd2ae21d4df4 is the decorator for checkout.
+          # - task: 6d15af64-176c-496d-b583-fd2ae21d4df4@1
+          #   displayName: Checkout Code
+          #   name: checkout_code 
+          #   inputs:
+          #     repository: self
+          #     persistCredentials: "true"
+          #     clean: true
+                  ## -> Checkout the source code.
+          - checkout: self
+            displayName: Checkout Source Code
+            name: checkout_source_code
+            clean: true
+            path: sourcecode
+            submodules: recursive
+
+          ## -> Download kube config 
+          - ${{ if or(eq(variables['Build.Repository.Name'], 'src-frontend'), startsWith(variables['Build.Repository.Name'], 'src-frontend.')) }}:
+            - task: DownloadSecureFile@1
+              displayName: 'Download Kube Config for novastack'
+              condition: and(succeeded(), in('${{ parameters.setEnvironment }}', 'prod-ms', 'prod-bff', 'prod-front', 'producao', 'prd-front'))
+              continueOnError: false
+              name: secureFile
+              inputs:
+                secureFile: kubeconf-${{ parameters.setEnvironment }}-ns.yml
+          
+          - ${{ if not(or(eq(variables['Build.Repository.Name'], 'src-frontend'), startsWith(variables['Build.Repository.Name'], 'src-frontend.'))) }}:
+            - task: DownloadSecureFile@1
+              displayName: 'Download Kube Config'
+              condition: and(succeeded(), in('${{ parameters.setEnvironment }}', 'prod-ms', 'prod-bff', 'prod-front', 'producao', 'prd'))
+              continueOnError: false
+              name: secureFile
+              inputs:
+                secureFile: kubeconf-${{ parameters.setEnvironment }}.yml
+
+          # - task: Bash@3
+          #   displayName: 'Create docker registry secret '
+          #   condition: succeeded()
+          #   continueOnError: true
+          #   inputs:
+          #     targetType: inline
+          #     script: |
+
+          #       dockerSecretName=$(echo $(DOCKER_SERVICE_CONNECTION) | tr A-Z a-z)
+                
+          #       echo "##[debug] Searching secrets..."
+          #       kubectl get secrets $dockerSecretName \
+          #         -n ${{ parameters.setEnvironment }} \
+          #         --kubeconfig=$(secureFile.secureFilePath) \
+          #         --insecure-skip-tls-verify
+
+          #       if [ $? -gt 0 ]; then
+          #         echo "##[debug] Setup docker registry."                                    
+
+          #         kubectl create secret docker-registry $dockerSecretName \
+          #           --docker-server=$(DOCKER_REGISTRY) \
+          #           --docker-username=$(DOCKER_REGISTRY_USERNAME) \
+          #           --docker-password=$(DOCKER_REGISTRY_PASSWORD) \
+          #           --docker-email=$(DOCKER_REGISTRY_EMAIL) \
+          #           -n ${{ parameters.setEnvironment }} \
+          #           --kubeconfig=$(secureFile.secureFilePath) \
+          #           --insecure-skip-tls-verify
+                    
+          #         if [ $? -gt 0 ]; then
+          #           echo "##[error] Error create docker registry $dockerSecretName"
+          #           exit 1;
+          #         else
+          #           echo "##[debug] Docker registry $dockerSecretName configured success!"
+          #         fi
+          #       else
+          #         echo "##[debug] Registry $dockerSecretName exists!"
+          #       fi
+
+          #       echo "##vso[task.setvariable variable=IMAGE_REPOSITORY_SECRET_NAME;]$dockerSecretName"
+
+          - task: Bash@3
+            displayName: 'Set Chart Version'
+            condition: succeeded()
+            inputs:
+              targetType: 'inline'
+              script: |
+                APP_NAME="$(APPLICATION_NAME)"
+
+                if [[ "$APP_NAME" != *"fb-app-vivo"* ]] && [[ "$APP_NAME" != *"framework-brasil"* ]]; then
+                  echo "Skipping chart version setup"
+                  return 0
+                fi
+
+                if [ -n "$(CHART_VERSION_PROD)" ]; then
+                  echo "##vso[task.setvariable variable=CHART_VERSION]$(CHART_VERSION_PROD)"
+                  echo "Using project version: $(CHART_VERSION_PROD)"
+                else
+                  if [[ "$APP_NAME" == *"-bff" ]]; then
+                    echo "Detected BFF application: $APP_NAME"
+                    echo "##vso[task.setvariable variable=CHART_VERSION]$(DEFAULT_BFF_CHART_VERSION_PROD)"
+                    echo "Using default version for BFF: $(DEFAULT_BFF_CHART_VERSION_PROD)"
+                  elif [[ "$APP_NAME" == *"-front" ]]; then
+                    echo "Detected FRONT application: $APP_NAME"
+                    echo "##vso[task.setvariable variable=CHART_VERSION]$(DEFAULT_FRONT_CHART_VERSION_PROD)"
+                    echo "Using default version for FRONT: $(DEFAULT_FRONT_CHART_VERSION_PROD)"
+                  fi
+                fi
+
+            
+          - task: Bash@3
+            displayName: "Deploy Application through helm"
+            condition: succeeded()           
+            inputs:
+              targetType: inline
+              script: |
+                
+                # if [ "${{ parameters.forceUpgrade }}" = "True"  && $(chartRepository) = "framework-brasil-helm"] ; then
+                #   echo "##[debug] Force upgrade enabled"
+                #   echo "##[section] INICIANDO UNINSTALL DA RELEASE $(APPLICATION_NAME)"
+                #   helm --kubeconfig $(secureFile.secureFilePath) uninstall $(APPLICATION_NAME) --namespace ${{ parameters.setEnvironment }} --timeout $(WAIT_TIMEOUT) --wait
+                # fi
+                
+                
+                if [ "${{ parameters.forceUpgrade }}" = "True"  ]; then
+
+                  echo "##[debug] Force upgrade enabled"
+
+                  echo "##[section] REMOVENDO ARTEFATOS DO $(APPLICATION_NAME) DO AMBIENTE"
+
+                  kubectl -n ${{ parameters.setEnvironment }} delete svc $(APPLICATION_NAME) --kubeconfig $(secureFile.secureFilePath) --insecure-skip-tls-verify
+                  kubectl -n ${{ parameters.setEnvironment }} delete svc "$(APPLICATION_NAME)-grpc" --kubeconfig $(secureFile.secureFilePath) --insecure-skip-tls-verify
+                  kubectl -n ${{ parameters.setEnvironment }} delete hpa $(APPLICATION_NAME) --kubeconfig $(secureFile.secureFilePath) --insecure-skip-tls-verify
+                  kubectl -n ${{ parameters.setEnvironment }} delete hpa "$(APPLICATION_NAME)-canary" --kubeconfig $(secureFile.secureFilePath) --insecure-skip-tls-verify                  
+                  kubectl -n ${{ parameters.setEnvironment }} delete dr $(APPLICATION_NAME) --kubeconfig $(secureFile.secureFilePath) --insecure-skip-tls-verify
+                  kubectl -n ${{ parameters.setEnvironment }} delete vs $(APPLICATION_NAME) --kubeconfig $(secureFile.secureFilePath) --insecure-skip-tls-verify
+                  kubectl -n ${{ parameters.setEnvironment }} delete deployment $(APPLICATION_NAME) --kubeconfig $(secureFile.secureFilePath) --insecure-skip-tls-verify
+                  kubectl -n ${{ parameters.setEnvironment }} delete deployment "$(APPLICATION_NAME)-canary" --kubeconfig $(secureFile.secureFilePath) --insecure-skip-tls-verify
+                  kubectl -n ${{ parameters.setEnvironment }} delete configmap "$(APPLICATION_NAME)" --kubeconfig $(secureFile.secureFilePath) --insecure-skip-tls-verify
+
+                  helm --kubeconfig $(secureFile.secureFilePath) uninstall $(APPLICATION_NAME) --namespace ${{ parameters.setEnvironment }} --timeout $(WAIT_TIMEOUT) --wait
+                 
+                  echo "##[section] FINALIZADA REMOÇÃO DE ARTEFATOS DO AMBIENTE"
+                fi 
+                
+
+                echo "##[section] HELM upgrade:"
+                echo "##[debug] KUBECONFIG: $(secureFile.secureFilePath)"
+                echo "##[debug] NAMESPACE: ${{ parameters.setEnvironment }}"
+        
+                echo "##[group] Properties for deployment"
+                echo "##[debug]FULL IMAGE NAME : '$(IMAGE_REGISTRY)/$(IMAGE_NAME):$(setVersion)'"
+                echo "##[debug]CHART_NAME: $(CHART_NAME)"
+                echo "##[debug]CHART_REPOSITORY: $(CHART_REPOSITORY)"
+                echo "##[debug]CHART_VERSION: $(CHART_VERSION)"
+                echo "##[debug]CHART_VERSION: $(CHART_VERSION)"
+                echo "##[debug]IMAGE_NAME: $(IMAGE_NAME)"
+                echo "##[debug]IMAGE_REGISTRY: $(IMAGE_REGISTRY)"
+                echo "##[debug]IMAGE_VERSION: $(setVersion)"
+                echo "##[endgroup]"
+                
+
+                echo "##[debug] Looking for values.(yml,yaml) file..."
+                valuesFile=$(find $(Pipeline.Workspace)/sourcecode/.azuredevops/config/${{ parameters.setEnvironment }} -name 'values*')
+
+                if [ -z $valuesFile ] ; then
+                  echo "##[error] values.(yml,yaml) not found. Aborting..."
+                  exit 1;
+                fi              
+                
+
+                echo "##[debug] valuesFile: $valuesFile"
+                echo "##[debug] $(cat $valuesFile)"
+                
+
+
+                mkdir -p $(System.DefaultWorkingDirectory)/chart
+                echo "descompactando o template do helm $(CHART_NAME)-$(CHART_VERSION)"
+                echo "downloading 'https://nexus.telefonica.com.br/repository/$(CHART_REPOSITORY)/$(CHART_NAME)-$(CHART_VERSION).tgz'"
+                
+                
+                curl -u '$(NEXUS_DEFAULT_USR)':'$(NEXUS_DEFAULT_PSW)' -O https://nexus.telefonica.com.br/repository/$(CHART_REPOSITORY)/$(CHART_NAME)-$(CHART_VERSION).tgz
+
+                file "$(CHART_NAME)-$(CHART_VERSION).tgz"                  
+                tar -zxvf "$(CHART_NAME)-$(CHART_VERSION).tgz" -C $(System.DefaultWorkingDirectory)/chart
+                rm "$(CHART_NAME)-$(CHART_VERSION).tgz"
+
+                #helm --kubeconfig $(secureFile.secureFilePath) status $(IMAGE_NAME) --namespace ${{ parameters.setEnvironment }}
+
+
+                  echo "##[section] ================================================================================================================================="
+                  echo "##[section]                                                      INICIANDO DEPLOY EM AMBIENTE PRODUTIVO! "
+                  echo "##[section] ================================================================================================================================="
+
+                set -e
+                helm --kubeconfig $(secureFile.secureFilePath) upgrade $(APPLICATION_NAME) --install $(System.DefaultWorkingDirectory)/chart/$(CHART_NAME) --atomic -f "$valuesFile" --namespace ${{ parameters.setEnvironment }} --wait --timeout $(setTimeout) --set image.tag=$(setVersion) --set image.name=$(IMAGE_NAME) --set image.repository=$(IMAGE_REGISTRY)
+                
+                echo "###[debug]helm upgrade $(APPLICATION_NAME) \
+                   $(System.DefaultWorkingDirectory)/chart/ \
+                   -f "$valuesFile" \
+                   --namespace ${{ parameters.setEnvironment }} \
+                   --install \
+                   --insecure-skip-tls-verify \
+                   --wait \
+                   --timeout ${WAIT_TIMEOUT} \
+                   --set "image.repository=$(IMAGE_REGISTRY)/$(IMAGE_NAME)" \
+                   --set "image.name=$(IMAGE_NAME)" \
+                   --set "image.tag=$(setVersion)" \
+                   --set "imagePullSecrets[0].name=$(IMAGE_REPOSITORY_SECRET_NAME)" \
+                   --output table \
+                   --history-max $(HELM_UPGRADE_HISTORY_MAX) \
+                   --atomic \
+                   --debug"
+
+       
+        on:
+          success:
+            steps:
+            - task: Bash@3
+              displayName: Lib Publish Success
+              name: t_success_message
+              inputs:
+                targetType: inline
+                script: |
+                  echo "##[section] ================================================================================================================================="
+                  echo "##[section]                                                      DEPLOY WAS SUCCESSFUL! "
+                  echo "##[section] ================================================================================================================================="
+                  echo "##[section] Parabéns sua aplicação foi implantada com sucesso no ambiente de runtime." 
+                  echo "##[section] Acesse a url da sua aplicação e valide  se sua nova versão foi entregue com sucesso."
+                  echo "##[section] "
+                  echo "##[section] $(ALERT_MESSAGE_ARROW) Sua aplicação foi implantada com sucesso no ambiente."
+                  echo "##[section] $(ALERT_MESSAGE_ARROW) Verifique com o responsável técnico como acessar acessar a sua aplicação."
+                  echo "##[section] $(ALERT_MESSAGE_ARROW) Caso não esteja conseguindo acessar a sua aplicação entre em contato com suporte."
+                  echo "##[section] "
+                  echo "##[section] Caso tenha dúvidas sobre essa fase do pipeline acesse a nossa documentação: $(CORPORATE_WIKI_DOC_URL)"
+                  echo "##[section]================================================================================================================================="
+
+          failure:
+            steps:
+            - task: Bash@3
+              displayName: Lib Publish Failure
+              name: t_failure_message
+              inputs:
+                targetType: inline
+                script: |
+                  echo "##[error] ================================================================================================================================="
+                  echo "##[error]                                                    DEPLOY WAS NOT SUCCESSFUL! "
+                  echo "##[error] ================================================================================================================================="
+                  echo "##[error] Se está vendo essa mensagem é porque aconteceu algo erro durante a impplantação da sua apliação."
+                  echo "##[error] "
+                  echo "##[error] Segue abaixo umas dicas para o Troubleshooting:"
+                  echo "##[error] $(ALERT_MESSAGE_ARROW) Consulte o log do estágio de deploy da aplicação."
+                  echo "##[error] $(ALERT_MESSAGE_ARROW) Verifique com o responsável técnico como proceder em caso de falha de ambiente."                  
+                  echo "##[error] "
+                  echo "##[error] Caso tenha dúvidas sobre essa fase do pipeline acesse a nossa documentação: $(CORPORATE_WIKI_DOC_URL)"
+                  echo "##[error] ================================================================================================================================="              
+      

@@ -1,0 +1,86 @@
+# Starter pipeline
+# Start with a minimal pipeline that you can customize to build and deploy your code.
+# Add steps that build, run tests, deploy, and more:
+# https://aka.ms/yaml
+
+variables:
+- name: PRIVATE_AGENT_SHARED
+  value: GeneralPurposeLinuxAgentsCI
+- name: PROXY_NSKP_SERVER
+  value: 10.240.58.39
+- name: PROXY_NSKP_PORT
+  value: 3128
+- name: PROXY_NSKP_HTTP
+  value: http://$(PROXY_NSKP_SERVER):$(PROXY_NSKP_PORT)
+- name: PROXY_NSKP_HTTPS
+  value: http://$(PROXY_NSKP_SERVER):$(PROXY_NSKP_PORT)
+- name: PROXY_NSKP_NO_PROXY
+  value: localhost,0.0.0.0,127.0.0.1,10.244.0.0/16,192.168.0.0/16,10.129.178.173,nexus.telefonica.com.br,acrsharedservices01.azurecr.io,appcs-azdevops-shared.azconfig.io,scm.azurewebsites.net
+- name: BRANCH
+  value: $(Build.SourceBranch)
+- name: COMMIT_ID
+  value: $(Build.SourceVersion)
+- name: COMMIT_MESSAGE
+  value: $(Build.SourceVersionMessage)
+- name: REPO_NAME
+  value: $(Build.Repository.Name)
+- name: REPO_ID
+  value: $(Build.Repository.Id)
+
+# https://docs.microsoft.com/en-us/azure/devops/pipelines/build/variables?view=azure-devops&tabs=yaml
+stages:
+  - stage: stg
+    displayName: "Publicar mensagens no tópico do Kafka"
+    pool: $(PRIVATE_AGENT_SHARED)
+    jobs:
+      - job: stg
+        steps:
+        - task: Bash@3
+          inputs:
+            targetType: inline
+            displayName: Coletar informações do commit
+            script: |-
+              apiUrl="https://dev.azure.com/telefonica-vivo-brasil/_apis/git/repositories/$(REPO_ID)/commits/$(COMMIT_ID)?api-version=7.1-preview.1"
+              echo "API_Azure: $apiUrl"
+              response=$(curl --retry 3 --retry-max-time 30 -H "Content-Type: application/json" -H "Authorization: Bearer $(System.AccessToken)" --proxy "$(PROXY_NSKP_HTTPS)" -s -w "%{http_code}" $apiUrl)
+              statusCode=${response:(-3)}
+              response=${response:0:(-3)}
+              echo "Resposta da API do Azure DevOps: $response"
+              echo "statusCodeAPI: $statusCode"
+
+              # Verifica se o status code é 200
+              if [ "$statusCode" -eq 200 ]; then
+                # Extrai o displayName ]
+                committer_name=$(echo $response | jq -r '.committer?.name // empty')
+                commit_date=$(echo $response | jq -r '.committer?.date // empty')
+
+                echo "##vso[task.setvariable variable=COMMITTER_NAME;]$committer_name"
+                echo "##vso[task.setvariable variable=COMMIT_DATE;]$commit_date"
+              else
+                echo "Erro na chamada da API do Azure DevOps. Status code não é 200."
+                exit 1
+              fi
+        - task: Bash@3
+          displayName: Imprimir informações do commit
+          inputs:
+            targetType: inline
+            script: |-
+              echo "Branch: $(BRANCH)"
+              echo "Id do commit: $(COMMIT_ID)"
+              echo "Nome do repositório: $(REPO_NAME)"
+              echo "Último commit feito por: $(COMMITTER_NAME)"
+              echo "Mensagem do último commit: $(COMMIT_MESSAGE)"
+              echo "Data/hora último commit realizado na master: $(COMMIT_DATE)"
+        - task: KafkaProducer@0
+          displayName: Publicar informações no tópico
+          inputs:
+            kafkaOamEndpoint: KafkaEsteiraDigitalProd
+            kafkaProducerClientId: esteira-digital-group
+            kafkaServer: oauth.bootstrap.apps.ocp-kafka-prd.redecorp.br:443
+            commitDate: $(COMMIT_DATE)
+            commitId: $(COMMIT_ID)
+            commitMessage: $(COMMIT_MESSAGE)
+            committerName: $(COMMITTER_NAME)
+            repoName: $(REPO_NAME)
+            kafkaTopic: "integracao-azure-jira-branch-master"
+            debug: true

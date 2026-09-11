@@ -1,0 +1,116 @@
+parameters:
+- name: environment
+  type: string
+  values:
+  - dev
+  - esteira1
+  - esteira2
+  - prodlike
+  - preprod
+  - producao
+- name: dependsOn
+  type: object
+  default: []
+- name: gateway
+
+stages:
+- stage: stage_deploy_${{ parameters.environment }}
+  pool: $(PRIVATE_AGENT_DEFAULT)
+  displayName: Deploy ${{ parameters.environment }}
+  dependsOn: ${{ parameters.dependsOn }}
+  # condition: and(succeeded(), eq(variables.flowIsMain, true))
+  jobs:
+  - deployment: deployment_${{ parameters.environment }}
+    displayName: Deploy ${{ parameters.environment }}
+    environment: deploy-${{ parameters.environment }}
+    variables:
+      API_MANAGER_BASE_URL: $(API_MANAGER_BASE_URL_${{ upper(parameters.environment) }})
+      ADMIN_USERNAME: $[ coalesce(variables.API_MANAGER_ADMIN_USERNAME_${{ upper(parameters.environment) }}, variables.API_MANAGER_ADMIN_USERNAME) ]
+      ADMIN_PASSWORD: $[ coalesce(variables.API_MANAGER_ADMIN_PASSWORD_${{ upper(parameters.environment) }}, variables.API_MANAGER_ADMIN_PASSWORD) ]
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+            path: $(CATALOG_CHECKOUT_PATH)
+          - template: /tasks/axway/deploy_set_api_version.yml
+            parameters:
+              parameterApiVersion: $(API_VERSION)
+              buildApiVersion: ""
+          - template: /tasks/axway/catalog/extract_variables.yml
+            parameters:
+              apiName: $(API_NAME)
+          - template: /tasks/nexus/download_file.yml
+            parameters:
+              repository: $(NEXUS_REPOSITORY)
+              remoteFileLocation: "$(NEXUS_COMPONENT_GROUP)/$(NEXUS_COMPONENT_NAME)/$(API_VERSION)/$(NEXUS_COMPONENT_NAME).dat"
+          - template: /tasks/axway/organizations/get_id.yml
+            parameters:
+              organizationName: $(extract_catalog_variables.ORGANIZATION_NAME)
+          - template: /tasks/axway/frontend_api/import.yml
+            parameters:
+              apiOrganizationID: $(ORGANIZATION_ID)
+              datFileLocation: $(Agent.TempDirectory)/$(NEXUS_COMPONENT_NAME).dat
+              repository: $(NEXUS_REPOSITORY)
+              remoteFileLocation: "$(NEXUS_COMPONENT_GROUP)/$(NEXUS_COMPONENT_NAME)/$(API_VERSION)/$(NEXUS_COMPONENT_NAME).dat"
+          - template: /tasks/axway/get_new_api.yml
+            parameters:
+              name: $(API_NAME)
+              apiVersion: $(API_VERSION)
+          - template: /tasks/axway/frontend_api/publish.yml
+            parameters:
+              frontendApiName: $(API_NAME)
+              frontendApiID: $(get_new_api.FRONTEND_NEW_API_ID)
+          - template: /tasks/axway/organizations/get_shared_organizations_id.yml
+            parameters:
+              sharedOrganizations: $(extract_catalog_variables.SHARED_ORGANIZATIONS)
+          - template: /tasks/axway/frontend_api/grantaccess.yml
+            parameters:
+              frontendApiID: $(get_new_api.FRONTEND_NEW_API_ID)
+              sharedOrganizationsID: $(SHARED_ORGANIZATIONS_ID)
+          - template: /tasks/axway/get_old_api.yml
+            parameters:
+              name: $(API_NAME)
+              frontendNewApiID: $(get_new_api.FRONTEND_NEW_API_ID)
+          - template: /tasks/axway/frontend_api/upgrade.yml
+            parameters:
+              frontendOldApiID: $(FRONTEND_OLD_API_ID)
+              frontendNewApiID: $(get_new_api.FRONTEND_NEW_API_ID)
+          - template: /tasks/axway/frontend_api/delete.yml
+            parameters:
+              frontendApiID: $(FRONTEND_OLD_API_ID)
+          - template: /tasks/axway/backend_api/delete.yml
+            parameters:
+              backendApiID: $(BACKEND_OLD_API_ID)
+          - template: /tasks/axway/applications/api_subscription.yml
+            parameters:
+              apiID: $(get_new_api.FRONTEND_NEW_API_ID)
+              apiName: $(API_NAME)
+              apiOrganizationName: $(extract_catalog_variables.ORGANIZATION_NAME)
+              apiSharedOrganizationsName: $(extract_catalog_variables.SHARED_ORGANIZATIONS)
+          - template: /tasks/gov_app/deploy.yaml
+            parameters:
+              version: $(API_VERSION)
+              namespace: ${{ parameters.environment }}
+              environment: ${{ parameters.environment }}
+              cluster: ${{ parameters.gateway }}
+              srcPath: $(Build.SourcesDirectory)
+        on:
+          failure:         
+            steps:
+            - template: /tasks/axway/deploy_set_api_version.yml
+              parameters:
+                parameterApiVersion: $(API_VERSION)
+                buildApiVersion: $(BUILD_API_VERSION)
+            - template: /tasks/axway/get_new_api.yml
+              parameters:
+                taskName: get_new_api_failure
+                name: $(API_NAME)
+                apiVersion: $(API_VERSION)
+                continueOnError: true
+            - template: /tasks/axway/frontend_api/delete.yml
+              parameters:
+                frontendApiID: $(get_new_api_failure.FRONTEND_NEW_API_ID)
+            - template: /tasks/axway/backend_api/delete.yml
+              parameters:
+                backendApiID: $(get_new_api_failure.BACKEND_NEW_API_ID)

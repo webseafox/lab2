@@ -1,0 +1,82 @@
+###
+### ISTO NAO E UM TEMPLATE
+###
+
+variables:
+- name: System.debug
+  value: "true"
+
+stages:
+- stage: 
+  displayName: 'Jira Integration'
+  pool: GeneralPurposeLinuxAgentsCI
+  jobs:
+  - job:
+    displayName: 'Jira Commit Integration'
+    steps:
+    - checkout: self
+      fetchDepth: 1
+
+    - task: Regex@4
+      displayName: 'Filter Commit Message'
+      inputs:
+        source: $(Build.SourceVersionMessage)
+        regex: '/^ {0,}([^ :]+) {0,}: {0,}(([^| ]+) {0,}\| {0,}([^| ]+) {0,}\| {0,}(.+) {0,})/gm'
+        # REGEX_MATCH > env: CHange | PTI3737-1219 | alteração de certificado para consumo kafka
+        # REGEX_GROUP_1 > env
+        # REGEX_GROUP_2 > CHange | PTI3737-1219 | alteração de certificado para consumo kafka
+        # REGEX_GROUP_3 > CHange
+        # REGEX_GROUP_4 > PTI3737-1219
+        # REGEX_GROUP_5 > alteração de certificado para consumo kafka
+
+    - task: TypeScriptRunner@4
+      displayName: 'Get Commit Info'
+      condition: eq(variables['REGEX_HAS_MATCH'], 'true')
+      inputs:
+        azureDevOpsEndpoint: 'Azure DevOps Api Generic'
+        script: |- # typescript
+          const { BUILD_REPOSITORY_ID } = process.env;
+          const commits = await (await connection.getGitApi()).getCommits(BUILD_REPOSITORY_ID, {$top: 1});
+          COMMITTER_NAME = commits[0].committer.name;
+          COMMIT_DATE = commits[0].committer.date;
+
+          set_variable('COMMITTER_NAME', COMMITTER_NAME);
+          set_variable('COMMIT_DATE', COMMIT_DATE);
+
+
+    - task: PythonRunner@4
+      displayName: 'Publicar informações no tópico'
+      condition: eq(variables['REGEX_HAS_MATCH'], 'true')
+      inputs:
+        script: |- # python
+          import requests, os, re
+
+          data = {
+            "customfield_33000": os.getEnv("BUILD_REPOSITORY_NAME"), # repositoryName,
+            "customfield_33001": os.getEnv("COMMITTER_NAME"), # commitAuthor,
+            "customfield_33002": os.getEnv("BUILD_SOURCEVERSIONMESSAGE"), # commitMessage,
+            "customfield_33003": os.getEnv("COMMIT_DATE"), # commitDate,
+            "customfield_33004": os.getEnv("BUILD_SOURCEVERSION"), # commitId,
+            "customfield_33300": os.getEnv("REGEX_GROUP_1"), # type,
+            "customfield_33301": os.getEnv("REGEX_GROUP_3"), # developmentClassification / scope
+          },
+          issueIdOrKey = os.getEnv("REGEX_MATCH_GROUP_4")
+          api_url = f"https://jira.telefonica.com.br/rest/api/2/issue/{issueIdOrKey}"
+          response = requests.post(api_url, json=data)
+          response.json()
+
+    # jira.telefonica.com.br
+    # - task: KafkaProducer@0.0.16
+    #   displayName: 'Publicar informações no tópico'
+    #   condition: eq(variables['REGEX_HAS_MATCH'], 'true')
+    #   inputs:
+    #     kafkaOamEndpoint: 'KafkaEsteiraDigitalProd'
+    #     kafkaProducerClientId: 'esteira-digital-group'
+    #     kafkaServer: 'oauth.bootstrap.apps.ocp-kafka-prd.redecorp.br:443'
+    #     commitDate: $(COMMIT_DATE)
+    #     commitId: $(Build.SourceVersion)
+    #     commitMessage: $(Build.SourceVersionMessage)
+    #     committerName: $(COMMITTER_NAME)
+    #     repoName: $(Build.Repository.Name)
+    #     kafkaTopic: "integracao-azure-jira-branch-master"
+    #     debug: true

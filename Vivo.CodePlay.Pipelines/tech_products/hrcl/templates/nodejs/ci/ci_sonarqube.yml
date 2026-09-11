@@ -1,0 +1,267 @@
+parameters:
+- name: environment
+
+steps:
+- checkout: self
+  persistCredentials: true
+
+- task: DownloadPipelineArtifact@2
+  displayName: "Download Tests"
+  inputs:
+    buildType: 'current'
+    artifactName: 'junit-report'
+    targetPath: '$(Build.SourcesDirectory)'
+
+- task: DownloadPipelineArtifact@2
+  displayName: "Download Coverage"
+  inputs:
+    buildType: 'current'
+    artifactName: 'coverage-report'
+    targetPath: '$(Build.SourcesDirectory)'
+
+- task: AzureKeyVault@2
+  displayName: 'Get SQ Secrets'
+  timeoutInMinutes: 1
+  retryCountOnTaskFailure: 5
+  inputs:
+    azureSubscription: DevOpsSharedResources
+    KeyVaultName: $(AKV_DEVOPS_NAME)
+    SecretsFilter: 'SONARQUBE-TOKEN, SONARQUBE-TOKEN-TAG'
+
+- task: Bash@3
+  displayName: 'Set SQ Vars'
+  name: sonarqube_credentials
+  condition: succeeded()
+  continueOnError: false
+  inputs:
+    targetType: inline
+    script: |
+      echo "##[group] Secrets for SONARQUBE"
+
+      echo "##vso[task.setvariable variable=SONARQUBE_TOKEN;isSecret=true]$(SONARQUBE-TOKEN)"
+
+      echo "##[endgroup]"
+      echo "##[debug] To open and check the information above, click the arrows on the left."
+    KeyVaultName: $(AKV_DEVOPS_NAME)
+    SecretsFilter: 'SONARQUBE-TOKEN'
+
+- task: Bash@3
+  displayName: 'Setup SQ Project'
+  name: setup_quality_gate
+  condition: succeeded()
+  continueOnError: false
+  inputs:
+    targetType: inline
+    script: |
+      url="$(SONARQUBE_URL)"
+      token="$(SONARQUBE_TOKEN)"
+      projectKey="$(SONAR_PROJECT_KEY)"
+      projectName="$(System.TeamProject)-$(Build.Repository.Name)"
+      projectQualityGate="$(SONARQUBE_PROJECT_QUALITYGATE)"
+      defaultQualityGate="$(SONARQUBE_DEFAULT_QUALITYGATE)"
+      
+      echo "##[debug] URL:......................: $url"
+      echo "##[debug] ProjectKey: ..............: $projectKey"
+      echo "##[debug] ProjectName: .............: $projectName"
+      echo "##[debug] ProjectQualityGate: ......: $projectQualityGate"
+      echo "##[debug] DefaultQualityGate: ......: $defaultQualityGate"
+
+      echo "##vso[task.setvariable variable=SONARQUBE_PROJECT_KEY;]$projectKey"
+      echo "##vso[task.setvariable variable=SONARQUBE_PROJECT_NAME]$projectName"
+
+      ## -> If no custom quality gate was provided, use default
+      if [[ -z $projectQualityGate ]]; then
+        echo "##[debug] Quality Gate not found, using default."
+        projectQualityGate="$defaultQualityGate"
+      fi
+
+      ## -> Checks if the project exists. If not, creates it.
+      echo "##[debug] Cheking if project exists on SonarQube..."
+      projectExists=$(curl -s -X GET -u $token: "$url/api/projects/search?projects=$projectKey" | jq '.paging.total' | sed 's/null/0/g')
+
+      echo "##[debug] Project Exists: $projectExists"
+
+      if [[ "$projectExists" -ne 1 ]]; then
+          echo "##[debug] Project do not exists, creating..."
+          echo "##[debug] Using curl --data-urlencode for automatic character encoding"
+          
+          projectStatus=$(curl -s -X POST -o ./.tmp.sonar.out -w "%{http_code}" -u $token: \
+            --data-urlencode "name=$projectName" \
+            --data-urlencode "project=$projectKey" \
+            --data-urlencode "visibility=public" \
+            "$url/api/projects/create")
+
+          echo "##[debug] Project Status: $projectStatus"
+
+          if [[ "$projectStatus" -eq 200 ]]; then
+            echo "##[debug] SonarQube project created for key $(SONAR_PROJECT_KEY)"
+          else
+            echo "##[error] Error to create SonarQube project for key $(SONAR_PROJECT_KEY)"
+            echo "##[error] $(cat ./.tmp.sonar.out | jq '.errors[0].msg')"
+          fi
+      fi
+
+      ## -> Checks if the project's Quality Gate exists. If not, use default.
+      projectQualityGateStatus=$(curl -s -o /dev/null -w "%{http_code}" -u $token: "$url/api/qualitygates/show?name=$projectQualityGate")
+
+      if [[ "$projectQualityGateStatus" -eq 200 ]]; then
+        echo "##[debug] Quality Gate found for $projectQualityGate"
+      else
+        echo "##[debug] Quality Gate not found, using default."
+        projectQualityGate="$defaultQualityGate"
+      fi
+
+      ## -> Links the project to its Quality Gate
+      echo "##[debug] Linking project to Quality Gate..."
+
+      status=$(curl -s -X POST -o /dev/null -w "%{http_code}" -u $token: "$url/api/qualitygates/select?gateName=$projectQualityGate&projectKey=$projectKey")
+
+      if [[ "$status" -ne 204 ]]; then
+        echo "##[error] Error while linking application to Quality Gate!"
+        rm -rf ./.tmp.sonar.out
+        exit 1;
+      fi
+
+      rm -rf ./.tmp.sonar.out
+
+      ## -> Load sonar-project.properties
+      
+      sonarqubeProperties="$(Build.SourcesDirectory)/.azuredevops/sonar-project.properties"
+      if [[ -f $sonarqubeProperties ]]; then
+        echo "##[debug] sonar-project.properties found on path: $sonarqubeProperties"
+        echo "##[debug] sonar-project.properties loaded."
+        echo "##vso[task.setvariable variable=SONARQUBE_PROPERTIES_FILE]$sonarqubeProperties"
+      else
+        echo "##[debug] sonar-project.properties not found."
+        echo "##[debug] Please add the file in the folder .azuredevops of the project."
+        exit 1;
+      fi
+      
+      echo "##[debug] Checking for reports..."
+      ls -ltha "$(Build.SourcesDirectory)"
+
+      junitReport="$(Build.SourcesDirectory)/junit-report.xml"
+      if [[ -f $junitReport ]]; then
+        echo "##[debug] junit-report.xml found on path: $junitReport"
+      else
+        echo "##[debug] junit-report.xml not found."
+      fi
+
+      lcovReport="$(Build.SourcesDirectory)/lcov.info"
+      if [[ -f $lcovReport ]]; then
+        echo "##[debug] lcov.info found on path: $lcovReport"
+      else
+        echo "##[debug] lcov.info not found."
+      fi
+  env:
+    SONARQUBE_TOKEN: $(SONARQUBE-TOKEN)
+    SONAR_SELF_HOSTED: $(SONAR_SELF_HOSTED)
+    SONARQUBE_TOKEN_SELF_HOSTED: $(SONARQUBE_TOKEN_SELF_HOSTED)
+    SONARQUBE_QUALITYGATE_TIMEOUT: $(SONARQUBE_QUALITYGATE_TIMEOUT)
+    
+- bash: |
+    echo "##[debug] SONARQUBE_PROPERTIES_FILE: $(SONARQUBE_PROPERTIES_FILE)"
+    echo "##[debug] SONARQUBE_PROJECT_KEY: $(SONARQUBE_PROJECT_KEY)"
+    echo "##[debug] SONARQUBE_PROJECT_NAME: $(SONARQUBE_PROJECT_NAME)"
+    echo "##[debug] BRANCH: $(Build.SourceBranchName)"
+
+    echo "Reading SonarQube properties file..."
+    cat $(SONARQUBE_PROPERTIES_FILE)
+  displayName: 'Show SQ Props'
+  condition: succeeded()
+  env:
+    SONARQUBE_PROPERTIES_FILE: $(SONARQUBE_PROPERTIES_FILE)
+    SONARQUBE_PROJECT_KEY: $(SONARQUBE_PROJECT_KEY)
+    SONARQUBE_PROJECT_NAME: $(SONARQUBE_PROJECT_NAME)
+
+- task: SonarSource.sonarqube.15B84CA1-B62F-4A2A-A403-89B77A063157.SonarQubePrepare@5
+  displayName: 'Prepare Analysis'
+  name: prepare_sonarqube
+  condition: succeeded()
+  continueOnError: true
+  inputs:
+    SonarQube: $(SONARQUBE_SERVICE_CONNECTION_NAME)
+    scannerMode: CLI
+    configFile: $(SONARQUBE_PROPERTIES_FILE)
+    extraProperties: |
+      sonar.scm.disabled=True
+      sonar.salesforce.enabled=false
+      sonar.projectBaseDir=./
+      sonar.inclusions=**
+      sonar.javascript.lcov.reportPaths=$(Build.SourcesDirectory)/lcov.info
+      sonar.junit.reportPaths=$(Build.SourcesDirectory)/junit-report.xml
+      sonar.projectKey=$(SONARQUBE_PROJECT_KEY)
+      sonar.projectName=$(SONARQUBE_PROJECT_NAME)
+      sonar.projectVersion=$(NEXT_VERSION)
+      sonar.analysis.repositoryName=$(Build.Repository.Name)
+      sonar.analysis.buildId=$(Build.BuildId)
+      sonar.analysis.repositoryId=$(Build.Repository.ID)
+      sonar.analysis.projectName=$(System.TeamProject)
+      sonar.analysis.projectId=$(System.TeamProjectId)
+      sonar.links.homepage=$(System.TeamFoundationCollectionUri)$(System.TeamProject)
+      sonar.links.ci=$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)&_a=summary
+      sonar.links.issue=$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_workitems
+      sonar.links.scm=$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_git/$(Build.Repository.Name)
+      sonar.scanner.metadataFilePath=$(Agent.TempDirectory)/sonar/$(Build.BuildId)/report-task.txt
+      sonar.qualitygate.wait=true
+
+- task: SonarSource.sonarqube.6D01813A-9589-4B15-8491-8164AEB38055.SonarQubeAnalyze@5
+  displayName: 'Run Analysis'
+  continueOnError: true
+  env:
+    ASDF_JAVA_VERSION: "openjdk-11.0.2"
+
+- task: Bash@3
+  displayName: 'Get TaskId'
+  name: sonar_task_id
+  condition: succeeded()
+  continueOnError: true
+  inputs:
+    workingDirectory: $(Agent.TempDirectory)/sonar/$(Build.BuildId)
+    targetType: inline
+    script: |
+
+      ## -> Load report_task
+      if [[ -z $(REPORT_TASK_NAME) ]]; then
+        echo "##[debug] report not found."
+        exit 1;
+      else
+        sonarTaskId="$(cat $(REPORT_TASK_NAME) | grep -o 'ceTaskId=[^,]*' | awk -F= '{print $2}')"
+        echo "##[debug] SONAR_TASK_ID.......: $sonarTaskId"
+        echo "##vso[task.setvariable variable=SONAR_TASK_ID;isOutput=true]$sonarTaskId"
+      fi
+
+- task: SonarSource.sonarqube.291ed61f-1ee4-45d3-b1b0-bf822d9095ef.SonarQubePublish@5
+  displayName: 'Publish QG'
+  continueOnError: true
+  env:
+    NODE_EXTRA_CA_CERTS: $(CACORP_LOCATION)
+
+- task: Bash@3
+  displayName: 'Check QG Status'
+  name: quality_gate_status
+  condition: succeeded()
+  continueOnError: true
+  inputs:
+    workingDirectory: $(Agent.TempDirectory)/sonar/$(Build.BuildId)
+    targetType: inline
+    script: |
+
+      echo "##[debug] SONAR_TASK_ID...............: $(sonar_task_id.SONAR_TASK_ID)"
+
+      sonarTaskUrl="$(SONARQUBE_URL)/api/ce/task?id=$(sonar_task_id.SONAR_TASK_ID)"
+      echo "##[debug] SONAR_TASK_URL..............: $sonarTaskUrl"
+
+      analysisId="$(curl -s -u "$(SONARQUBE_TOKEN):" "$sonarTaskUrl" | jq -r '.task.analysisId')"
+      echo "##[debug] ANALYSIS_ID.................: $analysisId"
+
+      sonarProjectStatusUrl="$(SONARQUBE_URL)/api/qualitygates/project_status?analysisId=$analysisId"
+      echo "##[debug] SONAR_PROJECT_STATUS_URL....: $sonarProjectStatusUrl"
+
+      analysisStatus="$(curl -s -u "$(SONARQUBE_TOKEN):" "$sonarProjectStatusUrl" | jq -r '.projectStatus.status')"
+      echo "##[debug] ANALYSIS_STATUS.............: $analysisStatus"
+
+      if [[ "$analysisStatus" == "ERROR" ]]; then
+        echo "##vso[task.logissue type=error;] Sonar Quality Gate status is ERROR - View details on step Run Code Analysis."
+        echo "##vso[task.complete result=Failed;]"
+      fi

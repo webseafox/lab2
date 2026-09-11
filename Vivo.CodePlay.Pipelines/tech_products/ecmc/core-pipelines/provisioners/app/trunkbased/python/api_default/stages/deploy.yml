@@ -1,0 +1,102 @@
+stages:
+- stage: deploy
+  condition: succeeded('package')
+  dependsOn:
+  - package
+  - ${{ if eq(parameters.enableDevflowValidations, True) }}:
+    - repo_finalize_validations
+  pool: ${{ parameters.private_agent_pool }}
+  ${{ if eq(parameters.dev_namespace_to_deploy, '') }}:
+    displayName: "Deploy ${{ parameters.environment }}"
+  ${{ else }}:
+    displayName: "Deploy ${{ parameters.dev_namespace_to_deploy }}"
+  jobs:
+  - job: "config_management_validation"
+    displayName: "Start config management"
+    workspace:
+      clean: all
+    steps:
+    - ${{ if eq(parameters.argocd_enabled, 'true') }}:
+      - checkout: CorePipelinesScripts
+        persistCredentials: true
+        fetchDepth: 1
+      - checkout: ArgoCD
+        persistCredentials: true
+        fetchDepth: 1
+      - checkout: ArgoCD-Production
+        persistCredentials: true
+        fetchDepth: 1
+      - checkout: self
+        persistCredentials: true
+        fetchDepth: 1
+
+    - template: /tech_products/ecmc/core-pipelines/tasks/config_management/setup.yml
+
+    - template: /tech_products/ecmc/core-pipelines/tasks/catalog_info/extract_variables.yml
+
+    - template: /tech_products/ecmc/core-pipelines/tasks/config_management/run_deploy_or_release.yml
+      parameters: ${{ parameters }}
+
+  - deployment: ${{ parameters.environment }}
+    condition: or (
+                and(
+                    always(), eq(variables.flowIsTagging, false), eq(variables.flowIsMain, true)
+                ),
+                startsWith(variables['Build.SourceBranch'], 'refs/heads/')
+            )
+    workspace:
+      clean: all
+    displayName: Deploy
+    environment: "deploy-${{ parameters.environment }}"
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+          - template: /tech_products/ecmc/core-pipelines/tasks/git/checkout_master_deploy.yml
+          - ${{ if or(eq(parameters.azureServiceConnectionEnabled, true), eq(parameters.kubernetesServiceConnectionEnabled, true)) }}:
+            - template: /tech_products/ecmc/core-pipelines/task_groups/deploy/run_deploy_with_service_connection.yml
+              parameters:
+                environment: ${{ parameters.environment }}
+                helmReleaseNamePrefix: ${{ parameters.helm_release_name_prefix }}
+                useExternalEnv: ${{ parameters.useExternalEnv }}
+                azureServiceConnectionEnabled: ${{ parameters.azureServiceConnectionEnabled }}
+                kubernetesServiceConnectionEnabled: ${{ parameters.kubernetesServiceConnectionEnabled }}
+          - ${{ else }}:
+            - template: /tech_products/ecmc/core-pipelines/provisioners/app/trunkbased/python/api_default/steps/deploy/deploy.yml
+              parameters:
+                environment: ${{ parameters.environment }}
+                kubeconfig: ${{ parameters.kubeconfig }}
+                helm_release_name_prefix: ${{ parameters.helm_release_name_prefix }}
+                useExternalEnv: ${{ parameters.useExternalEnv }}
+                git_tag: ${{ parameters.git_tag }}
+                dev_namespace_to_deploy: ${{parameters.dev_namespace_to_deploy}}
+                argocd_enabled: ${{ parameters.argocd_enabled }}
+        on:
+          success:
+            steps:
+            - template: /tech_products/ecmc/core-pipelines/provisioners/app/trunkbased/python/api_default/steps/deploy/success.yml
+              parameters:
+                environment: ${{ parameters.environment }}
+                kubeconfig: ${{ parameters.kubeconfig }}
+                git_tag: ${{ parameters.git_tag }}
+                helm_release_name_prefix: ${{ parameters.helm_release_name_prefix }}
+                dev_namespace_to_deploy: ${{parameters.dev_namespace_to_deploy}}
+            - template: /tech_products/ecmc/core-pipelines/task_groups/governance/check_govapp_policies.yml
+              parameters:
+                govAppBreakglass: false
+                govAppOperation: "deploy"
+                continueOnError: false
+                environment: ${{ parameters.environment }}
+                stack: "NODEJS"
+                dev_namespace_to_deploy: ${{parameters.dev_namespace_to_deploy}}
+
+          failure:
+            steps:
+            - template: /tech_products/ecmc/core-pipelines/provisioners/app/trunkbased/python/api_default/steps/deploy/failure.yml
+              parameters:
+                environment: ${{ parameters.environment }}
+                kubeconfig: ${{ parameters.kubeconfig }}
+                git_tag: ${{ parameters.git_tag }}
+                helm_release_name_prefix: ${{ parameters.helm_release_name_prefix }}
+                dev_namespace_to_deploy: ${{parameters.dev_namespace_to_deploy}}

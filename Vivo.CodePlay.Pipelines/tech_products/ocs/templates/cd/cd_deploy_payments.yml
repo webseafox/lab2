@@ -1,0 +1,403 @@
+parameters:
+- name: components_to_install
+- name: qa_environment
+- name: skip_deploy
+- name: weblogic_servers
+
+stages:
+
+- stage: deploy
+  displayName: "Deploy ${{ parameters.qa_environment }}"
+  dependsOn:
+  - package
+  
+  ${{ if contains(parameters.qa_environment, 'producao') }}:
+    pool: "GeneralPurposeLinuxAgentsCD"
+  ${{ else }}:
+    pool: "GeneralPurposeLinuxAgentsCD"
+  
+  jobs:
+
+  - job: bundles_to_install
+    displayName: Select Bundles
+    condition: eq('${{ parameters.skip_deploy }}', false)
+    steps:
+    - download: none 
+    - checkout: self
+
+    ## ARTIFACTS ANOTHER BUILD ID
+    - ${{ if startsWith(variables['Build.SourceBranch'], 'refs/tags') }}:
+      - bash: |
+          build_id=$(yq '.buildId' $(Build.SourcesDirectory)/.azuredevops/build.yaml)
+          echo "##vso[task.setvariable variable=BUILD_ID]$build_id"
+          echo "##[debug] Exporting variable 'BUILD_ID': $build_id"
+        name: export_build_id
+        displayName: Extract Build ID 
+
+      - task: DownloadBuildArtifacts@1
+        displayName: 'Download Specific Build Artifact'
+        inputs:
+          buildType: specific
+          project: '$(PROJECT_NAME)' 
+          pipeline: '$(PIPELINE_NAME)' 
+          buildVersionToDownload: specific
+          buildId: '$(BUILD_ID)' 
+          artifactName: 'bundles' 
+          downloadPath: '$(System.ArtifactsDirectory)'
+    
+    ## ARTIFACTS CURRENT BUILD ID
+    - ${{ else }}:
+
+      - task: DownloadBuildArtifacts@1
+        displayName: 'Download Pipeline Artifact'
+        inputs:
+          buildType: current
+          artifactName: 'bundles'
+          downloadPath: '$(System.ArtifactsDirectory)'         
+
+    - task: Bash@3
+      name: package_bundles
+      displayName: 'Package Bundles'
+      inputs:
+        targetType: inline
+        script: |
+          mkdir bundles_temp_dir
+          tar -xf $(System.ArtifactsDirectory)/bundles/bundles.tar -C bundles_temp_dir
+          mkdir selected_bundles
+          for file in $(echo ${{parameters.components_to_install}} | tr "," "\n")
+          do
+            cp bundles_temp_dir/$file.* selected_bundles/    
+            
+            if [ -f selected_bundles/$file.* ]; then
+              echo "##[debug] The copy of the $file file was successful."
+            else
+              echo "##[error] Error: The copy of the $file file failed."
+              echo "##vso[task.complete result=Failed;]"
+              echo "##vso[task.setvariable variable=INVALID_COMPONENT_TO_INSTALL;isOutput=true;]true"
+              echo "##[debug] Exporting variable 'INVALID_COMPONENT_TO_INSTALL': true"                                            
+
+              exit 1
+            fi                 
+          done
+          
+          echo "##[debug] Copy new_component"
+          cp new_component selected_bundles
+          echo "##[debug] List selected bundles:"
+          ls -la selected_bundles
+
+          echo "##vso[task.setvariable variable=INVALID_COMPONENT_TO_INSTALL;isOutput=true;]false"
+          echo "##[debug] Exporting variable 'INVALID_COMPONENT_TO_INSTALL': false"                    
+
+    - task: CopyFiles@2
+      displayName: Copy Bundles Files Staging Directory
+      inputs:
+        SourceFolder: '$(System.DefaultWorkingDirectory)/selected_bundles'
+        Contents: |
+          new_component
+          *.jar
+        TargetFolder: '$(Build.ArtifactStagingDirectory)'
+        CleanTargetFolder: true
+        OverWrite: true
+        flattenFolders: true
+
+    - task: PublishBuildArtifacts@1
+      displayName: Publish Bundles Artifacts
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+        ArtifactName: bundles
+        StoreAsTar: true  
+
+  - ${{ each rec in split(parameters.weblogic_servers,',') }}:
+    - deployment: ${{ parameters.qa_environment }}_${{rec}}
+      dependsOn: 
+      - bundles_to_install      
+      variables:
+        - template: /.azuredevops/config/${{ parameters.qa_environment }}/server${{rec}}_variables.yml@self
+      condition: and(
+                  succeeded(), 
+                  eq('${{ parameters.skip_deploy }}', false)
+                )
+      workspace:
+        clean: all
+      displayName: Deploy Bundles ${{rec}}
+
+      ${{ if or(contains(parameters.qa_environment, 'lab'), contains(parameters.qa_environment, 'dev')) }}:
+        environment: 
+          name: "deploy-pay_lab"
+          resourceType: VirtualMachine
+      ${{ else }}:
+        environment: "deploy-${{ parameters.qa_environment }}"
+
+      strategy:
+        runOnce:      
+          deploy:
+            steps:
+            - download: none 
+            - checkout: none
+
+            - task: DownloadBuildArtifacts@1
+              displayName: 'Download Pipeline Artifact'
+              inputs:
+                buildType: current
+                artifactName: 'bundles'
+                downloadPath: '$(System.ArtifactsDirectory)'   
+
+ #- ${{ if or(or(contains(parameters.qa_environment, 'esteira1'), contains(parameters.qa_environment, 'esteira2')), or(contains(parameters.qa_environment, 'prodlike'), contains(parameters.qa_environment, 'preprod'))) }}:
+              #- task: GetCredentialsSenhaSegura@1
+              #  displayName: 'Get Credentials Senha Segura'
+              #  name: get_credentials
+              #  inputs:
+              #    credentialId: ${{variables.CREDENTIAL_ID}}
+              #    SenhaSeguraEndpoint: 'https://10.238.69.35'
+                  #SenhaSeguraEndpoint: 'https://10.128.62.35'
+                  #SenhaSeguraEndpoint: 'https://10.243.17.35'
+                  #SenhaSeguraEndpoint: 'https://urano.redecorp.br'
+              #    usernameVariable: 'SENHA_SEGURA_USERNAME'
+              #    passwordVariable: 'SENHA_SEGURA_PASSWORD'
+              #  env:
+              #    NODE_EXTRA_CA_CERTS: $(CACORP_LOCATION)
+                   #HTTPS_PROXY: "http://10.240.58.39:3128"
+
+              #- task: DownloadSecureFile@1
+                #name: senhaSeguraKey
+                #displayName: Download Smart Key
+                #inputs:
+                  #secureFile: ${{variables.SMARTKEY}}
+
+              #- task: Bash@3
+              #  displayName: 'Decrypt Password'
+              #  name: get_token
+              #  continueOnError: true
+              #  inputs:
+              #    targetType: inline
+              #    script: |
+              #      echo "Username: $(get_credentials.SENHA_SEGURA_USERNAME)"
+              #      DECRYPTED_PASSWORD=$(echo -n $(get_credentials.SENHA_SEGURA_PASSWORD) | base64 -d --ignore-garbage | openssl rsautl -decrypt -inkey $(senhaSeguraKey.secureFilePath) -oaep)
+              #      echo "##vso[task.setvariable variable=DECRYPTED_PASSWORD;]$DECRYPTED_PASSWORD"
+              
+              
+              #- task: Bash@3
+              #  displayName: 'Show Password'
+              #  name: show_password
+              #  continueOnError: true
+              #  inputs:
+              #    targetType: inline
+              #    script: |
+              #      echo "Decrypted password: $(DECRYPTED_PASSWORD)"
+              
+              
+              #- task: UpdateCredentialsEndpointSshFromVivo@4
+              #  displayName: "Update Service Connection"
+              #  inputs:
+              #    sshEndpoint: ${{ variables.SERVICE_CONNECTION }}
+              #    username: $(get_credentials.SENHA_SEGURA_USERNAME)
+                  #username: $(DECRYPTED_PASSWORD)
+              #    password: $(DECRYPTED_PASSWORD)
+              #  env:
+              #    HTTPS_PROXY: "http://10.240.58.39:3128"
+              
+              
+              #- task: Bash@3
+              #  displayName: 'Delay for 5 seconds'    
+              #  inputs:
+              #    targetType: inline
+              #    script: |
+              #      echo "Waiting for 5 seconds..."
+              #      sleep 5  
+
+              #- task: CopyFilesOverSSH@0
+              #  displayName: 'Copy Package to Server'
+              #  inputs:
+              #    sshEndpoint: ${{ variables.SERVICE_CONNECTION }}
+              #    sourceFolder: $(System.ArtifactsDirectory)/bundles
+              #    contents: 'bundles.tar'
+              #    targetFolder: '${{ variables.TARGET_FOLDER }}'
+            
+            - task: CopyFilesOverSSH@0
+              displayName: 'Copy Package to Server'
+              inputs:
+                sshEndpoint: ${{ variables.SERVICE_CONNECTION }}
+                sourceFolder: $(System.ArtifactsDirectory)/bundles
+                contents: 'bundles.tar'
+                targetFolder: '${{ variables.TARGET_FOLDER }}'
+
+            - ${{ if or(startsWith(parameters.qa_environment, 'producao_'), eq(parameters.qa_environment, 'prodlike'), eq(parameters.qa_environment, 'preprod'), eq(parameters.qa_environment, 'esteira1'), eq(parameters.qa_environment, 'esteira2')) }}:
+              - task: SSH@0
+                displayName: 'Execute install bundle'
+                inputs:
+                  sshEndpoint: ${{ variables.SERVICE_CONNECTION }}
+                  runOptions: inline
+                  failOnStdErr: false
+                  inline: |
+                    sudo su - ${{ variables.USER }} <<EOF
+                    ${{ variables.SCRIPT }} ${{parameters.components_to_install}}
+                    EOF
+
+              - task: SSH@0
+                displayName: 'Restart Weblogic'
+                inputs:
+                  sshEndpoint: ${{variables.SERVICE_CONNECTION}}
+                  runOptions: inline
+                  failOnStdErr: false
+                  inline: |
+                    ${{ variables.SCRIPT_RESTART }}
+
+
+            - ${{ else }}:
+              - task: SSH@0
+                displayName: 'Execute install bundle'
+                inputs:
+                  sshEndpoint: ${{ variables.SERVICE_CONNECTION }}
+                  runOptions: inline
+                  failOnStdErr: false
+                  inline: |
+                    ${{ variables.SCRIPT }} ${{parameters.components_to_install}}
+
+  - ${{ each rec in split(parameters.weblogic_servers,',') }}:
+    - deployment: rollback_${{ parameters.qa_environment }}_${{rec}}
+      displayName: Rollback Bundles ${{rec}}
+      dependsOn: 
+      - ${{ each cont in split(parameters.weblogic_servers,',') }}:
+        - ${{ parameters.qa_environment }}_${{cont}}
+        - bundles_to_install
+      variables:
+        - template: /.azuredevops/config/${{ parameters.qa_environment }}/server${{rec}}_variables.yml@self
+        - name: INVALID_COMPONENT_TO_INSTALL
+          value: $[ dependencies.bundles_to_install.outputs['package_bundles.INVALID_COMPONENT_TO_INSTALL'] ]  
+ 
+      condition: and( 
+                    failed(),
+                    eq(variables.INVALID_COMPONENT_TO_INSTALL, false),
+                    eq('${{ parameters.skip_deploy }}', false)
+                  )
+
+      ${{ if or(contains(parameters.qa_environment, 'lab'), contains(parameters.qa_environment, 'dev')) }}:
+        environment:
+          name: "deploy-pay_lab"
+          resourceType: VirtualMachine
+      ${{ else }}:
+        environment: "deploy-${{ parameters.qa_environment }}"
+
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+            - download: none
+            - checkout: none
+
+            - ${{ if or(startsWith(parameters.qa_environment, 'producao_'), eq(parameters.qa_environment, 'prodlike'), eq(parameters.qa_environment, 'preprod'), eq(parameters.qa_environment, 'esteira1'), eq(parameters.qa_environment, 'esteira2')) }}:
+              - task: SSH@0
+                displayName: 'Execute rollback bundle'
+                condition: succeeded()
+                inputs:
+                  sshEndpoint: ${{ variables.SERVICE_CONNECTION }}
+                  runOptions: inline
+                  failOnStdErr: false
+                  inline: |
+                    sudo su - ${{ variables.USER }} <<EOF
+                    ${{ variables.SCRIPT_ROLLBACK }} ${{parameters.components_to_install}}
+                    EOF
+
+              - task: SSH@0
+                displayName: 'Restart Weblogic'
+                inputs:
+                  sshEndpoint: ${{variables.SERVICE_CONNECTION}}
+                  runOptions: inline
+                  failOnStdErr: false
+                  inline: |
+                    ${{ variables.SCRIPT_RESTART }}
+
+            - ${{ else }}:
+              - task: SSH@0
+                displayName: 'Execute rollback bundle'
+                condition: succeeded()
+                inputs:
+                  sshEndpoint: ${{ variables.SERVICE_CONNECTION }}
+                  runOptions: inline
+                  failOnStdErr: false
+                  inline: |
+                    ${{ variables.SCRIPT }} ${{parameters.components_to_install}}
+                    
+
+  - ${{ each rec in split(parameters.weblogic_servers,',') }}:
+    - job: manual_rollback_${{ parameters.qa_environment }}_${{rec}}
+      displayName: Manual Rollback Bundles ${{rec}}
+      pool: server
+      variables:
+        - template: /.azuredevops/config/${{ parameters.qa_environment }}/server${{rec}}_variables.yml@self
+      dependsOn: 
+      - bundles_to_install
+      - rollback_${{ parameters.qa_environment }}_${{rec}}
+      condition: and( 
+                    failed('rollback_${{ parameters.qa_environment }}_${{rec}}'),
+                    eq('${{ parameters.skip_deploy }}', false)
+                  )
+      steps:
+      - task: ManualValidation@0
+        inputs:
+          notifyUsers: 'vinicius.silva1@telefonica.com'
+          instructions: 'Instruções: service conn - ${{ variables.SERVICE_CONNECTION }}'
+          onTimeout: 'resume'
+
+  - job: governance_deploy
+    displayName: Governance Deploy
+    pool: $(PRIVATE_AGENT_DEFAULT)
+    
+    dependsOn: 
+    - ${{ each rec in split(parameters.weblogic_servers,',') }}:
+      - ${{ parameters.qa_environment }}_${{rec}}
+    condition: and(succeeded(), eq('${{ parameters.skip_deploy }}', false))    
+    steps:
+    - download: none 
+    - checkout: self
+
+    - script: |
+        if [ ! -f "catalog-info.yaml" ]; then
+          echo "##vso[task.logissue type=error] Unable to find catalog-info.yaml file (path=$(pwd))."
+        fi
+
+        COMPONENT_NAME="$(yq -r 'select(documentIndex == 0) | .metadata.name | select (.!=null)' catalog-info.yaml)"
+        echo "##vso[task.setvariable variable=COMPONENT_NAME]${COMPONENT_NAME}"
+        echo "##vso[task.setvariable variable=CATALOG_INFO_FILE_CONTENT]$(cat catalog-info.yaml)"
+      name: export_catalog_info
+      displayName: Reading Catalog Info File
+
+    - bash: |
+        version=$(grep version pom.xml | grep -v '<?xml' | grep '<version>'|head -n 1|awk '{print $1}'| cut -d'>' -f 2 | cut -d'<' -f 1)
+        echo "##vso[task.setvariable variable=APP_VERSION]$version"
+        echo "##[debug] Exporting variable 'APP_VERSION': $version"
+      name: export_current_version
+      displayName: Extract App Version 
+
+    ## DEPLOY TO PROD
+    - ${{ if startsWith(parameters.qa_environment, 'prod_') }}:
+      - task: VivoGovernance@1
+        inputs:
+          breakglass: $(GOVAPP_BREAK_GLASS)
+          cluster: "$(GOVAPP_CLUSTER)"
+          component: "$(COMPONENT_NAME)"
+          deployment: "$(COMPONENT_NAME)"
+          environment: "producao"
+          namespace: "$(GOVAPP_NAMESPACE)"
+          operation: "deploy"
+          serverEndpoint: $(GOVAPP_SERVICE_CONNECTION_NAME)
+          version: "$(APP_VERSION)"
+          catalogInfo: $(CATALOG_INFO_FILE_CONTENT)
+        continueOnError: true
+        condition: eq(lower(variables.GOVAPP_INTEGRATION_ENABLED), 'true')
+
+    - ${{ else }}:
+      - task: VivoGovernance@1
+        inputs:
+          breakglass: $(GOVAPP_BREAK_GLASS)
+          cluster: "$(GOVAPP_CLUSTER)"
+          component: "$(COMPONENT_NAME)"
+          deployment: "$(COMPONENT_NAME)"
+          environment: "${{ parameters.qa_environment }}"
+          namespace: "$(GOVAPP_NAMESPACE)"
+          operation: "deploy"
+          serverEndpoint: $(GOVAPP_SERVICE_CONNECTION_NAME)
+          version: "$(APP_VERSION)"
+          catalogInfo: $(CATALOG_INFO_FILE_CONTENT)
+        continueOnError: true
+        condition: eq(lower(variables.GOVAPP_INTEGRATION_ENABLED), 'true')

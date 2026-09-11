@@ -1,0 +1,143 @@
+parameters:
+  - name: environmentCode
+    type: string
+    default: ''
+jobs:
+- job: start_run_stress_test
+  dependsOn: pre_start_run_stress_test
+  workspace:
+    clean: all
+  variables:
+    ALLOW_RUN_STRESS_TEST: $[dependencies.pre_start_run_stress_test.outputs['validate_run_stress_test.ALLOW_RUN_STRESS_TEST']]
+  condition: and(succeeded(), eq(variables.ALLOW_RUN_STRESS_TEST, 'true'))
+  displayName: "Start run stress test"
+  timeoutInMinutes: 120
+  steps:
+    - checkout: none
+
+    - template: /tech_products/ecmc/sap-commerce/tasks/security/get_sap_tu_token.yaml
+      parameters:
+        displayName: 'Get SAP TU token'
+        exportAsOutput: true
+        stepName: 'get_sap_tu_token'
+
+    - bash: |
+        if [ -z "$SAP_TU_ACCESS_TOKEN" ] || [ "$SAP_TU_ACCESS_TOKEN" == "null" ]; then
+          echo "[error]Access token do Technical User indisponível"
+          exit 1
+        fi
+
+        CURL_HTTP_TIMEOUT=${CURL_HTTP_TIMEOUT:-30}
+        SAP_API_RESPONSE_FILE=${SAP_API_RESPONSE_FILE:-sap-api-response.json}
+        API_URL_RUN=$(echo "${API_URL_ENVIROMENTS_V1}" | sed "s/<SUBSCRIPTION_CODE>/${SUBSCRIPTION_CODE}/")
+        API_URL_RUN="${API_URL_RUN}/${ENVIRONMENT_CODE}/performance-test-plans/${STRESS_TEST_PLAN_ID}/runs"
+
+        echo "[command]Iniciando stress test via POST para ${API_URL_RUN}"
+        BODY_DATA='{"subscriptionCode": "'"${SUBSCRIPTION_CODE}"'","environmentCode": "'"${ENVIRONMENT_CODE}"'","planCode": "'"${STRESS_TEST_PLAN_ID}"'","name": "'"${STRESS_TEST_PLAN_NAME}"'"}'
+        echo "[command]Payload: ${BODY_DATA}"
+        HTTP_CODE_RESPONSE=$(curl --max-time $CURL_HTTP_TIMEOUT \
+          -o ${SAP_API_RESPONSE_FILE} \
+          -w "%{http_code}" \
+          -s \
+          -X POST \
+          -H "x-approuter-authorization: Bearer ${SAP_TU_ACCESS_TOKEN}" \
+          -H "Content-Type: application/json" \
+          -d "${BODY_DATA}" \
+          "${API_URL_RUN}")
+
+        echo "[command]HTTP Response Code: ${HTTP_CODE_RESPONSE}"
+        if [ -f "$SAP_API_RESPONSE_FILE" ]; then
+          echo "[command]Resposta da API:"
+          jq -r . "$SAP_API_RESPONSE_FILE"
+        fi
+
+        if [[ "${HTTP_CODE_RESPONSE}" == "200" ]]; then
+          echo "[section]Stress test iniciado com sucesso. HTTP Code: ${HTTP_CODE_RESPONSE}"
+        else
+          echo "[error]Falha ao iniciar o stress test. HTTP Code: ${HTTP_CODE_RESPONSE}"
+          exit 1
+        fi
+
+        RUN_CODE=$(jq -r '.code' "${SAP_API_RESPONSE_FILE}")
+
+        if [ -z "$RUN_CODE" ] || [ "$RUN_CODE" == "null" ]; then
+          echo "[error]Não foi possível obter o code do run iniciado"
+          exit 1
+        fi
+        echo "[section]Run iniciado com code: $RUN_CODE"
+        echo "##vso[task.setvariable variable=RUN_CODE;]${RUN_CODE}"
+      displayName: 'Start run stress test'
+      name: start_run_stress_test_status
+      condition: succeeded()
+      env:
+        SAP_TU_ACCESS_TOKEN: $(SAP_TU_ACCESS_TOKEN)
+        ENVIRONMENT_CODE: ${{ parameters.environmentCode }}
+
+    - bash: |
+        API_URL_RUN_STATUS=$(echo "$API_URL_ENVIROMENTS_V1" | sed "s/<SUBSCRIPTION_CODE>/$SUBSCRIPTION_CODE/")
+        API_URL_RUN_STATUS="${API_URL_RUN_STATUS}/${ENVIRONMENT_CODE}/performance-test-plans/${STRESS_TEST_PLAN_ID}/runs/${RUN_CODE}"
+
+        echo "[section]Acompanhando status do run em: $API_URL_RUN_STATUS"
+
+        # User-Agent foi necessário devido a algum bloqueio na request para SAP. Sem ele, a API retornava 404
+        STRESS_TEST_POLL_INTERVAL=${STRESS_TEST_POLL_INTERVAL:-60}
+        while (true)
+        do
+          HTTP_CODE_STATUS=$(curl --max-time $CURL_HTTP_TIMEOUT \
+            -o $SAP_API_RESPONSE_FILE \
+            -w "%{http_code}" \
+            -s \
+            -H "x-approuter-authorization: Bearer ${SAP_TU_ACCESS_TOKEN}" \
+            -H "Accept: application/json" \
+            -H "User-Agent: ${STRESS_TEST_USER_AGENT_REQUEST}" \
+            "${API_URL_RUN_STATUS}")
+
+          if [ -f "$SAP_API_RESPONSE_FILE" ]; then
+            echo "[group]Clique para visualizar a resposta da API"
+            jq -r . "$SAP_API_RESPONSE_FILE"
+            echo "[endgroup]"
+          fi
+
+          if [[ "$HTTP_CODE_STATUS" != "200" ]]; then
+            echo "[error]Falha ao consultar status do run. HTTP Code: $HTTP_CODE_STATUS"
+            exit 1
+          fi
+
+          RUN_STATUS=$(jq -r '.status' "$SAP_API_RESPONSE_FILE")
+
+          if [ -z "$RUN_STATUS" ] || [ "$RUN_STATUS" == "null" ]; then
+            echo "[warning]Não foi possível obter o status do run iniciado"
+            echo "[warning]Aguardando 30 segundos antes de tentar novamente..."
+            sleep 30
+            continue
+          fi
+          echo "[command]Status atual do run: $RUN_STATUS"
+
+          if [[ "$RUN_STATUS" == "FINISHED" ]]; then
+            echo "[section]Run finalizado com sucesso. Status: $RUN_STATUS"
+            break
+          elif [[ "$RUN_STATUS" == "RUNNING" ]]; then
+            echo "[command]Run ainda em execução. Aguardando ${STRESS_TEST_POLL_INTERVAL}s..."
+            sleep $STRESS_TEST_POLL_INTERVAL
+            continue
+          else
+            echo "[error]Status inesperado do run: $RUN_STATUS"
+
+            if [ -f "$SAP_API_RESPONSE_FILE" ]; then
+              echo "[group]Clique para visualizar a resposta da API"
+              jq -r . "$SAP_API_RESPONSE_FILE"
+              echo "[endgroup]"
+            fi
+            exit 1
+          fi
+
+          sleep $STRESS_TEST_POLL_INTERVAL
+        done
+      displayName: 'Watch run stress test status'
+      name: watch_run_stress_test_status
+      condition: succeeded()
+      env:
+        SAP_TU_ACCESS_TOKEN: $(SAP_TU_ACCESS_TOKEN)
+        RUN_CODE: $(RUN_CODE)
+        ENVIRONMENT_CODE: ${{ parameters.environmentCode }}
+

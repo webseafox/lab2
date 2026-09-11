@@ -1,0 +1,347 @@
+parameters:
+  - name: BUNDLE_NAME
+    type: string
+  - name: qa_environment
+    type: string
+  - name: MANUAL_BUNDLE_VERSION
+    type: string
+  - name: ROUTE_ORCHESTRATOR_URL
+    type: string
+  - name: desiredEnvFilePath
+    type: string
+    default: ''
+
+stages:
+  - stage: cd_environment_checklist
+    displayName: "CD - Environment Checklist"
+    pool:
+      name: GeneralPurposeLinuxAgentsCD
+    dependsOn:
+      - environment_init
+      - KeycloakAuth
+    condition: succeeded()
+
+    variables:
+      - name: MICROFRONTEND_NAME
+        value: ${{ parameters.BUNDLE_NAME }}
+      - name: MICROFRONTEND_ENVIRONMENT
+        value: ${{ parameters.qa_environment }}
+      - name: DESIRED_VERSION
+        value: ${{ parameters.MANUAL_BUNDLE_VERSION }}
+      - name: RO_URL
+        value: ${{ parameters.ROUTE_ORCHESTRATOR_URL }}
+      - name: KEYCLOAK_TOKEN
+        value: $[ stageDependencies.KeycloakAuth.GetKeycloakToken.outputs['CallKeycloakApi.KEYCLOAK_TOKEN'] ]
+      
+    jobs:
+      - job: environment_checklist
+        displayName: "Environment Checklist"
+        condition: succeeded()
+        steps:
+          - download: none
+
+          - task: 6d15af64-176c-496d-b583-fd2ae21d4df4@1
+            displayName: Checkout Code
+            name: checkout_code
+            inputs:
+              repository: self
+              persistCredentials: "true"
+              clean: true
+
+          - task: Bash@3
+            displayName: "Get enabled bundle information"
+            name: get_enabled_bundle_info
+            condition: succeeded()
+            inputs:
+              targetType: inline
+              script: |
+                URL="$(RO_URL)/microfrontends?name=$(MICROFRONTEND_NAME)"
+                TOKEN='$(KEYCLOAK_TOKEN)'
+                RESPONSE_FILENAME="route_orchestrator_response.json"
+                ERROR_FILENAME="route_orchestrator_error.log"
+
+                echo "##[debug] Route orchestrator URL: $URL"
+                echo "##[debug] Route orchestrator Bearer (Keycloak Token): $TOKEN"
+                echo "##vso[task.setvariable variable=RESPONSE_FILENAME;isOutput=true]$RESPONSE_FILENAME"
+                echo "##vso[task.setvariable variable=ERROR_FILENAME;isOutput=true]$ERROR_FILENAME"
+
+                ACCESS_TOKEN=$(echo "$TOKEN" | jq -r '.access_token' 2>/dev/null)
+                if [ -z "$ACCESS_TOKEN" ] || [ "$ACCESS_TOKEN" = "null" ]; then
+                  echo "##[error]Falha ao extrair \"access_token\" do token keycloak"
+                  exit 0
+                fi
+
+                RESPONSE=$(curl --location "$URL" \
+                    --header "Authorization: Bearer $ACCESS_TOKEN" \
+                    --header "Content-Type: application/json" \
+                    --silent --write-out "%{http_code}" --output $RESPONSE_FILENAME 2> $ERROR_FILENAME)
+
+                HTTP_STATUS=${RESPONSE: -3}
+                if [ $HTTP_STATUS -lt 200 ] || [ $HTTP_STATUS -gt 299 ]; then
+                    echo "##[error] Chamada para API falhou. HTTP Status: $HTTP_STATUS"
+                    exit 0
+                fi
+
+                ENABLED_RELEASE_JSON=$(jq -c '.[0].releases[] | select(.enabled==true) | . as $r | $r' $RESPONSE_FILENAME | head -n1)
+                if [ -z "${ENABLED_RELEASE_JSON// }" ]; then
+                  echo "##[error]Não foi possível encontrar uma release habilitada (enabled=true) no corpo da resposta"
+                  exit 0
+                fi
+
+                echo "##[debug] Encontrado bundle habilitado para \"$(MICROFRONTEND_NAME)\". Salvando o conteúdo em \"$RESPONSE_FILENAME\""
+                echo "$ENABLED_RELEASE_JSON" > $RESPONSE_FILENAME
+
+          - task: Bash@3
+            displayName: "Compare desired and enabled versions"
+            name: compare_versions
+            condition: succeeded()
+            inputs:
+              targetType: inline
+              script: |
+                RESPONSE_FILE="$(get_enabled_bundle_info.RESPONSE_FILENAME)"
+
+                # Tenta extrair a versão da release ativa
+                if [ ! -f "$RESPONSE_FILE" ]; then
+                  echo "##[error]Arquivo de resposta não encontrado: $RESPONSE_FILE"
+                  echo "##[debug] Habilitação de um RELEASE (IS_ROLLBACK=false)"
+                  echo "##vso[task.setvariable variable=IS_ROLLBACK;isOutput=true]false"
+                  exit 0
+                fi
+
+                ENABLED_VERSION="$(jq -r '.version // empty' "$RESPONSE_FILE" 2>/dev/null || true)"
+
+                if [ -z "${ENABLED_VERSION// }" ] || [ "$ENABLED_VERSION" = "null" ]; then
+                  echo "##[error]Não foi possível recuperar a versão do bundle habilitado a partir de $RESPONSE_FILE"
+                  echo "Pipeline interrompida. IS_ROLLBACK=false (sem comparação de versões)."
+                  echo "##vso[task.setvariable variable=IS_ROLLBACK;isOutput=true]false"
+                  exit 0
+                fi
+
+                echo "Versão do bundle habilitado (versão atual em $(MICROFRONTEND_ENVIRONMENT)): $ENABLED_VERSION"
+                echo "##vso[task.setvariable variable=ENABLED_VERSION;isOutput=true]$ENABLED_VERSION"
+
+                echo "Versão do bundle desejado (versão a subir em $(MICROFRONTEND_ENVIRONMENT)): $(DESIRED_VERSION)"
+                echo "##vso[task.setvariable variable=DESIRED_VERSION;isOutput=true]$(DESIRED_VERSION)"
+
+                # Checa se versões são iguais
+                if [ "$ENABLED_VERSION" = "$(DESIRED_VERSION)" ]; then
+                  echo -e "\e[34mREDEPLOY: versão atual ($ENABLED_VERSION) == versão desejada ($(DESIRED_VERSION)).\e[0m"
+                  echo "##vso[task.setvariable variable=IS_ROLLBACK;isOutput=true]false"
+                  exit 0
+                fi
+
+                # Compara versões (SemVer) para decidir rollback
+                if [ "$(printf "%s\n%s\n" "$ENABLED_VERSION" "$(DESIRED_VERSION)" | sort -V | head -n1)" = "$ENABLED_VERSION" ]; then
+                  echo -e "\e[32mRELEASE: versão atual ($ENABLED_VERSION) < versão desejada ($(DESIRED_VERSION)).\e[0m"
+                  echo "##vso[task.setvariable variable=IS_ROLLBACK;isOutput=true]false"
+                else
+                  echo -e "\e[31mROLLBACK: versão atual ($ENABLED_VERSION) > versão desejada ($(DESIRED_VERSION)).\e[0m"
+                  echo "##vso[task.setvariable variable=IS_ROLLBACK;isOutput=true]true"
+                fi
+
+          - task: Bash@3
+            displayName: "Get environment variables from desired and enabled releases"
+            name: get_env_vars
+            condition: succeeded()
+            inputs:
+              targetType: inline
+              script: |
+                DESIRED_ENVS_FILENAME="desired.env.$(MICROFRONTEND_ENVIRONMENT)"
+                ENABLED_ENVS_FILENAME="enabled.env.$(MICROFRONTEND_ENVIRONMENT)"
+
+                # ENVS do BUNDLE (desejado)
+                DESIRED_LOCAL_ENV_FILE="${{ parameters.desiredEnvFilePath }}"
+                if [ -z "$DESIRED_LOCAL_ENV_FILE" ]; then
+                  # Default (non-federated) behavior remains unchanged
+                  DESIRED_LOCAL_ENV_FILE="envs/.env.$(MICROFRONTEND_ENVIRONMENT)"
+                else
+                  # Federated-only fallback: try src/ prefix when custom path is provided
+                  if [ ! -f "$DESIRED_LOCAL_ENV_FILE" ]; then
+                    ALT_DESIRED_LOCAL_ENV_FILE="src/$DESIRED_LOCAL_ENV_FILE"
+                    echo "##[debug] Caminho de pesquisa de ambiente desejado (custom): '$DESIRED_LOCAL_ENV_FILE'"
+                    echo "##[debug] Caminho de pesquisa de ambiente desejado (fallback src): '$ALT_DESIRED_LOCAL_ENV_FILE'"
+
+                    if [ -f "$ALT_DESIRED_LOCAL_ENV_FILE" ]; then
+                      DESIRED_LOCAL_ENV_FILE="$ALT_DESIRED_LOCAL_ENV_FILE"
+                    fi
+                  fi
+                fi
+
+                echo "##[debug] Caminho de pesquisa de ambiente desejado (final): '$DESIRED_LOCAL_ENV_FILE'"
+
+                if [ -f "$DESIRED_LOCAL_ENV_FILE" ]; then
+                  # clean (spaces and comments) and sort env file
+                  grep -v '^[[:space:]]*#' "$DESIRED_LOCAL_ENV_FILE" \
+                    | sed -E 's/[[:space:]]+#.*$//' \
+                    | sed -E 's/^[[:space:]]+//' \
+                    | sed -E 's/[[:space:]]+$//' \
+                    | sed -E 's/[[:space:]]*=[[:space:]]*/=/' \
+                    | grep -v '^[[:space:]]*$' \
+                    | sort > "$DESIRED_ENVS_FILENAME"
+
+                  echo "##[group]$DESIRED_ENVS_FILENAME (Variáveis de ambiente do bundle desejado)"
+                  cat "$DESIRED_ENVS_FILENAME"
+                  echo "##[endgroup]"
+                else
+                  echo "##[warning]Não foi possível encontrar o arquivo de ambiente desejado. '$DESIRED_LOCAL_ENV_FILE'."
+                  touch $DESIRED_ENVS_FILENAME
+                fi
+
+                # Extrai envs aceitando dois formatos: se .envs é array usa o primeiro objeto, se é objeto usa diretamente
+                cat $(get_enabled_bundle_info.RESPONSE_FILENAME) | jq -r '
+                  .envs
+                  | if type=="array" then (.[0] // {}) else . end
+                  | if type=="object" then to_entries[] | "\(.key)=\(.value)" else empty end
+                ' | sed -E "s/^([A-Za-z_][A-Za-z0-9_]*)=['\"]?(.*)['\"]?$/\1=\2/" > "$ENABLED_ENVS_FILENAME" || true
+                sort -o "$ENABLED_ENVS_FILENAME" "$ENABLED_ENVS_FILENAME"
+
+                # Se o arquivo ficou vazio, apenas exibe debug (não falha)
+                if [ ! -s "$ENABLED_ENVS_FILENAME" ]; then
+                  echo "Nenhuma variável de ambiente encontrada para a release habilitada. Gerando arquivo vazio $ENABLED_ENVS_FILENAME"
+                  echo "##[debug]Estrutura de envs retornada:" && jq -r '.envs // "(envs ausente)"' $(get_enabled_bundle_info.RESPONSE_FILENAME)
+                  : > "$ENABLED_ENVS_FILENAME"
+                fi
+
+                echo "##[group]$ENABLED_ENVS_FILENAME (Variáveis de ambiente do bundle habilitado)"
+                cat "$ENABLED_ENVS_FILENAME"
+                echo "##[endgroup]"
+
+                echo "##vso[task.setvariable variable=DESIRED_ENVS_FILENAME;isOutput=true]$DESIRED_ENVS_FILENAME"
+                echo "##vso[task.setvariable variable=ENABLED_ENVS_FILENAME;isOutput=true]$ENABLED_ENVS_FILENAME"
+
+          - task: Bash@3
+            displayName: "Discriminate environment variables"
+            name: discriminate_env_vars
+            condition: succeeded()
+            inputs:
+              targetType: inline
+              script: |
+                ENABLED_ENVS_FILENAME=$(get_env_vars.ENABLED_ENVS_FILENAME)
+                DESIRED_ENVS_FILENAME=$(get_env_vars.DESIRED_ENVS_FILENAME)
+                IN_ENVS_FILENAME="in.env.$(MICROFRONTEND_ENVIRONMENT)"
+                OUT_ENVS_FILENAME="out.env.$(MICROFRONTEND_ENVIRONMENT)"
+
+                echo -e "\033[1mDiferenças entre variáveis no bundle habilitado e no bundle desejado\033[0m"
+
+                # Diferenças unificadas
+                DIFF_U=$(diff $ENABLED_ENVS_FILENAME $DESIRED_ENVS_FILENAME -u || true)
+
+                echo "##[group]Diferenças unificadas - Bundle Habilitado e Bundle Desejado"
+                echo "$DIFF_U"
+                echo "##[endgroup]"
+
+                # Variáveis adicionadas (linhas com '+' exceto cabeçalho '+++')
+                printf '%s\n' "$DIFF_U" | awk '/^\+[^+]/ && /[A-Za-z0-9_]+=/{sub(/^\+/,"");print}' > $IN_ENVS_FILENAME
+                # Variáveis removidas (linhas com '-' exceto cabeçalho '---')
+                printf '%s\n' "$DIFF_U" | awk '/^-[^-]/ && /[A-Za-z0-9_]+=/{sub(/^-/, "");print}' > $OUT_ENVS_FILENAME
+
+                echo "##[group]Variáveis adicionadas (Bundle Desejado)"
+                cat $IN_ENVS_FILENAME
+                echo "##[endgroup]"
+                echo "##[group]Variáveis removidas (Bundle Habilitado)"
+                cat $OUT_ENVS_FILENAME
+                echo "##[endgroup]"
+
+                echo "##vso[task.setvariable variable=IN_ENVS_FILENAME;isOutput=true]$IN_ENVS_FILENAME"
+                echo "##vso[task.setvariable variable=OUT_ENVS_FILENAME;isOutput=true]$OUT_ENVS_FILENAME"
+
+          - task: Bash@3
+            displayName: "Generate HTML Report"
+            name: generate_html_report
+            condition: succeeded()
+            inputs:
+              targetType: inline
+              script: |
+                DESIRED_ENVS=$(get_env_vars.DESIRED_ENVS_FILENAME)
+                ENABLED_ENVS=$(get_env_vars.ENABLED_ENVS_FILENAME)
+                IN_ENVS=$(discriminate_env_vars.IN_ENVS_FILENAME)
+                OUT_ENVS=$(discriminate_env_vars.OUT_ENVS_FILENAME)
+
+                echo "##[debug]Rollback: $(compare_versions.IS_ROLLBACK)"
+
+                # Função para escapar HTML
+                html_escape() {
+                  sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
+                }
+
+                APP_NAME="$(MICROFRONTEND_NAME)"
+                ENVIRONMENT="$(MICROFRONTEND_ENVIRONMENT)"
+                ENABLED_VERSION_RAW=$(compare_versions.ENABLED_VERSION)
+                if [ -z "${ENABLED_VERSION_RAW// }" ]; then
+                  ENABLED_VERSION_OUT="Não encontrado"
+                else
+                  ENABLED_VERSION_OUT="$ENABLED_VERSION_RAW"
+                fi
+                DESIRED_VERSION_RAW=$(DESIRED_VERSION)
+                if [ -z "${DESIRED_VERSION_RAW// }" ]; then
+                  DESIRED_VERSION_OUT="Não encontrado"
+                else
+                  DESIRED_VERSION_OUT="$DESIRED_VERSION_RAW"
+                fi
+                IS_ROLLBACK_OUT_RAW=$(compare_versions.IS_ROLLBACK)
+                case "$IS_ROLLBACK_OUT_RAW" in
+                  true) IS_ROLLBACK_OUT="SIM" ;;
+                  false) IS_ROLLBACK_OUT="NÃO" ;;
+                  *) IS_ROLLBACK_OUT="Indefinido" ;;
+                esac
+
+                {
+                  echo "<!doctype html>"
+                  echo "<html lang=\"pt-br\">"
+                  echo "<head>"
+                  echo "<meta charset=\"utf-8\">"
+                  echo "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+                  echo "<meta name=\"color-scheme\" content=\"light dark\">"
+                  echo "<title>$APP_NAME - $ENVIRONMENT</title>"
+                  echo "<link rel=\"stylesheet\" href=\"https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.fluid.classless.blue.min.css\">"
+                  echo "<style>pre.diffY{white-space:pre;font-family:monospace;tab-size:1}</style>"
+                  echo "</head>"
+                  echo "<body>"
+                  echo "<main>"
+                  echo "<h3>Checklist de Ambiente</h3>"
+                  echo "<h4>Aplicação</h4>"
+                  echo "<p>Nome: $APP_NAME</p>"
+                  echo "<p>Ambiente (Namespace): $ENVIRONMENT</p>"
+                  echo "<h4>Versões</h4>"
+                  echo "<p>Versão do bundle atual (Habilitado): $ENABLED_VERSION_OUT</p>"
+                  echo "<p>Versão do novo bundle (Desejado): $DESIRED_VERSION_OUT</p>"
+                  echo "<p>É um Rollback? <strong>$IS_ROLLBACK_OUT</strong></p>"
+                  echo "<hgroup>"
+                  echo "<h4>Variáveis do bundle habilitado ($ENVIRONMENT)</h4>"
+                  echo "<p>Variáveis de ambiente do bundle atual em $ENVIRONMENT</p>"
+                  echo "</hgroup>"
+                  echo "<pre><code>$(html_escape < $ENABLED_ENVS)</code></pre>"
+                  echo "<hgroup>"
+                  echo "<h4>Variáveis do bundle desejado ($ENVIRONMENT)</h4>"
+                  echo "<p>Variáveis de ambiente do bundle a ser implantado em $ENVIRONMENT</p>"
+                  echo "</hgroup>"
+                  echo "<pre><code>$(html_escape < $DESIRED_ENVS)</code></pre>"
+                  echo "<hgroup>"
+                  echo "<h4>Variáveis incluídas</h4>"
+                  echo "<p>Variáveis do bundle desejado que não estão presentes no bundle habilitado</p>"
+                  echo "</hgroup>"
+                  echo "<pre><code>$(html_escape < $IN_ENVS)</code></pre>"
+                  echo "<hgroup>"
+                  echo "<h4>Variáveis removidas</h4>"
+                  echo "<p>Variáveis do bundle habilitado que não estão presentes no bundle desejado</p>"
+                  echo "</hgroup>"
+                  echo "<pre><code>$(html_escape < $OUT_ENVS)</code></pre>"
+                  echo "</main>"
+                  echo "</body>"
+                  echo "</html>"
+                } > report.html
+
+                if [ -f report.html ]; then
+                  echo "##[group]report.html"
+                  cat report.html
+                  echo "##[endgroup]"
+                else
+                  echo "Falha ao gerar relatório"
+                fi
+
+          - task: PublishHtmlReport@1
+            displayName: "Publish HTML Report"
+            name: "publish_report"
+            condition: succeeded()
+            inputs:
+              reportDir: "report.html"

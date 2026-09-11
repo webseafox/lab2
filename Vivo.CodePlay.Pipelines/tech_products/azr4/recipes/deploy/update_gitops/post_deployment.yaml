@@ -1,0 +1,68 @@
+jobs:
+- job: post_deployment
+  pool: GeneralPurposeLinuxAgentsCD
+  condition: and(succeeded(), eq(variables['ARGOCD_SYNC'], 'true'))
+  steps:
+  - script: |
+      echo "##[debug] Download argocd binary"
+      curl -sSL -o ${ARGOCD_PATH} https://github.com/argoproj/argo-cd/releases/download/${ARGOCD_VERSION}/argocd-linux-amd64
+      chmod +x ${ARGOCD_PATH}
+      echo "##[debug] ArgoCD binary downloaded to ${ARGOCD_PATH}"
+      echo "##vso[task.setvariable variable=ARGOCD_PATH]${ARGOCD_PATH}"
+      ${ARGOCD_PATH} version --client
+    displayName: 'Download ArgoCD Binary'
+    name: download_argocd
+    env:
+      ARGOCD_VERSION: v2.13.3
+      ARGOCD_PATH: $(Build.BinariesDirectory)/argocd
+  - task: AzureKeyVault@2
+    displayName: 'Getting AKV Credentials'
+    timeoutInMinutes: 1
+    retryCountOnTaskFailure: 5
+    inputs:
+      azureSubscription: 'DevOpsSharedResources'
+      KeyVaultName: 'kv-azdevops-shared'
+      SecretsFilter: 'ARGOCD-4P-B64-CONFIG-FILE'
+  - script: |
+      echo "##[debug] Setting up argocd config file to ${ARGOCD_CONFIG_PATH}"
+      echo ${AKV_ARGOCD_4P_B64_CONFIG_FILE} | base64 -d > ${ARGOCD_CONFIG_PATH}
+      chmod 0600 ${ARGOCD_CONFIG_PATH}
+      echo "##vso[task.setvariable variable=ARGOCD_CONFIG_PATH]${ARGOCD_CONFIG_PATH}"
+    displayName: Set ARGOCD_CONFIG_PATH Var
+    name: set_argocd_config_path
+    env:
+      AKV_ARGOCD_4P_B64_CONFIG_FILE: $(ARGOCD-4P-B64-CONFIG-FILE)
+      ARGOCD_CONFIG_PATH: $(Agent.TempDirectory)/argocd-config
+  - script: |
+        #!/bin/bash
+        set -e
+        echo "##[debug] Diffs for ${ARGOCD_APP_NAME}"
+        ${ARGOCD_PATH}  app diff ${ARGOCD_APP_NAME} --config ${ARGOCD_CONFIG_PATH} || true
+        echo "##[debug] Done"
+    displayName: 'Diff ArgoCD App'
+    env:
+      ARGOCD_CONFIG_PATH: $(ARGOCD_CONFIG_PATH)
+      ARGOCD_APP_NAME: $(set_argocd_config_path.ARGOCD_APP_NAME)
+      ARGOCD_PATH: $(download_argocd.ARGOCD_PATH)
+  - script: |
+        #!/bin/bash
+        set -e
+        echo "##[debug] Syncing ${ARGOCD_APP_NAME}"
+        ${ARGOCD_PATH}  app sync ${ARGOCD_APP_NAME} --config ${ARGOCD_CONFIG_PATH}
+        echo "##[debug] Waiting for ${ARGOCD_APP_NAME} to be synced"
+        ${ARGOCD_PATH}  app wait ${ARGOCD_APP_NAME} --config ${ARGOCD_CONFIG_PATH}
+    displayName: 'Sync ArgoCD App'
+    env:
+      ARGOCD_CONFIG_PATH: $(ARGOCD_CONFIG_PATH)
+      ARGOCD_APP_NAME: $(set_argocd_config_path.ARGOCD_APP_NAME)
+      ARGOCD_PATH: $(download_argocd.ARGOCD_PATH)
+  - script: |
+      #!/bin/bash
+      set -e
+      echo "##[debug] Getting logs for ${ARGOCD_APP_NAME}"
+      ${ARGOCD_PATH} app logs ${ARGOCD_APP_NAME} --config ${ARGOCD_CONFIG_PATH}
+    displayName: 'Get ArgoCD App Logs'
+    env:
+      ARGOCD_CONFIG_PATH: $(ARGOCD_CONFIG_PATH)
+      ARGOCD_APP_NAME: $(set_argocd_config_path.ARGOCD_APP_NAME)
+      ARGOCD_PATH: $(download_argocd.ARGOCD_PATH)

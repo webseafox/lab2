@@ -1,0 +1,644 @@
+parameters:
+- name: skipSecurityGate
+  default: false
+- name: convisoCompany
+  default: 1350
+- name: appVersion
+  default: "DevSecOps"
+- name: vivoFlow
+  type: string
+  default: "none"
+- name: imageSource
+  default: "$(DOCKER_REGISTRY)/$(docker_metadata.DOCKER_IMAGE_NAME):$(docker_metadata.DOCKER_IMAGE_TAG)"
+
+steps:
+  - ${{ if or(eq(parameters.vivoFlow, 'none'),and(ne(parameters.vivoFlow, 'none'),or(eq(variables['Build.SourceBranchName'], 'master'),eq(variables['Build.SourceBranchName'], 'main'),startsWith(variables['Build.SourceBranchName'], 'release/'),contains(parameters.vivoFlow, variables['Build.SourceBranchName']),and(eq(variables['Build.Reason'], 'PullRequest'),contains(parameters.vivoFlow, replace(variables['System.PullRequest.TargetBranch'], 'refs/heads/', '')))))) }}:
+
+    - task: DownloadPipelineArtifact@2
+      displayName: 'Download AppSec Endpoints Artifact'
+      inputs:
+        buildType: 'current'
+        artifactName: 'AppSecEndpoints'
+        targetPath: '$(Pipeline.Workspace)/AppSecEndpoints'
+
+    - task: Bash@3
+      displayName: 'Set SCA Docker Variables'
+      inputs:
+        targetType: inline
+        script: |
+          ENDPOINTS_FILE="$(Pipeline.Workspace)/AppSecEndpoints/appsec_endpoints.json"
+
+          if [ ! -f "$ENDPOINTS_FILE" ]; then
+            echo "##vso[task.logissue type=error]AppSec Endpoints artifact not found!"
+            echo "##[error]The required artifact 'AppSecEndpoints' containing the configuration JSON could not be found."
+            exit 1
+          fi
+
+          echo "##[debug] Parsing endpoints from artifact..."
+          USE_DT_SCA_ENDPOINT=$(jq -r '.DT_SCA_ENDPOINT // empty' "$ENDPOINTS_FILE")
+
+          if [ -z "$USE_DT_SCA_ENDPOINT" ]; then
+            echo "##vso[task.logissue type=error]Missing required DT_SCA_ENDPOINT variable in AppSec Endpoints artifact!"
+            exit 1
+          fi
+
+          echo "=================================================================="
+          echo "AppSec Endpoints Loaded:"
+          echo "DT_SCA_ENDPOINT.........................: $USE_DT_SCA_ENDPOINT"
+          echo "=================================================================="
+
+          echo "##vso[task.setvariable variable=DT_SCA_ENDPOINT]$USE_DT_SCA_ENDPOINT"
+          echo "##vso[task.setvariable variable=DT_APP_DEFAULT_NAME]$(System.TeamProject)-$(Build.Repository.Name)"
+          echo "##vso[task.setvariable variable=DT_APP_DEFAULT_VERSION]DevSecOps"
+
+          echo "Security variables for this job have been set."
+
+    ## -> Download Security Tokens
+    - task: AzureKeyVault@2
+      displayName: 'Getting AKV Security Credentials'
+      timeoutInMinutes: 1
+      retryCountOnTaskFailure: 5
+      inputs:
+        azureSubscription: DevOpsSharedResources
+        KeyVaultName: $(AKV_DEVOPS_NAME)
+        SecretsFilter: 'CONVISO-API-KEY, DEPENDENCY-TRACK-TOKEN'
+      condition: and(eq(variables['DEPENDENCY-TRACK-TOKEN'], ''), eq(variables['CONVISO-API-KEY'], ''))
+
+    ## -> Syft Install
+    - task: SyftInstall@1
+      displayName: Install Syft
+      condition: eq(variables.USE_DT_DOCKER, 'true')
+      inputs:
+        mode: custom
+        useCache: true
+        version: 1.19.0
+
+    ## -> Get Service Connection
+    - task: LoadEndpointDockerRegistryFromVivo@4
+      name: docker_endpoint
+      displayName: 'Loading Docker Registry'
+      condition: eq(variables.USE_DT_DOCKER, 'true')
+      inputs:
+        endpoint: $(DOCKER_SERVICE_CONNECTION)
+        authParamsFilter: 'REGISTRY'
+
+    ## -> Remove HTTPS:// from Docker Registry
+    - task: NunjucksInline@4
+      condition: eq(variables.USE_DT_DOCKER, 'true')
+      displayName: 'Generating Image Source for SCA Scan'
+      inputs:
+        sourceType: 'text'
+        source: |
+          var DOCKER_REGISTRY = {{"$(docker_endpoint.AUTH_REGISTRY)" | replace(r/https?:\/\//, '')}}
+
+    ## -> Generates SBOM from Docker image
+    - task: GenerateSbomSyft@1
+      displayName: 'Generating SBOM with Syft'
+      condition: eq(variables.USE_DT_DOCKER, 'true')
+      inputs:
+        useDockerImage: true
+        reportPath: "cyclonedx_report.json"
+        imageSource: ${{ parameters.imageSource }}
+
+    ## -> Validates whether the image scan occurred normally and the SBOM was generated
+    - task: Bash@3
+      displayName: 'Validating SCAN'
+      condition: eq(variables.USE_DT_DOCKER, 'true')
+      env:
+        DT_APP_DEFAULT_NAME: "$(System.TeamProject)-$(Build.Repository.Name)"
+      inputs:
+        workingDirectory: '$(Build.SourcesDirectory)'
+        targetType: inline
+        script: |
+
+          echo "##[debug] Project name: $(DT_APP_DEFAULT_NAME)"
+          echo "##[debug] Project version: ${{ parameters.appVersion }}"
+          echo "##[debug] Report Path: cyclonedx_report.json"
+          if [ -e "cyclonedx_report.json" ]; then
+            echo "##[debug] Scan completed."
+            echo "##[debug] REPORT_PATH content (base64): $(base64 -w 0 cyclonedx_report.json)"
+          else
+            echo "##[debug] Scan fail."
+            exit 1
+          fi
+
+    - bash: |
+        echo "##[debug] Uploading BOM to DT..."
+
+        BOMCONTENT=$(cat cyclonedx_report.json | base64 -w 0)
+        ODTFILE="bom_payload.json"
+
+        echo "Nome do projeto: ${DT_APP_DEFAULT_NAME}"
+        echo "Versão: ${{ parameters.appVersion }}"
+
+        PAYLOAD='{ "projectName": "'${DT_APP_DEFAULT_NAME}'", "projectVersion": "'${{ parameters.appVersion }}'", "autoCreate": true, "bom": "'${BOMCONTENT}'" }'
+
+        echo -n $PAYLOAD > $ODTFILE
+
+        RESPONSE=$(curl -s \
+                    -X PUT "${DT_SCA_ENDPOINT}/v1/bom" \
+                    -H "X-API-Key: ${DT_TOKEN}" \
+                    -H 'Content-Type: application/json' \
+                    -d "@${ODTFILE}")
+
+        echo "##[debug]Uploaded! Response: ${RESPONSE}"
+
+        sbomToken=$(jq -r '.token' <<< "$RESPONSE")
+        echo "##vso[task.setvariable variable=SBOM_TOKEN]$sbomToken"
+
+        i="0"
+        retries="25"
+        echo "Aguardando Sincronização finalizar"
+        while [[ $i -lt $retries ]]
+        do
+
+        RESPONSE=$(curl -s \
+                    -X GET "${DT_SCA_ENDPOINT}/v1/event/token/${sbomToken}" \
+                    -H "X-API-Key: $(DEPENDENCY-TRACK-TOKEN)" \
+                    -H 'Content-Type: application/json')
+
+        echo "##[debug]Status de processamento: ${RESPONSE}"
+
+        if [[ "$(jq -r '.processing' <<< "$RESPONSE")" == "false" ]]
+        then
+            echo "Sincronização finalizada com sucesso"
+
+            DT_APP_DEFAULT_NAME=$(echo -n "$DT_APP_DEFAULT_NAME" | jq -sRr @uri)
+
+            echo "Nome do projeto: ${DT_APP_DEFAULT_NAME}"
+
+            RESPONSE=$(curl -s \
+                        -X GET "${DT_SCA_ENDPOINT}/v1/project/lookup?name=${DT_APP_DEFAULT_NAME}&version=${{ parameters.appVersion }}" \
+                        -H "X-API-Key: ${DT_TOKEN}" \
+                        -H 'Content-Type: application/json')
+
+            echo "##[debug]Valor do Lookup: ${RESPONSE}"
+
+            DT_PROJECT_ID=$(jq -r '.uuid' <<< "$RESPONSE")
+
+            gateValidation=$(jq -r '.metrics.policyViolationsSecurityUnaudited' <<< "$RESPONSE")
+
+            echo "##[debug]Valor do UUID: ${DT_PROJECT_ID}"
+
+            echo "##[debug]Violações não auditadas: ${gateValidation}"
+
+            echo "##vso[task.setvariable variable=GATE_VALIDATION]$gateValidation"
+
+            echo "##vso[task.setvariable variable=PROJECT_ID]$DT_PROJECT_ID"
+
+            exit 0
+        fi
+        i=$[$i+1]
+        sleep 15s
+        done
+
+        echo "##vso[task.logissue type=error;]Tempo esgotado - A Sincronização não foi finalizada, tente rodar novamente."
+        echo "##vso[task.complete result=Failed;]"
+      displayName: Uploading SBOM to DT
+      condition: eq(variables.USE_DT_DOCKER, 'true')
+      env:
+        DT_SCA_ENDPOINT: $(DT_SCA_ENDPOINT)
+        CACORP_LOCATION: $(CACORP_LOCATION)
+        DT_TOKEN: $(DEPENDENCY-TRACK-TOKEN)
+        DT_APP_DEFAULT_NAME: $(DT_APP_DEFAULT_NAME)
+        PROXY_AGENT_HTTPS: "$(PROXY_AGENT_HTTPS)"
+
+    ## -> Apply project tag based on extracted sigla
+    - bash: |
+        # Extrair sigla e fazer tagging do projeto
+        PROJECT_NAME_CLEAN=$(echo "${DT_APP_DEFAULT_NAME}" | sed 's/%20/ /g')
+
+        # Extrair a sigla
+        if [[ "$PROJECT_NAME_CLEAN" == *" - "* ]]; then
+          PROJECT_SIGLA=$(echo "${PROJECT_NAME_CLEAN}" | cut -d'-' -f1 | xargs | tr '[:upper:]' '[:lower:]')
+        else
+          PROJECT_SIGLA=$(echo "${PROJECT_NAME_CLEAN}" | sed -E 's/[-.].*//' | cut -d' ' -f1 | tr '[:upper:]' '[:lower:]')
+        fi
+
+        # Fazer tagging se a sigla não estiver vazia
+        if [ ! -z "$PROJECT_SIGLA" ]; then
+          TAG_PAYLOAD='["$(PROJECT_ID)"]'
+
+          TAG_RESPONSE=$(curl -s -w "\nHTTP_STATUS:%{http_code}" \
+                -X POST "${DT_SCA_ENDPOINT}/v1/tag/${PROJECT_SIGLA}/project" \
+                -H "X-API-Key: ${DT_TOKEN}" \
+                -H "Content-Type: application/json" \
+                -d "${TAG_PAYLOAD}")
+
+          HTTP_STATUS=$(echo "$TAG_RESPONSE" | grep "HTTP_STATUS:" | cut -d':' -f2)
+
+          if [[ "$HTTP_STATUS" =~ ^(200|204)$ ]]; then
+            echo "##[section]Projeto taggeado com sucesso: ${PROJECT_SIGLA}"
+          else
+            echo "##[warning]Falha ao aplicar tag '${PROJECT_SIGLA}'. HTTP Status: ${HTTP_STATUS}"
+          fi
+        fi
+      displayName: Tagging Asset in Dependency-Track
+      condition: eq(variables.USE_DT_DOCKER, 'true')
+      continueOnError: true
+      env:
+        DT_SCA_ENDPOINT: $(DT_SCA_ENDPOINT)
+        CACORP_LOCATION: $(CACORP_LOCATION)
+        DT_TOKEN: $(DEPENDENCY-TRACK-TOKEN)
+        DT_APP_DEFAULT_NAME: $(DT_APP_DEFAULT_NAME)
+        PROXY_AGENT_HTTPS: "$(PROXY_AGENT_HTTPS)"
+
+    ## -> Retriving SBOM Token and Moving SBOM to Artifacts Directory
+    - task: Bash@3
+      displayName: 'Moving SBOM'
+      condition: eq(variables.USE_DT_DOCKER, 'true')
+      inputs:
+        targetType: inline
+        script: |
+          echo "##[debug] SBOM token: $(SBOM_TOKEN)"
+          mv cyclonedx_report.json $(Build.ArtifactStagingDirectory)/
+
+    - task: PublishBuildArtifacts@1
+      displayName: "Publishing SBOM"
+      condition: eq(variables.USE_DT_DOCKER, 'true')
+      inputs:
+        pathToPublish: "$(Build.ArtifactStagingDirectory)/cyclonedx_report.json"
+        artifactName: "sbom-docker"
+
+    - task: convisoAzureSyncTask@1
+      displayName: "Conviso Sync"
+      condition: and( ne(variables.USE_CONVISO, 'false'), eq(variables.USE_DT_DOCKER, 'true'))
+      continueOnError: true
+      inputs:
+        API_KEY: "$(CONVISO-API-KEY)"
+        PROJECT_ID: "$(PROJECT_ID)"
+        INTEGRATION: "DEPENDENCY_TRACK"
+        COMPANY_ID: ${{ parameters.convisoCompany }}
+
+    - task: Bash@3
+      displayName: "Evaluate Security Gate (Warning Only)"
+      condition: and( ne(variables.SKIP_SECURITY_GATE_SCA, 'true'), eq(variables.USE_DT_DOCKER, 'true'))
+      inputs:
+        targetType: 'inline'
+        script: |
+          echo "##[debug] Dependency-Track Project ID: $(PROJECT_ID)"
+
+          set -e
+
+          # ============================================================================
+          # ATENÇÃO: neste template o Security Gate é SEMPRE não bloqueante.
+          # TODAS as vulnerabilidades (Critical/High), de Aplicação/SCA ou de Container/
+          # Imagem Base, são reportadas apenas como WARNING. A pipeline NUNCA falha aqui.
+          # Este comportamento é temporário e durará até a formalização do processo
+          # de provisionamento de imagens seguras.
+          # ============================================================================
+
+          curl -sf \
+            -X GET "${DT_SCA_ENDPOINT}/v1/violation/project/$(PROJECT_ID)?suppressed=true&pageNumber=1&pageSize=1000" \
+            -H "X-API-Key: $(DEPENDENCY-TRACK-TOKEN)" \
+            -H 'Content-Type: application/json' > dt_violations.json || {
+              echo "##vso[task.logissue type=error;] The Dependency-Track API is not responding due to a unexpected error. Please, try again by clicking on Rerun Failed Jobs or contact appsec_vivo.br@telefonica.com. Thanks"
+              echo "##vso[task.complete result=Failed;]"
+              exit 1
+            }
+
+          curl -sf \
+            -X GET "${DT_SCA_ENDPOINT}/v1/finding/project/$(PROJECT_ID)?suppressed=false" \
+            -H "X-API-Key: $(DEPENDENCY-TRACK-TOKEN)" \
+            -H 'Content-Type: application/json' > dt_findings.json || echo "[]" > dt_findings.json
+
+          if [ ! -s dt_violations.json ] || [ "$(cat dt_violations.json)" == "null" ]; then echo "[]" > dt_violations.json; fi
+          if [ ! -s dt_findings.json ] || [ "$(cat dt_findings.json)" == "null" ]; then echo "[]" > dt_findings.json; fi
+
+          COUNT=$(jq '[ .[] | select((.analysis.analysisState=="NOT_SET") or (.analysis == null) or (.analysis.analysisState == null)) ] | length' dt_violations.json)
+
+          jq -n --slurpfile findings dt_findings.json --slurpfile violations dt_violations.json '[
+            ($violations[0] | map(
+              select(.analysis.analysisState == "APPROVED" or .analysis.analysisState == "REJECTED") |
+              if .vulnerability and .vulnerability.vulnId then
+                "\(.component.uuid)|\(.vulnerability.vulnId)"
+              else
+                "\(.component.uuid)|ALL"
+              end
+            )) as $audited_keys |
+            $findings[0][]? |
+            select(
+              (.vulnerability.severity == "CRITICAL" or .vulnerability.severity == "HIGH") and
+              (.analysis.isSuppressed != true) and
+              (.analysis.state != "FALSE_POSITIVE" and .analysis.state != "NOT_AFFECTED" and .analysis.state != "RESOLVED") and
+              (
+                "\(.component.uuid)|\(.vulnerability.vulnId)" as $key1 |
+                "\(.component.uuid)|ALL" as $key2 |
+                ($audited_keys | index($key1) == null) and
+                ($audited_keys | index($key2) == null)
+              )
+            )
+          ]' > dt_blocking.json
+
+          # Para cada pacote vulnerável, procura no Dependency-Track a primeira versão
+          # em que a CVE já está corrigida e mostra ela junto das outras informações.
+
+          minusculo() {
+            tr '[:upper:]' '[:lower:]'
+          }
+
+          # Verdadeiro quando $1 vem antes de $2 (sort -V compara versão, não texto).
+          versao_menor() {
+            [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n 1)" = "$1" ]
+          }
+
+          # O nome do pacote está no 5º campo do CPE (cpe:2.3:a:fornecedor:PACOTE:...)
+          # ou no último trecho do PURL (pkg:maven/grupo/PACOTE@versao).
+          nome_do_pacote() {
+            local nome="$2"
+
+            case "$1" in
+              PURL) nome=$(echo "$nome" | sed 's/[?#].*//; s/@[^@]*$//'); nome="${nome##*/}" ;;
+              *)    nome=$(echo "$nome" | cut -d: -f5) ;;
+            esac
+
+            echo "$nome" | minusculo
+          }
+
+          detalhe_da_vulnerabilidade() {
+            curl -sf --max-time 10 \
+              -X GET "${DT_SCA_ENDPOINT}/v1/vulnerability/source/$1/vuln/$2" \
+              -H "X-API-Key: $(DEPENDENCY-TRACK-TOKEN)" \
+              -H 'Content-Type: application/json'
+          }
+
+          # Lista as correções da CVE: identidade do pacote e a primeira versão sem a falha.
+          correcoes_publicadas() {
+            echo "$1" | jq -r '.affectedComponents[]?
+              | select((.versionEndExcluding // "") != "")
+              | "\(.identityType)\t\(.identity)\t\(.versionEndExcluding)"'
+          }
+
+          # Menor correção que ainda é maior que a versão instalada, ou seja, o upgrade mínimo.
+          # Só considera as entradas que são do mesmo pacote do finding.
+          versao_corrigida() {
+            local pacote correcoes tipo identidade versao escolhida=""
+
+            pacote=$(echo "$2" | minusculo)
+            correcoes=$(correcoes_publicadas "$1") || return 0
+
+            while IFS=$'\t' read -r tipo identidade versao; do
+              [ "$(nome_do_pacote "$tipo" "$identidade")" = "$pacote" ] || continue
+              versao_menor "$3" "$versao" || continue
+              if [ -z "$escolhida" ] || versao_menor "$versao" "$escolhida"; then
+                escolhida="$versao"
+              fi
+            done <<< "$correcoes"
+
+            echo "$escolhida"
+          }
+
+          # Uma linha por finding: fonte, CVE, nome e versão do pacote.
+          # No máximo 50, para não disparar chamada demais no Dependency-Track.
+          SAFE_VERSIONS=""
+          VULN_LIST=$(jq -r '.[] | "\(.vulnerability.source // "NVD")\t\(.vulnerability.vulnId // "")\t\(.component.name // "")\t\(.component.version // "")"' dt_blocking.json | sort -u | head -n 50)
+
+          while IFS=$'\t' read -r VULN_SOURCE VULN_ID PKG_NAME PKG_VERSION; do
+            [ -n "$VULN_ID" ] && [ -n "$PKG_VERSION" ] || continue
+
+            VULN_DETAIL=$(detalhe_da_vulnerabilidade "$VULN_SOURCE" "$VULN_ID") || {
+              echo "##[debug] Sem dados de correção no Dependency-Track para ${VULN_ID}"
+              continue
+            }
+
+            SAFE_VERSION=$(versao_corrigida "$VULN_DETAIL" "$PKG_NAME" "$PKG_VERSION")
+            if [ -n "$SAFE_VERSION" ]; then
+              SAFE_VERSIONS="${SAFE_VERSIONS}${VULN_ID}|${PKG_NAME}|${SAFE_VERSION}"$'\n'
+            fi
+          done <<< "$VULN_LIST"
+
+          # Copia a versão encontrada para dentro de cada finding, no campo safe_version.
+          # Se algo falhar aqui o log só deixa de mostrar a sugestão, o gate continua igual.
+          if ENRICHED=$(jq --arg safe "$SAFE_VERSIONS" '
+            ($safe | split("\n") | map(select(. != "") | split("|")) | map({ key: "\(.[0])|\(.[1])", value: .[2] }) | from_entries) as $correcoes
+            | map(. + { safe_version: ($correcoes["\(.vulnerability.vulnId // "")|\(.component.name // "")"] // "") })
+          ' dt_blocking.json); then
+            echo "$ENRICHED" > dt_blocking.json
+          fi
+
+          SBOM_FILE="$(Build.ArtifactStagingDirectory)/cyclonedx_report.json"
+
+          if [ -f "$SBOM_FILE" ]; then
+            jq -r --slurpfile bom "$SBOM_FILE" '
+              ($bom[0].metadata.component["bom-ref"]? // "") as $root_ref |
+              (($bom[0].dependencies // []) | map(select(.ref == $root_ref)) | (.[0] // {}).dependsOn // []) as $direct_refs |
+              (($bom[0].components // []) | map(select(.["bom-ref"] != null and .purl != null) | {(.["bom-ref"]): .purl}) | add // {}) as $refToPurl |
+              ($direct_refs | map($refToPurl[.]) | map(select(. != null)) | map({(.): true}) | add // {}) as $directPurls |
+              (($bom[0].components // []) | map(select(.purl != null) | {(.purl): .}) | add // {}) as $bomDict |
+
+              map(
+                (if .component.purl != null then (((.component.purl | split(":")[1]) // "") | split("/")[0] // "Unknown") else "Unknown" end) as $pkg_type |
+                ($bomDict[.component.purl // "NO_PURL"] | .properties // null) as $full_props |
+                (if $full_props != null then
+                  ([$full_props[]? | select(.name | test("syft:location.*path")) | .value][0] // "N/A")
+                else "N/A" end) as $location |
+
+                (if $pkg_type == "apk" or $pkg_type == "deb" or $pkg_type == "rpm" or $pkg_type == "oci" or $pkg_type == "alpm"
+                  then "🐳 Container (Imagem Base \($pkg_type))"
+                elif ($pkg_type == "Unknown" and (.component.name // "" | ascii_downcase | test("rhel|alpine|debian|ubuntu|centos|rocky|alma")))
+                  then "🐳 Container (OS/Sistema Operacional)"
+                elif ($location != "N/A" and ($location | test("^(/usr/local/lib/node_modules|/usr/lib/node_modules|/usr/local/lib/python|/usr/lib/python|/usr/share/java|/usr/local/tomcat|/opt|/usr/local/bin|/usr/bin|/bin|/sbin|/usr/sbin)")))
+                  then "🐳 Container (Global \($pkg_type))"
+                else "📦 Aplicação/SCA (\($pkg_type))" end) as $origin |
+
+                (if ($origin | test("Container"))
+                  then "N/A (Infra/OS)"
+                elif (.component.purl != null and $directPurls[.component.purl])
+                  then "🎯 Direta (Direct)"
+                else "🔀 Transitiva (Transitive)" end) as $dep_type |
+
+                (if ($origin | test("Container")) then "container" else "app" end) as $origin_type |
+
+                . + {
+                  origin: $origin,
+                  dep_type: $dep_type,
+                  location: $location,
+                  origin_type: $origin_type
+                }
+              )
+            ' dt_blocking.json > dt_enriched.json
+          else
+            echo "##[warning] Arquivo cyclonedx_report.json não encontrado. Tratando todas as vulnerabilidades como de Projeto."
+            jq '
+              map(. + {
+                origin: "📦 Aplicação/SCA (Desconhecido)",
+                dep_type: "Desconhecido",
+                location: "N/A",
+                origin_type: "app"
+              })
+            ' dt_blocking.json > dt_enriched.json
+          fi
+
+          jq '[.[] | select(.origin_type == "app")]' dt_enriched.json > dt_app_warnings.json
+          jq '[.[] | select(.origin_type == "container")]' dt_enriched.json > dt_container_warnings.json
+
+          APP_COUNT=$(jq 'length' dt_app_warnings.json)
+          CONTAINER_COUNT=$(jq 'length' dt_container_warnings.json)
+          TOTAL_FINDINGS=$((APP_COUNT + CONTAINER_COUNT))
+
+          if [ "$TOTAL_FINDINGS" -gt 0 ]; then
+
+            APP_CRITICAL_COUNT=$(jq '[.[] | select(.vulnerability.severity == "CRITICAL")] | length' dt_app_warnings.json)
+            APP_HIGH_COUNT=$(jq '[.[] | select(.vulnerability.severity == "HIGH")] | length' dt_app_warnings.json)
+
+            CONT_CRITICAL_COUNT=$(jq '[.[] | select(.vulnerability.severity == "CRITICAL")] | length' dt_container_warnings.json)
+            CONT_HIGH_COUNT=$(jq '[.[] | select(.vulnerability.severity == "HIGH")] | length' dt_container_warnings.json)
+
+            ASSET_NAME_SEARCH="${DT_APP_DEFAULT_NAME} ${{ parameters.appVersion }}"
+            ASSET_QUERY="{ assets(companyId: \"${{ parameters.convisoCompany }}\", page: 1, limit: 10, search: {name: \"$ASSET_NAME_SEARCH\"}) { collection { id name } } }"
+            ASSET_PAYLOAD=$(jq -n --arg q "$ASSET_QUERY" '{query: $q}')
+            CONVISO_ASSET_ID=$(curl -sS --retry 3 --retry-delay 2 --max-time 15 -X POST -H "x-api-key: $(CONVISO-API-KEY)" -H "Content-Type: application/json" -d "$ASSET_PAYLOAD" "https://api.convisoappsec.com/graphql" | jq -r --arg exact_name "$ASSET_NAME_SEARCH" '[.data.assets.collection[]? | select(.name == $exact_name) | .id][0] // empty')
+
+            echo ""
+            echo "════════════════════════════════════════════════════════════════════════════════"
+            echo "##[warning]⚠️ SECURITY GATE WARNING — SCA (IMAGEM DOCKER) — NÃO BLOQUEANTE"
+            echo "════════════════════════════════════════════════════════════════════════════════"
+            echo "##vso[task.logissue type=warning;] Potential Critical/High vulnerabilities were found by our security tools for this image."
+            echo "##vso[task.logissue type=warning;] This template reports ALL findings as WARNING only and will NOT block the pipeline, regardless of origin (application or container)."
+            echo "##vso[task.logissue type=warning;] Check Vivo Appsec team wiki in https://wikicorp.telefonica.com.br/pages/viewpage.action?pageId=524036659 for more details."
+            echo "════════════════════════════════════════════════════════════════════════════════"
+
+            echo "📊 Resumo Geral de Violações de Política Não Auditadas: $COUNT"
+
+            if [ "$APP_COUNT" -gt 0 ]; then
+              echo "📦 Resumo de Vulnerabilidades de APLICAÇÃO/SCA (⚠️ NÃO BLOQUEANTES / WARNING):"
+              echo "   🔴 Critical : $APP_CRITICAL_COUNT"
+              echo "   🟠 High     : $APP_HIGH_COUNT"
+            fi
+
+            if [ "$CONTAINER_COUNT" -gt 0 ]; then
+              echo "🐳 Resumo de Vulnerabilidades de CONTAINER (⚠️ NÃO BLOQUEANTES / WARNING):"
+              echo "   🔴 Critical : $CONT_CRITICAL_COUNT"
+              echo "   🟠 High     : $CONT_HIGH_COUNT"
+              echo "   ----------------------------------------------------------------------------"
+              echo "   📢 AVISO IMPORTANTE SOBRE CONTAINERS:"
+              echo "   As vulnerabilidades acima são da Imagem Base ou de pacotes do Sistema"
+              echo "   Operacional. Elas geram este alerta, mas NÃO QUEBRAM a sua pipeline."
+              echo "   O deploy continuará normalmente."
+              echo "   Ação recomendada: Atualize a versão da imagem base (FROM) no seu Dockerfile."
+            fi
+
+            echo "════════════════════════════════════════════════════════════════════════════════"
+            echo "📖 PLAYBOOK DE CORREÇÃO (SCA) / REMEDIATION PLAYBOOK"
+            echo "════════════════════════════════════════════════════════════════════════════════"
+            echo "Preparamos um guia passo a passo para te ajudar a corrigir essas vulnerabilidades:"
+            echo "👉 https://wikicorp.telefonica.com.br/spaces/SEGDIG/pages/796298043/Playbook+para+Devs"
+            echo ""
+            echo "💡 DICA DE CORREÇÃO (DevEx):"
+            echo "• Se a Origem for 📦 Aplicação e o Tipo for Transitiva, NÃO edite arquivos em pastas internas."
+            echo "  Atualize a versão indiretamente pelo manifesto raiz (ex: package.json, pom.xml)."
+            echo "• Se a Origem for 🐳 Container, você NÃO conseguirá corrigir via código-fonte."
+            echo "  Você precisará atualizar a Imagem Base (ex: alterar a versão do FROM no Dockerfile)."
+            echo "════════════════════════════════════════════════════════════════════════════════"
+            echo ""
+
+            if [ -n "$CONVISO_ASSET_ID" ]; then
+              echo "🔗 Para detalhes completos das vulnerabilidades, acesse a listagem na Conviso Platform:"
+              echo "   https://app.convisoappsec.com/spa/company/${{ parameters.convisoCompany }}/vulnerabilities?assetIds=$CONVISO_ASSET_ID&severities=HIGH&severities=CRITICAL&statuses=IDENTIFIED&statuses=CREATED&page=1&perPage=100"
+            else
+              echo "⚠️  Não foi possível obter o link das vulnerabilidades na Conviso Platform."
+            fi
+
+            print_vulns() {
+              local data_file="$1"
+              jq -r '
+                .[] |
+                "┌─ [\(.vulnerability.severity // "UNKNOWN")] \(.vulnerability.vulnId // "UNKNOWN")\n" +
+                "│  Componente   : \(.component.name // "Unknown") \(.component.version // "Unknown")\n" +
+                "│  Versão segura: \(if (.safe_version // "") != "" then "\u001b[1;32m\(.safe_version)\u001b[0m (ou superior). Valide se essa versão não é afetada por outra CVE antes de atualizar" else "não identificada automaticamente. Veja a Referência abaixo" end)\n" +
+                "│  Origem       : \(.origin // "Unknown")\n" +
+                "│  Tipo Dep     : \(.dep_type // "Unknown")\n" +
+                "│  Caminho/Path : \(.location // "N/A")\n" +
+                "│  CWEs         : \(if (.vulnerability.cwes // []) | length > 0 then [.vulnerability.cwes[]? | "CWE-\(.cweId // "Unknown")"] | join(", ") else "N/A" end)\n" +
+                "│  Descrição    : \(.vulnerability.description // "Sem descrição" | gsub("\n"; " ") | .[0:250])\(if (.vulnerability.description != null and (.vulnerability.description | length) > 100) then "..." else "" end)\n" +
+                "│  Referência   : \(if (.vulnerability.vulnId // "") | startswith("CVE") then "https://nvd.nist.gov/vuln/detail/\(.vulnerability.vulnId)" else "https://osv.dev/vulnerability/\(.vulnerability.vulnId // "Unknown")" end)\n" +
+                "└────────────────────────────────────────────────────────────────"
+              ' "$data_file"
+            }
+
+            if [ "$APP_COUNT" -gt 0 ]; then
+              echo ""
+              echo "##[section]## Detalhes das Vulnerabilidades Não Bloqueantes (Aplicação/SCA) - WARNING ##"
+              echo ""
+              print_vulns dt_app_warnings.json
+            fi
+
+            if [ "$CONTAINER_COUNT" -gt 0 ]; then
+              echo ""
+              echo "##[section]## Detalhes das Vulnerabilidades Não Bloqueantes (Container / Imagem Base) - WARNING ##"
+              echo ""
+              print_vulns dt_container_warnings.json
+            fi
+
+            cat dt_violations.json > "$(Build.ArtifactStagingDirectory)/sca-violations.json"
+
+            echo ""
+            echo "════════════════════════════════════════════════════════════════════════════════"
+            echo "📢 NOVO CANAL DE SUPORTE APPSEC / NEW APPSEC SUPPORT CHANNEL"
+            echo "════════════════════════════════════════════════════════════════════════════════"
+            echo "👉 Acesse nosso Centro de Excelência: https://telefonicacorp.sharepoint.com/sites/SuporteSecurityChampions.TMBNL/SitePages/Home.aspx"
+            echo "Dúvidas sobre como corrigir essas vulnerabilidades? Nosso suporte agora é centralizado no Teams para garantir um melhor atendimento!"
+            echo "(Questions on how to fix these vulnerabilities? Our support is now centralized on Teams to ensure a better support experience!)"
+            echo ""
+            echo "DICA!!! Preparamos um guia passo a passo para te ajudar a corrigir essas vulnerabilidades: https://wikicorp.telefonica.com.br/spaces/SEGDIG/pages/796298043/Playbook+para+Devs"
+            echo "1️⃣ Primeiro acesso? Cadastre-se rápido aqui:"
+            echo "   First access? Register quickly here:"
+            echo "   👉 https://protect.checkpoint.com/v2/r02/___https://forms.office.com/Pages/ResponsePage.aspx?id=DmBElwQ-Lkm6oSXsJFxvEIEUqkLE2nxJo9w5p_Ap3pBUQlUzV00zTTg5Rk1KSDVGSFUxTjMyR0g0UC4u___.YzJlOnRlbGVmb25pY2FicmF6aWw6YzpvOjE5ZDMxODQ5YTI2ODEyYzAzNzZhYjM4MTI0NmU3NTM2Ojc6YmY5MDplZDUwOWM3Y2IzOWY3MDU1YjlhZTE0NzI4NTI5OTEwNmNkZDE2MmFlNDJhOGQ5N2E0NDQyYmM3ZjkwYTk5ZGFiOmg6VDpG"
+            echo ""
+            echo "2️⃣ Acesse o Centro De Excelência AppSec Vivo (Teams):"
+            echo "   Access the AppSec Vivo Center of Excellence (Teams):"
+            echo "   👉 https://protect.checkpoint.com/v2/r02/___https://teams.microsoft.com/l/team/19%3A5umImaIp9MNp2h-NjxPlAXYxUdm5Y-ez-2jWOCyH-6A1*40thread.tacv2/conversations?groupId=f337901f-f683-4b96-bf88-71d273fbb61e&tenantId=9744600e-3e04-492e-baa1-25ec245c6f10___.YzJlOnRlbGVmb25pY2FicmF6aWw6YzpvOjE5ZDMxODQ5YTI2ODEyYzAzNzZhYjM4MTI0NmU3NTM2Ojc6NzBiMzo0YTgzNzQ1ZDU4ZTA5MDUwMDAzZWZkMzFhODEzMWE3Y2Q2ODM4NjZjYmU2ZWUwOGY1ZjU1NTBjMTVkMmFhYTZiOmg6VDpG"
+            echo "════════════════════════════════════════════════════════════════════════════════"
+            echo "📧 E-mail / Email: appsec_vivo.br@telefonica.com"
+            echo "🌙 Plantão / After-hours support (Evernow): +55 (11) 5028-1152"
+            echo ""
+
+            # Validação Final: neste template NADA bloqueia. Sempre SucceededWithIssues.
+            echo "##vso[task.complete result=SucceededWithIssues;]Vulnerabilidades identificadas (aplicação e/ou container) - reportadas apenas como WARNING neste template."
+            exit 0
+
+          else
+            echo "##[debug] No critical and high vulnerabilities were found that violate AppSec policies."
+            echo "##[debug] For more information about the process, check Vivo Appsec team wiki in https://wikicorp.telefonica.com.br/pages/viewpage.action?pageId=524036659."
+          fi
+
+    - task: PublishBuildArtifacts@1
+      displayName: "Publicar relatório de vulnerabilidades SCA"
+      condition: and(succeededOrFailed(), eq(variables.USE_DT_DOCKER, 'true'))
+      continueOnError: true
+      inputs:
+        pathToPublish: "$(Build.ArtifactStagingDirectory)/sca-violations.json"
+        artifactName: "sca-violations"
+
+    - bash: |
+        echo "##vso[task.setvariable variable=SCA_FAILED;isOutput=true]true"
+      name: sca_status
+      condition: failed()
+      displayName: "Set Variable SCA Failed"
+
+  - ${{ else }}:
+    - task: Bash@3
+      displayName: 'Security Scan Skipped'
+      inputs:
+        targetType: inline
+        script: |
+          YELLOW='\033[1;33m'
+          BLUE='\033[0;34m'
+          NC='\033[0m' # No Color
+
+          if [[ "$(Build.Reason)" == "PullRequest" ]]; then
+            TARGET_BRANCH=$(echo "$(System.PullRequest.TargetBranch)" | sed 's/refs\/heads\///')
+            BRANCH_INFO="Target: $TARGET_BRANCH (via PR)"
+          else
+            BRANCH_INFO="$(Build.SourceBranchName)"
+          fi
+
+          echo -e "${YELLOW}==================================[ AÇÃO: SCAN IGNORADO (SKIPPED) ]==================================${NC}"
+          echo -e "Modo de Operação Ativo: ${YELLOW}VivoFlow${NC}"
+          echo -e "Branch Avaliada: ${YELLOW}$BRANCH_INFO${NC}"
+          echo -e "Regras de Validação em Vigor: ${YELLOW}master, main, release/*, ${{ join(', ', parameters.vivoFlow) }}${NC}"
+          echo ""
+          echo -e "${YELLOW}MOTIVO: O scan de segurança foi intencionalmente ignorado pois o branch avaliado '$BRANCH_INFO' não corresponde a nenhuma das regras de validação ativas.${NC}"
+          echo ""
+          echo -e "${BLUE}Dica: Se este branch deveria ser validado, acione a Equipe de AppSec appsec_vivo.br@telefonica.com${NC}"
+          echo -e "${YELLOW}====================================================================================================${NC}"

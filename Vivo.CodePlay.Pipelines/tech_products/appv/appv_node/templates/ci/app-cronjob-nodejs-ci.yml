@@ -1,0 +1,432 @@
+parameters:
+  - name: artifactDir
+    type: string
+    default: ''
+  - name: reuseArtifacts
+    type: boolean
+
+
+
+stages:
+
+- template: /tech_products/appv/global/initialize/nodejs-environment.yml
+
+- stage: ci_build
+  displayName: "CI - CronUpdate"
+  pool:
+    name: GeneralPurposeLinuxAgentsCI
+  dependsOn:
+  - environment_init
+
+#DefaultDevopsAgents
+
+  ## -> Loads variables from other stages.
+  variables:
+  - name: NEXUS_DEPS_USR
+    value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEPS_USR'] ]
+  - name: NEXUS_DEPS_PSW
+    value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEPS_PSW'] ]
+  
+  jobs:      
+  - job: build
+    displayName: Build
+    steps:
+
+    ## -> Clean the pipeline workspace and checkout the code.
+    ## -> 6d15af64-176c-496d-b583-fd2ae21d4df4 is the decorator for checkout.
+    - task: 6d15af64-176c-496d-b583-fd2ae21d4df4@1
+      displayName: Checkout Code
+      name: checkout_code 
+      inputs:
+        repository: self
+        persistCredentials: "true"
+        clean: true
+
+    ## -> Checkout the last commit that was pushed to the repository. 
+    ## -> Set last commit HASH to a variable. 
+    - task: Bash@3
+      displayName: Checkout Last Commit
+      name: checkout_last_commit
+      condition: succeeded()
+      continueOnError: false
+      inputs:
+        targetType: inline
+        script: |
+          echo "##[debug] Checkout last commit from '$(Build.SourceBranchName)'"
+
+          git config pull.rebase true
+          git fetch -f --depth 1 origin $(Build.SourceBranchName):$(Build.SourceBranchName)
+          git checkout -f $(Build.SourceBranchName)
+          lastCommitHash=$(git rev-parse --short=6 HEAD)
+
+          echo "##[debug] Last commit short hash '$lastCommitHash'"
+          echo "##vso[task.setvariable variable=SHORT_HASH]$lastCommitHash"
+
+    ## -> Update .env.example with a blank line and commit
+    - task: Bash@3
+      displayName: 'Update and Commit .env.example'
+      name: update_env_example
+      condition: succeeded()
+      continueOnError: false
+      inputs:
+        targetType: inline
+        script: |
+          echo "##[debug] Updating .env.example file"
+          
+          # Check if .env.example exists
+          if [ ! -f ".env.example" ]; then
+            echo "##[warning] .env.example file not found in repository root"
+            exit 0
+          fi
+          
+          # Add a blank line at the end of the file
+          echo " " >> .env.example
+          
+          # Configure git
+          git config user.email "azure-devops@telefonica.com"
+          git config user.name "Azure DevOps Pipeline"
+          
+          # Check if there are changes
+          if git diff --quiet .env.example; then
+            echo "##[debug] No changes detected in .env.example"
+          else
+            # Add and commit the changes
+            git add .env.example
+            git commit -m "chore: update .env.example [skip ci]"
+            
+            # Push the changes to master branch
+            git push origin HEAD:master
+            
+            echo "##[section] .env.example updated and committed successfully to master branch"
+          fi
+
+    ## -> Set artifact information to variables. This allows it to be used in other stages, jobs or tasks. 
+    - task: CmdLine@2
+      name: artifact_name
+      displayName: 'Get Artifact Name'
+      condition: succeeded()
+      continueOnError: false
+      inputs:
+        targetType: inline
+        script: |
+          setVariables(){
+            eval result=$2
+            echo "##vso[task.setvariable variable=$1;isOutput=true]$result"
+          }
+
+          packageJsonName=$(DOCKER_CMD_EXTRACT_PACKAGE_JSON_NAME)
+          setVariables "PACKAGE_JSON_NAME" $packageJsonName
+          echo "##[debug] package.json Name '$packageJsonName'"
+
+          packageJsonVersion=$(DOCKER_CMD_EXTRACT_PACKAGE_JSON_VERSION)
+          echo "##[debug] package.json Version '$packageJsonVersion'"
+
+          echo "##[debug] Set Artifact Name + Version"
+
+          artifactNameOnly="$(echo $packageJsonName | awk -F '/' '{print$NF}')"
+          setVariables "ARTIFACT_NAME_ONLY" $artifactNameOnly
+          echo "##[debug] Artifact Name '$artifactNameOnly'"
+          echo "##vso[task.setvariable variable=ARTIFACT_NAME_ONLY;isOutput=true]$artifactNameOnly"
+
+          artifactName="$artifactNameOnly-$packageJsonVersion"
+          setVariables "ARTIFACT_NAME" $artifactName
+          echo "##[debug] Full Artifact Name '$artifactName'"
+          echo "##vso[task.setvariable variable=ARTIFACT_NAME;isOutput=true]$artifactName"
+
+    - task: Bash@3
+      displayName: 'Download Artifacts from Nexus'
+      condition: and(
+        succeeded(),
+        eq(${{ parameters.reuseArtifacts }}, True))
+      continueOnError: false
+      inputs:
+        targetType: inline
+        script: |
+          set -e
+
+          file_name="$(artifact_name.ARTIFACT_NAME).tgz"
+          nexus_url="$(NEXUS_REPOSITORY_URL)/$(NEXUS_REPOSITORY)/$(NEXUS_COMPONENT_GROUP)/$(artifact_name.ARTIFACT_NAME_ONLY)/-/$file_name"
+          download_path="$(System.ArtifactsDirectory)"
+
+          echo "##[debug] Fetching artifact $file_name from: $nexus_url"
+
+          echo "##[debug] Download path: $download_path"
+          cd $download_path
+          curl -u $(NEXUS_DEPS_USR):$(NEXUS_DEPS_PSW) -O $nexus_url
+
+          echo "$(ls -lha '$(System.ArtifactsDirectory)')"
+          file -b $file_name
+
+          mkdir -p $(DEFAULT_WORKDIR_ARTIFACTS)/$(APPLICATION_NAME)
+          tar -zxf $download_path/$file_name -C $(DEFAULT_WORKDIR_ARTIFACTS)/$(APPLICATION_NAME)
+
+          shopt -s dotglob
+          mv $(DEFAULT_WORKDIR_ARTIFACTS)/$(APPLICATION_NAME)/*/* $(DEFAULT_WORKDIR_ARTIFACTS)/$(APPLICATION_NAME)/
+          rm -rf $(DEFAULT_WORKDIR_ARTIFACTS)/$(APPLICATION_NAME)/.azuredevops
+          cp -r $(System.DefaultWorkingDirectory)/.azuredevops $(DEFAULT_WORKDIR_ARTIFACTS)/$(APPLICATION_NAME)/.azuredevops
+          shopt -u dotglob
+
+          echo "##[debug] Target directory content:"
+          echo "$(ls -lha '$(DEFAULT_WORKDIR_ARTIFACTS)/$(APPLICATION_NAME)')"
+
+          echo "##[debug] package.json:"
+          cat $(DEFAULT_WORKDIR_ARTIFACTS)/$(APPLICATION_NAME)/package.json
+
+          touch $(DEFAULT_WORKDIR_ARTIFACTS)/$(APPLICATION_NAME)/$file_name
+
+    - task: AzureKeyVault@2  
+      displayName: 'Getting AKV credentials'
+      timeoutInMinutes: 1
+      retryCountOnTaskFailure: 5
+      inputs:    
+        azureSubscription: DevOpsSharedResources    
+        KeyVaultName: $(AKV_DEVOPS_NAME)
+        SecretsFilter: 'NEXUS-DEFAULT-USR, NEXUS-DEFAULT-PSW'
+
+    - task: Bash@3
+      displayName: 'Update npmrc file and path'
+      condition: and(
+        succeeded(),
+        eq(${{ parameters.reuseArtifacts }}, True))
+      inputs:
+        targetType: inline
+        script: |
+          echo "Update npmrc path to: $(DEFAULT_WORKDIR_ARTIFACTS)/$(APPLICATION_NAME)"
+          DEFAULT_NPMRC_TEMP_PATH=$(DEFAULT_WORKDIR_ARTIFACTS)/$(APPLICATION_NAME)
+
+          echo "Update npmrc file path to: $(DEFAULT_WORKDIR_ARTIFACTS)/$(APPLICATION_NAME)/.npmrc"
+          DEFAULT_NPMRC_TEMP_FILE_PATH=$(DEFAULT_WORKDIR_ARTIFACTS)/$(APPLICATION_NAME)/.npmrc
+
+          echo "##vso[task.setvariable variable=DEFAULT_NPMRC_TEMP_PATH]$DEFAULT_NPMRC_TEMP_PATH"
+          echo "npmrc path is $DEFAULT_NPMRC_TEMP_PATH"
+
+          echo "##vso[task.setvariable variable=DEFAULT_NPMRC_TEMP_FILE_PATH]$DEFAULT_NPMRC_TEMP_FILE_PATH"
+          echo "npmrc file path is $DEFAULT_NPMRC_TEMP_FILE_PATH"
+
+    - bash: |
+         echo "##[debug]DEFAULT_NPMRC_TEMP_FILE_PATH.....: $(DEFAULT_NPMRC_TEMP_FILE_PATH)"
+
+         if [ -f .npmrc ]; then
+           cp .npmrc $(DEFAULT_NPMRC_TEMP_FILE_PATH)
+         else
+           echo "##vso[task.logissue type=error]O arquivo .npmrc não foi encontrado!"
+           echo "##[error]O arquivo .npmrc não foi encontrado!"
+           exit 1;
+         fi
+
+         echo ##vso[task.setvariable variable=NPM_CONFIG_USERCONFIG]$(DEFAULT_NPMRC_TEMP_FILE_PATH)
+      displayName: "Setting up .npmrc"
+      workingDirectory: "${{ parameters.artifactDir }}"
+      env:
+        DEFAULT_NPMRC_TEMP_FILE_PATH: $(DEFAULT_NPMRC_TEMP_FILE_PATH)
+
+    - task: npmAuthenticate@0
+      inputs:
+        workingFile: $(DEFAULT_NPMRC_TEMP_FILE_PATH)
+      displayName: Set dependencies credentials (Azure Artifacts)
+      env:
+        HTTPS_PROXY: $(PROXY_AGENT_HTTPS)
+        HTTP_PROXY: $(PROXY_AGENT_HTTP)
+        NO_PROXY: $(PROXY_AGENT_NO_PROXY)
+
+    - bash: |
+        if [ -f .npmrc ]; then
+          auth_opt="email=vivo.devops.br@telefonica.com\nalways-auth=true"
+          auth=$(echo -n ${NEXUS_DEFAULT_USR}:${NEXUS_DEFAULT_PSW} | openssl base64)
+          repos=$(grep -o "registry=.*" .npmrc | cut -d':' -f2 | awk -v auth="$auth" '{print $0 ":_auth="auth""}')
+          { printf '\n'; echo -e "$repos\n$auth_opt"; } | tee -a >(cat >> .npmrc) > /dev/null
+          echo "##[debug]Credenciais configuradas!"
+        else
+          echo "##vso[task.logissue type=error]O arquivo .npmrc não foi encontrado!"
+          echo "##[error]O arquivo .npmrc não foi encontrado!"
+        exit 1;
+        fi
+
+      displayName: "Set dependencies credentials (Nexus)"
+      workingDirectory: $(DEFAULT_NPMRC_TEMP_PATH)
+      env:    
+        NEXUS_DEFAULT_USR: $(NEXUS-DEFAULT-USR)
+        NEXUS_DEFAULT_PSW: $(NEXUS-DEFAULT-PSW)  
+   
+    - task: Docker@2
+      name: login_devops
+      displayName: 'Login to Docker Registry'
+      continueOnError: true
+      inputs:
+        containerRegistry: ACR-DEVOPS
+        displayName: 'Login to Docker Registry'
+        command: 'login'
+
+    - task: Bash@3
+      displayName: 'Set build location and commands'
+      name: set_commands
+      inputs:
+        targetType: inline
+        script: |
+          echo "NODEJS_CMD_BUILD: $(NODEJS_CMD_BUILD)"
+          echo "NODEJS_CMD_BUILD_TEST: $(NODEJS_CMD_BUILD_TEST)"
+          echo "NODEJS_CMD_BUILD_POST_TEST: $(NODEJS_CMD_BUILD_POST_TEST)"
+
+          BUILD_LOCATION=.
+          BUILD_COMMAND="$NODEJS_CMD_BUILD && $NODEJS_CMD_BUILD_TEST && $NODEJS_CMD_BUILD_POST_TEST"
+          
+          if [ "${{ parameters.reuseArtifacts }}" = "True" ]; then
+            echo "##[debug] Using settings for reuseble artifact"
+
+            INSTALL_CMD=$(echo "$NODEJS_CMD_BUILD" | cut -d'&' -f1 | xargs)
+            if [ "$INSTALL_CMD" = "npm ci" ] || [ "$INSTALL_CMD" = "npm install" ]; then
+              BUILD_COMMAND="$INSTALL_CMD"
+            else
+              BUILD_COMMAND="npm install"
+            fi
+          fi
+
+          echo "##vso[task.setvariable variable=BUILD_LOCATION]$BUILD_LOCATION"
+          echo "BUILD_LOCATION: $BUILD_LOCATION"
+
+          echo "##vso[task.setvariable variable=BUILD_COMMAND]$BUILD_COMMAND"
+          echo "BUILD_COMMAND: $BUILD_COMMAND"
+
+    
+    # ==================================================================
+    # [Compliance] Verifica se o repositório está em conformidade com as políticas de configuração
+    # ==================================================================
+    - task: VivoDevOpsConfigCompliance@1
+      displayName: 'Check DevOps Config Compliance'
+      inputs:
+        workDir: $(BUILD_LOCATION)
+        policySets: |
+          image-definition-files
+
+    - task: Bash@3
+      displayName: Build Version
+      name: build_version
+      condition: and(
+        succeeded(), 
+        eq(variables.new_version.NEW_VERSION, ''), 
+        eq(${{ parameters.reuseArtifacts }}, False))
+      continueOnError: false
+      inputs:
+        targetType: inline
+        script: >
+          set -e
+          
+          BUILDER_IMAGE_NAME="builder/node"
+
+          docker build -t $BUILDER_IMAGE_NAME -f .azuredevops/builder.Dockerfile $(BUILD_LOCATION)
+
+          echo "###[debug]docker run --rm \
+              --user="$(DOCKER_CMD_USERNAME):$(DOCKER_CMD_GROUP)" \
+              --network host \
+              --log-driver none \
+              -e NPM_CONFIG_USERCONFIG="/tmp/.npmrc" \
+              -e HTTPS_PROXY=$(PROXY_AGENT_HTTPS) \
+              -e PUPPETEER_SKIP_DOWNLOAD=true \
+              -e HTTP_PROXY=$(PROXY_AGENT_HTTP) \
+              -e NO_PROXY=$(PROXY_AGENT_NO_PROXY) \
+              -e TZ="America/Sao_Paulo" \
+              -e SYSTEM_ACCESSTOKEN="$(System.AccessToken)" \
+              -e NEXUS_DEPS_USR="$(NEXUS_DEPS_USR)" \
+              -e NEXUS_DEPS_PSW="$(NEXUS_DEPS_PSW)" \
+              -e NPM_CONFIG_CACHE=/tmp/npm-cache \
+              -e JEST_CLOVER_OUTPUT_DIR=./_devops/test \
+              -v $(pwd):/app \
+              -v $(DEFAULT_NPMRC_TEMP_FILE_PATH):/tmp/.npmrc \
+              -w $(DOCKER_WORKDIR) \
+              $BUILDER_IMAGE_NAME sh -c '$(BUILD_COMMAND)'"
+
+          docker run --rm \
+              --user="$(DOCKER_CMD_USERNAME):$(DOCKER_CMD_GROUP)" \
+              --network host \
+              --log-driver none \
+              -e NPM_CONFIG_USERCONFIG="/tmp/.npmrc" \
+              -e HTTPS_PROXY=$(PROXY_AGENT_HTTPS) \
+              -e PUPPETEER_SKIP_DOWNLOAD=true \
+              -e HTTP_PROXY=$(PROXY_AGENT_HTTP) \
+              -e NO_PROXY=$(PROXY_AGENT_NO_PROXY) \
+              -e TZ="America/Sao_Paulo" \
+              -e SYSTEM_ACCESSTOKEN="$(System.AccessToken)" \
+              -e NEXUS_DEPS_USR="$(NEXUS_DEPS_USR)" \
+              -e NEXUS_DEPS_PSW="$(NEXUS_DEPS_PSW)" \
+              -e NPM_CONFIG_CACHE=/tmp/npm-cache \
+              -e JEST_CLOVER_OUTPUT_DIR=./_devops/test \
+              -v $(pwd):/app \
+              -v $(DEFAULT_NPMRC_TEMP_FILE_PATH):/tmp/.npmrc \
+              -w $(DOCKER_WORKDIR) \
+              $BUILDER_IMAGE_NAME sh -c "$(BUILD_COMMAND)"
+                    
+
+          echo "##[debug] Build with version: $(new_version.NEW_VERSION)"
+
+          if [[ "${BUMP_VERSION_ENABLED}" == 'true' ]]; then
+            npm --no-git-tag-version version $(new_version.NEW_VERSION) --allow-same-version
+          fi
+
+    - task: Bash@3
+      displayName: Install dependencies
+      name: install_dependencies
+      condition: and(
+        succeeded(), 
+        eq(variables.new_version.NEW_VERSION, ''), 
+        eq(${{ parameters.reuseArtifacts }}, True))
+      continueOnError: false
+      inputs:
+        targetType: inline
+        script: >
+          set -e
+
+          ARTIFACT_LOCATION=$(DEFAULT_WORKDIR_ARTIFACTS)/$(APPLICATION_NAME)
+
+          BUILDER_IMAGE_NAME="builder/node"
+
+          docker build -t $BUILDER_IMAGE_NAME -f .azuredevops/builder.Dockerfile $(BUILD_LOCATION)
+
+          echo "###[debug]docker run --rm \
+              --user="$(DOCKER_CMD_USERNAME):$(DOCKER_CMD_GROUP)" \
+              --network host \
+              --log-driver none \
+              -e NPM_CONFIG_USERCONFIG="/tmp/.npmrc" \
+              -e HTTPS_PROXY=$(PROXY_AGENT_HTTPS) \
+              -e PUPPETEER_SKIP_DOWNLOAD=true \
+              -e HTTP_PROXY=$(PROXY_AGENT_HTTP) \
+              -e NO_PROXY=$(PROXY_AGENT_NO_PROXY) \
+              -e TZ="America/Sao_Paulo" \
+              -e SYSTEM_ACCESSTOKEN="$(System.AccessToken)" \
+              -e NEXUS_DEPS_USR="$(NEXUS_DEPS_USR)" \
+              -e NEXUS_DEPS_PSW="$(NEXUS_DEPS_PSW)" \
+              -e NPM_CONFIG_CACHE=/tmp/npm-cache \
+              -v $ARTIFACT_LOCATION:/app \
+              -v $(DEFAULT_NPMRC_TEMP_FILE_PATH):/tmp/.npmrc \
+              -w $(DOCKER_WORKDIR) \
+              $BUILDER_IMAGE_NAME sh -c '$(BUILD_COMMAND)'"
+
+          docker run --rm \
+              --user="$(DOCKER_CMD_USERNAME):$(DOCKER_CMD_GROUP)" \
+              --network host \
+              --log-driver none \
+              -e NPM_CONFIG_USERCONFIG="/tmp/.npmrc" \
+              -e HTTPS_PROXY=$(PROXY_AGENT_HTTPS) \
+              -e PUPPETEER_SKIP_DOWNLOAD=true \
+              -e HTTP_PROXY=$(PROXY_AGENT_HTTP) \
+              -e NO_PROXY=$(PROXY_AGENT_NO_PROXY) \
+              -e TZ="America/Sao_Paulo" \
+              -e SYSTEM_ACCESSTOKEN="$(System.AccessToken)" \
+              -e NEXUS_DEPS_USR="$(NEXUS_DEPS_USR)" \
+              -e NEXUS_DEPS_PSW="$(NEXUS_DEPS_PSW)" \
+              -e NPM_CONFIG_CACHE=/tmp/npm-cache \
+              -v $ARTIFACT_LOCATION:/app \
+              -v $(DEFAULT_NPMRC_TEMP_FILE_PATH):/tmp/.npmrc \
+              -w $(DOCKER_WORKDIR) \
+              $BUILDER_IMAGE_NAME sh -c "$(BUILD_COMMAND)"
+
+          ls -la $ARTIFACT_LOCATION
+
+    - script: | 
+        if [ "${{ parameters.reuseArtifacts }}" = "True" ]; then
+          echo "##[debug] Using settings for reuseble artifact"
+
+          cd $(DEFAULT_WORKDIR_ARTIFACTS)/$(APPLICATION_NAME)
+        fi
+        
+        zip -r -q --symlinks '$(Build.ArtifactStagingDirectory)/$(artifact_name.ARTIFACT_NAME).zip' . -x .git/\* ?/\* \*/npm-cache/\* \*/\*.log
+      displayName: 'Add zip with symlinks'

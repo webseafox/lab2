@@ -1,0 +1,206 @@
+resources:
+  repositories:
+    - repository: WeblogicScripts
+      name: MIGR-Gps2/gps-pipeline-resources
+      type: git
+      ref: refs/heads/master
+
+parameters:  
+- name: deploymentName
+  displayName: Escolha o módulo para publicar no WebLogic
+  values:
+  - wizard
+  - admin
+
+- name: environment
+  displayName: Escolha a esteira de QA para para deploy
+  type: string
+  default: DEV
+  values:
+  - DEV
+  - ESTEIRA1
+  - ESTEIRA2
+  - PREPROD
+  - PRODLIKE
+  - PROD
+
+#Incluir Variaveis da Library
+variables:
+  - group: GPS-CO.WeblogicCreds.${{ parameters.environment }}
+  - name: ARTIFACT_ID
+    value: ${{ parameters.deploymentName }}-co-ear
+  - name: System.debug
+    value: "true"
+
+stages:
+- stage: deploy
+  displayName: "Deploy"
+  pool: DefaultDevOpsAgents
+
+  jobs:
+  - deployment: deploy_on_weblogic
+    displayName: Deploy on WebLogic
+    workspace:
+      clean: all
+    environment:
+      name: ${{ parameters.environment }}
+
+    strategy:
+      runOnce:
+
+        preDeploy:
+          steps:  
+        
+          - task: Bash@3
+            inputs:
+              targetType: 'inline'
+              script: |
+                echo "##[debug] sshEndpoint=WL_GPS-CO-${{parameters.environment}}"
+                echo "##[debug] ARTIFACT_ID=$(ARTIFACT_ID)"
+                echo "##[debug] ARTIFACT_TARGETFOLDER=$(ARTIFACT_TARGETFOLDER)"
+                echo "##[debug] SCRIPTS_TARGETFOLDER=$(SCRIPTS_TARGETFOLDER)"
+                echo "##[debug] WEBLOGIC_USER=$(WEBLOGIC_USER)"
+                echo "##[debug] WEBLOGIC_PASS=$(WEBLOGIC_PASS) # Não deve ser exibido!"
+                echo "##[debug] WEBLOGIC_ADMIN_SERVER_URL=$(WEBLOGIC_ADMIN_SERVER_URL)"
+                echo "##[debug] WEBLOGIC_CLUSTER=$(WEBLOGIC_CLUSTER)"
+                echo "##[debug] WLST_SCRIPT=$(WLST_SCRIPT)"
+            displayName: Verify Variables
+
+          - task: SSH@0
+            displayName: Check SSH Connection
+            inputs:
+              sshEndpoint: 'WL_GPS-CO-${{parameters.environment}}'
+              runOptions: 'inline'
+              inline: >-
+                echo "Conectado com sucesso via Service Connection WL_GPS-CO-${{parameters.environment}}"
+                ls -lha $(SCRIPTS_TARGETFOLDER)
+              readyTimeout: '20000'
+          
+          ## -> Checkout no repositório que tem os scripts Weblogic
+          - checkout: WeblogicScripts
+
+          ## -> Transfere os scripts pro servidor
+          - task: CopyFilesOverSSH@0
+            displayName: Transfering Weblogic Scripts
+            inputs:
+              sshEndpoint: 'WL_GPS-CO-${{parameters.environment}}'
+              sourceFolder: $(Build.SourcesDirectory)/scripts
+              contents: '*'
+              targetFolder: '$(SCRIPTS_TARGETFOLDER)'
+              readyTimeout: '20000'
+
+        deploy:
+          steps:
+          - task: Bash@3
+            displayName: Get Artifact Version
+            name: artifact_version
+            inputs:
+              targetType: 'inline'
+              script: |
+                echo "##vso[task.setvariable variable=ARTIFACT_VERSION;isOutput=true]1.2.1195"
+          
+          - task: AzureKeyVault@2
+            inputs:
+              azureSubscription: 'DevOpsSharedResources'
+              KeyVaultName: 'kv-azdevops-shared'
+              SecretsFilter: 'NEXUS-DEPS-USR, NEXUS-DEPS-PSW'
+              RunAsPreJob: true
+
+          - script: >-
+              echo "Verifique o MD5 no Nexus através da URL: https://nexus.telefonica.com.br/service/rest/v1/search/assets/download?repository=gps2-mvn&maven.groupId=br.com.gvt.gps2&maven.artifactId=$(ARTIFACT_ID)&maven.extension=ear.md5&version=$(artifact_version.ARTIFACT_VERSION)"
+            displayName: Nexus MD5 URL
+
+          - task: Bash@3
+            name: download_artifact
+            inputs:
+              targetType: 'inline'
+              script: >-
+                curl
+                -L
+                -u $(NEXUS-DEPS-USR):$(NEXUS-DEPS-PSW) 
+                'https://nexus.telefonica.com.br/service/rest/v1/search/assets/download?repository=gps2-mvn&maven.groupId=br.com.gvt.gps2&maven.artifactId=$(ARTIFACT_ID)&maven.extension=ear&version=$(artifact_version.ARTIFACT_VERSION)'
+                -o $(System.ArtifactsDirectory)/$(ARTIFACT_ID)-$(artifact_version.ARTIFACT_VERSION).ear
+            displayName: Download Artifact from Nexus
+
+          - task: Bash@3
+            name: artifact_md5
+            inputs:
+              targetType: 'inline'
+              script: |-
+                md5sum $(System.ArtifactsDirectory)/$(ARTIFACT_ID)-$(artifact_version.ARTIFACT_VERSION).ear
+            displayName: Get Artifact MD5
+
+          - task: CopyFilesOverSSH@0
+            displayName: Transfering Artifact
+            inputs:
+              sshEndpoint: 'WL_GPS-CO-${{parameters.environment}}'
+              sourceFolder: $(System.ArtifactsDirectory)
+              contents: $(ARTIFACT_ID)-$(artifact_version.ARTIFACT_VERSION).ear
+              targetFolder: '$(ARTIFACT_TARGETFOLDER)/'
+              readyTimeout: '20000'
+
+          - task: SSH@0
+            displayName: Undeploy/Retiring Artifact
+            inputs:
+              sshEndpoint: 'WL_GPS-CO-${{parameters.environment}}'
+              runOptions: 'commands'
+              commands: >
+                $(WLST_SCRIPT)
+                $(SCRIPTS_TARGETFOLDER)/UndeployAppRetired.py
+                $(WEBLOGIC_USER)
+                $(WEBLOGIC_PASS)
+                $(WEBLOGIC_ADMIN_SERVER_URL)
+                $(ARTIFACT_ID)
+              readyTimeout: '20000'
+
+          - task: SSH@0
+            displayName: Deploy Artifact
+            inputs:
+              sshEndpoint: 'WL_GPS-CO-${{parameters.environment}}'
+              runOptions: 'commands'
+              commands: >
+                $(WLST_SCRIPT)
+                $(SCRIPTS_TARGETFOLDER)/HotDeployApp.py
+                $(WEBLOGIC_USER)
+                $(WEBLOGIC_PASS)
+                $(WEBLOGIC_ADMIN_SERVER_URL)
+                $(ARTIFACT_ID)
+                $(ARTIFACT_TARGETFOLDER)/$(ARTIFACT_ID)-$(artifact_version.ARTIFACT_VERSION).ear
+                $(WEBLOGIC_CLUSTER)
+              readyTimeout: '20000'
+
+        on:
+          success:
+            steps:
+            - task: Bash@3
+              displayName: Deploy on WebLogic Success
+              name: t_success_message
+              inputs:
+                targetType: inline
+                script: |
+                  echo "##[section]================================================================================================================================="
+                  echo "##[section]                                                 SUCCESS WEBLOGIC DEPLOY"
+                  echo "##[section]================================================================================================================================="
+                  echo "##[section]Parabéns o artefato '$(ARTIFACT_ID)' foi publicado com sucesso no Weblogic"
+                  echo "##[section]"
+                  echo "##[section]================================================================================================================================="
+
+          failure:
+            steps:
+            - task: Bash@3
+              displayName: Deploy on WebLogic Failure
+              name: t_failure_message
+              inputs:
+                targetType: inline
+                script: |
+                  echo "##[error] ================================================================================================================================="
+                  echo "##[error]                                                  FAILURE WEBLOGIC DEPLOY"
+                  echo "##[error] ================================================================================================================================="
+                  echo "##[error] Se está vendo essa mensagem é porque aconteceu algo erro durante o deploy do artefato '$(ARTIFACT_ID)'."
+                  echo "##[error] "
+                  echo "##[error] Segue abaixo umas dicas para o Troubleshooting:"
+                  echo "##[error] Consulte o log do estágio de publicação do artefato."
+                  echo "##[error] Verifique se a versão corrente da biblioteca já existe no repositório (sobrescrita não é permitido)."
+                  echo "##[error] Confira se as informações do repositório e credenciais de acesso estão corretas."
+                  echo "##[error] "
+                  echo "##[error] ================================================================================================================================="

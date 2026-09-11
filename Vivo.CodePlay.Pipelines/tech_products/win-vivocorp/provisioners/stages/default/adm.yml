@@ -1,0 +1,181 @@
+parameters:
+- name: environment
+  type: string
+
+stages:
+- stage: adm
+  displayName: "Adm get e import"
+  dependsOn: 
+  - restart
+  - import_files
+  pool: $(PollVivoCorpSiebelAgents)
+  jobs:
+  - job: put_files
+    displayName: "Adm get e import"
+    #condition: eq(stageDependencies.import_files.import_files.outputs['checkOnrFiles.onr_found'], 'true')
+    steps:
+      - checkout: none
+      - task: PowerShell@2
+        displayName: 'Execute $(admGetScriptName)'
+        inputs:
+          targetType: 'inline'
+          script: |
+            $sourceDir = "C:\Siebel_Devops\$(environmentNameUpperCase)\temp\ADM"
+            $destinationDir = "C:\Siebel_Devops\$(environmentNameUpperCase)\temp\stage_xml"
+
+            if (Test-Path -Path $destinationDir) {
+              Write-Output "Conteúdo de $destinationDir antes da execução:"
+              Get-ChildItem -Path $destinationDir -File -Filter "*.xml" | ForEach-Object { $_.FullName }
+            } else {
+              Write-Output "O diretório $destinationDir não existe."
+              New-Item -ItemType Directory -Path $destinationDir | Out-Null
+            }
+
+            if (!(Test-Path -Path $sourceDir)) {
+              Write-Output "Diretório de origem não encontrado: $sourceDir"
+              exit 0
+            }
+
+            Get-ChildItem -Path $destinationDir -File -Filter "*.xml" | Remove-Item -Force
+
+            $xmlFiles = Get-ChildItem -Path $sourceDir -Recurse -File -Filter "*.xml"
+            if ($xmlFiles.Count -eq 0) {
+              Write-Output "Nenhum XML encontrado em $sourceDir. Encerrando etapa de SFTP."
+              exit 0
+            }
+
+            $xmlFiles | ForEach-Object {
+              Copy-Item -Path $_.FullName -Destination $destinationDir
+            }
+ 
+            sftp -o StrictHostKeyChecking=no -i "$(SIEBEL_PRIVATE_KEY)" -b $(admGetScriptName) $(host) 22
+
+            exit
+
+      - task: PowerShell@2
+        displayName: 'Transfer Batch Files'
+        inputs:
+          targetType: 'inline'
+          script: |
+            $sourceDir = "C:\Siebel_Devops\$(environmentNameUpperCase)\temp\batch"
+            $sourceParentDir = Split-Path -Path $sourceDir -Parent
+            $remoteHost = "$(sbleimUser)@$(ipHost)"
+            $remoteDir = "/opt/integracao/predeploy/tags"
+            $remoteBatchDir = "/opt/integracao/predeploy/tags/batch"
+            $sftpBatchFile = Join-Path -Path $env:TEMP -ChildPath ("sftp_batch_{0}.txt" -f ([guid]::NewGuid().ToString("N")))
+
+            Write-Host "Iniciando transferência de arquivos de batch..."
+
+            if (-not (Test-Path -LiteralPath $sourceDir)) {
+              Write-Host "[ERROR] O diretório `"$sourceDir`" não existe."
+              exit 0
+            }
+
+            @(
+              "lcd `"$sourceParentDir`""
+              "cd $remoteDir"
+              "put -r batch"
+              "bye"
+            ) | Set-Content -LiteralPath $sftpBatchFile -Encoding ASCII
+
+            try {
+              & sftp -o StrictHostKeyChecking=no -i "$(SIEBEL_PRIVATE_KEY)" -b $sftpBatchFile $remoteHost 22
+              if ($LASTEXITCODE -ne 0) {
+                Write-Host "[ERROR] Falha ao enviar os arquivos via SFTP."
+                exit 1
+              }
+
+              & ssh -o StrictHostKeyChecking=no -i "$(SIEBEL_PRIVATE_KEY)" $remoteHost "cd $remoteBatchDir; find . -type f -print0 | xargs -0 dos2unix"
+              if ($LASTEXITCODE -ne 0) {
+                Write-Host "[ERROR] Falha ao converter arquivos para formato Unix."
+                exit 1
+              }
+
+              & ssh -o StrictHostKeyChecking=no -i "$(SIEBEL_PRIVATE_KEY)" $remoteHost "cp -R $remoteBatchDir/ /opt/integracao/"
+              if ($LASTEXITCODE -ne 0) {
+                Write-Host "[ERROR] Falha ao copiar os arquivos para o diretório final."
+                exit 1
+              }
+
+              & ssh -o StrictHostKeyChecking=no -i "$(SIEBEL_PRIVATE_KEY)" $remoteHost "rm -rf $remoteBatchDir/*"
+              if ($LASTEXITCODE -ne 0) {
+                Write-Host "[ERROR] Falha ao limpar arquivos temporários no servidor."
+                exit 1
+              }
+
+              Remove-Item -LiteralPath $sourceDir -Recurse -Force
+            }
+            finally {
+              if (Test-Path -LiteralPath $sftpBatchFile) {
+                Remove-Item -LiteralPath $sftpBatchFile -Force
+              }
+            }
+
+      - task: CmdLine@2
+        displayName: 'Execute $(importAdmScriptName)'
+        continueOnError: true
+        inputs:
+          script: |
+            echo Iniciando importação de ADMs...
+            echo Ambiente: $(environmentNameUpperCase)
+            echo iniciando a conexão SSH para $(host)
+            ssh -o StrictHostKeyChecking=no -i "$(SIEBEL_PRIVATE_KEY)" $(host) "$(importAdmScriptName)"
+            echo conexão SSH estabelecida com sucesso!
+
+            echo Verificando se existem ADMs para importar...
+            if exist C:\Siebel_Devops\$(environmentNameUpperCase)\temp\stage_xml\*.xml (
+                echo ADMs foram importados! Necessário novo restart.
+
+                dir /b /a-d C:\Siebel_Devops\$(environmentNameUpperCase)\temp\stage_xml\*.xml
+
+                ssh -o StrictHostKeyChecking=no -i "$(SIEBEL_PRIVATE_KEY)" $(host) $(devopsStopScriptName)
+
+                echo Iniciando Siebel Server....
+
+                setlocal enableextensions
+
+                ssh -o StrictHostKeyChecking=no -i "$(SIEBEL_PRIVATE_KEY)" $(host) "bash -c '$(devopsStartScriptName)'"
+
+            ) else (
+                echo Nenhum ADM importado. Terminando processo...
+                exit 0
+            )
+
+      - task: cmdline@2
+        displayName: 'Clean up XML files'
+        inputs:
+          script: |
+            @echo off
+            echo Verificando se existe arquivos na pasta ADM para limpar
+            setlocal enabledelayedexpansion
+            set "found_files=false"
+            
+            REM Verifica recursivamente se existem arquivos XML na pasta ADM e subpastas
+            for /r "C:\Siebel_Devops\$(environmentNameUpperCase)\temp\ADM" %%f in (*.xml) do (
+                set "found_files=true"
+                goto :found_adm_files
+            )
+            
+            :found_adm_files
+            if "!found_files!"=="true" (
+                echo Deleting XML files recursively in C:\Siebel_Devops\$(environmentNameUpperCase)\temp\ADM
+                dir /s /b C:\Siebel_Devops\$(environmentNameUpperCase)\temp\ADM\*.xml
+                del /s /q C:\Siebel_Devops\$(environmentNameUpperCase)\temp\ADM\*.xml
+                echo XML files deleted successfully from ADM and all subdirectories.
+                echo Verificando se ainda existem arquivos XML...
+                dir /s /b C:\Siebel_Devops\$(environmentNameUpperCase)\temp\ADM\*.xml 2>nul || echo No XML files remain in ADM directory.
+            ) else (
+                echo No XML files found to delete in ADM directory and subdirectories.
+            )
+
+            echo Verificando se existe arquivos na pasta stage_xml para limpar
+            if exist "C:\Siebel_Devops\$(environmentNameUpperCase)\temp\stage_xml\*.xml" (
+                echo Deleting XML files in C:\Siebel_Devops\$(environmentNameUpperCase)\temp\stage_xml
+                cd /d "C:\Siebel_Devops\$(environmentNameUpperCase)\temp\stage_xml"
+                dir /s /q *.xml
+                del /s /q *.xml
+                echo XML files deleted successfully from stage_xml.
+            ) else (
+                echo No XML files found to delete into stage_xml.
+                exit 0
+            )

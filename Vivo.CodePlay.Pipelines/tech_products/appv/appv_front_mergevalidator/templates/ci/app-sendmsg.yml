@@ -1,0 +1,259 @@
+stages:
+  - stage: ci_notification
+    displayName: "CI - Teams Notification"
+    pool:
+      name: GeneralPurposeLinuxAgentsCI
+
+    dependsOn:
+      - ci_build
+      - ci_quality_gate
+      - ci_security
+    condition: always()
+
+    variables:
+      - name: teamsWebhookUrl
+        value: 'https://telefonicacorp.webhook.office.com/webhookb2/d6e93e61-a639-4cae-b43c-71e80cca1f3a@9744600e-3e04-492e-baa1-25ec245c6f10/IncomingWebhook/8baf927fb231495e8697ffb6cf15998b/4ab0dbff-76b5-417b-b024-ce39298d9110/V2MVmsaWbCZOlwXuQyFXNtgfYBnVghTmKgQ20lZoDqn0U1'
+      
+      # Captura dos resultados dos jobs específicos
+      - name: BUILD_RESULT
+        value: $[ stageDependencies.ci_build.build.outputs['set_build_result.build_result'] ]
+      - name: QUALITYGATE_RESULT
+        value: $[ stageDependencies.ci_quality_gate.sonarqube.outputs['set_qualitygate_result.qualitygate_result'] ]
+      - name: FORTIFY_RESULT
+        value: $[ stageDependencies.ci_security.fortify_scan.outputs['set_fortify_result.fortify_result'] ]
+      - name: SCA_RESULT
+        value: $[ stageDependencies.ci_security.sca_scan.outputs['set_sca_result.sca_result'] ]
+
+    jobs:
+
+      - job: Notification
+        displayName: "Send Teams Notification"
+        steps:
+
+          # ===== Envia notificação para o Teams =====
+          - bash: |
+              set -euo pipefail
+
+              echo "===================================================="
+              echo "Coletando informações da execução..."
+              echo "===================================================="
+
+              # Variáveis do Azure DevOps
+              BUILD_NAME='$(Build.DefinitionName)'
+              BUILD_ID='$(Build.BuildId)'
+              BUILD_NUMBER='$(Build.BuildNumber)'
+              PROJECT='$(System.TeamProject)'
+              REPO='$(Build.Repository.Name)'
+              BRANCH='$(Build.SourceBranch)'
+              COMMIT='$(Build.SourceVersion)'
+              REQUESTEDFOR='$(Build.RequestedFor)'
+              STARTTIME='$(Build.StartTime)'
+              BUILD_REASON='$(Build.Reason)'
+              RUN_URL='$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)'
+              PIPELINE_URL='$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_build?definitionId=$(System.DefinitionId)'
+              
+              # Formatar Build.Reason de forma amigável
+              case "$BUILD_REASON" in
+                Manual)                 BUILD_REASON_LABEL="🖱️ Manual" ;;
+                IndividualCI)           BUILD_REASON_LABEL="🔄 CI Automático" ;;
+                BatchedCI)              BUILD_REASON_LABEL="🔄 CI em Lote" ;;
+                Schedule)               BUILD_REASON_LABEL="⏰ Agendado (Cron)" ;;
+                PullRequest)            BUILD_REASON_LABEL="🔀 Pull Request" ;;
+                BuildCompletion)        BUILD_REASON_LABEL="✅ Build Completion" ;;
+                ResourceTrigger)        BUILD_REASON_LABEL="📦 Resource Trigger" ;;
+                ValidateShelveset)      BUILD_REASON_LABEL="🔍 Validate Shelveset" ;;
+                CheckInShelveset)       BUILD_REASON_LABEL="📥 Check-in Shelveset" ;;
+                Triggered)              BUILD_REASON_LABEL="⚡ Trigger Automático" ;;
+                *)                      BUILD_REASON_LABEL="❓ ${BUILD_REASON}" ;;
+              esac
+              
+              echo "Build Reason: $BUILD_REASON -> $BUILD_REASON_LABEL"
+
+              # Obter status dos stages via Azure DevOps REST API
+              echo "Obtendo status dos stages via REST API..."
+              
+              ORG_URL='$(System.TeamFoundationCollectionUri)'
+              PROJECT='$(System.TeamProject)'
+              BUILD_ID='$(Build.BuildId)'
+              
+              # URL encode do nome do projeto (substituir espaços por %20)
+              PROJECT_ENCODED=$(echo "$PROJECT" | sed 's/ /%20/g')
+              
+              # Obter timeline do build que contém informações de todos os stages
+              TIMELINE_URL="${ORG_URL}${PROJECT_ENCODED}/_apis/build/builds/${BUILD_ID}/timeline?api-version=7.0"
+              
+              echo "Buscando timeline: $TIMELINE_URL"
+              
+              TIMELINE_JSON=$(curl -s -H "Authorization: Bearer $(System.AccessToken)" "$TIMELINE_URL")
+              
+              # DEBUG: Mostrar primeiras linhas do JSON
+              echo "DEBUG - Timeline JSON (primeiras linhas):"
+              echo "$TIMELINE_JSON" | head -n 20
+              
+              # DEBUG: Mostrar todos os stages encontrados
+              echo "DEBUG - Stages encontrados:"
+              echo "$TIMELINE_JSON" | jq -r '.records[]? | select(.type=="Stage") | "\(.name): \(.result)"' 2>/dev/null || echo "Erro ao processar com jq"
+              
+              # Verificar se obteve resposta válida
+              if [ -z "$TIMELINE_JSON" ] || ! echo "$TIMELINE_JSON" | jq empty 2>/dev/null; then
+                echo "⚠️ Aviso: Não foi possível obter timeline da API. Usando status padrão."
+                BUILD_STATUS="Unknown"
+                QUALITYGATE_STATUS="Unknown"
+                SECURITY_STATUS="Unknown"
+              else
+                # Extrair status dos stages pelo nome
+                # No timeline, stages aparecem como records com type "Stage"
+                BUILD_STATUS=$(echo "$TIMELINE_JSON" | jq -r '.records[]? | select(.type=="Stage" and .name=="ci_build") | .result' 2>/dev/null || echo "")
+                QUALITYGATE_STATUS=$(echo "$TIMELINE_JSON" | jq -r '.records[]? | select(.type=="Stage" and .name=="ci_quality_gate") | .result' 2>/dev/null || echo "")
+                SECURITY_STATUS=$(echo "$TIMELINE_JSON" | jq -r '.records[]? | select(.type=="Stage" and .name=="ci_security") | .result' 2>/dev/null || echo "")
+                
+                # Fallback se jq falhar ou não encontrar
+                [ -z "$BUILD_STATUS" ] || [ "$BUILD_STATUS" == "null" ] && BUILD_STATUS="Unknown"
+                [ -z "$QUALITYGATE_STATUS" ] || [ "$QUALITYGATE_STATUS" == "null" ] && QUALITYGATE_STATUS="Unknown"
+                [ -z "$SECURITY_STATUS" ] || [ "$SECURITY_STATUS" == "null" ] && SECURITY_STATUS="Unknown"
+                
+                # Normalizar valores (Azure retorna: succeeded, failed, canceled, etc)
+                # Capitalizar primeira letra para ficar: Succeeded, Failed, Canceled
+                if [ "$BUILD_STATUS" != "Unknown" ]; then
+                  BUILD_STATUS=$(echo "$BUILD_STATUS" | awk '{print toupper(substr($0,1,1)) tolower(substr($0,2))}')
+                fi
+                if [ "$QUALITYGATE_STATUS" != "Unknown" ]; then
+                  QUALITYGATE_STATUS=$(echo "$QUALITYGATE_STATUS" | awk '{print toupper(substr($0,1,1)) tolower(substr($0,2))}')
+                fi
+                if [ "$SECURITY_STATUS" != "Unknown" ]; then
+                  SECURITY_STATUS=$(echo "$SECURITY_STATUS" | awk '{print toupper(substr($0,1,1)) tolower(substr($0,2))}')
+                fi
+              fi
+              
+              echo "DEBUG -> BUILD_STATUS=${BUILD_STATUS}, QUALITYGATE_STATUS=${QUALITYGATE_STATUS}, SECURITY_STATUS=${SECURITY_STATUS}"
+
+              # Formatar branch/commit
+              CLEAN_BRANCH="${BRANCH#refs/heads/}"
+              CLEAN_COMMIT="${COMMIT:0:8}"
+
+              # Determinar status geral e cor
+              OVERALL_STATUS="Succeeded"
+              COLOR="2EB886"
+              EMOJI="✅"
+
+              if [ "$BUILD_STATUS" = "Failed" ] || [ "$QUALITYGATE_STATUS" = "Failed" ] || [ "$SECURITY_STATUS" = "Failed" ]; then
+                OVERALL_STATUS="Failed"
+                COLOR="D00000"
+                EMOJI="❌"
+              elif [ "$BUILD_STATUS" = "Canceled" ] || [ "$QUALITYGATE_STATUS" = "Canceled" ] || [ "$SECURITY_STATUS" = "Canceled" ] || \
+                   [ "$BUILD_STATUS" = "Cancelled" ] || [ "$QUALITYGATE_STATUS" = "Cancelled" ] || [ "$SECURITY_STATUS" = "Cancelled" ]; then
+                OVERALL_STATUS="Canceled"
+                COLOR="808080"
+                EMOJI="🛑"
+              elif [ "$BUILD_STATUS" = "SucceededWithIssues" ] || [ "$QUALITYGATE_STATUS" = "SucceededWithIssues" ] || [ "$SECURITY_STATUS" = "SucceededWithIssues" ]; then
+                OVERALL_STATUS="SucceededWithIssues"
+                COLOR="FFA500"
+                EMOJI="⚠️"
+              fi
+
+              echo "Overall Status: $OVERALL_STATUS"
+
+              # Função para emoji por status
+              get_emoji() {
+                case "$1" in
+                  Succeeded)            echo "✅" ;;
+                  Failed)               echo "❌" ;;
+                  Canceled|Cancelled)   echo "🛑" ;;
+                  SucceededWithIssues)  echo "⚠️" ;;
+                  *)                    echo "❓" ;;
+                esac
+              }
+
+              BUILD_EMOJI=$(get_emoji "$BUILD_STATUS")
+              QUALITYGATE_EMOJI=$(get_emoji "$QUALITYGATE_STATUS")
+              SECURITY_EMOJI=$(get_emoji "$SECURITY_STATUS")
+
+              # Obter status dos jobs específicos das variáveis de pipeline
+              BUILD_JOB_RESULT='$(BUILD_RESULT)'
+              QUALITYGATE_JOB_RESULT='$(QUALITYGATE_RESULT)'
+              FORTIFY_JOB_RESULT='$(FORTIFY_RESULT)'
+              SCA_JOB_RESULT='$(SCA_RESULT)'
+              
+              # Converter true/false para emojis
+              get_job_emoji() {
+                case "$1" in
+                  true)   echo "✅ Sucesso" ;;
+                  false)  echo "❌ Falhou" ;;
+                  *)      echo "❓ N/A" ;;
+                esac
+              }
+              
+              BUILD_JOB_STATUS=$(get_job_emoji "$BUILD_JOB_RESULT")
+              QUALITYGATE_JOB_STATUS=$(get_job_emoji "$QUALITYGATE_JOB_RESULT")
+              FORTIFY_JOB_STATUS=$(get_job_emoji "$FORTIFY_JOB_RESULT")
+              SCA_JOB_STATUS=$(get_job_emoji "$SCA_JOB_RESULT")
+              
+              echo "DEBUG -> Job Results: BUILD=${BUILD_JOB_RESULT}, QG=${QUALITYGATE_JOB_RESULT}, FORTIFY=${FORTIFY_JOB_RESULT}, SCA=${SCA_JOB_RESULT}"
+
+              # Construir payload (MessageCard)
+              PAYLOAD="$(cat <<EOF
+              {
+                "@type": "MessageCard",
+                "@context": "https://schema.org/extensions",
+                "summary": "Pipeline ${BUILD_NAME} - ${OVERALL_STATUS}",
+                "themeColor": "${COLOR}",
+                "title": "${EMOJI} Pipeline **${BUILD_NAME}** finalizada: ${OVERALL_STATUS}",
+                "sections": [
+                  {
+                    "activityTitle": "📦 Projeto: **${PROJECT}**",
+                    "activitySubtitle": "Repositório: **${REPO}** | Branch: **${CLEAN_BRANCH}**",
+                    "facts": [
+                      { "name": "Build Number:", "value": "${BUILD_NUMBER}" },
+                      { "name": "Commit:", "value": "${CLEAN_COMMIT}" },
+                      { "name": "Tipo de Execução:", "value": "${BUILD_REASON_LABEL}" },
+                      { "name": "Solicitado por:", "value": "${REQUESTEDFOR}" }
+                    ],
+                    "markdown": true
+                  },
+                  {
+                    "activityTitle": "🔍 Detalhes dos Jobs:",
+                    "facts": [
+                      { "name": "Build Version:",      "value": "${BUILD_JOB_STATUS}" },
+                      { "name": "Quality Gate:",       "value": "${QUALITYGATE_JOB_STATUS}" },
+                      { "name": "Fortify Scan:",       "value": "${FORTIFY_JOB_STATUS}" },
+                      { "name": "SCA Scan:",           "value": "${SCA_JOB_STATUS}" }
+                    ],
+                    "markdown": true
+                  }
+                ],
+                "potentialAction": [
+                  {
+                    "@type": "OpenUri",
+                    "name": "🔎 Ver resultados do build",
+                    "targets": [ { "os": "default", "uri": "${RUN_URL}" } ]
+                  },
+                  {
+                    "@type": "OpenUri",
+                    "name": "⚙️ Abrir pipeline",
+                    "targets": [ { "os": "default", "uri": "${PIPELINE_URL}" } ]
+                  }
+                ]
+              }
+              EOF
+              )"
+
+              echo "===================================================="
+              echo "Enviando notificação para o Teams..."
+              echo "===================================================="
+              echo "Payload preview:"
+              echo "${PAYLOAD}" | head -n 20
+
+              HTTP_CODE=$(curl -sS -o /tmp/teams_response.txt -w "%{http_code}" \
+                   -H 'Content-Type: application/json' \
+                   -d "${PAYLOAD}" \
+                   '$(teamsWebhookUrl)')
+
+              echo "HTTP Status Code: $HTTP_CODE"
+
+              if [ "$HTTP_CODE" -eq 200 ] || [ "$HTTP_CODE" -eq 202 ]; then
+                echo "✅ Notification sent successfully to Teams!"
+              else
+                echo "⚠️ Warning: Received HTTP $HTTP_CODE from Teams webhook"
+                cat /tmp/teams_response.txt 2>/dev/null || true
+              fi
+            displayName: 'Send Teams Notification'

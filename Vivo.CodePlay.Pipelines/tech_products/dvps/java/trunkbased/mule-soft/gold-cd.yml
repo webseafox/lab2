@@ -1,0 +1,557 @@
+parameters:
+- name: _PACKAGE_VERSION
+  type: string
+  default: ''
+- name: packageVersion
+  type: string
+  default: 'latest'
+- name: ENV_MAP
+  type: object
+  default:
+    poc: 
+      propertiesFileName: "B2B-DEV-FENIX.yaml"
+      anypointEnv: "B2B-DEV-FENIX"
+      anypointEnvAppName: "dev"
+      envHealthEndpoint: "dev"
+    dev: 
+      propertiesFileName: "B2B-DEV-FENIX.yaml"
+      anypointEnv: "B2B-DEV-FENIX"
+      anypointEnvAppName: "dev"
+      envHealthEndpoint: "dev"
+
+    esteira01: 
+      propertiesFileName: "B2B-Esteira1.yaml"
+      anypointEnv: "B2B-Esteira1"
+      anypointEnvAppName: "qa1"
+      envHealthEndpoint: "esteira1"
+
+    esteira02: 
+      propertiesFileName: "B2B-Esteira2.yaml"
+      anypointEnv: "B2B-Esteira2"
+      anypointEnvAppName: "qa2"
+      envHealthEndpoint: "esteira2"
+
+    preprod: 
+      propertiesFileName: "B2B-PreProd.yaml"
+      anypointEnv: "B2B-PreProd"
+      anypointEnvAppName: "preprod"
+      envHealthEndpoint: "preprod"
+
+    prodlike: 
+      propertiesFileName: "B2B-Prodlike.yaml"
+      anypointEnv: "B2B-Prodlike"
+      anypointEnvAppName: "prodlike"
+      envHealthEndpoint: "prodlike"
+
+    master: 
+      propertiesFileName: "B2B-Producao.yaml"
+      anypointEnv: "B2B-Producao"
+      anypointEnvAppName: "prod"
+      envHealthEndpoint: "prod"  
+
+variables:
+  # Variables for Proxy
+- name: PROXY_SQUID_SERVER
+  value: "10.240.58.39:3128" # proxy Squid para evitar erros de timeout do proxy NetSkope.
+- name: PROXY_NSKP_SERVER
+  value: "nskp.redecorp.br:8080"
+- name: PROXY_AGENT_HTTP
+  value: "http://$(PROXY_SQUID_SERVER)"
+- name: PROXY_AGENT_HTTPS
+  value: "http://$(PROXY_SQUID_SERVER)"
+- name: PROXY_AGENT_NO_PROXY
+  value: "localhost,0.0.0.0,127.0.0.1,10.244.0.0/16,192.168.0.0/16,10.129.178.173,nexus.telefonica.com.br,acrsharedservices01.azurecr.io,appcs-azdevops-shared.azconfig.io,scm.azurewebsites.net"
+- name: PROXY_ADDL_NO_PROXY
+  value: ""
+
+
+- ${{ if or(eq(variables['Build.SourceBranchName'], 'dev'), eq(variables['Build.SourceBranchName'], 'esteira01'), eq(variables['Build.SourceBranchName'], 'esteira02'), eq(variables['Build.SourceBranchName'], 'preprod'), eq(variables['Build.SourceBranchName'], 'prodlike'), eq(variables['Build.SourceBranchName'], 'master')) }}:
+  - name: PROPERTIES_FILE_NAME
+    value: "${{ parameters.ENV_MAP[variables['Build.SourceBranchName']].propertiesFileName }}"
+  - name: ANYPOINT_ENVIRONMENT
+    value: "${{ parameters.ENV_MAP[variables['Build.SourceBranchName']].anypointEnv }}"
+  - name: ANYPOINT_ENVIRONMENT_IN_APPLICATION_NAME
+    value: "${{ parameters.ENV_MAP[variables['Build.SourceBranchName']].anypointEnvAppName }}"
+  - name: ENVIRONMENT_HEALTH_ENDPOINT
+    value: "${{ parameters.ENV_MAP[variables['Build.SourceBranchName']].envHealthEndpoint }}"
+
+- ${{ else }}:
+  - name: PROPERTIES_FILE_NAME
+    value: ''
+  - name: ANYPOINT_ENVIRONMENT
+    value: ''
+  - name: ANYPOINT_ENVIRONMENT_IN_APPLICATION_NAME
+    value: ''
+  - name: ENVIRONMENT_HEALTH_ENDPOINT
+    value: ''
+
+- group: "azdo-team-project-variables"
+
+- group: "calendario-releases"
+
+# deploy params
+- ${{ if eq(variables['Build.SourceBranchName'], 'dev') }}:
+  - group: "deploy-params-${{ variables['Build.DefinitionName'] }}-dev"
+- ${{ if eq(variables['Build.SourceBranchName'], 'esteira01') }}:
+  - group: "deploy-params-${{ variables['Build.DefinitionName'] }}-esteira01"
+- ${{ if eq(variables['Build.SourceBranchName'], 'esteira02') }}:
+  - group: "deploy-params-${{ variables['Build.DefinitionName'] }}-esteira02"
+- ${{ if eq(variables['Build.SourceBranchName'], 'preprod') }}:
+  - group: "deploy-params-${{ variables['Build.DefinitionName'] }}-preprod"
+- ${{ if eq(variables['Build.SourceBranchName'], 'prodlike') }}:
+  - group: "deploy-params-${{ variables['Build.DefinitionName'] }}-prodlike"
+- ${{ if eq(variables['Build.SourceBranchName'], 'master') }}:
+  - group: "deploy-params-${{ variables['Build.DefinitionName'] }}-prod"  
+
+- group: "${{ variables['Build.Repository.Name'] }}"
+
+- ${{ if eq(variables['Build.SourceBranch'], 'refs/heads/master') }}:
+  - group: "mule-prod-variables"
+
+stages:
+- stage: deploy
+  displayName: "Deploy"
+  condition: eq(variables['SKIP_LEGACY_PIPELINE'], 'true')
+  pool:
+    name: $(AGENT_POOL_CD)
+  jobs:
+  - job: run_deploy
+    displayName: "Running deploy on CloudHub"
+    steps:
+
+    - bash: |
+        ORG=$(System.CollectionUri)
+        PROJECT=$(System.TeamProjectId)
+        GROUP_NAME="$(Build.Repository.Name)"
+
+        echo "##[debug] ORG: $ORG"
+        echo "##[debug] PROJECT: $PROJECT"
+        echo "##[debug] GROUP_NAME: $GROUP_NAME"
+
+        if [[ "$(Build.SourceBranchName)" == *"release"* ]]; then
+          VAR_NAME="RELEASE_PACKAGE_VERSION"
+        else
+          VAR_NAME=$(echo "$(Build.SourceBranchName)_PACKAGE_VERSION" | tr '[:lower:]' '[:upper:]')
+        fi
+        
+        echo "##[debug] VAR_NAME: $VAR_NAME"
+
+        echo "##[command]az pipelines variable-group list --org $ORG --project $PROJECT --query \"[?name=='$GROUP_NAME'].id\" -o tsv"
+
+        GROUP_ID=$(az pipelines variable-group list \
+          --org $ORG \
+          --project $PROJECT \
+          --query "[?name=='$GROUP_NAME'].id" \
+          -o tsv)
+
+        # Validar se achou o grupo
+        if [ -z "$GROUP_ID" ]; then
+          echo "Grupo de variáveis '$GROUP_NAME' não encontrado."
+          exit 1
+        fi
+
+        echo "##[command]az pipelines variable-group variable list --group-id $GROUP_ID --org $ORG --project $PROJECT --query \"variables.${VAR_NAME}.value\" -o tsv" 
+
+        echo "##[command]az pipelines variable-group variable list --group-id $GROUP_ID --org $ORG --project $PROJECT -o json"
+
+        RESPONSE=$(az pipelines variable-group variable list \
+          --group-id $GROUP_ID \
+          --org $ORG \
+          --project $PROJECT \
+          -o json)
+
+        VERSION=$(echo "$RESPONSE" | jq -r ".${VAR_NAME}.value")
+
+        if [ -z "$VERSION" ]; then
+          echo "Variable '$VAR_NAME' not found in the variable group."
+          exit 1
+        fi
+
+        echo "##[debug] VERSION: $VERSION"
+
+        echo "##vso[task.setvariable variable=_PACKAGE_VERSION]$VERSION"
+      name: setVersionStep
+      condition: eq('${{ parameters.packageVersion }}', 'latest')
+      displayName: "Get current package version from variable group"
+      env:
+        HTTP_PROXY: $(PROXY_AGENT_HTTP)
+        HTTPS_PROXY: $(PROXY_AGENT_HTTPS)
+        AZURE_DEVOPS_EXT_PAT: $(System.AccessToken)
+
+    - bash: |
+        echo "##vso[task.setvariable variable=_PACKAGE_VERSION]${{ parameters.packageVersion }}"
+      name: setCustomVersionStep
+      condition: ne('${{ parameters.packageVersion }}', 'latest')
+      displayName: "Set custom package version"
+
+    - task: AzureKeyVault@2
+      displayName: 'Getting AKV credentials'
+      timeoutInMinutes: 1
+      retryCountOnTaskFailure: 5
+      inputs:
+        azureSubscription: DevOpsSharedResources
+        KeyVaultName: kv-azdevops-shared
+        SecretsFilter: 'NEXUS-DEFAULT-USR, NEXUS-DEFAULT-PSW'
+    
+    - task: XmlParseFromVivo@4
+      displayName: 'Get groupId and artifactId from pom.xml'
+      inputs:
+        type: 'file'
+        origin: $(Build.SourcesDirectory)/pom.xml
+        jpaths: |
+          var POM_XML_GROUP_ID = .project.groupId._text
+          var POM_XML_ARTIFACT_ID = .project.artifactId._text
+
+    - task: UniversalPackages@0
+      displayName: Download Universal Package (latest)
+      inputs:
+        command: download
+        vstsFeed: "3d53bc62-8749-4931-ae46-a443b73bc87a"
+        vstsFeedPackage: "$(POM_XML_GROUP_ID).$(Build.SourceBranchName).$(POM_XML_ARTIFACT_ID)"
+        vstsPackageVersion: "$(_PACKAGE_VERSION)"
+        downloadDirectory: "$(Build.ArtifactStagingDirectory)"
+
+    - task: XmlParseFromVivo@4
+      displayName: 'Get New pom.xml info'
+      inputs:
+        type: 'file'
+        origin: $(Build.ArtifactStagingDirectory)/pom.xml
+        jpaths: |
+          var POM_XML_VERSION = .project.version._text
+          var POM_XML_GROUP_ID = .project.groupId._text
+          var POM_XML_ARTIFACT_ID = .project.artifactId._text
+
+    - task: DownloadSecureFile@1
+      displayName: 'Getting settings file'
+      name: muleSettings
+      inputs:
+        secureFile: "settings-mule.xml"
+    
+    - task: CmdLine@2
+      displayName: Extracting properties from config file
+      inputs:
+        script: >
+          echo "##vso[task.setvariable variable=CLOUD_HUB_PROPS]"
+
+          if [ ! -f "src/main/resources/properties/$(PROPERTIES_FILE_NAME)" ]; then
+              echo "The file 'src/main/resources/properties/$(PROPERTIES_FILE_NAME)' does not exist."
+              exit 0
+          fi
+
+          PROPS=$(yq '.cloudhub | select (.!=null)' src/main/resources/properties/$(PROPERTIES_FILE_NAME) | tr -d ':' | awk '{print $1}')
+
+          if [ -z "$PROPS" ]; then
+              echo "The field 'cloudhub' does not exist."
+              exit 0
+          fi
+
+          for PROP in $PROPS; do
+            PROPERTIES_ARGS_STRING="$PROPERTIES_ARGS_STRING -D$PROP=$(yq ".cloudhub.$PROP" src/main/resources/properties/$(PROPERTIES_FILE_NAME))"
+          done
+
+          echo "##vso[task.setvariable variable=CLOUD_HUB_PROPS]${PROPERTIES_ARGS_STRING}"
+        workingDirectory: $(Build.SourcesDirectory)
+
+    - script: |
+        echo "##[debug] DEFAULT_ENV_CONFIG: $DEFAULT_ENV_CONFIG"
+        ENV_CONFIG_NAME="$(Build.SourceBranchName)"
+        echo "##[debug] ENV_CONFIG_NAME: $ENV_CONFIG_NAME"
+
+        case "$ENV_CONFIG_NAME" in
+          dev|esteira01|esteira02|preprod|prodlike|master)
+            PROPERTIES_FILE_NAME="$(PROPERTIES_FILE_NAME)"
+            ENV_HEALTH_ENDPOINT="$(ENVIRONMENT_HEALTH_ENDPOINT)"
+            ;;
+          *)
+            echo "##[debug] ENV_CONFIG_NAME not found. Falling back to DEFAULT_ENV_CONFIG: $DEFAULT_ENV_CONFIG"
+            ENV_CONFIG_NAME="$DEFAULT_ENV_CONFIG"
+            PROPERTIES_FILE_NAME="$(PROPERTIES_FILE_NAME)"
+            ANYPOINT_ENVIRONMENT="$(ANYPOINT_ENVIRONMENT)"
+            ANYPOINT_ENVIRONMENT_IN_APPLICATION_NAME="$(ANYPOINT_ENVIRONMENT_IN_APPLICATION_NAME)"
+            ENV_HEALTH_ENDPOINT="$(ENVIRONMENT_HEALTH_ENDPOINT)"
+            ;;
+        esac
+
+        echo "##[debug] PROPERTIES_FILE_NAME: $PROPERTIES_FILE_NAME"
+        echo "##[debug] ENVIRONMENT_HEALTH_ENDPOINT: $ENV_HEALTH_ENDPOINT"
+
+        echo "##vso[task.setvariable variable=PROPERTIES_FILE_NAME;isoutput=true]$PROPERTIES_FILE_NAME"
+        echo "##vso[task.setvariable variable=ENVIRONMENT_HEALTH_ENDPOINT;isoutput=true]$ENV_HEALTH_ENDPOINT"
+      name: resolve_env_config
+      displayName: "Resolve Environment Configuration from Parameter Map"
+      env:
+        DEFAULT_ENV_CONFIG: $(MULE_DEFAULT_ENV_CONFIG)
+        PROPERTIES_FILE_NAME: $(PROPERTIES_FILE_NAME)
+        ENVIRONMENT_HEALTH_ENDPOINT: $(ENVIRONMENT_HEALTH_ENDPOINT)
+
+    - script: |
+        echo "🔍 Lendo informações do pom.xml em: $(Build.SourcesDirectory)/pom.xml"
+
+        POM_PATH="$(Build.SourcesDirectory)/pom.xml"
+
+        # Extrair artifactId
+        ARTIFACT_ID=$(xmllint --xpath "/*[local-name()='project']/*[local-name()='artifactId']/text()" "$POM_PATH")
+        if [ -z "$ARTIFACT_ID" ]; then
+          echo "❌ Não foi possível extrair 'artifactId' do pom.xml"
+          exit 1
+        fi
+        echo "✅ artifactId encontrado: $ARTIFACT_ID"
+
+        # Extrair version
+        POM_VERSION=$(xmllint --xpath "/*[local-name()='project']/*[local-name()='version']/text()" "$POM_PATH")
+        if [ -z "$POM_VERSION" ]; then
+          echo "❌ Não foi possível extrair 'version' do pom.xml"
+          exit 1
+        fi
+        echo "✅ version encontrado: $POM_VERSION"
+
+        # Exportar como variáveis de pipeline
+        echo "##vso[task.setvariable variable=ARTIFACT_ID]$ARTIFACT_ID"
+        echo "##vso[task.setvariable variable=POM_VERSION]$POM_VERSION"
+      name: extract_pom_info
+      displayName: "Extract artifactId and version from pom.xml"
+
+    - bash: |
+        # Map branch name to Library variable group env suffix
+        BRANCH="$(Build.SourceBranchName)"
+        case "$BRANCH" in
+          master) ENV_SUFFIX="prod" ;;
+          *) ENV_SUFFIX="$BRANCH" ;;
+        esac
+
+        GROUP_NAME="deploy-params-$(Build.DefinitionName)-${ENV_SUFFIX}"
+        echo "##[debug] Looking up variable group: $GROUP_NAME"
+
+        GROUP_JSON=$(az pipelines variable-group list \
+          --org "$(System.CollectionUri)" \
+          --project "$(System.TeamProjectId)" \
+          --query "[?name=='$GROUP_NAME']" \
+          --output json 2>/dev/null)
+
+        if [ -z "$GROUP_JSON" ] || [ "$GROUP_JSON" = "[]" ]; then
+          echo "##[warning] Variable group '$GROUP_NAME' not found. Deploying without extra options."
+          echo "##vso[task.setvariable variable=DYNAMIC_EXTRA_OPTION]"
+          exit 0
+        fi
+
+        VAR_NAMES=$(echo "$GROUP_JSON" | jq -r '.[0].variables | keys[]')
+
+        EXTRA_OPTS=""
+        BUILT_VARS=()
+        for VAR_NAME in $VAR_NAMES; do
+          case "$VAR_NAME" in
+            "mule.verbose"|"mule.version"|"CUSTOMIZED_JAVA_VERSION") continue ;;
+          esac
+          VAR_NAME_ENV=$(echo "$VAR_NAME" | tr '[:lower:]' '[:upper:]' | tr '.' '_')
+          VAR_VALUE=$(printenv "$VAR_NAME_ENV")
+          if [ -n "$VAR_VALUE" ]; then
+            EXTRA_OPTS="$EXTRA_OPTS -D${VAR_NAME}=${VAR_VALUE}"
+            BUILT_VARS+=("$VAR_NAME")
+          else
+            echo "##[warning] Variable '$VAR_NAME' not found in environment (may be secret or unset)"
+          fi
+        done
+
+        echo "Variables included in extraOption (${#BUILT_VARS[@]}):"
+        for V in "${BUILT_VARS[@]}"; do
+          echo "  - $V"
+        done
+        echo "##vso[task.setvariable variable=DYNAMIC_EXTRA_OPTION]$EXTRA_OPTS"
+      name: build_dynamic_extra_option
+      displayName: "Build dynamic extraOption from Library variable group"
+      env:
+        HTTP_PROXY: $(PROXY_AGENT_HTTP)
+        HTTPS_PROXY: $(PROXY_AGENT_HTTPS)
+        AZURE_DEVOPS_EXT_PAT: $(System.AccessToken)
+
+    - template: templates/maven-deploy.yml
+      parameters:
+        extraOption: $(DYNAMIC_EXTRA_OPTION)
+
+- stage: backpromotion
+  displayName: 'Backpromotion to Lower Environments'
+  dependsOn: deploy
+  # condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/master'))
+  condition: false
+  jobs:
+  - job: create_backpromotion_prs
+    displayName: 'Create Backpromotion PRs'
+    steps:
+    - checkout: none
+    - bash: |
+        # =======================
+        # Configurações iniciais
+        # =======================
+        export HTTP_PROXY=$(PROXY_AGENT_HTTP)
+        export HTTPS_PROXY=$(PROXY_AGENT_HTTPS)
+        export NO_PROXY="$(PROXY_AGENT_NO_PROXY),dev.azure.com,telefonica-vivo-brasil.visualstudio.com"
+        export AZURE_CLI_CONNECTION_TIMEOUT=60
+        export AZURE_CLI_READ_TIMEOUT=60
+
+        ORG=$(System.CollectionUri)
+        PROJECT=$(System.TeamProjectId)
+        REPOSITORY_NAME="$(Build.Repository.Name)"
+        SOURCE_BRANCH="master"
+        TODAY=$(date +%Y%m%d)
+
+        echo "##[debug] ORG: $ORG"
+        echo "##[debug] PROJECT: $PROJECT"
+        echo "##[debug] REPOSITORY_NAME: $REPOSITORY_NAME"
+        echo "##[debug] TODAY: $TODAY"
+
+        # =======================
+        # Obter ID do repositório
+        # =======================
+        REPOSITORY_ID=$(az repos list \
+          --org "$ORG" \
+          --project "$PROJECT" \
+          --query "[?name=='$REPOSITORY_NAME'].id" -o tsv)
+        if [ -z "$REPOSITORY_ID" ]; then
+          echo "##[error] Repository not found"
+          exit 1
+        fi
+
+        # =======================
+        # Criar PR: master -> prodlike
+        # =======================
+        echo "##[section] Creating PR from master to prodlike"
+        az repos pr create --org "$ORG" --project "$PROJECT" \
+          --repository "$REPOSITORY_ID" \
+          --source-branch "$SOURCE_BRANCH" \
+          --target-branch "prodlike" \
+          --title "Backpromotion: master → prodlike" \
+          --description "Automated backpromotion PR to prodlike" \
+          --auto-complete true \
+          --delete-source-branch false \
+          --squash false \
+          --output table
+
+        # =======================
+        # Buscar RLM futuras
+        # =======================
+        echo "##[section] Detecting future RLM branches"
+        ALL_RLMS=$(az repos ref list --org "$ORG" --project "$PROJECT" \
+          --repository "$REPOSITORY_ID" --query "[?starts_with(name,'refs/heads/release/RLM')].name" -o tsv | sed 's#refs/heads/##')
+        
+        FUTURE_RLMS=()
+        for RLM in $ALL_RLMS; do
+          RL_DATE=$(echo $RLM | sed -E 's#release/RLM([0-9]{8})#\1#')
+          if [[ "$RL_DATE" -gt "$TODAY" ]]; then
+            FUTURE_RLMS+=("$RLM")
+          fi
+        done
+
+        echo "##[debug] Future RLM branches: ${FUTURE_RLMS[*]}"
+
+        # =======================
+        # Função para descobrir ambiente no calendário
+        # =======================
+        get_environment() {
+            local RL="$1"
+
+            echo "##[section] Iniciando obtenção de ambiente para RL: '$RL'"
+
+            # Data corrente no formato AAAAMMDD
+            local TODAY=$(date +%Y%m%d)
+
+            # Extrai apenas o mês (MM) de release/RLMYYYYMMDD
+            RL_NUM=$(echo "$RL" | sed -E 's#.*/RLM[0-9]{4}([0-9]{2})[0-9]{2}#\1#')
+            RL_DATE=$(echo "$RL" | sed -E 's#.*/RLM([0-9]{8})#\1#')
+
+            # Se a RLM já passou, não há ambiente válido
+            if [[ "$RL_DATE" -lt "$TODAY" ]]; then
+                echo "##[debug] RLM $RL já ocorreu, ignorando"
+                export AMBIENTE=""
+                echo "##[section] Finalizado processo de obtenção de ambiente para RL: '$RL'"
+                return 0
+            fi
+
+            RELEASE_NAME=$(echo "$RL" | sed -E 's#^release/##')
+
+            # Recupera as datas no formato DD/MM/AAAA
+            RAW_SPRINT_INICIO=$(eval echo \$RL${RL_NUM}_SPRINTINICIO)
+            RAW_SPRINT_FINAL=$(eval echo \$RL${RL_NUM}_SPRINTFINAL)
+            RAW_PREPROD=$(eval echo \$RL${RL_NUM}_PREPROD)
+            RAW_RELEASE=$(eval echo \$RL${RL_NUM}_RELEASE)
+
+            # Converte manualmente para AAAAMMDD
+            SPRINT_INICIO=$(echo "$RAW_SPRINT_INICIO" | awk -F'/' '{print $3$2$1}')
+            SPRINT_FINAL=$(echo "$RAW_SPRINT_FINAL" | awk -F'/' '{print $3$2$1}')
+            PREPROD=$(echo "$RAW_PREPROD" | awk -F'/' '{print $3$2$1}')
+            RELEASE=$(echo "$RAW_RELEASE" | awk -F'/' '{print $3$2$1}')
+            ESTEIRA=$(eval echo \$RL${RL_NUM}_ESTEIRA | tr '[:upper:]' '[:lower:]' | xargs)
+
+            # Verificar se está em período de sprint
+            if [[ "$TODAY" -ge "$SPRINT_INICIO" && "$TODAY" -le "$SPRINT_FINAL" ]]; then
+                echo "##[section] Estamos em período de sprint"
+                AMBIENTE="$ESTEIRA"
+            # Caso contrário, se está no período de preprod
+            elif [[ "$TODAY" -ge "$PREPROD" && "$TODAY" -le "$RELEASE" ]]; then
+                echo "##[section] Estamos em período de preprod"
+                AMBIENTE="preprod"
+            else
+                echo "##[warning] Fora dos períodos de sprint e preprod"
+                AMBIENTE=""
+            fi
+
+            if [[ -n "$AMBIENTE" ]]; then
+                echo "##[debug] Ambiente calculado para $RL: $AMBIENTE"
+            else
+                echo "##[warning] Não foi possível determinar ambiente válido para $RL"
+            fi
+            export AMBIENTE
+
+            echo "##[section] Finalizado processo de obtenção de ambiente para RL: '$RL'"
+        }
+
+        # =======================
+        # Criar PRs para RLM futuras ou ambientes
+        # =======================
+        if [ ${#FUTURE_RLMS[@]} -gt 0 ]; then
+          for RLM in "${FUTURE_RLMS[@]}"; do
+            echo "##[section] Creating PR master → $RLM"
+            az repos pr create --org "$ORG" --project "$PROJECT" \
+              --repository "$REPOSITORY_ID" \
+              --source-branch "$SOURCE_BRANCH" \
+              --target-branch "$RLM" \
+              --title "Backpromotion: master → $RLM" \
+              --description "Automated backpromotion PR to future RLM branch" \
+              --auto-complete true \
+              --delete-source-branch false \
+              --squash true \
+              --output table
+
+            # Criar PR RLM → ambiente
+            get_environment "$RLM"
+            echo "##[debug] AMBIENTE resolved outside function: '$AMBIENTE'"
+
+            # Sanitiza os nomes de branch removendo espaços e quebras de linha
+            RLM=$(echo "$RLM" | tr -d '\r' | xargs)
+            AMBIENTE=$(echo "$AMBIENTE" | tr -d '\r' | xargs)
+
+            if [[ -n "$AMBIENTE" ]]; then
+              echo "##[section] Creating PR $RLM → $AMBIENTE"
+
+              az repos pr create --org "$ORG" --project "$PROJECT" \
+                --repository "$REPOSITORY_ID" \
+                --source-branch "$RLM" \
+                --target-branch "$AMBIENTE" \
+                --title "Backpromotion: $RLM → $AMBIENTE" \
+                --description "Automated backpromotion PR from RLM to environment" \
+                --auto-complete true \
+                --delete-source-branch false \
+                --squash true \
+                --output table
+            fi
+          done
+        else
+          echo "##[debug] No future RLM branches found"
+        fi
+
+        echo "##[section] Backpromotion PR creation completed"
+      displayName: 'Create Backpromotion PRs'
+      env:
+        HTTP_PROXY: $(PROXY_AGENT_HTTP)
+        HTTPS_PROXY: $(PROXY_AGENT_HTTPS)
+        NO_PROXY: $(PROXY_AGENT_NO_PROXY)
+        AZURE_DEVOPS_EXT_PAT: $(PROJECT_PAT_TOKEN)

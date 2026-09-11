@@ -1,0 +1,78 @@
+parameters:
+- name: pythonVersion
+  type: string
+- name: currentVersion
+  type: string
+- name: newVersion
+  type: string
+  default: ""
+- name: incrementLevel
+  default: patch
+
+steps:
+- bash: |
+    echo "newversion: ${NEW_VERSION}"
+
+    cat << EOF > lib-package.sh
+    #!/bin/bash
+    echo "##[debug]Iniciando processo de empacotamento da library através do container..."
+    
+    echo "##[debug]Criando ambiente virtual python..."
+    make virtualenv
+
+    echo "##[debug]Ativando ambiente virtual python..."
+    source .venv/bin/activate
+
+    if [ -n "${NEW_VERSION}" ]; then
+      echo "##[debug]BumpVersion ativo. A versão '${NEW_VERSION}' será usada no processo de empacotamento"
+
+      echo "##[debug]Atualizando versão da library..."
+      bumpversion --current-version ${CURRENT_VERSION} --new-version ${NEW_VERSION} ${INCREMENT_LEVEL} setup.py
+    fi
+
+    echo "##[debug]Instalando/Restaurando dependências da library..."
+    make install
+    
+    echo "##[debug]Instalando wheel library..."
+    pip install wheel
+
+    echo "##[debug]Criando o pacote da library..."
+    make build
+    EOF
+  displayName: Create Package Script
+  env:
+    CURRENT_VERSION: "${{ parameters.currentVersion }}"
+    NEW_VERSION: "${{ parameters.newVersion }}"
+    INCREMENT_LEVEL: ${{ parameters.incrementLevel }}
+
+- template: /tech_products/srus/tasks/python/run_bash_on_docker.yml
+  parameters:
+    pythonVersion: "${{ parameters.pythonVersion }}"
+    scriptNameOrCmd: "bash lib-package.sh"
+    displayName: Build and Package
+
+# Novo passo para criar o pacote para o Databricks
+- bash: |
+
+    # LIMPAR O DIRETÓRIO DE NOTEBOOKS
+    if [ -d $(Build.BinariesDirectory)/notebooks ]; then
+      rm -r $(Build.BinariesDirectory)/notebooks
+    fi
+
+    # CRIAR DIRETÓRIO DE NOTEBOOKS
+    mkdir -p $(Build.BinariesDirectory)/notebooks/$(Build.Repository.Name)
+
+    # COPIAR TODOS OS ARQUIVOS DO SOURCES DIRECTORY PARA O DIRETÓRIO DE NOTEBOOKS, EXCLUINDO .venv, .azuredevops e dist
+    find $(Build.SourcesDirectory) -type d \( -name ".venv" -o -name ".azuredevops" -o -name "dist" \) -prune -o -type f -print | while read file; do
+      # Obter o caminho relativo e criar os diretórios necessários dentro de notebooks
+      relative_path=$(dirname "${file#$(Build.SourcesDirectory)/}")
+      mkdir -p "$(Build.BinariesDirectory)/notebooks/$(Build.Repository.Name)/$relative_path"
+      cp "$file" "$(Build.BinariesDirectory)/notebooks/$(Build.Repository.Name)/$relative_path"
+    done
+  displayName: Packaging for Databricks
+
+
+- template: /tech_products/srus/tasks/artifacts/publish_pipeline.yml
+  parameters:
+    artifactName: databricksPackage
+    targetPath: $(Build.BinariesDirectory)

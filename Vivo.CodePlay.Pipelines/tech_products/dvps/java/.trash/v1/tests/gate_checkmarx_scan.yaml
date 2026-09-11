@@ -1,0 +1,301 @@
+###
+### ISTO NAO E UM TEMPLATE 
+###
+### E UM TESTE DE SCAN DO FORTIFY
+###
+
+variables:
+- name: System.debug
+  value: "true"
+
+stages:
+- stage: stage_fortify_gate
+  displayName: 'Fortify Gate'
+  pool: GeneralPurposeLinuxAgentsCI
+  variables:
+  - name: CACORP_LOCATION
+    value: "$(Agent.HomeDirectory)/../../certs/CACORP.pem"
+
+  - name: ASDF_JDK_11
+    value: "openjdk-11.0.2"
+
+  - name: FORTIFY_PROJECT_NAME
+    value: "$(System.TeamProject)-$(Build.Repository.Name)"
+
+
+  jobs:
+  - job: app_config_keys
+    displayName: "Get AppSec Config Keys"
+    steps:
+    - task: Bash@3
+      displayName: About Stage
+      env:
+        DOC_URL: $(CORPORATE_WIKI_DOC_URL)
+        MESSAGE: >
+          Lembre-se que a esteira apenas reflete o comportamento da sua aplicação e de acordo com as variáveis definidas.
+      inputs:
+        targetType: inline
+        script: "RED='\\033[0;31m'\nGREEN='\\033[0;32m'\nBLUE='\\033[0;34m'\nYELLOW='\\033[1;33m'\nBG_GREEN='\\033[42;1;37m'\n\necho ' ================================================================================================================================'\necho '|                            _                ___                   ___ _            _ _                                         |'\necho '|                     /\\   /(_)_   _____     / __\\___  _ __ ___    / _ (_)_ __   ___| (_)_ __   ___  ___                         |'\necho '|                     \\ \\ / / \\ \\ / / _ \\   / /  / _ \\|  __/ _ \\  / /_)/ |  _ \\ / _ \\ | |  _ \\ / _ \\/ __|                        |'\necho '|                      \\ V /| |\\ V / (_) | / /__| (_) | | |  __/ / ___/| | |_) |  __/ | | | | |  __/\\__ \\                        |'\necho '|                       \\_/ |_| \\_/ \\___/  \\____/\\___/|_|  \\___| \\/    |_|  __/ \\___|_|_|_| |_|\\___||___/                        |'\necho '|                                                                        |_|                                                     |'\necho ' ================================================================================================================================'\necho \"                                                                                                      powered by Vivo DevOps Team\"\necho \"\"\n\nprintf \"\n=================================================================================================================================\n${GREEN}                                                 ${SYSTEM_STAGEDISPLAYNAME} \n=================================================================================================================================\n\n${MESSAGE}\n\n${YELLOW}Em caso de dúvidas sobre essa fase do pipeline acesse a documentação: ${BLUE}${DOC_URL}\n\n=================================================================================================================================\n\"\n"
+    - task: Bash@3
+      displayName: "App Configuration Info"
+      inputs:
+        targetType: inline
+        script: >
+          echo "##[debug] APP CONFIG ENABLED.............: $(APP_CONFIGURATION_ENABLED)"
+
+          echo "##[debug] APP CONFIG SUBSCRIPTION........: $(APP_CONFIGURATION_AZURE_SUBSCRIPTION)"
+
+          echo "##[debug] APP CONFIG ENDPOINT............: $(APP_CONFIGURATIN_ENDPOINT)"
+
+    - task: NunjucksInline@4
+      displayName: 'Generate app configuration keys'
+      inputs:
+        sourceType: 'text'
+        autoSurround: false
+        source: |
+          # var LABEL_GLOBAL = GLOBAL
+          # var KEY_GLOBAL_FORTIFY = FORTIFY
+          # var KEY_GLOBAL_CONVISO = CONVISO
+          # var KEY_GLOBAL_CHECKMARX = CHECKMARX
+          # var KEY_GLOBAL_SKIP_SECURITY_GATE = SKIP_SECURITY_GATE
+
+          # var LABEL_PROJECT = {{ SYSTEM_TEAMPROJECT }}
+          var KEY_PROJECT_FORTIFY = FORTIFY_{{ SYSTEM_TEAMPROJECTID | replace(r/-/ig, '_') | upper }}
+          var KEY_PROJECT_CONVISO = CONVISO_{{ SYSTEM_TEAMPROJECTID | replace(r/-/ig, '_') | upper }}
+          var KEY_PROJECT_CHECKMARX = CHECKMARX_{{ SYSTEM_TEAMPROJECTID | replace(r/-/ig, '_') | upper }}
+          var KEY_PROJECT_SKIP_SECURITY_GATE = SKIP_SECURITY_GATE_{{ SYSTEM_TEAMPROJECTID | replace(r/-/ig, '_') | upper }}
+
+          var LABEL_COMPONENT = {{ SYSTEM_TEAMPROJECT }}/{{ BUILD_REPOSITORY_NAME }}
+          var KEY_COMPONENT_FORTIFY = FORTIFY_{{ BUILD_REPOSITORY_ID | replace(r/-/ig, '_') | upper }}
+          var KEY_COMPONENT_CONVISO = CONVISO_{{ BUILD_REPOSITORY_ID | replace(r/-/ig, '_') | upper }}
+          var KEY_COMPONENT_CHECKMARX = CHECKMARX_{{ BUILD_REPOSITORY_ID | replace(r/-/ig, '_') | upper }}
+          var KEY_COMPONENT_SKIP_SECURITY_GATE = SKIP_SECURITY_GATE_{{ BUILD_REPOSITORY_ID | replace(r/-/ig, '_') | upper }}
+
+    - task: AzureAppConfiguration.azure-app-configuration-task.custom-build-release-task.AzureAppConfiguration@6
+      displayName: 'Download app configuration keys'
+      timeoutInMinutes: 1
+      retryCountOnTaskFailure: 5
+      inputs:
+        azureSubscription: DevOpsSharedResources
+        AppConfigurationEndpoint: https://appcs-azdevops-shared.azconfig.io
+        Label: >-
+          GLOBAL,
+          $(SYSTEM_TEAMPROJECT),
+          $(LABEL_COMPONENT)
+      # env:
+      #   HTTPS_PROXY: $(PROXY_AGENT_HTTPS)
+      #   HTTP_PROXY: $(PROXY_AGENT_HTTP)
+      #   NO_PROXY: $(PROXY_AGENT_NO_PROXY)
+      
+    - task: PythonRunner@4
+      displayName: "App Configuration Info"
+      inputs:
+        script: |-
+          import os
+          def get_varname(var_name):
+            os.getenv(var_name)
+
+          def get_bool(var_name, default = "false"):
+            """Retrieve environment variable or return 'false' if it doesn't exist or is empty."""
+            return os.getenv(var_name, default).lower() in ("yes", "true", "t", "1")
+
+          # Variáveis principais
+          USE_FORTIFY = False
+          USE_CONVISO = False
+          USE_CHECKMARX = False
+          SKIP_GATE = False
+          USE_APPCONFIG = get_bool("APP_CONFIGURATION_ENABLED") == True
+          GLOBAL_FORTIFY = get_bool("FORTIFY") == True
+          PROJECT_FORTIFY = get_bool(os.getenv("KEY_PROJECT_FORTIFY")) == True
+          COMPONENT_FORTIFY = get_bool(os.getenv("KEY_COMPONENT_FORTIFY")) == True
+          GLOBAL_CONVISO = get_bool("CONVISO") == True
+          PROJECT_CONVISO = get_bool(os.getenv("KEY_PROJECT_CONVISO")) == True
+          COMPONENT_CONVISO = get_bool(os.getenv("KEY_COMPONENT_CONVISO")) == True
+          GLOBAL_CHECKMARX = get_bool("CHECKMARX") == True
+          PROJECT_CHECKMARX = get_bool(os.getenv("KEY_PROJECT_CHECKMARX")) == True
+          COMPONENT_CHECKMARX = get_bool(os.getenv("KEY_COMPONENT_CHECKMARX")) == True
+          GLOBAL_SKIP_SECURITY_GATE = get_bool("SKIP_SECURITY_GATE") == True
+          PROJECT_SKIP_SECURITY_GATE = get_bool(os.getenv("KEY_PROJECT_SKIP_SECURITY_GATE")) == True
+          COMPONENT_SKIP_SECURITY_GATE = get_bool(os.getenv("KEY_COMPONENT_SKIP_SECURITY_GATE")) == True
+
+          if USE_APPCONFIG:
+            # FORTIFY SETTINGS
+            USE_FORTIFY = (GLOBAL_FORTIFY and PROJECT_FORTIFY and COMPONENT_FORTIFY)
+            # CONVISO SETTINGS
+            USE_CONVISO = (GLOBAL_CONVISO and PROJECT_CONVISO and COMPONENT_CONVISO and USE_FORTIFY)
+            # CHECKMARX SETTINGS
+            if GLOBAL_CHECKMARX and PROJECT_CHECKMARX and COMPONENT_CHECKMARX:
+              USE_CHECKMARX = True
+              USE_FORTIFY = False
+              USE_CONVISO = False
+
+            # SKIP_SECURITY_GATE SETTINGS
+            SKIP_GATE = (GLOBAL_SKIP_SECURITY_GATE or PROJECT_SKIP_SECURITY_GATE or COMPONENT_SKIP_SECURITY_GATE)
+
+          else:
+            
+            # Alternativa se USE_APPCONFIG não é "true"
+            USE_CHECKMARX = get_bool("USE_CHECKMARX") == True
+            SKIP_GATE = get_bool("SKIP_SECURITY_GATE") == True
+
+            SKIP_SECURITY = get_bool("skip_security") == True
+            SKIP_FORTIFY_GATE = get_bool("skip_fortify_gate") == True
+            SKIP_CONVISO_SECURITY_GATE = get_bool("SKIP_CONVISO_SECURITY_GATE") == True
+
+            if not SKIP_SECURITY:
+              if not SKIP_FORTIFY_GATE:
+                USE_FORTIFY = True
+              if not SKIP_CONVISO_SECURITY_GATE:
+                USE_CONVISO = True
+              if USE_CHECKMARX:
+                USE_FORTIFY = False
+                USE_CONVISO = False
+            else:
+              USE_CHECKMARX = False
+
+          # def set_variable(name, value):
+          #   print(f"task.setvariable {name}, {value}")
+
+          set_variable('USE_APPCONFIG', str(USE_APPCONFIG).lower())
+          set_variable('GLOBAL_FORTIFY', str(GLOBAL_FORTIFY).lower())
+          set_variable('PROJECT_FORTIFY', str(KEY_PROJECT_FORTIFY).lower())
+          set_variable('COMPONENT_FORTIFY', str(COMPONENT_FORTIFY).lower())
+          set_variable('GLOBAL_CONVISO', str(GLOBAL_CONVISO).lower())
+          set_variable('PROJECT_CONVISO', str(PROJECT_CONVISO).lower())
+          set_variable('COMPONENT_CONVISO', str(COMPONENT_CONVISO).lower())
+          set_variable('GLOBAL_CHECKMARX', str(GLOBAL_CHECKMARX).lower())
+          set_variable('PROJECT_CHECKMARX', str(PROJECT_CHECKMARX).lower())
+          set_variable('COMPONENT_CHECKMARX', str(COMPONENT_CHECKMARX).lower())
+          set_variable('GLOBAL_SKIP_SECURITY_GATE', str(GLOBAL_SKIP_SECURITY_GATE).lower())
+          set_variable('PROJECT_SKIP_SECURITY_GATE', str(PROJECT_SKIP_SECURITY_GATE).lower())
+          set_variable('COMPONENT_SKIP_SECURITY_GATE', str(COMPONENT_SKIP_SECURITY_GATE).lower())
+
+          # Variáveis de saída para Azure Pipelines
+          set_variable('USE_FORTIFY', str(USE_FORTIFY).lower())
+          set_variable('USE_CONVISO', str(USE_CONVISO).lower())
+          set_variable('USE_CHECKMARX', str(USE_CHECKMARX).lower())
+          set_variable('SKIP_SECURITY_GATE', str(SKIP_GATE).lower())
+
+    - task: TemplateRender@4
+      displayName: 'Render app configuration keys'
+      inputs:
+        # destination: file://${AGENT_TEMPDIRECTORY}/app_config_vars.json
+        source: |-
+          {
+            "items": [
+              {"key": "FORTIFY","value": "{{ GLOBAL_FORTIFY }}","label": "GLOBAL","content_type": null,"tags": {}},
+              {"key": "CONVISO","value": "{{ GLOBAL_CONVISO }}","label": "GLOBAL","content_type": null,"tags": {}},
+              {"key": "CHECKMARX","value": "{{ GLOBAL_CHECKMARX }}","label": "GLOBAL","content_type": null,"tags": {}},
+              {"key": "SKIP_SECURITY_GATE","value": "{{ GLOBAL_SKIP_SECURITY_GATE }}","label": "GLOBAL","content_type": null,"tags": {}},
+              {"key": "{{ KEY_PROJECT_FORTIFY }}", "value": {{  PROJECT_FORTIFY }}","label": "{{ LABEL_PROJECT }}","content_type": null,"tags": {}},
+              {"key": "{{ KEY_PROJECT_CONVISO }}","value": "{{ PROJECT_CONVISO }}","label": "{{ LABEL_PROJECT }}","content_type": null,"tags": {}},
+              {"key": "{{ KEY_PROJECT_CHECKMARX }}","value": "{{ PROJECT_CHECKMARX }}","label": "{{ LABEL_PROJECT }}","content_type": null,"tags": {}},
+              {"key": "{{ KEY_PROJECT_SKIP_SECURITY_GATE }}","value": "{{ PROJECT_SKIP_SECURITY_GATE }}","label": "{{ LABEL_PROJECT }}","content_type": null,"tags": {}},
+              {"key": "{{ KEY_COMPONENT_FORTIFY }}","value": "{{ COMPONENT_FORTIFY }}","label": "{{ LABEL_COMPONENT }}","content_type": null,"tags": {}},
+              {"key": "{{ KEY_COMPONENT_CONVISO }}","value": "{{ COMPONENT_CONVISO }}","label": "{{ LABEL_COMPONENT }}","content_type": null,"tags": {}},
+              {"key": "{{ KEY_COMPONENT_CHECKMARX }}","value": "{{ COMPONENT_CHECKMARX }}","label": "{{ LABEL_COMPONENT }}","content_type": null,"tags": {}},
+              {"key": "{{ KEY_COMPONENT_SKIP_SECURITY_GATE }}","value": "{{ COMPONENT_SKIP_SECURITY_GATE }}","label": "{{ LABEL_COMPONENT }}","content_type": null,"tags": {}}
+            ]
+          }
+
+    # - task: AzureAppConfiguration.azure-app-configuration-task-push.custom-build-release-task.AzureAppConfigurationPush@6
+    #   displayName: 'Push app configuration keys'
+    #   condition: and( succeeded(), eq(variables['APP_CONFIGURATION_ENABLED'], 'true') )
+    #   inputs:
+    #     azureSubscription: $(APP_CONFIGURATION_AZURE_SUBSCRIPTION)
+    #     AppConfigurationEndpoint: $(APP_CONFIGURATIN_ENDPOINT)
+    #     ConfigurationFile: '$(Agent.TempDirectory)/app_config_vars.json'
+    #     FileContentProfile: appconfig/kvset
+    #   env:
+    #     HTTPS_PROXY: $(PROXY_AGENT_HTTPS)
+    #     HTTP_PROXY: $(PROXY_AGENT_HTTP)
+    #     NO_PROXY: $(PROXY_AGENT_NO_PROXY)
+
+
+  # - job: checkmarx_scan
+  #   dependsOn:
+  #   - app_config_keys
+  #   variables:
+  #   - name: USE_CHECKMARX
+  #     value: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_CHECKMARX'] ]
+  #   - name: SKIP_SECURITY_GATE
+  #     value: $[ or(eq(dependencies.app_config_keys.outputs['evaluate_flags.SKIP_SECURITY_GATE'], 'true'), eq(variables.CHECKMARX_IGNORE_SECURITY_GATE, 'true')) ]
+  #   condition: and( succeeded(), eq(variables.USE_CHECKMARX, 'true'), eq(variables.flowIsToReview, true), not(startsWith(variables['Build.SourceBranch'], 'refs/tags/')) )
+  #   displayName: "Checkmarx Scan"
+  #   steps:
+  #   - task: Bash@3
+  #     displayName: Setup Gate Condition
+  #     continueOnError: true
+  #     env:
+  #       SKIP_SECURITY_GATE: $(SKIP_SECURITY_GATE)
+  #     inputs:
+  #       targetType: inline
+  #       script: |
+  #         if [[ "${SKIP_SECURITY_GATE}" == "True" ]]; then
+  #           echo "##[warning]O Security Gate está Desligado, a avaliação não será executada."
+  #           exit -1
+  #         fi
+  #         echo "##[debug]O Security Gate está Ligado."
+  #   - task: Bash@3
+  #     displayName: "Prepare Gates"
+  #     env:
+  #       CHECKMARX_THRESHOLD_ARGS_OUT: CHECKMARX_THRESHOLD_ARGS
+  #       SAST_HIGH: 1
+  #       SAST_MEDIUM: ''
+  #       SAST_LOW: ''
+  #       IAC_HIGH: 1
+  #       IAC_MEDIUM: ''
+  #       IAC_LOW: ''
+  #       SCA_HIGH: 1
+  #       SCA_MEDIUM: ''
+  #       SCA_LOW: ''
+  #       API_HIGH: 1
+  #       API_MEDIUM: ''
+  #       API_LOW: ''
+  #     inputs:
+  #       targetType: inline
+  #       script: |
+  #         getGate () {
+  #           ENGINE=$1
+  #           GATE_SEVERITY=$2
+  #           RET=$([[ -n ${GATE_SEVERITY} ]] && echo -n "${ENGINE}=${GATE_SEVERITY};" || echo -n "")
+  #           echo $RET
+  #         }
+
+  #         SAST="$(getGate sast-high ${SAST_HIGH})$(getGate sast-medium ${SAST_MEDIUM})$(getGate sast-low ${SAST_LOW})"
+  #         IAC="$(getGate iac-security-high ${IAC_HIGH})$(getGate iac-security-medium ${IAC_MEDIUM})$(getGate iac-security-low ${IAC_LOW})"
+  #         SCA="$(getGate sca-high ${SCA_HIGH})$(getGate sca-medium ${SCA_MEDIUM})$(getGate sca-low ${SCA_LOW})"
+  #         API="$(getGate api-security-high ${API_HIGH})$(getGate api-security-medium ${API_MEDIUM})$(getGate api-security-low ${API_LOW})"
+
+  #         if [[ -n "${SAST}" || -n "${IAC}" || -n "${SCA}" || -n "${API}" ]]; then
+  #           CHECKMARX_THRESHOLD_ARGS="--threshold \"${SAST}${IAC}${SCA}${API}\""
+  #         fi
+
+  #         echo "##vso[task.setvariable variable=${CHECKMARX_THRESHOLD_ARGS_OUT};]$CHECKMARX_THRESHOLD_ARGS"
+  #         echo "${CHECKMARX_THRESHOLD_ARGS_OUT}: ${CHECKMARX_THRESHOLD_ARGS}"
+  #   - task: Checkmarx AST@2
+  #     displayName: Checkmarx Scan
+  #     continueOnError: true
+  #     inputs:
+  #       CheckmarxService: 'checkmarx'
+  #       projectName: '$(CHECKMARX_APP_DEFAULT_NAME)'
+  #       branchName: '$(Build.SourceBranchName)'
+  #       tenantName: '$(CHECKMARX_TENANT)'
+  #       additionalParams: $(CHECKMARX_THRESHOLD_ARGS)
+  #     env:
+  #       HTTP_PROXY: $(PROXY_AGENT_HTTPS)
+  #   - task: Bash@3
+  #     displayName: Gate Validation
+  #     condition: in(variables['Agent.JobStatus'], 'SucceededWithIssues')
+  #     env:
+  #       SKIP_SECURITY_GATE: $(SKIP_SECURITY_GATE)
+  #     inputs:
+  #       targetType: inline
+  #       script: |
+  #         echo "SKIP_SECURITY_GATE: ${SKIP_SECURITY_GATE}"
+  #         if [[ ! "${SKIP_SECURITY_GATE}" =~ ^(T|t)rue$ ]]; then
+  #           echo "##vso[task.logissue type=error;]O Security Gate falhou!"
+  #           echo "##vso[task.complete result=Failed;]"
+  #           exit
+  #         fi
+  #         echo "##[warning]O Security Gate está Desligado e a validação do Gate foi ignorada!"

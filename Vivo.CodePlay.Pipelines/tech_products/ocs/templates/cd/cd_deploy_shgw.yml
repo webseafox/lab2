@@ -1,0 +1,388 @@
+parameters:
+  - name: components_to_install
+  - name: qa_environment
+  - name: skip_deploy
+  - name: version_to_install
+  - name: pool
+
+stages:
+  - stage: deploy
+    displayName: "Deploy ${{ parameters.qa_environment }}"
+    dependsOn:
+      - package
+    pool: ${{ parameters.pool }}
+    jobs:
+      - job: bundles_to_install
+        displayName: Select Bundles
+        condition: eq('${{ parameters.skip_deploy }}', false)
+        steps:
+          - download: none
+          - checkout: self
+
+          ## ARTIFACTS ANOTHER BUILD ID
+          - ${{ if startsWith(variables['Build.SourceBranch'], 'refs/tags') }}:
+              - bash: |
+                  echo "Branch/tag selecionado: $(Build.SourceBranch)"
+                  # Extrair só o nome da tag
+                  build_id=$(echo "$(Build.SourceBranch)" | sed 's#refs/tags/##')
+                  echo "Tag extraída: $build_id"
+                  echo "##vso[task.setvariable variable=BUILD_ID]$build_id"
+                  echo "PROJECT_NAME: $(PROJECT_NAME)"
+                  echo "PIPELINE_NAME: $(PIPELINE_NAME)"
+                  echo "BUILD_ID: $(BUILD_ID)"
+                name: export_build_id
+                displayName: Extract Build ID 
+
+              - task: DownloadBuildArtifacts@1
+                displayName: "Download Specific Build Artifact"
+                inputs:
+                  buildType: specific
+                  project: "$(PROJECT_NAME)"
+                  pipeline: "$(PIPELINE_NAME)"
+                  buildVersionToDownload: specific
+                  buildId: "$(BUILD_ID)"
+                  artifactName: "app"
+                  downloadPath: "$(System.ArtifactsDirectory)"
+
+          ## ARTIFACTS CURRENT BUILD ID
+          - ${{ else }}:
+              - task: DownloadBuildArtifacts@1
+                displayName: "Download Pipeline Artifact"
+                inputs:
+                  buildType: current
+                  artifactName: "app"
+                  downloadPath: "$(System.ArtifactsDirectory)"
+
+          - task: Bash@3
+            name: package_app
+            displayName: "Package App"
+            inputs:
+              targetType: inline
+              script: |
+                mkdir bundles_temp_dir
+                cp $(System.ArtifactsDirectory)/app/* bundles_temp_dir/
+                tar -xmf $(System.ArtifactsDirectory)/app/app.tar -C bundles_temp_dir
+                mkdir selected_bundles
+                echo "##[debug] List bundles_temp_dir:"
+                ls -la bundles_temp_dir
+                echo "##[debug] List bundles_temp_dir/il-gtw/configurations:"
+                ls -la bundles_temp_dir/il-gtw/configurations/target
+                for file in $(echo ${{parameters.components_to_install}} | tr "," "\n")
+                    do
+                        if [ ${{parameters.components_to_install}} == "configurations" ]; then
+                            echo "##[debug] Copying configurations for il-gtw"
+                            cp bundles_temp_dir/il-gtw/configurations/target/ilgtw-${{parameters.version_to_install}}-smartgateway-config-files.zip selected_bundles/
+                            mkdir selected_bundles/configurations
+                            echo "##[debug] Unzipping configurations for il-gtw"
+                            unzip -o selected_bundles/ilgtw-${{parameters.version_to_install}}-smartgateway-config-files.zip -d selected_bundles/configurations
+                        elif [ ${{parameters.components_to_install}} == "engine"]; then
+                            echo "##[debug] Copying engine for il-gtw"
+                            mkdir selected_bundles/engine
+                            engine_list="api-engine bridge-engine commons-engine data-mapping router-engine"
+                            for engine in $engine_list
+                                do
+                                    jar_path="bundles_temp_dir/il-gtw/engine/$engine/target"
+                                    jar_file=$(ls $jar_path/*.jar 2>/dev/null | head -n 1)
+                                    if [ -f "$jar_file" ]; then
+                                        echo "##[debug] Copying $jar_file"
+                                        mkdir selected_bundles/engine/$engine
+                                        cp "$jar_file" selected_bundles/engine/$engine/
+                                    else
+                                        echo "##[error] Error: Jar not found for $engine in $jar_path"
+                                        echo "##vso[task.complete result=Failed;]"
+                                        exit 1
+                                    fi
+                                done
+                        elif [ ${{parameters.components_to_install}} == "features"]; then
+                            echo "##[debug] Copying features for il-gtw"
+                            mkdir -p selected_bundles/features
+                            cp bundles_temp_dir/il-gtw/features/target/feature/*.html selected_bundles/features/
+                        elif [ ${{parameters.components_to_install}} == "plugins"]; then
+                            echo "##[debug] Copying plugins for il-gtw"
+                            mkdir selected_bundles/plugins
+                            plugins_list="commons featuretoggle-api featuretoggle-command featuretoggle-configadmin heartbeat logging metrics redis"
+                            for plugin in $plugins_list
+                                do
+                                    jar_path="bundles_temp_dir/il-gtw/plugins/$plugin/target"
+                                    jar_file=$(ls $jar_path/*.jar 2>/dev/null | head -n 1)
+                                    if [ -f "$jar_file" ]; then
+                                        echo "##[debug] Copying $jar_file"
+                                        mkdir selected_bundles/plugins/$plugin
+                                        cp "$jar_file" selected_bundles/plugins/$plugin/
+                                    else
+                                        echo "##[error] Error: Jar not found for $plugin in $jar_path"
+                                        echo "##vso[task.complete result=Failed;]"
+                                        exit 1
+                                    fi
+                                done
+                        elif [ ${{parameters.components_to_install}} == "repo"]; then
+                            echo "##[debug] Copying repo for il-gtw"
+                            cp bundles_temp_dir/il-gtw/repo/target/karaf/repo-${{parameters.version_to_install}}.zip selected_bundles/
+                            unzip -o selected_bundles/repo-${{parameters.version_to_install}}.zip -d selected_bundles/
+                        else
+                            echo "##[error] Error: The copy of the $file file failed."
+                            echo "##vso[task.complete result=Failed;]"
+                            echo "##vso[task.setvariable variable=INVALID_COMPONENT_TO_INSTALL;isOutput=true;]true"
+                            echo "##[debug] Exporting variable 'INVALID_COMPONENT_TO_INSTALL': true"      
+                            exit 1
+                        fi               
+                    done
+
+                echo "##[debug] List selected bundles:"
+                ls -la selected_bundles
+
+                echo "##vso[task.setvariable variable=INVALID_COMPONENT_TO_INSTALL;isOutput=true;]false"
+                echo "##[debug] Exporting variable 'INVALID_COMPONENT_TO_INSTALL': false"
+
+          - task: CopyFiles@2
+            displayName: Copy Bundles Files Staging Directory
+            inputs:
+              SourceFolder: "$(System.DefaultWorkingDirectory)/selected_bundles"
+              Contents: |
+                **
+              TargetFolder: "$(Build.ArtifactStagingDirectory)"
+              CleanTargetFolder: true
+              OverWrite: true
+              flattenFolders: false
+
+          - task: PublishBuildArtifacts@1
+            displayName: Publish Bundles Artifacts
+            inputs:
+              PathtoPublish: "$(Build.ArtifactStagingDirectory)"
+              ArtifactName: bundles
+              StoreAsTar: true
+
+      - deployment: deploy_${{ parameters.qa_environment }}
+        displayName: Deploy Bundles
+        dependsOn:
+          - bundles_to_install
+
+        variables:
+          - template: /.azuredevops/config/${{ parameters.qa_environment }}/server_variables.yml@self
+          - template: /.azuredevops/config/${{ parameters.qa_environment }}/environments_variables.yml@self
+          - name: deploy_app_folder
+            value: "/opt/osgi/deploy_app"
+          - name: current_date
+            value: $[ format('{0:yyyy}.{0:MM}.{0:dd}', pipeline.startTime) ]
+          - name: backup_datetime
+            value: $[ format('{0:yyyy}{0:MM}{0:dd}{0:HH}{0:mm}{0:ss}', pipeline.startTime) ]
+        condition: and(
+          succeeded(),
+          eq('${{ parameters.skip_deploy }}', false)
+          )
+        workspace:
+          clean: all
+        ${{ if or(contains(parameters.qa_environment, 'teste'), contains(parameters.qa_environment, 'lab')) }}:
+          environment:
+            name: "deploy-his_lab"
+            resourceType: VirtualMachine
+        ${{ else }}:
+          environment: "deploy-${{ parameters.qa_environment }}"
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: none
+                - checkout: none
+
+                - task: DownloadBuildArtifacts@1
+                  displayName: "Download Pipeline Artifact"
+                  inputs:
+                    buildType: current
+                    artifactName: "bundles"
+                    downloadPath: "$(System.ArtifactsDirectory)"
+                - script: |
+                    #!/bin/bash        
+                    echo "##vso[task.setvariable variable=backup_datetime;isOutput=true]$(backup_datetime)"
+                    echo "##[debug] Exporting variable 'backup_datetime': $(backup_datetime)"
+                  name: set_backup_datetime
+                - ${{ each connection in split(variables.SERVICE_CONNECTION,',') }}:
+                  - template: /tech_products/ocs/templates/cd/shgw/cd_get_credentials.yml
+                    parameters:
+                      CLIENT_ID: ${{ variables.CLIENT_ID }}
+                      CLIENT_SECRET: ${{ variables.CLIENT_SECRET }}
+                      CREDENTIAL_ID: ${{ variables.CREDENTIAL_ID }}
+                      SMART_KEY: ${{ variables.SMART_KEY }}
+                      SERVICE_CONNECTION: ${{ connection }}
+                      qa_environment: ${{ parameters.qa_environment }}
+
+                  - template: /tech_products/ocs/templates/cd/shgw/cd_create_backup.yml
+                    parameters:
+                      service_connection: ${{ connection }}
+                      backup_datetime: ${{ variables.backup_datetime }}
+                      deploy_app_folder: ${{ variables.deploy_app_folder }}
+                      user: ${{ variables.USER}}
+                      qa_environment: ${{ parameters.qa_environment }}
+
+                  - template: /tech_products/ocs/templates/cd/shgw/cd_stop_application.yml
+                    parameters:
+                      qa_environment: ${{ parameters.qa_environment }}
+                      service_connection: ${{ connection }}
+                      deploy_app_folder: ${{ variables.deploy_app_folder }}
+                      user: ${{ variables.USER}}
+                      components_to_install: ${{ parameters.components_to_install }}
+                      version_to_install: ${{ parameters.version_to_install }}
+
+                  - template: /tech_products/ocs/templates/cd/shgw/cd_install_bundles.yml
+                    parameters:
+                      version_to_install: ${{ parameters.version_to_install }}
+                      service_connection: ${{ connection }}
+                      deploy_app_folder: ${{ variables.deploy_app_folder }}
+                      user: ${{ variables.USER}}
+                      FORCE_ROLLBACK: 0
+                      qa_environment: ${{ parameters.qa_environment }}
+
+                  - template: /tech_products/ocs/templates/cd/shgw/cd_start_application.yml
+                    parameters:
+                      qa_environment: ${{ parameters.qa_environment }}
+                      service_connection: ${{ connection }}
+                      deploy_app_folder: ${{ variables.deploy_app_folder }}
+                      user: ${{ variables.USER}}
+  
+
+      - deployment: rollback_${{ parameters.qa_environment }}
+        displayName: Rollback Bundles
+
+        dependsOn:
+          - bundles_to_install
+          #- deploy_ilgtw
+
+        variables:
+          - template: /.azuredevops/config/${{ parameters.qa_environment }}/server_variables.yml@self
+          - template: /.azuredevops/config/${{ parameters.qa_environment }}/environments_variables.yml@self
+          - name: deploy_app_folder
+            value: "/opt/osgi/deploy_app"
+          - name: INVALID_COMPONENT_TO_INSTALL
+            value: $[ dependencies.bundles_to_install.outputs['package_bundles.INVALID_COMPONENT_TO_INSTALL'] ]
+          - name: current_date
+            value: $[ format('{0:yyyy}.{0:MM}.{0:dd}', pipeline.startTime) ]
+          - name: backup_datetime
+            value: $[ dependencies.${{ parameters.qa_environment }}.outputs['set_backup_datetime.backup_datetime'] ]
+
+        condition: and(or(failed('bundles_to_install'), failed('deploy_ilgtw')),eq('${{ parameters.skip_deploy }}', false))
+
+        ${{ if or(contains(parameters.qa_environment, 'teste'), contains(parameters.qa_environment, 'lab')) }}:
+          environment:
+            name: "deploy-his_lab"
+            resourceType: VirtualMachine
+        ${{ else }}:
+          environment: "deploy-${{ parameters.qa_environment }}"
+
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: none
+                - checkout: none
+
+                - task: DownloadBuildArtifacts@1
+                  displayName: "Download Pipeline Artifact"
+                  inputs:
+                    buildType: current
+                    artifactName: "bundles"
+                    downloadPath: "$(System.ArtifactsDirectory)"
+                - ${{ each connection in split(variables.SERVICE_CONNECTION,',') }}:
+                  - template: /tech_products/ocs/templates/cd/shgw/cd_stop_application.yml
+                    parameters:
+                      qa_environment: ${{ parameters.qa_environment }}
+                      service_connection: ${{ connection }}
+                      deploy_app_folder: ${{ variables.deploy_app_folder }}
+                      user: ${{ variables.USER}}
+                      components_to_install: ${{ parameters.components_to_install }}
+                      version_to_install: ${{ parameters.version_to_install }}
+
+                  - template: /tech_products/ocs/templates/cd/shgw/cd_rollback.yml
+                    parameters:
+                      qa_environment: ${{ parameters.qa_environment }}
+                      backup_datetime: ${{ variables.backup_datetime }}
+                      service_connection: ${{ connection }}
+                      deploy_app_folder: ${{ variables.deploy_app_folder }}
+                      user: ${{ variables.USER}}
+
+                  - template: /tech_products/ocs/templates/cd/shgw/cd_start_application.yml
+                    parameters:
+                      qa_environment: ${{ parameters.qa_environment }}
+                      service_connection: ${{ connection }}
+                      deploy_app_folder: ${{ variables.deploy_app_folder }}
+                      user: ${{ variables.USER}}    
+
+      - job: manual_rollback_${{ parameters.qa_environment }}
+        displayName: Manual Rollback Bundles
+        pool: server
+        variables:
+          - template: /.azuredevops/config/${{ parameters.qa_environment }}/server_variables.yml@self
+        dependsOn:
+          - bundles_to_install
+          - rollback_${{ parameters.qa_environment }}
+        condition: and(
+          failed('rollbacks'),
+          eq('${{ parameters.skip_deploy }}', false)
+          )
+        steps:
+          - task: ManualValidation@0
+            inputs:
+              notifyUsers: "vinicius.silva1@telefonica.com"
+              instructions: "Instruções: service conn - ${{ variables.SERVICE_CONNECTION }}"
+              onTimeout: "resume"
+
+      - job: governance_deploy
+        displayName: Governance Deploy
+        pool: ${{ parameters.pool }}
+
+        dependsOn:
+        #- deploy_ilgtw
+        condition: and(succeeded(), eq('${{ parameters.skip_deploy }}', false))
+        steps:
+          - download: none
+          - checkout: self
+
+          - script: |
+              if [ ! -f "catalog-info.yaml" ]; then
+                echo "##vso[task.logissue type=error] Unable to find catalog-info.yaml file (path=$(pwd))."
+              fi
+
+              COMPONENT_NAME="$(yq -r 'select(documentIndex == 0) | .metadata.name | select (.!=null)' catalog-info.yaml)"
+              echo "##vso[task.setvariable variable=COMPONENT_NAME]${COMPONENT_NAME}"
+              echo "##vso[task.setvariable variable=CATALOG_INFO_FILE_CONTENT]$(cat catalog-info.yaml)"
+            name: export_catalog_info
+            displayName: Reading Catalog Info File
+
+          - bash: |
+              version=$(grep version il-gtw/pom.xml | grep -v '<?xml' | grep '<version>'|head -n 1|awk '{print $1}'| cut -d'>' -f 2 | cut -d'<' -f 1)
+              echo "##vso[task.setvariable variable=APP_VERSION]$version"
+              echo "##[debug] Exporting variable 'APP_VERSION': $version"
+            name: export_current_version
+            displayName: Extract App Version
+
+          ## DEPLOY TO PROD
+          - ${{ if startsWith(parameters.qa_environment, 'producao') }}:
+              - task: VivoGovernance@1
+                inputs:
+                  breakglass: $(GOVAPP_BREAK_GLASS)
+                  cluster: "$(GOVAPP_CLUSTER)"
+                  component: "$(COMPONENT_NAME)"
+                  deployment: "$(COMPONENT_NAME)"
+                  environment: "producao"
+                  namespace: "$(GOVAPP_NAMESPACE)"
+                  operation: "deploy"
+                  serverEndpoint: $(GOVAPP_SERVICE_CONNECTION_NAME)
+                  version: "$(APP_VERSION)"
+                  catalogInfo: $(CATALOG_INFO_FILE_CONTENT)
+                continueOnError: true
+                condition: eq(lower(variables.GOVAPP_INTEGRATION_ENABLED), 'true')
+
+          - ${{ else }}:
+              - task: VivoGovernance@1
+                inputs:
+                  breakglass: $(GOVAPP_BREAK_GLASS)
+                  cluster: "$(GOVAPP_CLUSTER)"
+                  component: "$(COMPONENT_NAME)"
+                  deployment: "$(COMPONENT_NAME)"
+                  environment: "${{ parameters.qa_environment }}"
+                  namespace: "$(GOVAPP_NAMESPACE)"
+                  operation: "deploy"
+                  serverEndpoint: $(GOVAPP_SERVICE_CONNECTION_NAME)
+                  version: "$(APP_VERSION)"
+                  catalogInfo: $(CATALOG_INFO_FILE_CONTENT)
+                continueOnError: true
+                condition: eq(lower(variables.GOVAPP_INTEGRATION_ENABLED), 'true')

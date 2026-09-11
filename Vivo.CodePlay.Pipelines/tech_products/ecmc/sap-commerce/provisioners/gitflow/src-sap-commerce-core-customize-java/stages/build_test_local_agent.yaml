@@ -1,0 +1,625 @@
+parameters:
+  - name: enable_devflow_validations
+    type: boolean
+    default: False
+  - name: serviceConnectionName
+    default: $(SONARQUBE_SERVICE_CONNECTION_NAME)
+  - name: sourceFolder
+    default: $(Build.SourcesDirectory)
+  - name: artifactPublishName
+    type: string
+    default: app
+  - name: pathtoPublish
+    type: string
+    default: $(Build.ArtifactStagingDirectory)
+
+stages:     
+  - stage: build_test
+    displayName: "Prepare Build & Test"
+    pool:
+      name: $(PRIVATE_AGENT_SAPCOMM)
+    dependsOn:
+      - pipeline_init
+      - ${{ if and(eq(variables['flowIsPullRequest'], True), eq(parameters.enable_devflow_validations, True)) }}:
+          - repo_validations
+    jobs:
+      - job: "prepare_build"
+        displayName: "Pre Build and Test Core Customize"
+        condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+        workspace:
+          clean: all
+        steps:
+          - checkout: self
+            fetchDepth: 1
+
+          - bash: |
+              echo "##[section]Stage para execução de build e testes do Core Customize"
+            displayName: "Job information"
+
+          # SECURITY STAGE REQUIRES app.tar.gz. NOT REMOVE THIS TEMPLATE INCLUDE
+          # THE IF CONDITION IS ALLOWED TO BE REMOVED
+          - ${{ if eq(variables['Build.Reason'], 'PullRequest') }}:
+              - template: /tech_products/ecmc/sap-commerce/task_groups/pre_build/hybris_essentials_local_agent.yaml
+
+  - stage: build_test_for_gates
+    displayName: "Build & Test"
+    pool:
+      name: $(PRIVATE_AGENT_SAPCOMM)
+    dependsOn:
+      - pipeline_init
+      - ${{ if and(eq(variables['Build.Reason'], 'PullRequest'), eq(parameters.enable_devflow_validations, True)) }}:
+          - repo_validations
+    jobs:
+      - job: "start_build"
+        displayName: "Build and Test Core Customize"
+        workspace:
+          clean: all
+        timeoutInMinutes: 600
+        steps:
+          - checkout: self
+            fetchDepth: 1
+
+          - bash: |
+              echo "##[section]Stage para execução de build e testes do Core Customize"
+              # mkdir -p $(System.DefaultWorkingDirectory)/hybris-downloaded-artifact
+            displayName: "Job information"
+
+          - template: /tech_products/ecmc/sap-commerce/tasks/artifacts/copy_cxcom.yaml
+
+          - script: |
+              CONFIG_FILE="$(Build.SourcesDirectory)/.azuredevops/sapcomm-versions.yaml"
+
+              if [ ! -f "$CONFIG_FILE" ]; then
+                echo "##[error]Arquivo de configuração não encontrado: $CONFIG_FILE"
+                echo "##[error]Crie o arquivo .azuredevops/sapcomm-versions.yaml com os atributos 'versions.sapcomm' e 'versions.telco'."
+                exit 1
+              fi
+
+              echo "##[section]####### Lendo versões do arquivo $CONFIG_FILE #######"
+              cat "$CONFIG_FILE"
+              echo "##[section]#####################################################"
+
+              JDK_VERSION=$(awk -F': ' '/jdk:/ {gsub(/[[:space:]]/, "", $2); print $2}' "$CONFIG_FILE")
+
+              # Use the Java version available in the agent
+              JAVA_HOME_LOCAL=/opt/java/$JDK_VERSION
+              if [ -z "$JAVA_HOME_LOCAL" ] || [ ! -x "$JAVA_HOME_LOCAL/bin/java" ]; then
+                echo "##[error]Failed to find Java 21 installation directory: '$JAVA_HOME_LOCAL'"
+                echo "##[section]Available Java versions:"
+                asdf list java || echo "No Java versions found"
+                exit 1
+              fi
+              echo "##[section]Java path: $JAVA_HOME_LOCAL"
+              "$JAVA_HOME_LOCAL/bin/java" -version
+              echo "##vso[task.setvariable variable=JAVA_HOME_LOCAL]$JAVA_HOME_LOCAL"
+              echo "##vso[task.prependpath]$JAVA_HOME_LOCAL/bin"
+            displayName: "Set Java Version from Local agent"
+
+          - script: |
+              java -version
+            displayName: "Validate Java Version"
+
+          - script: |
+              cd $(System.DefaultWorkingDirectory)
+              cat $(System.DefaultWorkingDirectory)/hybris/bin/platform/build.number
+            displayName: "Validate Hybris Directory"
+
+          - script: |
+              cd $(Build.SourcesDirectory)/hybris
+              mv -v config config_old
+            displayName: "Renaming config folder"
+
+          - script: |
+              cd $(Build.SourcesDirectory)/hybris/bin/platform
+              export JAVA_HOME="$(JAVA_HOME_LOCAL)"
+              sed -i "2i export ANT_MEM_OPTS=\"$(BUILD_ANT_MEM_OPTS)\"" ./setantenv.sh
+              source ./setantenv.sh
+
+              echo | ant
+            displayName: "Recreating config folder"
+
+          - script: |
+              cp -r $(System.DefaultWorkingDirectory)/hybris/config_old/environments/pipeextensions.xml $(System.DefaultWorkingDirectory)/hybris/config/localextensions.xml
+              cp -r $(System.DefaultWorkingDirectory)/hybris/config_old/local.properties $(System.DefaultWorkingDirectory)/hybris/config/
+              cp -rf $(System.DefaultWorkingDirectory)/hybris/config_old/customize/ $(System.DefaultWorkingDirectory)/hybris/config/
+              cp -rf $(System.DefaultWorkingDirectory)/hybris/config_old/ant/ $(System.DefaultWorkingDirectory)/hybris/config/
+            displayName: "Updating config files"
+
+          - script: |
+              echo "##[section] ####### localextensions.xml #######"
+              cat $(System.DefaultWorkingDirectory)/hybris/config/localextensions.xml
+              echo
+
+              echo "##[section] ####### local.properties #######"
+              cat $(System.DefaultWorkingDirectory)/hybris/config/local.properties
+              echo
+
+              echo "##[section] ####### Pasta hybris/config #######"
+              ls -la $(System.DefaultWorkingDirectory)/hybris/config/
+              echo
+
+              echo "##[section] ####### Pasta hybris/config/customize #######"
+              ls -la $(System.DefaultWorkingDirectory)/hybris/config/customize
+              echo
+
+              echo "##[section] ####### Pasta hybris/config/ant #######"
+              ls -la $(System.DefaultWorkingDirectory)/hybris/config/ant
+            displayName: "Validate config files"
+
+          - script: |
+              cd $(Build.SourcesDirectory)/hybris/bin/platform
+              export JAVA_HOME="$(JAVA_HOME_LOCAL)"
+              sed -i "2i export ANT_MEM_OPTS=\"$(BUILD_ANT_MEM_OPTS)\"" ./setantenv.sh
+              export ANT_MEM_OPTS="$(BUILD_ANT_MEM_OPTS)"
+              source ./setantenv.sh
+              
+              ant customize
+            displayName: "ant customize"
+
+          - script: |
+              PAT=$(System.AccessToken)
+              URI=$(System.CollectionUri)${SYSTEM_TEAMPROJECT}
+              REPO_ID=$(Build.Repository.ID)
+              PR_ID=$(System.PullRequest.PullRequestId)
+
+              # Função para verificar se um caminho corresponde aos padrões de exclusão
+              matches_exclusion_pattern() {
+                local file_path="$1"
+
+                # Remover barra inicial se existir
+                file_path="${file_path#/}"
+
+                local exclusions="$SONAR_COVERAGE_EXCLUSIONS"
+                local excluded_exts="$SONAR_EXCLUDEDEXTENSIONS"
+
+                # 1. Verificar padrões de exclusão do sonar.coverage.exclusions
+                if [ -n "$exclusions" ]; then
+                  IFS=',' read -ra PATTERNS <<< "$exclusions"
+                  for pattern in "${PATTERNS[@]}"; do
+                    pattern=$(echo "$pattern" | xargs)
+                    [ -z "$pattern" ] && continue
+                    # Remover prefixo "file:" se existir (sintaxe SonarQube)
+                    pattern="${pattern#file:}"
+                    # Converter padrão SonarQube para regex:
+                    # **/ -> .*
+                    # *   -> [^/]*
+                    regex_pattern=$(echo "$pattern" | sed 's|\*\*/|.*/|g' | sed 's|\*|[^/]*|g')
+                    if echo "$file_path" | grep -qE "$regex_pattern"; then
+                      #echo "##[debug]Excluído por sonar.coverage.exclusions: $file_path -> $pattern"
+                      return 0
+                    fi
+                  done
+                fi
+
+                # 2. Verificar padrões de exclusão do sonar.exclusions
+                local sonar_exclusions="$SONAR_EXCLUSIONS"
+                if [ -n "$sonar_exclusions" ]; then
+                  IFS=',' read -ra PATTERNS <<< "$sonar_exclusions"
+                  for pattern in "${PATTERNS[@]}"; do
+                    pattern=$(echo "$pattern" | xargs)
+                    [ -z "$pattern" ] && continue
+                    # Remover prefixo "file:" se existir (sintaxe SonarQube)
+                    pattern="${pattern#file:}"
+                    regex_pattern=$(echo "$pattern" | sed 's|\*\*/|.*/|g' | sed 's|\*|[^/]*|g')
+                    if echo "$file_path" | grep -qE "$regex_pattern"; then
+                      return 0
+                    fi
+                  done
+                fi
+
+                # 3. Verificar padrões de caminho em sonar.excludedExtensions
+                # Aceita formato: "vivocore,vivofacades,somemodule"
+                # Se o caminho contém qualquer um desses padrões, deve ser excluído
+                if [ -n "$excluded_exts" ]; then
+                  # Extrair o nome da extensão antes de /src/
+                  extension_name=$(echo "$file_path" | sed -n 's|.*/\([^/]*\)/src/.*|\1|p')
+
+                  if [ -n "$extension_name" ]; then
+                    IFS=',' read -ra PATTERN_ARR <<< "$excluded_exts"
+                    for pattern in "${PATTERN_ARR[@]}"; do
+                      pattern=$(echo "$pattern" | xargs)
+                      [ -z "$pattern" ] && continue
+                      # Verificar match exato do nome da extensão
+                      if [ "$extension_name" = "$pattern" ]; then
+                        return 0
+                      fi
+                    done
+                  fi
+                fi
+
+                return 1  # Não excluído
+              }
+
+              # Função para verificar se um TESTE deve ser excluído
+              # Testes só são excluídos por sonar.excludedExtensions (módulos ignorados),
+              # NÃO por sonar.coverage.exclusions ou sonar.exclusions (que contêm **/testsrc/**)
+              matches_test_exclusion_pattern() {
+                local file_path="$1"
+                file_path="${file_path#/}"
+
+                local excluded_exts="$SONAR_EXCLUDEDEXTENSIONS"
+
+                if [ -n "$excluded_exts" ]; then
+                  extension_name=$(echo "$file_path" | sed -n 's|.*/\([^/]*\)/testsrc/.*|\1|p')
+                  [ -z "$extension_name" ] && extension_name=$(echo "$file_path" | sed -n 's|.*/\([^/]*\)/src/.*|\1|p')
+
+                  if [ -n "$extension_name" ]; then
+                    IFS=',' read -ra PATTERN_ARR <<< "$excluded_exts"
+                    for pattern in "${PATTERN_ARR[@]}"; do
+                      pattern=$(echo "$pattern" | xargs)
+                      [ -z "$pattern" ] && continue
+                      if [ "$extension_name" = "$pattern" ]; then
+                        return 0
+                      fi
+                    done
+                  fi
+                fi
+
+                return 1  # Não excluído
+              }
+
+              URL_AZ_PR=$(echo "$URI/_apis/git/repositories/$REPO_ID/pullRequests/$PR_ID/iterations?api-version=7.1" | sed 's/ /%20/g')
+
+              echo "##[debug]###############################################################"
+              echo "##[debug]URI: $URI"
+              echo "##[debug]REPO_ID: $REPO_ID"
+              echo "##[debug]PR_ID: $PR_ID"
+              echo "##[debug]URL SERVICE: $URL_AZ_PR"
+              echo "##[debug]###############################################################"
+
+              ITERATIONS_RESPONSE=$(curl -s \
+              -H "accept: application/json;api-version=7.1" \
+              -H "Content-Type: application/json" \
+              -u ":$PAT" \
+              "$URL_AZ_PR")
+
+              # Validar se a resposta é um JSON válido
+              if ! echo "$ITERATIONS_RESPONSE" | jq empty 2>/dev/null; then
+                echo "##[error]Error to search PullRequest Iterations!"
+                exit 1
+              fi
+
+              # Verificar se o JSON tem a estrutura esperada
+              if ! echo "$ITERATIONS_RESPONSE" | jq -e '.value' >/dev/null 2>&1; then
+                echo "##[error]Error to get Value property in Json response"
+                exit 1
+              fi
+
+              # Extrair valor de sonar.coverage.exclusions do arquivo de propriedades
+              SONAR_COVERAGE_EXCLUSIONS=""
+              SONAR_EXCLUDEDEXTENSIONS=""
+              SONAR_EXCLUSIONS=""
+              if [ -f ".azuredevops/sonar-project.properties" ]; then
+                SONAR_COVERAGE_EXCLUSIONS=$(grep '^sonar.coverage.exclusions=' .azuredevops/sonar-project.properties | tail -1 | cut -d'=' -f2-)
+                SONAR_EXCLUDEDEXTENSIONS=$(grep '^sonar.excludedExtensions=' .azuredevops/sonar-project.properties | tail -1 | cut -d'=' -f2-)
+                SONAR_EXCLUSIONS=$(grep '^sonar.exclusions=' .azuredevops/sonar-project.properties | tail -1 | cut -d'=' -f2-)
+                echo "##[command] SONAR_COVERAGE_EXCLUSIONS: $SONAR_COVERAGE_EXCLUSIONS"
+                echo "##[command] SONAR_EXCLUDEDEXTENSIONS: $SONAR_EXCLUDEDEXTENSIONS"
+                echo "##[command] SONAR_EXCLUSIONS: $SONAR_EXCLUSIONS"
+              else
+                echo "##[warning]Arquivo pitest-project.properties não encontrado"
+              fi
+
+              COUNT_ITERATIONS=$(echo "$ITERATIONS_RESPONSE" | jq '.count')
+
+              # Criar arquivo temporário para armazenar todos os resultados
+              TEMP_FILE=$(mktemp)
+              TEMP_FILE_TESTS=$(mktemp)
+
+              # Extrai os IDs e itera sobre cada um
+              URL_AZ_CHANGES=$(echo "$URI/_apis/git/repositories/$REPO_ID/pullRequests/$PR_ID/iterations/$COUNT_ITERATIONS/changes?\$top=$(PULLREQUEST_CHANGES_NUMBER_API)&api-version=7.1" | sed 's/ /%20/g')
+
+              echo "##[debug]################################################################"
+              echo "##[debug]URL_AZ_CHANGES: $URL_AZ_CHANGES"
+              echo "##[debug]################################################################"
+
+              # Faz a chamada para cada ID de iteração
+              CHANGES_RESPONSE=$(curl -s \
+              -H "accept: application/json;api-version=7.1" \
+              -H "Content-Type: application/json" \
+              -u ":$PAT" \
+              "$URL_AZ_CHANGES")
+
+              # Validar resposta das mudanças
+              if ! echo "$CHANGES_RESPONSE" | jq empty 2>/dev/null; then
+                echo "##[warning]Test classes not found in this iteration!"
+                exit 0
+              fi
+
+              # Extrair e filtrar caminhos dos arquivos Java
+              filtered_java_files=$(echo "$CHANGES_RESPONSE" | jq -r '.changeEntries[]?.item.path | select(. != null and endswith(".java"))' | while read -r file_path; do
+                if ! matches_exclusion_pattern "$file_path"; then
+                  echo "$file_path"
+                fi
+              done)
+
+              # Extrair e filtrar caminhos dos testes (apenas por excludedExtensions, não por coverage/exclusions)
+              filtered_test_files=$(echo "$CHANGES_RESPONSE" | jq -r '.changeEntries[]?.item.path | select(. != null and endswith("Test.java"))' | while read -r file_path; do
+                if ! matches_test_exclusion_pattern "$file_path"; then
+                  echo "$file_path"
+                fi
+              done)
+
+              echo "$filtered_java_files" > "$TEMP_FILE"
+              echo "$filtered_test_files" > "$TEMP_FILE_TESTS"
+
+              # Processa o arquivo: extrai as classes Java a partir de "br/" e substitui barras por pontos
+              PR_CLASSES=""
+              if [ -s "$TEMP_FILE" ]; then
+                PR_CLASSES=$(cat "$TEMP_FILE" | grep -v -E "(Test|IntegrationTest|UnitTest)\.java$" | grep -o "br/.*" | sed 's/\//./g' | sed 's/\.java$//' | sort -u | tr '\n' ',' | sed 's/,$//' || true)
+              fi
+
+              # Primeiro, extrair testes reais do TEMP_FILE_TESTS
+              # Processar testes reais com validação
+              PR_TESTS=""
+              if [ -s "$TEMP_FILE_TESTS" ]; then
+                PR_TESTS=$(cat "$TEMP_FILE_TESTS" | grep -o "br/.*" | sed 's/\//./g' | sed 's/\.java"*$//' | sort -u | tr '\n' ',' | sed 's/,$//' || true)
+              fi
+
+              # Depois, gerar classes inferidas baseado em PR_TESTS com sufixo "Test"
+              INFERRED_CLASSES=""
+              if [ -n "$PR_TESTS" ]; then
+                INFERRED_CLASSES=$(echo "$PR_TESTS" | sed 's/IntegrationTest//g' | sed 's/UnitTest//g' | sed 's/Test//g')
+              fi
+
+              # Depois, gerar testes inferidos baseado em PR_CLASSES com sufixo "Test"
+              INFERRED_TESTS=""
+              if [ -n "$PR_CLASSES" ]; then
+                INFERRED_TESTS=$(echo "$PR_CLASSES" | sed 's/,/Test,/g' | sed 's/$/Test/')
+              fi
+
+              # Combinar os dois tipos de testes, removendo duplicatas
+              ALL_CLASSES=""
+              if [ -n "$PR_CLASSES" ] && [ -n "$INFERRED_CLASSES" ]; then
+                # Combinar ambas as listas e remover duplicatas
+                ALL_CLASSES=$(echo "$PR_CLASSES,$INFERRED_CLASSES" | tr ',' '\n' | sed '/^$/d' | sort -u | tr '\n' ',' | sed 's/,$//')
+              elif [ -n "$PR_CLASSES" ]; then
+                ALL_CLASSES="$PR_CLASSES"
+              elif [ -n "$INFERRED_CLASSES" ]; then
+                ALL_CLASSES="$INFERRED_CLASSES"
+              fi
+
+              # Combinar os dois tipos de testes, removendo duplicatas
+              ALL_TESTS=""
+              if [ -n "$PR_TESTS" ] && [ -n "$INFERRED_TESTS" ]; then
+                # Combinar ambas as listas e remover duplicatas
+                ALL_TESTS=$(echo "$PR_TESTS,$INFERRED_TESTS" | tr ',' '\n' | sed '/^$/d' | sort -u | tr '\n' ',' | sed 's/,$//')
+              elif [ -n "$PR_TESTS" ]; then
+                ALL_TESTS="$PR_TESTS"
+              elif [ -n "$INFERRED_TESTS" ]; then
+                ALL_TESTS="$INFERRED_TESTS"
+              fi
+
+              # Remove o arquivo temporário
+              rm -f "$TEMP_FILE" "$TEMP_FILE_TESTS"
+
+              echo "##[command]ALL CLASSES=$ALL_CLASSES"
+              echo "##[command]ALL TESTS=$ALL_TESTS"
+
+              echo "##vso[task.setvariable variable=ALL_CHANGED_TESTS]$ALL_TESTS"
+              echo "##vso[task.setvariable variable=ALL_CHANGED_CLASSES]$ALL_CLASSES"
+            displayName: Getting updated classes files
+            condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+            env:
+              HTTP_PROXY: $(PROXY_NSKP_HTTP)
+              HTTPS_PROXY: $(PROXY_NSKP_HTTPS)
+              NO_PROXY: $(PROXY_NSKP_NO_PROXY)
+
+          - script: |
+              cd $(Build.SourcesDirectory)/hybris/bin/platform
+              export JAVA_HOME="$(JAVA_HOME_LOCAL)"
+              sed -i "2i export ANT_MEM_OPTS=\"$(BUILD_ANT_MEM_OPTS)\"" ./setantenv.sh
+              export ANT_MEM_OPTS="$(BUILD_ANT_MEM_OPTS)"
+              source ./setantenv.sh
+
+              ant clean
+            displayName: "ant clean"
+
+          - script: |
+              MAVEN_CONFIG_DIR="$(Build.SourcesDirectory)/hybris/bin/platform/resources/ant/maven-config"
+              STATIC_SETTINGS_FILE="/devops/sapcommerce/PIPE-CONF/maven/settings.xml"
+
+              if [ ! -d "$MAVEN_CONFIG_DIR" ]; then
+                echo "##[error]Diretório não encontrado: $MAVEN_CONFIG_DIR"
+                exit 1
+              fi
+
+              if [ ! -f "$STATIC_SETTINGS_FILE" ]; then
+                echo "##[error]Arquivo estático de proxy não encontrado no agente: $STATIC_SETTINGS_FILE"
+                exit 1
+              fi
+
+              cp -f "$STATIC_SETTINGS_FILE" "$MAVEN_CONFIG_DIR/settings.xml"
+
+              echo "##[section]settings.xml substituído em $MAVEN_CONFIG_DIR"
+              cat "$MAVEN_CONFIG_DIR/settings.xml"
+            displayName: "Configure Maven proxy settings.xml"
+
+          - script: |
+              cd $(Build.SourcesDirectory)/hybris/bin/platform
+              export JAVA_HOME="$(JAVA_HOME_LOCAL)"
+              sed -i "2i export ANT_MEM_OPTS=\"$(BUILD_ANT_MEM_OPTS)\"" ./setantenv.sh
+              export ANT_MEM_OPTS="$(BUILD_ANT_MEM_OPTS)"
+              source ./setantenv.sh
+              export ANT_OPTS=$ANT_OPTS" -Dhttp.proxyHost=$(PROXY_LOCAL_AGENT_HOST) -Dhttp.proxyPort=$(PROXY_LOCAL_AGENT_PORT) -Dhttps.proxyHost=$(PROXY_LOCAL_AGENT_HOST) -Dhttps.proxyPort=$(PROXY_LOCAL_AGENT_PORT)"
+              
+              ant all
+            displayName: "ant all"
+
+          - script: |
+              cd $(Build.SourcesDirectory)/hybris/bin/platform
+              export JAVA_HOME="$(JAVA_HOME_LOCAL)"
+              sed -i "2i export ANT_MEM_OPTS=\"$(BUILD_ANT_MEM_OPTS)\"" ./setantenv.sh
+              export ANT_MEM_OPTS="$(BUILD_ANT_MEM_OPTS)"
+              source ./setantenv.sh
+              
+              if [[ "$(Build.Reason)" == "PullRequest" && -n "$(ALL_CHANGED_TESTS)" ]]; then
+                echo "##[section]Running tests for changed classes only: ant yunitinit -Dtest=$(ALL_CHANGED_TESTS)"
+                ant yunitinit -Dtest=$(ALL_CHANGED_TESTS)
+              else
+                ant yunitinit
+              fi
+            displayName: "ant yunitinit"
+
+          - script: |
+              cd $(Build.SourcesDirectory)/hybris/bin/platform
+              export JAVA_HOME="$(JAVA_HOME_LOCAL)"
+              sed -i "2i export ANT_MEM_OPTS=\"$(BUILD_ANT_MEM_OPTS)\"" ./setantenv.sh
+              export ANT_MEM_OPTS="$(BUILD_ANT_MEM_OPTS)"
+              source ./setantenv.sh
+
+              JACOCO_EXEC=False
+              if [[ "$(Build.Reason)" == "PullRequest" ]]; then
+                if [[ -n "$(ALL_CHANGED_TESTS)" ]]; then
+                  echo "##[section]Running tests for changed classes only: ant jacocoalltests -Dtestclasses.packages=$(ALL_CHANGED_TESTS)"
+                  ant jacocoalltests -Dtestclasses.packages=$(ALL_CHANGED_TESTS)
+                  JACOCO_EXEC=True
+                else
+                  echo "##[section]Nenhum teste encontrado para execução do Jacoco. Pulando execução."
+                fi
+              else
+                ant jacocoalltests
+                JACOCO_EXEC=True
+              fi
+              echo "##vso[task.setvariable variable=JACOCO_EXEC;isOutput=true]${JACOCO_EXEC}"
+              echo "[section]JACOCO_EXEC ...........: $JACOCO_EXEC"
+            name: run_jacoco
+            displayName: "ant jacocoalltests"
+
+          - script: |
+              cd $(Build.SourcesDirectory)/hybris/bin/platform
+              export JAVA_HOME="$(JAVA_HOME_LOCAL)"
+              sed -i "2i export ANT_MEM_OPTS=\"$(BUILD_ANT_MEM_OPTS)\"" ./setantenv.sh
+              export ANT_MEM_OPTS="$(BUILD_ANT_MEM_OPTS)"
+              source ./setantenv.sh
+ 
+              PITEST_EXEC=False
+              if [[ "$(Build.Reason)" == "PullRequest" && -n "$(ALL_CHANGED_CLASSES)" && -n "$(ALL_CHANGED_TESTS)" ]]; then
+                ant pitest -Dpitest.targetClasses=$(ALL_CHANGED_CLASSES) -Dpitest.targetTests=$(ALL_CHANGED_TESTS) -Dpitest.outputFormats=XML,HTML
+                PITEST_EXEC=True
+              else
+                echo "##[section]Nenhum teste encontrado para execução do PiTest. Pulando execução."
+                PITEST_EXEC=False
+              fi
+              echo "##vso[task.setvariable variable=PITEST_EXEC;isOutput=true]${PITEST_EXEC}"
+              echo "[section]PITEST_EXEC ...........: $PITEST_EXEC"
+            name: run_pitest
+            displayName: "ant pitest"
+            condition: and(
+                          eq(variables.PITEST_IS_ENABLED, 'True'),
+                          eq(variables['run_jacoco.JACOCO_EXEC'], 'True'),
+                          eq(variables.flowIsPullRequest, True),
+                          ne(variables['flowIsPRStageWithMasterSapCommerce'], 'true')
+                        )
+            continueOnError: true
+
+          - bash: |
+              echo "##[section]Config additional properties .azuredevops/sonar-project.properties"
+              if [[ "$(Build.Reason)" == "PullRequest" ]]; then
+                BRANCH=$(echo "$(System.PullRequest.SourceBranch)" | sed 's/refs\/heads\///g')
+                # echo "sonar.branch.name=$BRANCH" >> $(Build.SourcesDirectory)/.azuredevops/sonar-project.properties
+                echo "sonar.newCode.referenceBranch=$(System.PullRequest.TargetBranchName)" >> $(Build.SourcesDirectory)/.azuredevops/sonar-project.properties
+              else
+                BRANCH=$(echo "$(Build.SourceBranch)" | sed 's/refs\/heads\///g')
+                echo "sonar.branch.name=$BRANCH" >> $(Build.SourcesDirectory)/.azuredevops/sonar-project.properties
+              fi
+              echo "sonar.analysisCache.enabled=$(SONAR_ANALYSIS_CACHE_ENABLED)" >> $(Build.SourcesDirectory)/.azuredevops/sonar-project.properties
+              sed  -i '/^sonar.log.level/d' $(Build.SourcesDirectory)/.azuredevops/sonar-project.properties
+              echo "sonar.log.level=${SONAR_LOG_LEVEL}" >> $(Build.SourcesDirectory)/.azuredevops/sonar-project.properties
+
+              APP_VERSION=$(cat VERSION)
+              echo "Setting variable APP_VERSION: ............... : ${APP_VERSION}"
+              echo "##vso[task.setvariable variable=APP_VERSION]$APP_VERSION"
+
+              PROJECT_KEY=$(cat .azuredevops/sonar-project.properties | grep  'sonar.projectKey' | sed 's/sonar.projectKey\=//')
+              echo "Setting variable PROJECT_KEY: ............... : ${PROJECT_KEY}"
+              echo "##vso[task.setvariable variable=PROJECT_KEY]$PROJECT_KEY"
+
+              echo "##[section]Detalhes do arquivo .azuredevops/sonar-project.properties"
+              echo "##[section]Para logs do Sonar com mais detalhes altere o valor da variável SONAR_LOG_LEVEL com o valor DEBUG"
+              cat $(Build.SourcesDirectory)/.azuredevops/sonar-project.properties
+            condition: eq(variables['run_jacoco.JACOCO_EXEC'], 'True')
+            continueOnError: true
+            displayName: "Add properties to sonar-project.properties"
+            env:
+              SONAR_LOG_LEVEL: $(SONAR_LOG_LEVEL)
+
+          - task: SonarQubePrepare@7
+            condition: eq(variables['run_jacoco.JACOCO_EXEC'], 'True')
+            inputs:
+              SonarQube: "${{ parameters.serviceConnectionName }}"
+              scannerMode: "CLI"
+              configFile: "$(Build.SourcesDirectory)/.azuredevops/sonar-project.properties"
+              extraProperties: |
+                sonar.scm.disabled=True
+              #sonar.projectVersion=$(APP_VERSION)
+
+
+          # Run SonarQube analysis only for "not PRs" or variable flowIsPRStageWithMasterSapCommerce is true and continue on error
+          - task: SonarQubeAnalyze@7
+            continueOnError: true
+            condition: and(
+                        or(
+                          ne(variables['Build.Reason'], 'PullRequest'),
+                          eq(variables['flowIsPRStageWithMasterSapCommerce'], 'true')
+                        ),
+                        eq(variables['run_jacoco.JACOCO_EXEC'], 'True')
+                      )
+            inputs:
+              jdkversion: "JAVA_HOME"
+            displayName: Analysis PR master with stage or stage with master
+
+          # Run SonarQube analysis only for  PRs or variable flowIsPRStageWithMasterSapCommerce is not equal true and not continue on error
+          - task: SonarQubeAnalyze@7
+            continueOnError: true
+            condition: and(
+                          eq(variables['Build.Reason'], 'PullRequest'),
+                          ne(variables['flowIsPRStageWithMasterSapCommerce'], 'true'),
+                          eq(variables['run_jacoco.JACOCO_EXEC'], 'True')
+                        )
+            inputs:
+              jdkversion: "JAVA_HOME"
+            displayName: Analysis PR
+
+          - task: SonarQubePublish@7
+            condition: eq(variables['run_jacoco.JACOCO_EXEC'], 'True')
+            inputs:
+              pollingTimeoutSec: $(SONARQUBE_QUALITYGATE_TIMEOUT)
+
+          - task: PublishPipelineArtifact@1
+            condition: eq(variables['run_jacoco.JACOCO_EXEC'], 'True')
+            inputs:
+              targetPath: "$(Build.SourcesDirectory)/hybris/log/junit"
+              artifactName: "JunitReport"
+              publishLocation: "Pipeline"
+            displayName: "Publish Junit Report"
+            continueOnError: true
+
+          - task: PublishPipelineArtifact@1
+            condition: eq(variables['run_jacoco.JACOCO_EXEC'], 'True')
+            inputs:
+              targetPath: "$(Build.SourcesDirectory)/hybris/log/jacoco/html"
+              artifactName: "JacocoReport"
+              publishLocation: "Pipeline"
+            displayName: "Publish Jacoco Report"
+            continueOnError: true
+
+          - task: PublishPipelineArtifact@1
+            condition: and(
+                          eq(variables.PITEST_IS_ENABLED, 'True'),
+                          eq(variables['run_jacoco.JACOCO_EXEC'], 'True'),
+                          eq(variables.flowIsPullRequest, True),
+                          ne(variables['flowIsPRStageWithMasterSapCommerce'], 'true')
+                        )
+            inputs:
+              targetPath: "$(Build.SourcesDirectory)/hybris/log/pitest-reports"
+              artifactName: "PitestReport"
+              publishLocation: "Pipeline"
+            displayName: "Publish Pitest Report"
+            continueOnError: true
+
+          - task: PublishCodeCoverageResults@2
+            condition: eq(variables['run_jacoco.JACOCO_EXEC'], 'True')
+            continueOnError: true
+            inputs:
+              summaryFileLocation: "$(Build.SourcesDirectory)/hybris/log/jacoco/jacoco-*-report.xml"

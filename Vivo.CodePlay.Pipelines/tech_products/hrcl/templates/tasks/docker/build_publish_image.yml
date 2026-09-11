@@ -1,0 +1,87 @@
+parameters:
+- name: appName
+  type: string
+- name: dockerImageName
+  type: string
+- name: dockerImageTag
+  type: string
+- name: appVersion
+  type: string
+
+steps:
+# ==================================================================
+# [Compliance] Verifica se o repositório está em conformidade com as políticas de configuração
+# ==================================================================
+- task: VivoDevOpsConfigCompliance@1
+  displayName: 'Check DevOps Config Compliance'
+  inputs:
+    workDir: $(DEFAULT_WORKDIR_ARTIFACTS)
+    policySets: |
+      image-definition-files
+
+- task: Docker@2
+  displayName: Docker Build
+  inputs:
+    containerRegistry: $(DOCKER_DEFAULT_REGISTRY_SERVICE_CONNECTION_NAME)
+    command: build
+    repository: '${{ parameters.dockerImageName}}'
+    Dockerfile: "$(DEFAULT_WORKDIR_ARTIFACTS)/.azuredevops/runtime.Dockerfile"
+    buildContext: "$(DEFAULT_WORKDIR_ARTIFACTS)"
+    arguments: '--no-cache --build-arg APPLICATION_NAME=${{ parameters.appName }} --build-arg APPLICATION_PATH=target --build-arg APP_VERSION=${{ parameters.appVersion }} --build-arg HTTP_PROXY="$(PROXY_AGENT_HTTP)" --build-arg HTTPS_PROXY="$(PROXY_AGENT_HTTPS)" --build-arg NO_PROXY="$(PROXY_AGENT_NO_PROXY)"'
+    tags: |
+      ${{ parameters.dockerImageTag }}
+
+- task: AzureKeyVault@2
+  displayName: 'Getting AKV credentials'
+  timeoutInMinutes: 1
+  retryCountOnTaskFailure: 5  
+  inputs:    
+    azureSubscription: DevOpsSharedResources    
+    KeyVaultName: $(AKV_DEVOPS_NAME)
+    SecretsFilter: 'DEPENDENCY-TRACK-TOKEN, CONVISO-API-KEY'
+  condition: and(eq(variables['DEPENDENCY-TRACK-TOKEN'], ''), eq(variables['CONVISO-API-KEY'], ''), eq(variables.USE_DT_DOCKER, 'true'))
+      
+- template: /tech_products/hrcl/templates/task_groups/security/run_sca_scan_docker.yml
+  parameters: 
+    skipSecurityGate: ${{ variables['SKIP_SECURITY_GATE_SCA'] }}
+    
+- task: Docker@2
+  displayName: Docker Push
+  name: dockerPushImage
+  condition: and(succeeded(), eq(variables.flowIsPullRequest, false))
+  inputs:
+    containerRegistry: $(DOCKER_DEFAULT_REGISTRY_SERVICE_CONNECTION_NAME)
+    command: push
+    repository: "${{ parameters.dockerImageName }}"
+    addPipelineData: true
+    addBaseImageData: true
+    tags: |
+      ${{ parameters.dockerImageTag }}
+
+- script: |
+    if [ "$(Agent.JobStatus)" == "Failed" ]; then
+      echo "##[error]Erro no push da imagem Docker. Possíveis causas:"
+      echo "1. Verifique se está havendo instabilidade na rede e tente novamente."
+      echo "2. Verifique se as credenciais do registry estão configuradas corretamente."
+      echo "3. Verifique se a imagem já existe, pois não é permitida a sobrescrita."
+      echo "4. Valide o nome e a tag da imagem:"
+      echo "   - Nome: ${{ parameters.dockerImageName }}"
+      echo "   - Tag: ${{ parameters.dockerImageTag }}"
+      echo "5. Verifique permissões de escrita no registro."
+      exit 1
+    fi
+  displayName: "Troubleshooting help"
+  condition: failed()
+
+- script: |
+    echo "##[group] ${DOCKER_OUTPUT}"
+    cat ${DOCKER_OUTPUT}
+    echo "##[endgroup]"
+
+    DOCKER_DIGEST="$(cat ${DOCKER_OUTPUT} | grep "digest" | awk -F ' ' '{print $3}')"
+    echo "##[debug] DOCKER_DIGEST..........: ${DOCKER_DIGEST}"
+    echo "##vso[task.setvariable variable=DOCKER_DIGEST;isOutput=true]${DOCKER_DIGEST}"
+  displayName: Export Image Digest
+  name: docker_digest
+  env:
+    DOCKER_OUTPUT: $(dockerPushImage.DockerOutput)

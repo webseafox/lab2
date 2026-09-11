@@ -1,0 +1,377 @@
+parameters:
+  - name: skipReleaseCreation
+    type: boolean
+
+stages:
+- stage: ci_publish
+  displayName: "CI - Publish"
+  pool: $(PRIVATE_AGENT_DEFAULT)
+  dependsOn:
+  - environment_init
+  - ci_build
+  - ${{ if and( or(eq(variables['Build.SourceBranch'], 'refs/heads/master'), eq(variables['Build.SourceBranch'], 'refs/heads/main'), eq(variables['Build.Reason'], 'PullRequest')), not(startsWith(variables['Build.SourceBranch'], 'refs/tags/'))) }}:
+    - security
+  condition: |
+    and(
+      succeeded(),
+      not(startsWith(variables['Build.SourceBranch'], 'refs/tags/'))
+    )
+
+  ## -> Loads variables from other stages.
+  variables:
+  - name: MAVEN_SETTINGS_LOCATION
+    value: $[ stageDependencies.environment_init.environment.outputs['settings_variables.MAVEN_SETTINGS_LOCATION'] ]
+  - name: NEXUS_DEPS_USR
+    value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEPS_USR'] ]
+  - name: NEXUS_DEPS_PSW
+    value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEPS_PSW'] ]
+  - name: NEXUS_DEFAULT_USR
+    value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEFAULT_USR'] ]
+  - name: NEXUS_DEFAULT_PSW
+    value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEFAULT_PSW'] ]
+  - name: NEW_VERSION
+    value: $[ stageDependencies.ci_build.build.outputs['new_version.NEW_VERSION'] ]
+  - name: ARTIFACT_NAME
+    value: $[ stageDependencies.ci_build.build.outputs['artifact_name.ARTIFACT_NAME'] ]
+
+  jobs:
+
+  ## -> Using a job of type deployment for publish.
+  ## -> Only runs publish library for master branch and in CI steps. Does not run on manual pushes.
+  - deployment: publish
+    displayName: Publish Library
+    condition: and(
+      succeeded(),
+      eq('${{ parameters.skipReleaseCreation }}', false ),
+      or(
+        eq( variables['Build.Reason'], 'IndividualCI'),
+        eq( variables['Build.Reason'], 'BatchedCI'),
+        and( eq(False, true), eq(variables['Build.Reason'], 'Manual') )
+        ))
+    workspace:
+      clean: all
+    environment:
+      name: $(DEPLOY_ENVIRONMENT_LIB)
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+
+          ## -> Downlood and uncompress the downloaded artifact.
+          ## -> 30f35852-3f7e-4c0c-9a88-e127b4f97211 is the decorator for download artifact.
+          - task: DownloadBuildArtifacts@1
+            displayName: 'Download Build Artifacts'
+            inputs:
+              artifactName: app
+              cleanDestinationFolder: false
+              extractTars: true
+              parallelizationLimit: 8
+              downloadPath: $(System.ArtifactsDirectory)
+
+          ## -> Set artifact information to variables.
+          - task: Bash@3
+            displayName: Artifacts Info
+            inputs:
+              targetType: inline
+              script: |
+                echo "##[debug] Artifact name: '$(ARTIFACT_NAME)'"
+                echo "##[debug] Downloaded as: 'app'"
+
+                # Navigate to the artifacts directory and find the actual project directory
+                cd $(DEFAULT_WORKDIR_ARTIFACTS_APP)
+
+                echo "##[debug] Current directory: $(pwd)"
+                echo "##[debug] Available directories:"
+                ls -la
+
+                # Check if app directory exists and what's inside
+                if [ -d "app" ]; then
+                  cd app
+                  echo "##[debug] Contents of app directory:"
+                  ls -la
+
+                  # Check if there's a tar file to extract
+                  if [ -f "app.tar" ]; then
+                    echo "##[debug] Found app.tar, extracting..."
+                    tar -xf app.tar
+                    rm app.tar
+                    echo "##[debug] Files after tar extraction:"
+                    ls -la
+                  fi
+
+                  # Find the actual project directory (excluding system directories)
+                  # Look for directories with package.json or other project indicators
+                  extracted_dirs=""
+
+                  echo "##[debug] Checking for package.json in current directory..."
+                  # First check if package.json exists in current directory
+                  if [ -f "package.json" ]; then
+                    echo "##[debug] Found package.json in current directory, using app as root"
+                    echo "##vso[task.setvariable variable=ACTUAL_ARTIFACT_DIR]."
+                  else
+                    echo "##[debug] No package.json in current directory, checking subdirectories..."
+                    # Look for subdirectories that contain package.json
+                    found_package_json=false
+                    for dir in */; do
+                      dir_name=$(basename "$dir")
+                      echo "##[debug] Checking directory: $dir_name"
+                      if [ -d "$dir" ] && [ -f "$dir/package.json" ] && [ "$dir_name" != ".github" ] && [ "$dir_name" != ".azuredevops" ] && [ "$dir_name" != ".git" ]; then
+                        actual_dir="$dir_name"
+                        echo "##[debug] Found package.json in subdirectory: $actual_dir"
+                        echo "##vso[task.setvariable variable=ACTUAL_ARTIFACT_DIR]$actual_dir"
+                        extracted_dirs="$actual_dir"
+                        found_package_json=true
+                        break
+                      fi
+                    done
+
+                    if [ "$found_package_json" = false ]; then
+                      echo "##[debug] No package.json found in any subdirectory, looking for first valid directory..."
+                      # Find first directory that doesn't start with "." (excludes all hidden directories)
+                      extracted_dirs=$(find . -maxdepth 1 -type d ! -name "." ! -name ".*" | head -1)
+                      if [ -n "$extracted_dirs" ]; then
+                        actual_dir=$(basename "$extracted_dirs")
+                        echo "##[debug] Using first valid directory: $actual_dir"
+                        echo "##vso[task.setvariable variable=ACTUAL_ARTIFACT_DIR]$actual_dir"
+                      else
+                        echo "##[warning] No valid subdirectory found, package.json should be in root"
+                        echo "##[debug] Using app directory as root"
+                        echo "##vso[task.setvariable variable=ACTUAL_ARTIFACT_DIR]."
+                      fi
+                    fi
+                  fi
+                else
+                  echo "##[error] App directory not found"
+                  exit 1
+                fi
+
+          ## -> Publish Artifact to NEXUS.
+          ## -> Only allowed for the specified branches below. Other branches must skip this task.
+          ## -> Using npm to push to nexus.
+          - task: Bash@3
+            displayName: Publish to Nexus
+            env:
+              HTTPS_PROXY: http://10.240.58.39:3128
+              HUSKY: 0
+            condition: and(
+              succeeded(),
+              or(
+              eq(variables['Build.SourceBranchName'],'master'),
+              eq(variables['Build.SourceBranchName'],'main'),
+              eq(variables['Build.SourceBranchName'],'prodlike'),
+              eq(variables['Build.SourceBranchName'],'preprod'),
+              eq(variables['Build.SourceBranchName'],'esteira1'),
+              eq(variables['Build.SourceBranchName'],'esteira2'),
+              eq(variables['Build.SourceBranchName'],'dev'),
+              eq(variables['Build.SourceBranchName'],'chg')))
+            inputs:
+              targetType: inline
+              script: |
+                # Determine the correct working directory
+                BASE_DIR="$(DEFAULT_WORKDIR_ARTIFACTS_APP)/app"
+                ACTUAL_DIR="${ACTUAL_ARTIFACT_DIR:-}"
+
+                if [ "$ACTUAL_DIR" = "." ] || [ -z "$ACTUAL_DIR" ]; then
+                  WORK_DIR="$BASE_DIR"
+                else
+                  WORK_DIR="$BASE_DIR/$ACTUAL_DIR"
+                fi
+
+                echo "##[debug] Working directory: $WORK_DIR"
+                cd "$WORK_DIR"
+
+                echo "##[debug] Current working directory: $(pwd)"
+                echo "##[debug] Files in current directory:"
+                ls -la
+                echo "##[debug] HUSKY environment: $HUSKY"
+                echo "##[debug] Maven settings.....: $(MAVEN_SETTINGS_LOCATION)."
+                echo "##[debug] Publishing to Repository: $(NEXUS_REPO_LIB_MVN)."
+                echo "##[debug] Default URL: $(NEXUS_REPOSITORY_URL)."
+                echo "##[debug] Deployment Repository: $(NEXUS_REPO_LIB_MVN)::default::$(NEXUS_REPOSITORY_URL)/$(NEXUS_REPO_LIB_MVN)."
+
+                run_npm_publish() {
+                  echo "##[debug] Publishing to Nexus:"
+                  echo "##[debug] Looking for .npmrc in current directory: $(pwd)"
+
+                  # Check for .npmrc in various possible locations
+                  locations=(".npmrc" "../.npmrc" "../../.npmrc")
+                  npmrc_found=""
+
+                  for location in "${locations[@]}"; do
+                    if [ -f "$location" ]; then
+                      npmrc_found="$location"
+                      echo "##[debug] Found .npmrc at: $location"
+                      break
+                    fi
+                  done
+
+                  if [ -z "$npmrc_found" ]; then
+                    # Look for .npmrc in the base artifacts directory
+                    if [ -f "$(DEFAULT_WORKDIR_ARTIFACTS_APP)/app/.npmrc" ]; then
+                      npmrc_found="$(DEFAULT_WORKDIR_ARTIFACTS_APP)/app/.npmrc"
+                      echo "##[debug] Found .npmrc in base app directory"
+                      # Copy it to current directory
+                      cp "$npmrc_found" ./.npmrc
+                      npmrc_found=".npmrc"
+                    fi
+                  fi
+
+                  if [ -n "$npmrc_found" ]; then
+                    echo "##[debug] Using .npmrc file: $npmrc_found"
+                    auth_opt="email=vivo.devops.br@telefonica.com\nalways-auth=true"
+                    auth=$(echo -n $(NEXUS_DEFAULT_USR):$(NEXUS_DEFAULT_PSW) | openssl base64)
+                    repos=$(grep -o "registry=.*" "$npmrc_found" | cut -d':' -f2 | awk -v auth="$auth" '{print $0 ":_auth="auth""}')
+                    { printf '\n'; echo -e "$repos\n$auth_opt"; } | tee -a >(cat >> "$npmrc_found") > /dev/null
+                    echo "##[debug] Credenciais configuradas."
+                    echo "Credenciais configuradas!"
+
+                    # Ensure Husky is completely disabled in CI environment
+                    export HUSKY=0
+                    export CI=true
+                    export HUSKY_SKIP_INSTALL=1
+                    export HUSKY_SKIP_HOOKS=1
+                    echo "##[debug] HUSKY disabled: $HUSKY"
+
+                    # Remove husky from package.json scripts temporarily if it exists
+                    if [ -f "package.json" ]; then
+                      echo "##[debug] Temporarily disabling Husky scripts in package.json"
+                      # Create backup
+                      cp package.json package.json.backup
+
+                      # Remove husky-related scripts using jq if available, otherwise sed
+                      if command -v jq > /dev/null 2>&1; then
+                        jq 'del(.scripts.prepare) | del(.scripts.postinstall) | if .scripts then .scripts = (.scripts | with_entries(select(.value | test("husky") | not))) else . end' package.json > package.json.tmp && mv package.json.tmp package.json
+                        echo "##[debug] Used jq to remove husky scripts"
+                      else
+                        # Fallback: use sed to remove common husky scripts
+                        sed -i 's/"prepare":[^,]*,\?//g; s/"postinstall":[^,]*,\?//g; s/,}/}/g' package.json
+                        echo "##[debug] Used sed to remove husky scripts"
+                      fi
+                    fi
+
+                    output=$(npm publish --verbose --access=restricted)
+                    publish_exit_code=$?
+
+                    # Restore original package.json if backup exists
+                    if [ -f "package.json.backup" ]; then
+                      echo "##[debug] Restoring original package.json"
+                      mv package.json.backup package.json
+                    fi
+
+                    if [[ $publish_exit_code -ne 0 ]] ; then
+                      echo '##[error] Error while executing curl command to push artifact to nexus.'
+                      echo '##[error] Check [Lib Publish Failure] job in the pipeline for more information.'
+                      exit 1
+                    fi
+
+                  else
+                    echo "##[debug] Checking package.json existence:"
+                    if [ -f "package.json" ]; then
+                      echo "##[debug] package.json found in current directory"
+                    else
+                      echo "##[warning] package.json not found in current directory"
+                    fi
+                    echo '##vso[task.logissue type=error] Error while executing npm publish. The file .npmrc was not found.'
+                    exit 1
+                  fi
+                }
+
+                run_npm_publish
+        on:
+          success:
+            steps:
+            - task: Bash@3
+              displayName: Lib Publish Success
+              name: t_success_message
+              inputs:
+                targetType: inline
+                script: |
+                  echo "##[section]================================================================================================================================="
+                  echo "##[section]                                                 SUCCESS LIB PUBLISH"
+                  echo "##[section]================================================================================================================================="
+                  echo "##[section]Parabéns sua biblioteca foi publicada com sucesso no repositório de artefatos"
+                  echo "##[section]"
+                  echo "##[section]Caso tenha dúvidas sobre essa fase do pipeline acesse a nossa documentação: $(CORPORATE_WIKI_DOC_URL)"
+                  echo "##[section]================================================================================================================================="
+
+            ## -> In case of successs, creates the GIT tag
+            - task: jabbera.git-tag-on-release-task.git-tag-on-release-task.git-tag-on-release-task@9
+              retryCountOnTaskFailure: 3
+              displayName: "Git tag with version"
+              inputs:
+                staticTagName: $(NEW_VERSION)
+              condition: ne(variables.BUMP_VERSION_ENABLED, true)
+
+          failure:
+            steps:
+            - task: Bash@3
+              displayName: Lib Publish Failure
+              name: t_failure_message
+              inputs:
+                targetType: inline
+                script: |
+                  echo "##[error] ================================================================================================================================="
+                  echo "##[error]                                                  FAILURE LIB PUBLISH"
+                  echo "##[error] ================================================================================================================================="
+                  echo "##[error] Se está vendo essa mensagem é porque aconteceu algo erro durante a publicação da sua biblioteca."
+                  echo "##[error] "
+                  echo "##[error] Segue abaixo umas dicas para o Troubleshooting:"
+                  echo "##[error] $(ALERT_MESSAGE_ARROW) Consulte o log do estágio de publicação do artefato."
+                  echo "##[error] $(ALERT_MESSAGE_ARROW) Verifique se a versão corrente da biblioteca já existe no repositório (sobrescrita não é permitido)."
+                  echo "##[error] $(ALERT_MESSAGE_ARROW) Confira se as informações do repositório e credenciais de acesso estão corretas."
+                  echo "##[error] "
+                  echo "##[error] Caso tenha dúvidas sobre essa fase do pipeline acesse a nossa documentação: $(CORPORATE_WIKI_DOC_URL)"
+                  echo "##[error] ================================================================================================================================="
+
+  - job: push_repo_version_bump
+    displayName: "Push/tag version bump"
+    condition: succeeded()
+    dependsOn:
+    - publish
+    steps:
+
+    ## -> Clean the pipeline workspace and checkout the code.
+    ## -> 6d15af64-176c-496d-b583-fd2ae21d4df4 is the decorator for checkout.
+    - task: 6d15af64-176c-496d-b583-fd2ae21d4df4@1
+      condition: eq(variables.BUMP_VERSION_ENABLED, true)
+      inputs:
+        repository: self
+        persistCredentials: "true"
+        clean: true
+
+    ## -> Checkout the last commit that was pushed to the repository.
+    - task: Bash@3
+      displayName: Checkout Last Commit
+      name: checkout_last_commit
+      condition: eq(variables.BUMP_VERSION_ENABLED, true)
+      inputs:
+        targetType: inline
+        script: |
+          echo "##[debug] Checkout last commit from '$(Build.SourceBranchName)'"
+
+          git config pull.rebase true
+          git fetch -f --depth 1 origin $(Build.SourceBranchName):$(Build.SourceBranchName)
+          git checkout -f $(Build.SourceBranchName)
+
+    ## -> Bump version in code
+    - task: Bash@3
+      displayName: Update Source Version
+      condition: eq(variables.BUMP_VERSION_ENABLED, true)
+      inputs:
+        targetType: inline
+        script: |
+
+          echo "##[debug] Pushing NEW_VERSION: $(NEW_VERSION)"
+          jq '.version="$(NEW_VERSION)"' package.json > /tmp/package.json
+          mv /tmp/package.json package.json
+
+    ## -> Push new version to git
+    - task: Bash@3
+      displayName: 'Commit Updated Version'
+      condition: eq(variables.BUMP_VERSION_ENABLED, true)
+      env:
+        BRANCH_NAME: "$(Build.SourceBranchName)"
+        TAG_REPO: true
+      inputs:
+        targetType: inline
+        script: "TAG_PUSH_PARAM=\"\"\n\necho \"##[debug] TAG_REPO.....: ${TAG_REPO}\"\n\ngit add .\ngit commit -am \"[CI SKIP] Project version has been updated. Released version '${NEW_VERSION}'\" --author=\"$BUILD_REQUESTEDFOR <$BUILD_REQUESTEDFOREMAIL>\"\n\nif [[ \"${TAG_REPO}\" == \"true\" ]]; then\n  TAG_PUSH_PARAM=\"--tags\"\n\n  git tag ${NEW_VERSION}\nfi\n\ngit status\necho \"##[command] git push origin ${TAG_PUSH_PARAM} ${BRANCH_NAME}\"\ngit push origin ${TAG_PUSH_PARAM} ${BRANCH_NAME}\n\nif [ $? -ne 0 ]; then \n  echo \"##vso[task.logissue type=error;] Git push failed. Permission denied\"\n  echo \"##vso[task.complete result=Failed;]\"\n  exit 1\nfi  \n\necho \"Version updated to ${NEW_VERSION}\"\n"

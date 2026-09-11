@@ -1,0 +1,58 @@
+﻿stages:
+- stage: finalize
+  dependsOn:
+  - build_test
+  - bump_version
+  - code_analysis
+  - security
+  displayName: "Finalize"
+  pool: $(PRIVATE_AGENT_DEFAULT)
+  jobs:
+    - job: create_tag
+      displayName: "Create version tag"
+      variables:
+      - name: NEW_VERSION
+        value: $[ stageDependencies.bump_version.bump_version.outputs['BumpVersion.NEW_VERSION'] ]
+      - name: NEW_GIT_SHA
+        value: $[ stageDependencies.bump_version.bump_version.outputs['BumpVersion.NEW_GIT_SHA'] ]
+      steps:
+      - checkout: self
+        fetchDepth: 1
+        persistCredentials: true
+      - bash: |
+          cd $(Build.SourcesDirectory)
+          echo "NEW_VERSION .....: $(NEW_VERSION)"
+          echo -n $(NEW_VERSION) > VERSION
+
+          git config user.email "azure-pipelines@telefonicati.onmicrosoft.com"
+          git config user.name "Azure Pipelines"
+
+          git fetch
+          git reset --hard $NEW_GIT_SHA
+
+          git tag $(NEW_VERSION) $(NEW_GIT_SHA)
+          git push origin refs/tags/$(NEW_VERSION) --force
+        displayName: "Create version tag"
+
+    - job: job_commit_hash_to_core
+      condition: succeeded()
+      dependsOn:
+      - create_tag
+      variables:
+        - name: NEW_VERSION
+          value: $[ stageDependencies.bump_version.bump_version.outputs['BumpVersion.NEW_VERSION'] ]
+        - name: NEW_GIT_SHA
+          value: $[ stageDependencies.bump_version.bump_version.outputs['BumpVersion.NEW_GIT_SHA'] ]
+      displayName: "Update submodule/Commit hash and tag"
+      steps:
+        - checkout: CloudSapCommerce
+          clean: true
+          fetchDepth: 1
+          persistCredentials: true
+        - template: /tech_products/ecmc/sap-commerce/tasks/versioning/update_repo_core_version.yaml
+          parameters:
+            newVersion: $(NEW_VERSION)
+            newGitSha: $(NEW_GIT_SHA)
+            workingDirectory: $(Build.SourcesDirectory)/$(Build.Repository.Name)
+            workingDirectoryCore: $(Build.SourcesDirectory)
+            repoIsCore: true

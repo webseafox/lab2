@@ -1,0 +1,294 @@
+helm_upgrade() { # helm_upgrade "$NAMESPACE" "release_name" "helm_chart" "$OPERATION_HOST_ENVIRONMENT" "$ENVIRONMENT" "5m" "more_params"
+    local namespace="$1"
+    local release_name="$2"
+    local helm_chart="$3"
+    local operation_host_environment="$4"
+    local environment="$5"
+    local timeout="${6:-55m}"
+    local more_params="$7"
+
+    echo "##[command][$namespace]helm -n $namespace upgrade $release_name /midias/$operation_host_environment/helm-charts/$helm_chart --values /midias/$operation_host_environment/helm-charts/$helm_chart/override-values.yaml --values /midias/$operation_host_environment/helm-charts/$helm_chart/env/$environment.yaml --values /midias/$operation_host_environment/helm-charts/$helm_chart/secret-values/$environment-secret.yaml --timeout $timeout $more_params"
+    
+    helm -n "$namespace" upgrade "$release_name" "/midias/$operation_host_environment/helm-charts/$helm_chart" \
+        --values "/midias/$operation_host_environment/helm-charts/$helm_chart/override-values.yaml" \
+        --values "/midias/$operation_host_environment/helm-charts/$helm_chart/env/$environment.yaml" \
+        --values "/midias/$operation_host_environment/helm-charts/$helm_chart/secret-values/$environment-secret.yaml" \
+        --timeout "$timeout" \
+        $more_params
+}
+
+echo -ne "\n####################################################################################################"
+echo -n "######################################## POST-START ACTIONS ########################################"
+echo "####################################################################################################"
+
+BRM_NAMESPACES="brm15-apps" # $(kubectl get namespaces | grep -E 'brm.*apps|apps.*brm' | awk '{print $1}' | tr '\n' ' ' | sed 's/ $//')
+
+echo -n "##[debug] ACTION ....................................................: $ACTION"
+echo -n "##[debug] OPERATION_HOST_ENVIRONMENT ................................: $OPERATION_HOST_ENVIRONMENT"
+echo -n "##[debug] NODE IPS ..................................................: $NODE_IPS"
+echo -n "##[debug] WAIT NODE READY TIMEOUT ...................................: $WAIT_NODE_READY_TIMEOUT"
+echo -n "##[debug] WAIT PDC READY TIMEOUT ....................................: $WAIT_PDC_READY_TIMEOUT"
+echo -n "##[debug] WAIT PRICINGUPDATER READY TIMEOUT .........................: $WAIT_PRICINGUPDATER_READY_TIMEOUT"
+echo -n "##[debug] ENVIRONMENT ...............................................: $ENVIRONMENT"
+echo "##[debug] BRM NAMESPACES ............................................: $BRM_NAMESPACES"
+
+echo ">>>>>>>>>>>>>>>>>>>>>>>>>>>>>> Wait Nodes 'Ready,SchedulingDisabled' Status"
+IS_TIMEOUT="false"
+IPS="$NODE_IPS"
+IFS=',' read -ra IP_ARRAY <<< "$IPS"
+
+IFS=' ' read -ra IP_ARRAY <<< "$IPS"
+for IP in "${IP_ARRAY[@]}"; do
+    IP=$(echo "$IP" | xargs)
+    [ -z "$IP" ] && continue
+
+    echo ">>>>> Node $IP"
+    echo ">> Waiting to be Ready [Timeout: $WAIT_NODE_READY_TIMEOUT] ..."
+    echo "##[command]kubectl wait --for=condition=Ready node/$IP --timeout=$WAIT_NODE_READY_TIMEOUT"
+    kubectl wait --for=condition=Ready node/$IP --timeout=$WAIT_NODE_READY_TIMEOUT || { echo "Node $IP did not become Ready within timeout.\n"; exit 1; }
+
+    echo ">> Waiting to be SchedulingDisabled [Timeout: $WAIT_NODE_READY_TIMEOUT] ..."
+    echo "##[command]kubectl get node $IP -o jsonpath={.spec.taints} | grep -q node.kubernetes.io/unschedulable"
+    
+    TIMEOUT=$(echo "$WAIT_NODE_READY_TIMEOUT" | sed 's/m$//')
+    TIMEOUT=$((TIMEOUT * 60))
+    ELAPSED=0
+    
+    while ! kubectl get node $IP -o jsonpath='{.spec.taints}' | grep -q "node.kubernetes.io/unschedulable"; do
+        echo "⏳ Node is Ready but not yet SchedulingDisabled. Retrying in 5 seconds ..."
+        sleep 5
+
+        ELAPSED=$((ELAPSED + 5))
+        if [ $ELAPSED -ge $TIMEOUT ]; then
+            echo "❌ Timeout reached waiting for node $IP to be SchedulingDisabled."
+            IS_TIMEOUT="true"
+            break
+        fi
+    done
+done
+
+echo ""
+
+if [ "$IS_TIMEOUT" = "true" ]; then
+    echo "❌ Timeout reached waiting for one or more nodes to be Ready,SchedulingDisabled."
+    exit 1
+else
+    echo "✅ Nodes $NODE_IPS are Ready and SchedulingDisabled."
+fi
+
+echo ""
+echo ">>>>>>>>>>>>>>>>>>>>>>>>>>>>>> Uncordon Nodes "
+echo "##[command]kubectl uncordon $NODE_IPS"
+kubectl uncordon $NODE_IPS
+
+for NAMESPACE in $BRM_NAMESPACES; do
+    BRM_VERSION=$(echo "$NAMESPACE" | grep -o '[0-9]\+')
+
+    echo "==================================== $NAMESPACE [$BRM_VERSION] ====================================="
+
+    echo "##[group][$NAMESPACE] >> 1/11 >>>>>>>> Scale Up NFS Provisioner ..."
+    echo "##[command][$NAMESPACE] kubectl -n $NAMESPACE get deployments | grep nfs | awk '{print \$1}' 2> /dev/null"
+    NFSPOV=`kubectl -n $NAMESPACE get deployments | grep nfs | awk '{print $1}' 2> /dev/null`
+    if [ ! -z "$NFSPOV" ]; then
+        echo ">> Scaling UP NFS Provisioner [$NFSPOV]. Waiting 15 seconds ..."
+        echo "##[command][$NAMESPACE] kubectl -n $NAMESPACE scale deployments $NFSPOV --replicas=1"
+        kubectl -n $NAMESPACE scale deployments $NFSPOV --replicas=1
+        sleep 15
+    fi
+    echo "##[endgroup]"
+
+    echo "##[group][$NAMESPACE] >> 2/11 >>>>>>>> Cleaning and restarting wl-operator pods. Waiting 15 seconds ..."
+    echo "##[command][$NAMESPACE] kubectl -n wl-operator delete pods --all"
+    kubectl -n wl-operator delete pods --all
+    sleep 15
+    echo "##[endgroup]"
+
+    echo "##[group][$NAMESPACE] >> 3/11 >>>>>>>> Restart PDC, billingcare and billingcare-extension Domains [Timeout: 5m] ..."
+    helm_upgrade "$NAMESPACE" "brm$BRM_VERSION-op-job" "package-oc-cn-op-job-helm-chart" "$OPERATION_HOST_ENVIRONMENT" "$ENVIRONMENT" "5m"
+    echo "##[endgroup]"
+
+    echo "##[group][$NAMESPACE] >> 4/11 >>>>>>>> Waiting Jobs ..."
+    echo "##[command][$NAMESPACE] kubectl get jobs -n "$NAMESPACE" --no-headers grep -E -v '1/1' wc -l"
+    for ((counter=1; counter<=120; counter++)); do
+        PENDING=$(kubectl get jobs -n "$NAMESPACE" --no-headers \
+                | grep -E -v '1/1' \
+                | wc -l)
+
+        if [[ "$PENDING" == *"Failed"* ]]; then
+            echo "[$NAMESPACE] ⚠️ One or more jobs have failed."
+        fi
+
+        if [[ "$PENDING" -eq 0 ]]; then
+            echo "[$NAMESPACE] ✅ All jobs have completed (Complete or Failed)."
+            break
+        fi
+
+        echo "[$NAMESPACE] ⏳ [$counter/120] Waiting $PENDING Jobs to complete or fail. Checking again in 10 seconds ..."
+        kubectl -n $NAMESPACE get jobs --ignore-not-found --no-headers | grep -E -v '1/1' 2> /dev/null
+        sleep 10
+    done
+
+    if [[ "$counter" -gt 120 ]]; then
+        echo "[$NAMESPACE] ❌ Timeout: jobs did not complete or fail after 120 attempts."
+    fi
+    echo "##[endgroup]"
+
+    echo "##[group][$NAMESPACE] >> 5/11 >>>>>>>> Restart Domains [Timeout: 5m] ..."
+    helm_upgrade "$NAMESPACE" "brm$BRM_VERSION-core" "package-oc-cn-helm-chart" "$OPERATION_HOST_ENVIRONMENT" "$ENVIRONMENT" "5m"
+    echo "##[endgroup]"
+
+    echo "##[group][$NAMESPACE] >> 6/11 >>>>>>>> Waiting PDC Running ..."
+    echo "##[command][$NAMESPACE] kubectl -n $NAMESPACE get pods --ignore-not-found --no-headers | grep -E -i \"pdc.*adminserver.*1/1.*Running\" 2> /dev/null"
+    
+    for ((counter=1; counter<=120; counter++)); do
+        while IFS= read -r pod; do
+            if [[ "$pod" == *"pdc"* ]] ; then
+                
+                if [[ "$pod" == *"introspector"* ]]; then
+                    echo "[$NAMESPACE] PDC introspector is running ..."
+                elif [[ "$pod" == *"1/1"* ]] && [[ "$pod" == *"Running"* ]] && [[ "$pod" == *"adminserver"* ]]; then
+                    echo "$pod $(date '+%Y-%m-%d %H:%M:%S')" 
+                    PDCREADY="YES"
+                elif [[ "$pod" == *"0/1"* ]] && [[ "$pod" == *"Running"* ]] && [[ "$pod" == *"adminserver"* ]]; then
+                    echo "[$NAMESPACE] PDC Admin is starting ..."
+                else
+                    if [[ "$counter" -gt 120 ]]; then
+                        echo "[$NAMESPACE] ❌ Timeout: PDC AdminServer did not reach Running state after 120 attempts."
+                    fi
+                fi
+            fi
+                    
+            if [[ "$pod" == *"bcws"* ]] ; then
+                if [[ "$pod" == *"introspector"* ]]; then
+                    echo "[$NAMESPACE] BCWS introspector is running ..."
+                elif [[ "$pod" == *"1/1"* ]] && [[ "$pod" == *"Running"* ]] && [[ "$pod" == *"admin-server"* ]]; then
+                    echo "$pod $(date '+%Y-%m-%d %H:%M:%S')" 
+                    BCWSREADY="YES"
+                elif [[ "$pod" == *"0/1"* ]] && [[ "$pod" == *"Running"* ]] && [[ "$pod" == *"admin-server"* ]]; then
+                    echo "[$NAMESPACE] BCWS Admin is starting ..."
+                else
+                    if [[ "$counter" -gt 120 ]]; then
+                        echo "[$NAMESPACE] ❌ Timeout: BCWS AdminServer did not reach Running state after 120 attempts."
+                    fi
+                fi
+            fi
+                    
+            if [[ "$pod" == *"billingcare"* ]]; then
+                if [[ "$pod" == *"introspector"* ]]; then
+                    echo "[$NAMESPACE] BILLINGCARE introspector is running ..."
+                elif [[ "$pod" == *"1/1"* ]] && [[ "$pod" == *"Running"* ]] && [[ "$pod" == *"admin-server"* ]]; then
+                    echo "$pod $(date '+%Y-%m-%d %H:%M:%S')" 
+                    BCREADY="YES"
+                elif [[ "$pod" == *"0/1"* ]] && [[ "$pod" == *"Running"* ]] && [[ "$pod" == *"admin-server"* ]]; then
+                    echo "[$NAMESPACE] BILLINGCARE Admin is starting ..."
+                else
+                    if [[ "$counter" -gt 120 ]]; then
+                        echo "[$NAMESPACE] ❌ Timeout: BILLINGCARE AdminServer did not reach Running state after 120 attempts."
+                    fi
+                fi
+            fi
+        done < <( kubectl -n $NAMESPACE get pods --ignore-not-found --no-headers | grep -E "bcws.*|billingcare.*|pdc.*" 2> /dev/null )
+
+        if [[ "$PDCREADY" == "YES" ]] && [[ "$BCWSREADY" == "YES" ]] && [[ "$BCREADY" == "YES" ]]; then
+            echo "[$NAMESPACE] ✅ PDC, BCWS and BILLINGCARE AdminServers are running."
+            break
+        fi
+
+        echo "[$NAMESPACE] ⏳ [$counter/120] Waiting for pdc AdminServer to be Running. Checking again in 10 seconds ..."
+        sleep 10
+    done
+    echo "##[endgroup]"
+
+    echo "##[group][$NAMESPACE] >> 7/11 >>>>>>>> Restart OCOMC [Timeout: 5m] ..."
+    helm_upgrade "$NAMESPACE" "ocomc$BRM_VERSION-core" "package-oc-cn-ocomc-helm-chart" "$OPERATION_HOST_ENVIRONMENT" "$ENVIRONMENT" "5m"    
+    echo "##[endgroup]"
+
+    echo "##[group][$NAMESPACE] >> 8/11 >>>>>>>> Restart ECE [Timeout: 5m] ..."
+    helm_upgrade "$NAMESPACE" "brm$BRM_VERSION-ece" "package-oc-cn-ece-helm-chart" "$OPERATION_HOST_ENVIRONMENT" "$ENVIRONMENT" "5m"
+    echo "##[endgroup]"
+
+    echo "##[group][$NAMESPACE] >> 9/11 >>>>>>>> Waiting PricingUpdater Running ..."
+    echo "##[command][$NAMESPACE] kubectl -n $NAMESPACE get pods --ignore-not-found --no-headers | grep -i \"pricingupdater\" | grep \"Running\" 2> /dev/null"
+
+    IMPORTJOB="YES"
+    for ((counter=1; counter<=240; counter++)); do
+        CHEKPODS=`kubectl -n $NAMESPACE get pods --ignore-not-found --no-headers | grep -i "pricingupdater" | grep "Running" 2> /dev/null`
+        PODNAME=`echo $CHEKPODS | awk '{print $1}' 2> /dev/null`
+
+        echo "[$NAMESPACE] ⏳ [$counter/240] Checking PricingUpdater..."
+    
+        if [[ $counter -eq 240 ]]; then
+            echo "[$NAMESPACE] ❌ Timeout: PricingUpdater did not reach Running state after 240 attempts."
+            break
+        fi
+
+        if [[ "$CHEKPODS" == *"Container"* ]]; then
+
+            echo "[$NAMESPACE] ⏳ [$counter/240] $PODNAME is creating ..."
+        fi
+
+        if [[ "$CHEKPODS" == *"Pending"* ]]; then
+
+            echo "[$NAMESPACE] ⏳ [$counter/240] $PODNAME is pending  ..."
+        fi
+
+        if [[ "$CHEKPODS" == *"1/1"* ]]; then
+            echo "[$NAMESPACE] ✅ PricingUpdater is running."
+            break
+        fi
+
+        if [[ "$CHEKPODS" == *"0/1"* ]] && [[ "$CHEKPODS" == *"Running"* ]]; then
+
+            LOGS=`kubectl -n $NAMESPACE logs $PODNAME 2> /dev/null`
+
+            if [[ "$LOGS" == *"Time taken to parse"* ]]; then
+                echo "[$NAMESPACE] ⏳ [$counter/240] $PODNAME is processing data. Checking again in 10 seconds ..."
+                IMPORTJOB="NO"
+             else
+             echo "[$NAMESPACE] ⏳ [$counter/240] $PODNAME is waiting for data. Checking again in 10 seconds ..."
+            fi
+        fi
+        
+        if [ $counter -eq 120 ] && [ "$IMPORTJOB" == "YES" ]; then
+            echo "[$NAMESPACE] ⚠️ Contingency: Re-run importExport job..."
+            echo "##[command][$NAMESPACE] kubectl -n $NAMESPACE get jobs --no-headers --ignore-not-found | grep \"import-export\" | awk '{print $1}' 2> /dev/null"
+            JOB=`kubectl -n $NAMESPACE get jobs --no-headers --ignore-not-found | grep "import-export" | awk '{print $1}' 2> /dev/null`
+            if [ ! -z "$JOB" ]; then
+                kubectl -n $NAMESPACE delete job $JOB
+            fi
+            helm_upgrade "$NAMESPACE" "brm$BRM_VERSION-core" "package-oc-cn-helm-chart" "$OPERATION_HOST_ENVIRONMENT" "$ENVIRONMENT" "" "--set-string ocpdc.configEnv.importExport.IE_Operation=publish --set-string ocpdc.configEnv.importExport.IE_Component=all --set-string ocpdc.configEnv.importExport.IE_FileName=\"\" --set-string ocpdc.configEnv.importExport.extraCmdLineArgs=\"-target ece\""
+        fi
+        
+        if [ $counter -eq 180 ]; then
+            echo "[$NAMESPACE] ⚠️ Contingency 2: $PODNAME Appears to be stuck, restarting Pricing pod..."
+            kubectl -n $NAMESPACE delete pod $PODNAME --ignore-not-found
+            sleep 10
+            echo "##[command][$NAMESPACE] kubectl -n $NAMESPACE get jobs --no-headers --ignore-not-found | grep \"import-export\" | awk '{print $1}' 2> /dev/null"
+            JOB=`kubectl -n $NAMESPACE get jobs --no-headers --ignore-not-found | grep "import-export" | awk '{print $1}' 2> /dev/null`
+            if [ ! -z "$JOB" ]; then
+                kubectl -n $NAMESPACE delete job $JOB
+            fi
+            helm_upgrade "$NAMESPACE" "brm$BRM_VERSION-core" "package-oc-cn-helm-chart" "$OPERATION_HOST_ENVIRONMENT" "$ENVIRONMENT" "" "--set-string ocpdc.configEnv.importExport.IE_Operation=publish --set-string ocpdc.configEnv.importExport.IE_Component=all --set-string ocpdc.configEnv.importExport.IE_FileName=\"\" --set-string ocpdc.configEnv.importExport.extraCmdLineArgs=\"-target ece\""
+
+
+            helm -n $NAMESPACE upgrade brm$BRM_VERSION-core /midias/$OPERATION_HOST_ENVIRONMENT/helm-charts/package-oc-cn-helm-chart --reuse-values --set-string ocpdc.configEnv.importExport.IE_Operation=publish --set-string ocpdc.configEnv.importExport.IE_Component=all --set-string ocpdc.configEnv.importExport.IE_FileName="" --set-string ocpdc.configEnv.importExport.extraCmdLineArgs="-target ece"
+            continue
+        fi
+
+        sleep 10
+    done
+
+    echo "##[endgroup]"
+
+    echo "##[group][$NAMESPACE] >> 10/11 >>>>>>>> Scaling Up deployments ..."
+    echo "##[command][$NAMESPACE] kubectl scale deployments --all --replicas=1 -n $NAMESPACE"
+    kubectl scale deployments --all --replicas=1 -n $NAMESPACE
+    
+    echo "##[group][$NAMESPACE] >> 11/11 >>>>>>>> Scaling Up statefulset ..."
+    echo "##[command][$NAMESPACE] kubectl scale statefulset --all --replicas=1 -n $NAMESPACE"
+    kubectl scale statefulset --all --replicas=1 -n $NAMESPACE
+
+    echo "[$NAMESPACE] ⏱️ End of process: $(date)"
+
+    echo "===================================== end of $NAMESPACE ======================================="
+done

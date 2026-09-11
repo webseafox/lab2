@@ -1,0 +1,430 @@
+﻿# ==================================================================
+# Pipeline: CI/CD Unificado - CCIN Middleware WebLogic (HML)
+# ==================================================================
+# Pipeline legado unificado para esteiras de homologação.
+# Recomendação: usar pipelines separados de CI e CD (padrão CodePlay).
+#
+# Stages:
+#   1. Security Scan (AppSec Config + Fortify + SCA)
+#   2. Build & Test (Maven + JaCoCo + SonarQube = Quality Gate)
+#   3. Deploy WebLogic (WAR obtido do Pipeline Artifact do stage Build)
+#
+# Não publica artefato em nenhum feed (Azure Artifacts/Nexus) e não commita
+# nada no repositório - o WAR trafega apenas como Pipeline Artifact interno
+# entre os stages Build e Deploy.
+# ==================================================================
+
+parameters:
+  - name: javaVersion
+    displayName: 'Versão do Java'
+    type: string
+    default: 'openjdk-17.0.2'
+    values:
+      - 'openjdk-21.0.2'
+      - 'openjdk-17.0.2'
+      - 'openjdk-11.0.2'
+  - name: sonarJavaVersion
+    displayName: 'Versão do Java para análise SonarQube'
+    type: string
+    default: 'openjdk-17.0.2'
+    values:
+      - 'openjdk-21.0.2'
+      - 'openjdk-17.0.2'
+      - 'openjdk-11.0.2'
+  - name: mavenCustomSettings
+    displayName: 'Caminho para o settings.xml customizado do Maven'
+    type: string
+    default: '.azuredevops/settings.xml'
+  - name: buildArtifactName
+    displayName: 'Nome do artefato de build'
+    type: string
+    default: 'war_artifact'
+  - name: enableCoverage
+    displayName: 'Habilitar geração de relatórios de cobertura de código (JaCoCo)'
+    type: boolean
+    default: true
+  - name: enableTest
+    displayName: 'Habilitar execução de testes'
+    type: boolean
+    default: true
+  - name: runQualityGate
+    displayName: 'Executar Quality Gate (SonarQube)'
+    type: boolean
+    default: true
+  - name: enableCache
+    displayName: 'Habilitar cache de dependências Maven'
+    type: boolean
+    default: true
+  - name: enableFortifyExclusions
+    displayName: 'Faz checkout do repositório Fortify Exclusions'
+    type: boolean
+    default: false
+  - name: ssh
+    type: string
+    displayName: 'Service Connection SSH'
+    default: 'SSH_ROTEAMENTO_$(Build.SourceBranchName)'
+
+# ============================================================================
+# NOTA: no pipe pai, o prefixo usado em "IP" ($[format('HOST_{PREFIXO}_...')])
+# deve bater com o prefixo do CLUSTER e do SSH daquele app (ex: MOVEL, ROTEAMENTO,
+# FERRAMENTAS). Prefixos divergentes resultam em IP vazio (t3://:7000).
+
+# ============================================================================
+# Variáveis definidas no Pipeline Pai (pipePai.yml)
+# ============================================================================
+# Este template herda todas as variáveis do pipeline pai:
+# - SIGLA, ESTEIRA, IP, CLUSTER, APP
+# - MAVEN_CACHE_FOLDER, MAVEN_CUSTOM_SETTINGS, MAVEN_REPO_LOCAL
+# - Todas as variáveis da Azure DevOps (System.*, Build.*, etc)
+
+stages:
+
+# ============================================================================
+# STAGE 1: SECURITY SCAN (AppSec Configuration + Fortify + SCA)
+# ============================================================================
+- stage: security_scan
+  pool: GeneralPurposeLinuxAgentsCI
+  displayName: Security Scan
+  jobs:
+  - job: AppSecConfigKeys
+    displayName: 'Get AppSec Config Keys'
+    steps:
+    - template: /security/get_appconfig_keys_framework.yml
+      parameters:
+        azureSubscription: DevOpsSharedResources
+        appConfigurationEndpoint: https://appcs-azdevops-shared.azconfig.io
+
+  - job: run_fortify
+    displayName: Run Fortify
+    dependsOn: AppSecConfigKeys
+    variables:
+      USE_FORTIFY: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.USE_FORTIFY'] ]
+      USE_CONVISO: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.USE_CONVISO'] ]
+      SKIP_SECURITY_GATE: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.SKIP_SECURITY_GATE'] ]
+      FORTIFY_APP_VERSION: $[ dependencies.AppSecConfigKeys.outputs['scan_version_name.FORTIFY_APP_VERSION'] ]
+    condition: and(succeeded(), eq(variables.USE_FORTIFY, 'true'))
+    steps:
+    - template: /security/define_appsec_app_version.yml
+
+    - template: /security/run_fortify_scan.yml
+      parameters:
+        vivoFlow: "DEV,EsteiraPreProd,EsteiraQA1,EsteiraQA2,EsteiraQA3,EsteiraQA4"
+        fortifyExclusionRepository: 'FortifyExclusion'
+        enableFortifyExclusions: ${{ parameters.enableFortifyExclusions }}
+        appLanguage: 'java'
+        appVersion: '$(FORTIFY_APP_VERSION)'
+
+  - job: sca_scan
+    displayName: SCA Scan
+    dependsOn: AppSecConfigKeys
+    variables:
+      USE_DEPENDENCY_TRACK: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.USE_DEPENDENCY_TRACK'] ]
+    condition: and(succeeded(), eq(variables.USE_DEPENDENCY_TRACK, 'true'))
+    steps:
+    - template: /security/define_appsec_app_version.yml
+
+    - template: /security/run_sca_scan.yml
+      parameters:
+        appVersion: '$(FORTIFY_APP_VERSION)'
+        buildArtifactName: '${{ parameters.buildArtifactName }}'
+
+# ============================================================================
+# STAGE 2: BUILD & TEST (Maven + JaCoCo + SonarQube)
+# ============================================================================
+- stage: Build
+  displayName: '🏗️ Build ${{ variables[''Build.SourceBranchName''] }}'
+  dependsOn: security_scan
+  condition: succeeded()
+  jobs:
+  - job: Build
+    displayName: '🏗️ Build'
+    pool: GeneralPurposeLinuxAgentsCI
+    steps:
+      - checkout: self
+        displayName: '🔄 Checkout code'
+        fetchDepth: 0
+        clean: true
+
+      - task: AzureKeyVault@2
+        displayName: '🔑 Secrets from AKV'
+        inputs:
+          azureSubscription: 'DevOpsSharedResources'
+          KeyVaultName: 'kv-azdevops-shared'
+          SecretsFilter: 'NEXUS-DEPS-USR, NEXUS-DEPS-PSW'
+
+      - ${{ if eq(parameters.enableCache, true) }}:
+        - task: Cache@2
+          displayName: 'Cache Maven dependencies'
+          inputs:
+            key: 'maven | "$(Agent.OS)" | **/pom.xml'
+            restoreKeys: |
+              maven | "$(Agent.OS)"
+              maven
+            path: $(MAVEN_CACHE_FOLDER)
+
+      - task: VersionManagerVivo@8
+        displayName: 'Next version'
+        inputs:
+          passthroughVersion: true
+          command: 'nextVersion'
+          branchingStrategy: 'trunkbased'
+          versionFile: 'pom.xml'
+          bumpMethod: 'patch'
+        name: VersionManagerVivo
+
+      - task: Maven@4
+        displayName: 'Validate Project'
+        inputs:
+          goals: validate
+          options: >-
+            -s $(MAVEN_CUSTOM_SETTINGS)
+            -Dmaven.repo.local=$(MAVEN_REPO_LOCAL)
+          mavenPomFile: pom.xml
+          mavenOptions: '-Xmx3072m'
+          mavenVersionOption: 'Path'
+          mavenDirectory: /home/svc_devopscorp/.asdf/installs/maven/3.9.9
+          javaHomeOption: 'JDKVersion'
+          publishJUnitResults: false
+        env:
+          ASDF_JAVA_VERSION: ${{ parameters.javaVersion }}
+          MAVEN_CUSTOM_SETTINGS: $(MAVEN_CUSTOM_SETTINGS)
+          NEXUS_DEPS_USR: $(NEXUS-DEPS-USR)
+          NEXUS_DEPS_PSW: $(NEXUS-DEPS-PSW)
+          AZURE_DEVOPS_PAT: $(System.AccessToken)
+          SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+
+      - task: Maven@4
+        displayName: 'Build'
+        inputs:
+          goals: clean compile package
+          options: >-
+            -s $(MAVEN_CUSTOM_SETTINGS)
+            -Dmaven.repo.local=$(MAVEN_REPO_LOCAL)
+            -Dmaven.test.skip=true
+            -P prod
+          mavenPomFile: pom.xml
+          mavenOptions: '-Xmx3072m'
+          mavenVersionOption: 'Path'
+          mavenDirectory: /home/svc_devopscorp/.asdf/installs/maven/3.9.9
+          javaHomeOption: 'JDKVersion'
+          publishJUnitResults: false
+        env:
+          ASDF_JAVA_VERSION: ${{ parameters.javaVersion }}
+          MAVEN_CUSTOM_SETTINGS: $(MAVEN_CUSTOM_SETTINGS)
+          NEXUS_DEPS_USR: $(NEXUS-DEPS-USR)
+          NEXUS_DEPS_PSW: $(NEXUS-DEPS-PSW)
+          AZURE_DEVOPS_PAT: $(System.AccessToken)
+          SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+          VERSION: $(VersionManagerVivo.VERSION)
+
+      - ${{ if eq(parameters.enableTest, true) }}:
+        - task: Maven@4
+          displayName: 'Run Tests with JaCoCo'
+          inputs:
+            goals: 'test jacoco:report'
+            options: >-
+              -B
+              -s $(MAVEN_CUSTOM_SETTINGS)
+              -Dmaven.repo.local=$(MAVEN_REPO_LOCAL)
+            mavenPomFile: pom.xml
+            mavenOptions: '-Xmx3072m'
+            mavenVersionOption: 'Path'
+            mavenDirectory: /home/svc_devopscorp/.asdf/installs/maven/3.9.9
+            javaHomeOption: 'JDKVersion'
+            publishJUnitResults: false
+          env:
+            ASDF_JAVA_VERSION: ${{ parameters.javaVersion }}
+            MAVEN_CUSTOM_SETTINGS: $(MAVEN_CUSTOM_SETTINGS)
+            NEXUS_DEPS_USR: $(NEXUS-DEPS-USR)
+            NEXUS_DEPS_PSW: $(NEXUS-DEPS-PSW)
+            AZURE_DEVOPS_PAT: $(System.AccessToken)
+            SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+
+        - task: PublishTestResults@2
+          displayName: 'Publish Test Results'
+          condition: succeededOrFailed()
+          inputs:
+            testResultsFormat: 'JUnit'
+            testResultsFiles: '**/target/surefire-reports/*.xml'
+            failTaskOnFailedTests: true
+            mergeTestResults: true
+
+        - ${{ if eq(parameters.enableCoverage, true) }}:
+          - task: PublishCodeCoverageResults@2
+            displayName: 'Publish Code Coverage'
+            condition: succeededOrFailed()
+            inputs:
+              codeCoverageTool: 'JaCoCo'
+              summaryFileLocation: '$(Build.SourcesDirectory)/target/site/jacoco/jacoco.xml'
+              reportDirectory: '$(Build.SourcesDirectory)/target/site/jacoco'
+
+      - ${{ if eq(parameters.runQualityGate, true) }}:
+        - task: SonarAnalysisFromVivo@4
+          displayName: 'SonarQube Full Analysis'
+          inputs:
+            command: 'analysis'
+            SonarQubeVip: 'VIVO_SONARQUBE_VIP'
+            SonarQube: 'VIVO_SONARQUBE'
+            scannerMode: 'cli'
+            configFile: '.azuredevops/sonar-project.properties'
+            cliProjectKey: '$(System.TeamProject)-$(Build.Repository.Name)'
+            cliProjectName: '$(System.TeamProject)-$(Build.Repository.Name)'
+            cliProjectVersion: $(VersionManagerVivo.VERSION)
+            qualityGate: 'AzureDevOps-Default'
+            acronym: $(SIGLA)
+            reportPath: '$(Agent.TempDirectory)/sonar/$(Build.BuildId)/report-task.txt'
+            pollingTimeoutSec: '300'
+            useOpaRepository: 'true'
+            codePlayServiceConnection: 'CodePlay'
+            opaProject: 'DVPS - DEVOPS'
+            opaRepository: 'Vivo.OpenPolicy.SonarQube'
+            opaBranch: 'master'
+            useAppConfig: true
+            appConfigurationEndpoint: 'https://appcs-azdevops-shared.azconfig.io'
+            azureSubscription: DevOpsSharedResources
+            sonarUrlPemCertificate: $(Agent.HomeDirectory)/../../certs/CACORP.pem
+            extraProperties: |
+              sonar.coverage.jacoco.xmlReportPaths=$(Build.SourcesDirectory)/target/site/jacoco/jacoco.xml
+              sonar.java.binaries=$(Build.SourcesDirectory)/target/classes
+              sonar.scanner.metadataFilePath=$(Agent.TempDirectory)/sonar/$(Build.BuildId)/report-task.txt
+              sonar.qualitygate.wait=false
+              sonar.qualitygate.timeout=300
+          env:
+            ASDF_JAVA_VERSION: ${{ parameters.sonarJavaVersion }}
+
+      - task: CopyFiles@2
+        displayName: 'Copy pom.xml to target directory'
+        condition: succeeded()
+        inputs:
+          SourceFolder: '$(Build.SourcesDirectory)'
+          Contents: 'pom.xml'
+          TargetFolder: '$(Build.SourcesDirectory)/target'
+
+      - task: PublishPipelineArtifact@1
+        displayName: 'Publish Build Artifact'
+        condition: succeeded()
+        inputs:
+          targetPath: '$(Build.SourcesDirectory)/target'
+          artifact: '${{ parameters.buildArtifactName }}'
+          publishLocation: 'pipeline'
+
+      - task: PowerShell@2
+        displayName: '🏷️ Export version for deploy'
+        condition: succeeded()
+        name: SetVersion
+        inputs:
+          targetType: 'inline'
+          script: |
+            $version = "$(VersionManagerVivo.VERSION)"
+            Write-Host "Build version: $version"
+            Write-Host "##vso[task.setvariable variable=PACKAGE_VERSION;isOutput=true]$version"
+
+# ============================================================================
+# STAGE 3: DEPLOY (WebLogic)
+# ============================================================================
+# O WAR não é publicado em nenhum feed - é o mesmo Pipeline Artifact gerado
+# pelo stage Build (PublishPipelineArtifact), baixado aqui via
+# DownloadPipelineArtifact@2 (artefato interno da run, não é "Azure Artifacts").
+# ============================================================================
+- stage: Deploy
+  displayName: '🚀 Deploy ${{ variables[''Build.SourceBranchName''] }}'
+  dependsOn:
+    - security_scan
+    - Build
+  condition: succeeded()
+  pool: GeneralPurposeLinuxAgentsCD
+  variables:
+    PACKAGE_VERSION: $[ stageDependencies.Build.Build.outputs['SetVersion.PACKAGE_VERSION'] ]
+  jobs:
+    - deployment: Deploy${{ variables['Build.SourceBranchName'] }}
+      displayName: 'Deploy ${{ variables[''Build.SourceBranchName''] }}'
+      environment: 'deploy-dev'
+      pool: GeneralPurposeLinuxAgentsCD
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+              # WAR gerado no stage Build (Pipeline Artifact interno, sem publish em feed)
+              - task: DownloadPipelineArtifact@2
+                displayName: '⬇️ Download WAR (Build artifact)'
+                inputs:
+                  buildType: 'current'
+                  artifactName: '${{ parameters.buildArtifactName }}'
+                  targetPath: '$(Pipeline.Workspace)/artifacts'
+
+              # Copiar artefato para servidor
+              - task: CopyFilesOverSSH@0
+                displayName: '📤 Transfer WAR to QA'
+                inputs:
+                  sshEndpoint: ${{ parameters.ssh }}
+                  sourceFolder: '$(Pipeline.Workspace)/artifacts'
+                  contents: '**/*.war'
+                  targetFolder: '$(ARTIFACT_TARGETFOLDER)'
+                  readyTimeout: '20000'
+
+              # ==================================================================
+              # TO-DO: voltar para WLST (UndeployApp.py + CleanDeployApp.py) assim que a
+              # permissão de execução WLST for regularizada no ambiente de HML.
+              # Enquanto isso, deploy via weblogic.Deployer -redeploy (task abaixo).
+              # ==================================================================
+              # - task: SSH@0
+              #   displayName: '🗑️ Undeploy app'
+              #   inputs:
+              #     sshEndpoint: 'SSH_ROTEAMENTO_${{ variables[''Build.SourceBranchName''] }}'
+              #     runOptions: 'commands'
+              #     commands: |
+              #       CRED_FILE=$(mktemp /tmp/wlst_creds.XXXXXX)
+              #       chmod 600 "$CRED_FILE"
+              #       echo "$(WEBLOGIC_USER)" > "$CRED_FILE"
+              #       echo "$(WEBLOGIC_PASS)" >> "$CRED_FILE"
+              #       $(WLST_SCRIPT) $(SCRIPTS_TARGETFOLDER)/UndeployApp.py --cred-file "$CRED_FILE" t3://$(IP):7000 $(APP)
+              #       STATUS=$?
+              #       rm -f "$CRED_FILE"
+              #       exit $STATUS
+              #     readyTimeout: '20000'
+              #
+              # - task: SSH@0
+              #   displayName: '🚀 Clean Deploy WLST'
+              #   inputs:
+              #     sshEndpoint: 'SSH_ROTEAMENTO_${{ variables[''Build.SourceBranchName''] }}'
+              #     runOptions: 'commands'
+              #     commands: |
+              #       CRED_FILE=$(mktemp /tmp/wlst_creds.XXXXXX)
+              #       chmod 600 "$CRED_FILE"
+              #       echo "$(WEBLOGIC_USER)" > "$CRED_FILE"
+              #       echo "$(WEBLOGIC_PASS)" >> "$CRED_FILE"
+              #       sudo -u weblogic $(WLST_SCRIPT) $(SCRIPTS_TARGETFOLDER)/CleanDeployApp.py --cred-file "$CRED_FILE" t3://$(IP):7000 $(APP) $(ARTIFACT_TARGETFOLDER)/$(APP).war $(CLUSTER) $(PACKAGE_VERSION)
+              #       STATUS=$?
+              #       rm -f "$CRED_FILE"
+              #       exit $STATUS
+              #     readyTimeout: '20000'
+
+              - task: SSH@0
+                name: DeployWar
+                displayName: '🚀 Deploy WAR no WebLogic'
+                inputs:
+                  sshEndpoint: ${{ parameters.ssh }}
+                  runOptions: 'commands'
+                  commands: '$(JAVA_PATH_SSH) -cp $(WL_PATH_SSH) weblogic.Deployer -adminurl t3://$(IP):7000 -username $(WEBLOGIC_USER) -password $(WEBLOGIC_PASS) -targets $(CLUSTER) -redeploy -name $(APP) -remote -upload -source /opt/web/applications/deploy/$(APP).war'
+                  readyTimeout: '20000'
+
+    - job: EventHub
+      displayName: '📡 EventHub Registration'
+      dependsOn: Deploy${{ variables['Build.SourceBranchName'] }}
+      condition: always()
+      steps:
+        - task: VivoEventHubTools@2
+          displayName: '📡 Registro de deploy no EventHub'
+          condition: always()
+          continueOnError: true
+          inputs:
+            command: 'deploy'
+            eventHubConnection: 'EVHCodeProd'
+            componentVersion: $(PACKAGE_VERSION)
+            deployArtifactName: '$(APP)'
+            deployArtifactType: 'war'
+            deployEnvironmentType: 'weblogic'
+            deployEnvironmentName: 'qa'
+            deployEnvironmentCluster: '$(CLUSTER)'
+            annotations: 'deploy-mechanism=wlst,artifact-type=war,server-type=weblogic'
+            pipelineType: 'tech_products/ccin/middleware'

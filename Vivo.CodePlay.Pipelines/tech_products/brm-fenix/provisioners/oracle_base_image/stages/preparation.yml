@@ -1,0 +1,116 @@
+parameters:
+  - name: oracleBaseImageUpdate
+    type: object
+
+stages:
+  - stage: stage_prep
+    displayName: "Preparation"
+    pool: $(POOL)
+    jobs:
+      - job: preparation
+        displayName: "Preparation"
+        steps:
+          - template: ../../../task_groups/checkout/checkout.yml
+            parameters:
+              repository: self
+              path: "$(SOURCE_CODE_FOLDER)"
+              disablePullRebase: true
+
+          - template: ../../../task_groups/artifact/publish.yml
+            parameters:
+              artifactName: "$(SOURCE_CODE_FOLDER)"
+              targetPath: "$(SOURCE_CODE_FOLDER_PATH)"
+
+          - script: |
+              _IS_IMAGES_IN_REPOSITORY=false
+
+              if [ -d "$(SOURCE_CODE_FOLDER_PATH)/$IMAGES_FOLDER_IN_REPOSITORY" ] && [ "$(ls -A $(SOURCE_CODE_FOLDER_PATH)/$IMAGES_FOLDER_IN_REPOSITORY 2>/dev/null)" ]; then
+                echo "##[section]✔️ The folder $IMAGES_FOLDER_IN_REPOSITORY is not empty."
+
+                VALID_IMAGES=()
+                INVALID_IMAGES=()
+
+                # Correção para tratar VALID_EXTENSIONS como um array
+                VALID_EXTENSIONS_ARRAY=(${VALID_EXTENSIONS//,/ })
+
+                for file in $(ls $(SOURCE_CODE_FOLDER_PATH)/$IMAGES_FOLDER_IN_REPOSITORY); do
+                  if [ "$file" == "README.md" ]; then
+                    echo "     🧾 $file is a README file and will be ignored."
+                    continue
+                  fi
+
+                  EXTENSION=$(echo "$file" | grep -oE '\.tar\.gz$|\.tar$|\.zip$' | sed 's/^\.//')
+
+                  if [[ ! " ${VALID_EXTENSIONS_ARRAY[@]} " =~ " ${EXTENSION} " ]]; then
+                    INVALID_IMAGES+=("$file")
+                    echo "     ❌ $file"
+                  else
+                    _IS_IMAGES_IN_REPOSITORY=true
+                    VALID_IMAGES+=("$file")
+                    echo "     ✔️ $file"
+                  fi
+                done
+
+                if [ ${#INVALID_IMAGES[@]} -gt 0 ]; then
+                  echo "##vso[task.logissue type=warning]The following files have invalid extensions: ${INVALID_IMAGES[@]}"
+                fi
+
+                if [ ${#VALID_IMAGES[@]} -eq 0 ]; then
+                  echo "##vso[task.logissue type=error]No valid images found in the repository. Please check the contents of the folder $IMAGES_FOLDER_IN_REPOSITORY."
+                  exit 1
+                else
+                  echo "##vso[task.setvariable variable=VALID_IMAGES;isOutput=true]${VALID_IMAGES[@]}"
+                fi
+              else
+                echo "##vso[task.logissue type=error]The folder $IMAGES_FOLDER_IN_REPOSITORY is empty. Please check if the images were committed correctly."
+                exit 1
+              fi
+
+              echo "##vso[task.setvariable variable=IS_IMAGES_IN_REPOSITORY;isoutput=true]${_IS_IMAGES_IN_REPOSITORY}"
+            name: check_images_repository
+            displayName: "Checking images in Repository"
+            condition: and(succeeded(), eq('${{ parameters.oracleBaseImageUpdate.oracleImageLink }}', '-'))
+
+      - job: informations
+        displayName: "Informations"
+        dependsOn: preparation
+        variables:
+          - name: IS_IMAGES_IN_REPOSITORY
+            value: $[ dependencies.preparation.outputs['check_images_repository.IS_IMAGES_IN_REPOSITORY'] ]
+          - name: VALID_IMAGES
+            value: $[ dependencies.preparation.outputs['check_images_repository.VALID_IMAGES'] ]
+        steps:
+          - checkout: none
+          - task: CmdLine@2
+            name: task_information
+            displayName: "Informations"
+            inputs:
+              script: |
+                if [ "$(IS_IMAGES_IN_REPOSITORY)" != "true" ]; then
+                  # Retrieves information from the Oracle image link parameter.
+                  ORACLE_IMAGE_LINK="${{ parameters.oracleBaseImageUpdate.oracleImageLink }}"
+                  ARTIFACT=$(echo "$ORACLE_IMAGE_LINK" | awk -F'patch_file=' '{print $2}')
+                  ARTIFACT_FILE_EXTENSION=$(IFS='.' read -ra ext <<< $ARTIFACT && echo "${ext[1]}")
+                  ARTIFACT_DOWNLOADED_NEW_NAME="$(IFS='.' read -ra art_nn <<< $ARTIFACT && echo "${art_nn[0]}")__$(date +"%d%m%Y_%H%M%S")"
+
+                  # Prints the retrieved information.
+                  echo "##[debug] ORACLE IMAGE LINK ...........................................: $ORACLE_IMAGE_LINK"
+                  echo "##[debug] ARTIFACT ....................................................: $ARTIFACT"
+                  echo "##[debug] ARTIFACT FILE EXTENSION .....................................: $ARTIFACT_FILE_EXTENSION"
+
+                  # Sets output variables for later use in the pipeline.
+                  echo "##vso[task.setvariable variable=ARTIFACT;isoutput=true]$ARTIFACT"
+                  echo "##vso[task.setvariable variable=ARTIFACT_EXTENSION;isoutput=true]$ARTIFACT_FILE_EXTENSION"
+                  echo "##vso[task.setvariable variable=ARTIFACT_NEW_NAME;isoutput=true]$ARTIFACT_DOWNLOADED_NEW_NAME"
+                else
+                  echo "##[debug] VALID IMAGES EXTENSIONS .....................................: $VALID_EXTENSIONS"
+                  echo "##[debug] IMAGES FOLDER IN REPOSITORY .................................: $IMAGES_FOLDER_IN_REPOSITORY"
+                  echo "##[debug] IMAGES IN REPOSITORY ........................................: $VALID_IMAGES"
+                fi
+
+                echo "##[debug] PUSH PATH IN ACR ............................................: ${{ parameters.oracleBaseImageUpdate.pathACR }}"
+                echo "##[debug] CUSTOM TAG ..................................................: ${{ parameters.oracleBaseImageUpdate.customTag }}"
+                echo "##[debug] DOWNLOADED COMPACTED IMAGES FOLDER ..........................: $DOWNLOADED_COMPACTED_IMAGES_FOLDER"
+                echo "##[debug] DOWNLOADED COMPACTED IMAGES FOLDER PATH .....................: $DOWNLOADED_COMPACTED_IMAGES_FOLDER_PATH"
+                echo "##[debug] TAR IMAGES FOLDER ...........................................: $TAR_IMAGES_FOLDER"
+                echo "##[debug] TAR IMAGES FOLDER PATH ......................................: $TAR_IMAGES_FOLDER_PATH"

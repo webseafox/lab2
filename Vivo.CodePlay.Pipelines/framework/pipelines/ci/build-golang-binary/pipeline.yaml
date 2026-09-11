@@ -1,0 +1,985 @@
+# ==================================================================
+# Pipeline: Publish Golang Binary - Publicação de Binários Go
+# -----------------------------------------------------
+# Pipeline de Integração Contínua completo para aplicações Go.
+# Compila, testa, analisa qualidade (SonarQube), verifica segurança
+# (Fortify SAST), verifica dependências (SCA), versiona e publica binário.
+# -----------------------------------------------------
+# Capacidades Implementadas:
+# ✅ Build Go com versionamento
+# ✅ Publicação de binário como artefato (Pipeline + Azure Artifacts)
+# ✅ Versionamento automático (commit/tag)
+# ✅ Testes unitários com cobertura Go native
+# ✅ Quality Gate SonarQube parametrizável
+# ✅ Cache Go Modules para performance
+# ✅ Autenticação GOPROXY/Nexus flexível
+# ✅ Azure App Configuration integration
+# ✅ Static Analysis com golangci-lint
+# ✅ Race condition detection
+# ✅ Análise de segurança SAST (Fortify)
+# ✅ Análise de composição de software SCA (Dependency-Track)
+# ✅ Controle de segurança (Key Vault)
+# -----------------------------------------------------
+# TODOs Futuras Melhorias:
+# - Suporte a múltiplos destinos (Nexus, S3, FTP)
+# - Integração com govulncheck
+# ==================================================================
+
+parameters:
+# ==================================================================
+# Infraestrutura e Ambiente
+# ==================================================================
+- name: agentPool
+  type: string
+  default: GeneralPurposeLinuxAgentsCI
+  displayName: 'Agent Pool para execução'
+
+- name: useNetworkProxy
+  type: boolean
+  default: false
+  displayName: 'Configurar proxy de rede para acesso externo (se necessário)'
+
+# ==================================================================
+# Controle de Fluxo e Capacidades
+# ==================================================================
+- name: prValidationOnly
+  type: boolean
+  default: false
+  displayName: 'Executa apenas validação, não publica nem gera versão'
+
+- name: enableCache
+  type: boolean
+  default: true
+  displayName: 'Habilitar cache de módulos Go'
+
+- name: enableTest
+  type: boolean
+  default: true
+  displayName: 'Executar testes unitários'
+
+- name: enableRaceDetection
+  type: boolean
+  default: true
+  displayName: 'Habilitar detecção de race conditions nos testes'
+
+- name: enableLint
+  type: boolean
+  default: false
+  displayName: 'Executar golangci-lint (análise estática)'
+
+- name: enableCoverage
+  type: boolean
+  default: false
+  displayName: 'Habilitar cobertura de código nos testes'
+
+- name: runQualityGate
+  type: boolean
+  default: true
+  displayName: 'Executar Quality Gate (SonarQube)'
+
+# ==================================================================
+# Configurações de Go
+# ------------------------------------------------------------------
+# Versão do Go é lida do arquivo .tool-versions (ASDF) por padrão
+# Se não existir .tool-versions, usa a versão especificada no parâmetro
+# GOPROXY pode ser configurado para usar Nexus como proxy de módulos
+# ==================================================================
+- name: goVersion
+  type: string
+  default: ''
+  displayName: 'Versão do Go (vazio = usar .tool-versions)'
+
+- name: workingDirectory
+  type: string
+  default: $(Build.SourcesDirectory)
+  displayName: 'Diretório do projeto Go (onde está o go.mod)'
+
+- name: mainPackage
+  type: string
+  default: 'main.go'
+  displayName: 'Caminho do pacote principal (main package)'
+
+- name: binaryName
+  type: string
+  default: '$(Build.Repository.Name)'
+  displayName: 'Nome do binário compilado'
+
+# ==================================================================
+# Configurações de GOPROXY e Nexus
+# ------------------------------------------------------------------
+# Para usar o Nexus como GOPROXY, configure a URL do Nexus
+# Formato: https://nexus.exemplo.com/repository/go-proxy/
+# ==================================================================
+- name: useNexusProxy
+  type: boolean
+  default: false
+  displayName: 'Usar Nexus como GOPROXY'
+
+- name: goproxyUrl
+  type: string
+  default: 'https://proxy.golang.org,direct'
+  displayName: 'URL do GOPROXY (usar Nexus se useNexusProxy=true)'
+
+# ==================================================================
+# Configurações de Build
+# ==================================================================
+- name: buildTags
+  type: string
+  default: ''
+  displayName: 'Build tags (ex: netgo,osusergo)'
+
+- name: ldflags
+  type: string
+  default: '-s -w'
+  displayName: 'Linker flags para otimização'
+
+- name: versionLdFlag
+  type: string
+  default: 'main.Version'
+  displayName: 'Path da variável Go para injeção de versão via ldflags (ex: main.Version, meu/pkg/cmd.Version)'
+
+- name: cgoEnabled
+  type: boolean
+  default: false
+  displayName: 'Habilitar CGO'
+
+- name: targetOS
+  type: string
+  default: 'linux'
+  displayName: 'Sistema operacional alvo'
+  values:
+    - 'linux'
+    - 'darwin'
+    - 'windows'
+
+- name: targetArch
+  type: string
+  default: 'amd64'
+  displayName: 'Arquitetura alvo'
+  values:
+    - 'amd64'
+    - 'arm64'
+    - 'arm'
+
+- name: publishMultiPlatform
+  type: boolean
+  default: true
+  displayName: 'Compilar e publicar múltiplos binários (linux/darwin/windows)'
+
+- name: targetPlatforms
+  type: object
+  default:
+    platforms:
+      - os: linux
+        arch: amd64
+      - os: linux
+        arch: arm64
+      - os: darwin
+        arch: amd64
+      - os: darwin
+        arch: arm64
+      - os: windows
+        arch: amd64
+  displayName: 'Lista de plataformas alvo (cada item com os e arch)'
+
+# ==================================================================
+# Configurações de Publicação (Azure Artifacts)
+# ==================================================================
+- name: feedName
+  type: string
+  default: $(DEFAULT_FEED_NAME)
+  displayName: 'Nome do feed do Azure Artifacts (Universal Packages)'
+
+- name: packageName
+  type: string
+  default: '$(Build.Repository.Name)'
+  displayName: 'Nome do pacote no Azure Artifacts'
+
+- name: projectScopedFeed
+  type: boolean
+  default: true
+  displayName: 'Usar feed com escopo do projeto (true) ou organização (false)'
+
+# ==================================================================
+# Configurações de Segurança
+# ==================================================================
+- name: enableFortifyExclusions
+  displayName: 'Faz checkout do repositório Fortify Exclusions'
+  type: boolean
+  default: false
+
+# ==================================================================
+# Configurações de Versionamento
+# ==================================================================
+- name: versionFile
+  type: string
+  default: 'VERSION'
+  displayName: 'Arquivo de versionamento'
+
+- name: branchingStrategy
+  type: string
+  default: 'trunkbased'
+  displayName: 'Estratégia de versionamento'
+  values:
+    - 'trunkbased'
+    - 'vivoflow'
+    - 'releaseflow'
+    - 'gitlabflow'
+    - 'gitlabflow-semantic'
+    - 'custom'
+    - 'monorepo'
+
+# ==================================================================
+# Configurações do Sonar
+# ==================================================================
+- name: useSonarConfigFile
+  type: boolean
+  default: true
+  displayName: 'Usar arquivo de configuração do SonarQube?'
+
+- name: sonarConfigFilePath
+  type: string
+  default: '.azuredevops/sonar-project.properties'
+  displayName: 'Caminho do arquivo de configuração do SonarQube'
+
+- name: sonarPollingTimeoutSec
+  type: string
+  default: '300'
+  displayName: 'Timeout do Polling SonarQube (s)'
+
+- name: sonarJavaVersion
+  type: string
+  default: 'openjdk-17.0.2'
+  displayName: 'Versão do Java para análise SonarQube'
+  values:
+    - 'openjdk-21.0.2'
+    - 'openjdk-17.0.2'
+    - 'openjdk-11.0.2'
+
+# ==================================================================
+# Service Connection do SonarQube
+# Hoje ainda permite referenciar manualmente o Sonar VIP ou comum.
+# Será depreciado em breve (história futura) para aderir à governança da ADR 0006.
+# ==================================================================
+- name: sonarServiceConnection
+  type: string
+  default: 'VIVO_SONARQUBE'
+  displayName: '(DEPRECATED) Service Connection do SonarQube'
+
+- name: sonarQualityGate
+  type: string
+  default: 'AzureDevOps-Default'
+  displayName: 'Quality Gate do SonarQube'
+
+- name: sonarScannerMode
+  type: string
+  default: 'cli'
+  displayName: 'Modo do scanner SonarQube'
+  values:
+    - 'cli'
+    - 'dotnet'
+
+- name: sonarProjectKey
+  type: string
+  default: '$(System.TeamProject)-$(Build.Repository.Name)'
+  displayName: 'Chave do projeto no SonarQube'
+
+- name: sonarProjectName
+  type: string
+  default: '$(System.TeamProject)-$(Build.Repository.Name)'
+  displayName: 'Nome do projeto no SonarQube'
+
+# ==================================================================
+# Configurações de App Configuration
+# ==================================================================
+- name: useAppConfig
+  type: boolean
+  default: true
+  displayName: 'Usar Azure App Configuration para SonarQube'
+
+variables:
+  SIGLA: $[ lower(split(variables['System.TeamProject'],' ')[0]) ]
+  DEFAULT_FEED_NAME: $[ lower(split(variables['System.TeamProject'],' ')[0]) ]
+  VERSION_FILE_PATH: ${{ parameters.workingDirectory }}/${{ parameters.versionFile }}
+  GO_CACHE_FOLDER: $(Pipeline.Workspace)/.go/pkg/mod
+  GO_BUILD_CACHE: $(Pipeline.Workspace)/.go/build-cache
+  ${{ if eq(parameters.enableCache, true) }}:
+    GOMODCACHE: $(GO_CACHE_FOLDER)
+    GOCACHE: $(GO_BUILD_CACHE)
+  ${{ if eq(parameters.cgoEnabled, true) }}:
+    CGO_ENABLED: '1'
+  ${{ else }}:
+    CGO_ENABLED: '0'
+  GOOS: ${{ parameters.targetOS }}
+  GOARCH: ${{ parameters.targetArch }}
+
+  # Variáveis utilizadas por templates de Segurança (Fortify/SCA)
+  CACORP_LOCATION: $(Agent.HomeDirectory)/../../certs/CACORP.pem
+  FORTIFY_APP_DEFAULT_VERSION: DevSecOps
+  APP_LANGUAGE: 'go'
+
+  # Configurações de KeyVault para Segurança
+  AKV_DEVOPS_NAME: 'kv-azdevops-shared'
+
+  # Variables for Proxy
+  PROXY_NSKP_SERVER: "nskp.redecorp.br:8080"
+  PROXY_SQUID_SERVER: "10.240.58.39:3128"
+  PROXY_AGENT_HTTP: "http://$(PROXY_NSKP_SERVER)"
+  PROXY_AGENT_HTTPS: "http://$(PROXY_NSKP_SERVER)"
+  PROXY_AGENT_NO_PROXY: "localhost,0.0.0.0,127.0.0.1,10.244.0.0/16,192.168.0.0/16,10.129.178.173,nexus.telefonica.com.br,acrsharedservices01.azurecr.io,appcs-azdevops-shared.azconfig.io,scm.azurewebsites.net"
+
+# ==================================================================
+# Estágios do Pipeline
+# ==================================================================
+stages:
+# ==================================================================
+# Stage 1: GoBuild - Compilação, Testes e Análise de Qualidade
+# Descrição: Compila aplicação Go, executa testes unitários com cobertura,
+#            análise estática (golangci-lint) e análise SonarQube
+# ==================================================================
+- stage: GoBuild
+  displayName: 'Build & Test Go Binary'
+  condition: succeeded()
+  jobs:
+  - job: GoBuild
+    displayName: 'Go Build & Test'
+    pool: ${{ parameters.agentPool }}
+    steps:
+    # ==================================================================
+    # [Configuração Inicial] Checkout do código
+    # ==================================================================
+    - checkout: self
+
+    # AVISO TEMPORÁRIO: Este bloco será removido após a remoção definitiva do parâmetro 'sonarServiceConnection'.
+    # Exibe warning para quem ainda sobrescreve manualmente o parâmetro.
+    - ${{ if ne(parameters.sonarServiceConnection, 'VIVO_SONARQUBE') }}:
+      - script: |
+          echo "##vso[task.logissue type=warning]O parâmetro 'sonarServiceConnection' está depreciado e será removido após 30/06/2026. Consulte ADR 0006 e ADR 0008 para detalhes. A escolha da instância Sonar será automática via custom task e vip.json. Atualize seu pipeline!"
+          echo "##vso[task.logissue type=warning]ADR 0006: https://dev.azure.com/telefonica-vivo-brasil/DevOps/_git/Vivo.CodePlay.Pipelines?path=/doc/adr/0006-uso-do-sonar.md"
+          echo "##vso[task.logissue type=warning]ADR 0008: https://dev.azure.com/telefonica-vivo-brasil/DevOps/_git/Vivo.CodePlay.Pipelines?path=/framework/docs/adr/0008-sonar-vip-governance.md"
+          echo "##vso[task.complete result=SucceededWithIssues;]"
+        displayName: '⚠️ AVISO: Depreciação do sonarServiceConnection'
+
+    # ==================================================================
+    # [Observabilidade] Exibe parâmetros quando em modo debug
+    # ==================================================================
+    - task: VivoUtilsFromVivo@1
+      displayName: 'Show Pipeline Parameters'
+      condition: eq(variables['System.Debug'], 'true')
+      inputs:
+        command: 'show-pipeline-parameters'
+        parameters: '${{ convertToJson(parameters) }}'
+
+    # ==================================================================
+    # [Autenticação Opcional] Nexus via Azure Key Vault para GOPROXY
+    # ==================================================================
+    - ${{ if eq(parameters.useNexusProxy, true) }}:
+      - task: AzureKeyVault@2
+        displayName: 'Secrets from AKV'
+        inputs:
+          azureSubscription: "DevOpsSharedResources"
+          KeyVaultName: "kv-azdevops-shared"
+          SecretsFilter: >-
+            NEXUS-DEPS-USR, NEXUS-DEPS-PSW
+
+    # ==================================================================
+    # [Performance] Cache Go Modules
+    # ==================================================================
+    - ${{ if eq(parameters.enableCache, true) }}:
+      - script: |
+          mkdir -p "$(GO_CACHE_FOLDER)"
+          mkdir -p "$(GO_BUILD_CACHE)"
+        displayName: 'Prepare Cache Directories'
+
+      - task: Cache@2
+        displayName: 'Cache Go modules'
+        inputs:
+          key: 'go-mod | "$(Agent.OS)" | ${{ parameters.workingDirectory }}/go.mod'
+          restoreKeys: |
+            go-mod | "$(Agent.OS)"
+            go-mod
+          path: $(GO_CACHE_FOLDER)
+        continueOnError: true
+
+      - task: Cache@2
+        displayName: 'Cache Go build'
+        inputs:
+          key: 'go-build | "$(Agent.OS)" | ${{ parameters.workingDirectory }}/go.mod'
+          restoreKeys: |
+            go-build | "$(Agent.OS)"
+            go-build
+          path: $(GO_BUILD_CACHE)
+        continueOnError: true
+
+    # ==================================================================
+    # [Versionamento] Definição da versão (VersionManager)
+    # ==================================================================
+    - task: VersionManagerVivo@8
+      displayName: 'Next version'
+      inputs:
+        command: 'nextVersion'
+        branchingStrategy: ${{ parameters.branchingStrategy }}
+        versionFile: $(VERSION_FILE_PATH)
+        bumpMethod: 'patch'
+        passthroughVersion: ${{ parameters.prValidationOnly }}
+      name: VersionManagerVivo
+
+    # ==================================================================
+    # [Configuração] Setup Go Environment
+    # ==================================================================
+    - script: |
+        echo "##[section]Configurando ambiente Go"
+        echo "##[debug]GOOS=$(GOOS)"
+        echo "##[debug]GOARCH=$(GOARCH)"
+        echo "##[debug]CGO_ENABLED=$(CGO_ENABLED)"
+        echo "##[debug]Go Version: ${{ parameters.goVersion }}"
+        
+        # Configura GOPROXY baseado na variável de ambiente
+        if [ "${USE_NEXUS_PROXY,,}" = "true" ]; then
+          export GOPROXY="${GOPROXY_URL}"
+        else
+          export GOPROXY="https://proxy.golang.org,direct"
+        fi
+        
+        echo "##vso[task.setvariable variable=GOPROXY]${GOPROXY}"
+        echo "##[debug]GOPROXY=${GOPROXY}"
+        
+        # Verifica versão do Go
+        go version
+        go env
+      displayName: 'Setup Go Environment'
+      workingDirectory: ${{ parameters.workingDirectory }}
+      env:
+        ASDF_GOLANG_VERSION: ${{ parameters.goVersion }}
+        USE_NEXUS_PROXY: ${{ parameters.useNexusProxy }}
+        GOPROXY_URL: ${{ parameters.goproxyUrl }}
+
+    # ==================================================================
+    # [Dependências] Download de módulos Go
+    # ==================================================================
+    - script: |
+        echo "##[section]Baixando módulos Go"
+        go mod download
+        go mod verify
+        echo "##[debug]Módulos verificados com sucesso"
+      displayName: 'Download Go Modules'
+      workingDirectory: ${{ parameters.workingDirectory }}
+      env:
+        ASDF_GOLANG_VERSION: ${{ parameters.goVersion }}
+        ${{ if eq(parameters.useNexusProxy, true) }}:
+          GOPROXY: ${{ parameters.goproxyUrl }}
+          GONOPROXY: 'none'
+          GONOSUMDB: '*'
+
+    # ==================================================================
+    # [Lint] Análise estática com golangci-lint
+    # ==================================================================
+    - ${{ if eq(parameters.enableLint, true) }}:
+      - script: |
+          echo "##[section]Executando golangci-lint"
+          
+          # Instala golangci-lint se não estiver disponível
+          # TODO: Instalar direto nos agentes
+          if ! command -v golangci-lint &> /dev/null; then
+            echo "##[debug]Instalando golangci-lint"
+            curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(go env GOPATH)/bin v1.55.2
+            export PATH="$(go env GOPATH)/bin:$PATH"
+          fi
+          
+          # Executa lint com relatório
+          golangci-lint run --out-format=checkstyle > golangci-lint-report.xml || true
+          golangci-lint run --out-format=colored-line-number
+        displayName: 'Run golangci-lint'
+        workingDirectory: ${{ parameters.workingDirectory }}
+        continueOnError: true
+        env:
+          ASDF_GOLANG_VERSION: ${{ parameters.goVersion }}
+
+      - task: PublishPipelineArtifact@1
+        displayName: 'Publish Lint Report'
+        condition: always()
+        continueOnError: true
+        inputs:
+          targetPath: '${{ parameters.workingDirectory }}/golangci-lint-report.xml'
+          artifact: 'lint-report'
+          publishLocation: 'pipeline'
+
+    # ==================================================================
+    # [Build] Compilação dos binários Go
+    # ==================================================================
+    - ${{ if eq(parameters.publishMultiPlatform, true) }}:
+      # ==================================================================
+      # [Build Multi-Plataforma] Compila um binário para cada plataforma
+      # Cada plataforma gera um step separado para melhor rastreabilidade
+      # ==================================================================
+      - ${{ each platform in parameters.targetPlatforms.platforms }}:
+        - script: |
+            echo "##[section]Compilando ${{ platform.os }}/${{ platform.arch }}"
+            VERSION="$(VersionManagerVivo.VERSION)"
+            BUILD_TIME=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+            GIT_COMMIT=$(git rev-parse --short HEAD)
+            LDFLAGS="${LDFLAGS_PARAM} -X '${VERSION_LDFLAG}=${VERSION}' -X 'main.BuildTime=${BUILD_TIME}' -X 'main.GitCommit=${GIT_COMMIT}'"
+
+            mkdir -p "bin/${{ platform.os }}-${{ platform.arch }}"
+
+            if [ "${{ platform.os }}" = "windows" ]; then
+              OUTPUT_NAME="${BINARY_NAME}.exe"
+            else
+              OUTPUT_NAME="${BINARY_NAME}"
+            fi
+
+            BUILD_CMD="go build -v -ldflags \"${LDFLAGS}\""
+            if [ -n "${BUILD_TAGS}" ]; then
+              BUILD_CMD="${BUILD_CMD} -tags ${BUILD_TAGS}"
+            fi
+            BUILD_CMD="${BUILD_CMD} -o bin/${{ platform.os }}-${{ platform.arch }}/${OUTPUT_NAME} ${MAIN_PACKAGE}"
+
+            echo "##[command]GOOS=${{ platform.os }} GOARCH=${{ platform.arch }} CGO_ENABLED=${CGO_ENABLED} ${BUILD_CMD}"
+            GOOS="${{ platform.os }}" GOARCH="${{ platform.arch }}" CGO_ENABLED="${CGO_ENABLED}" eval ${BUILD_CMD}
+
+            if [ "${{ platform.os }}" != "windows" ]; then
+              chmod +x "bin/${{ platform.os }}-${{ platform.arch }}/${OUTPUT_NAME}"
+            fi
+            echo "##[section]Binário gerado:"
+            ls -la "bin/${{ platform.os }}-${{ platform.arch }}/"
+          displayName: 'Build ${{ platform.os }}/${{ platform.arch }}'
+          workingDirectory: ${{ parameters.workingDirectory }}
+          env:
+            ASDF_GOLANG_VERSION: ${{ parameters.goVersion }}
+            CGO_ENABLED: $(CGO_ENABLED)
+            VERSION: $(VersionManagerVivo.VERSION)
+            LDFLAGS_PARAM: ${{ parameters.ldflags }}
+            VERSION_LDFLAG: ${{ parameters.versionLdFlag }}
+            BUILD_TAGS: ${{ parameters.buildTags }}
+            BINARY_NAME: ${{ parameters.binaryName }}
+            MAIN_PACKAGE: ${{ parameters.mainPackage }}
+
+    - ${{ else }}:
+      # ==================================================================
+      # [Build Single Target] Compila para uma única plataforma
+      # ==================================================================
+      - script: |
+          echo "##[section]Compilando $(GOOS)/$(GOARCH)"
+          VERSION="$(VersionManagerVivo.VERSION)"
+          BUILD_TIME=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+          GIT_COMMIT=$(git rev-parse --short HEAD)
+          LDFLAGS="${LDFLAGS_PARAM} -X '${VERSION_LDFLAG}=${VERSION}' -X 'main.BuildTime=${BUILD_TIME}' -X 'main.GitCommit=${GIT_COMMIT}'"
+
+          mkdir -p bin
+
+          if [ "${GOOS}" = "windows" ]; then
+            OUTPUT_NAME="${BINARY_NAME}.exe"
+          else
+            OUTPUT_NAME="${BINARY_NAME}"
+          fi
+
+          BUILD_CMD="go build -v -ldflags \"${LDFLAGS}\""
+          if [ -n "${BUILD_TAGS}" ]; then
+            BUILD_CMD="${BUILD_CMD} -tags ${BUILD_TAGS}"
+          fi
+          BUILD_CMD="${BUILD_CMD} -o bin/${OUTPUT_NAME} ${MAIN_PACKAGE}"
+          echo "##[command]${BUILD_CMD}"
+          eval ${BUILD_CMD}
+
+          if [ "${GOOS}" != "windows" ]; then
+            chmod +x "bin/${OUTPUT_NAME}"
+          fi
+
+          echo "##[section]Binário gerado:"
+          ls -la bin/
+        displayName: 'Build Go Application'
+        workingDirectory: ${{ parameters.workingDirectory }}
+        env:
+          ASDF_GOLANG_VERSION: ${{ parameters.goVersion }}
+          CGO_ENABLED: $(CGO_ENABLED)
+          GOOS: $(GOOS)
+          GOARCH: $(GOARCH)
+          VERSION: $(VersionManagerVivo.VERSION)
+          LDFLAGS_PARAM: ${{ parameters.ldflags }}
+          VERSION_LDFLAG: ${{ parameters.versionLdFlag }}
+          BUILD_TAGS: ${{ parameters.buildTags }}
+          BINARY_NAME: ${{ parameters.binaryName }}
+          MAIN_PACKAGE: ${{ parameters.mainPackage }}
+
+# ==================================================================
+# CAPACIDADE: TESTES UNITÁRIOS + COBERTURA (condicional enableTest)
+# Descrição: Executa testes com cobertura nativa do Go
+# Documentação: https://dvps.redecorp.azr/portal/codeplay/capacidades/catalog/testes-unitarios
+# Pré-requisitos: Testes implementados seguindo convenções Go (_test.go)
+# Artefatos: relatórios JUnit XML + cobertura HTML/XML
+# ==================================================================
+    - ${{ if eq(parameters.enableTest, true) }}:
+      # ==================================================================
+      # [Testes & Cobertura] Execução de Testes Unitários
+      # ==================================================================
+      - script: |
+          echo "##[section]Preparando ambiente de testes"
+          mkdir -p test-results
+          echo "##[debug]Diretório de testes: test-results"
+          
+          # Define flags de teste base (sem verbose por padrão)
+          TEST_FLAGS=""
+          
+          # Adiciona verbose se System.Debug habilitado
+          if [ "${SYSTEM_DEBUG,,}" = "true" ]; then
+            TEST_FLAGS="-v"
+            echo "##[debug]Verbose mode habilitado"
+          fi
+          
+          # Adiciona cobertura se habilitado
+          if [ "${ENABLE_COVERAGE,,}" = "true" ]; then
+            TEST_FLAGS="${TEST_FLAGS} -cover"
+            echo "##[debug]Cobertura de código habilitada"
+          fi
+          
+          # Adiciona detecção de race conditions se habilitado
+          if [ "${ENABLE_RACE_DETECTION,,}" = "true" ] && [ "${GOOS}" = "linux" ]; then
+            TEST_FLAGS="${TEST_FLAGS} -race"
+            export CGO_ENABLED=1
+            echo "##[debug]Race condition detection habilitado"
+          fi
+          
+          echo "##[debug]TEST_FLAGS: ${TEST_FLAGS}"
+          echo "##[section]Executando testes unitários"
+          echo "##[command]go test ${TEST_FLAGS} ./..."
+          go test ${TEST_FLAGS} ./... 2>&1 | tee test-results/test-output.txt
+          TEST_EXIT_CODE=${PIPESTATUS[0]}
+          echo "##[debug]Exit code: ${TEST_EXIT_CODE}"
+          
+          if [ ${TEST_EXIT_CODE} -eq 0 ]; then
+            echo "##[section]✓ Testes executados com sucesso"
+            # Extrai resumo de cobertura se habilitado
+            if [ "${ENABLE_COVERAGE,,}" = "true" ]; then
+              echo "##[section]Resumo de cobertura:"
+              grep "coverage:" test-results/test-output.txt | tail -5 | tee test-results/coverage-summary.txt
+            fi
+          else
+            echo "##[error]Testes falharam com exit code ${TEST_EXIT_CODE}"
+            echo "##[section]Últimas linhas do output:"
+            tail -15 test-results/test-output.txt
+          fi
+          
+          echo "##[debug]Arquivos gerados:"
+          ls -lah test-results/
+          
+          exit ${TEST_EXIT_CODE}
+        displayName: 'Run Tests with Coverage'
+        workingDirectory: ${{ parameters.workingDirectory }}
+        env:
+          ASDF_GOLANG_VERSION: ${{ parameters.goVersion }}
+          CGO_ENABLED: $(CGO_ENABLED)
+          ENABLE_COVERAGE: ${{ parameters.enableCoverage }}
+          ENABLE_RACE_DETECTION: ${{ parameters.enableRaceDetection }}
+          SYSTEM_DEBUG: $(System.Debug)
+
+      # ==================================================================
+      # [Publicação] Relatórios de Testes
+      # ==================================================================
+      - task: PublishPipelineArtifact@1
+        displayName: 'Publish Test Reports'
+        condition: succeededOrFailed()
+        inputs:
+          targetPath: '${{ parameters.workingDirectory }}/test-results'
+          artifact: 'test-reports'
+          publishLocation: 'pipeline'
+
+#############################################################################
+# CAPACIDADE: QUALITY GATE (SONARQUBE)
+#############################################################################
+# Descrição: Análise estática de código e quality gate
+# Documentação: https://dvps.redecorp.azr/portal/codeplay/capacidades/catalog/quality-gate
+# Pré-requisitos:
+#   - Service Connection 'SonarQube' configurada
+#   - Projeto configurado no SonarQube
+#   - Quality Gate definido no SonarQube
+# Configuração: Parâmetro 'runQualityGate' = true
+#############################################################################
+    - ${{ if eq(parameters.runQualityGate, true) }}:
+      # ==================================================================
+      # [SonarQube] Análise Completa de Qualidade de Código
+      # ==================================================================
+      - task: SonarAnalysisFromVivo@4
+        displayName: 'SonarQube Full Analysis'
+        inputs:
+          command: 'analysis'
+          SonarQubeVip: 'VIVO_SONARQUBE_VIP'
+          SonarQube: 'VIVO_SONARQUBE'
+          scannerMode: ${{ parameters.sonarScannerMode }}
+          ${{ if eq(parameters.useSonarConfigFile, true) }}:
+            configFile: ${{ parameters.sonarConfigFilePath }}
+          cliProjectKey: ${{ parameters.sonarProjectKey }}
+          cliProjectName: ${{ parameters.sonarProjectName }}
+          cliProjectVersion: $(VersionManagerVivo.VERSION)
+          qualityGate: ${{ parameters.sonarQualityGate }}
+          acronym: $(SIGLA)
+          reportPath: '$(Agent.TempDirectory)/sonar/$(Build.BuildId)/report-task.txt'
+          pollingTimeoutSec: ${{ parameters.sonarPollingTimeoutSec }}
+          useOpaRepository: 'true'
+          codePlayServiceConnection: 'CodePlay'
+          opaProject: 'DVPS - DEVOPS'
+          opaRepository: 'Vivo.OpenPolicy.SonarQube'
+          opaBranch: 'master'
+          useAppConfig: ${{ parameters.useAppConfig }}
+          azureSubscription: DevOpsSharedResources
+          appConfigurationEndpoint: 'https://appcs-azdevops-shared.azconfig.io'
+          sonarUrlPemCertificate: $(Agent.HomeDirectory)/../../certs/CACORP.pem
+          extraProperties: |
+            sonar.sources=${{ parameters.workingDirectory }}
+            sonar.exclusions=**/*_test.go,**/vendor/**,**/testdata/**
+            sonar.tests=${{ parameters.workingDirectory }}
+            sonar.test.inclusions=**/*_test.go
+            sonar.scanner.metadataFilePath=$(Agent.TempDirectory)/sonar/$(Build.BuildId)/report-task.txt
+            sonar.qualitygate.wait=false
+            sonar.qualitygate.timeout=${{ parameters.sonarPollingTimeoutSec }}
+        env:
+          ASDF_JAVA_VERSION: ${{ parameters.sonarJavaVersion }}
+
+    # ==================================================================
+    # [Publicação] Artefatos do Build para Próximos Stages
+    # ==================================================================
+    - ${{ if eq(parameters.publishMultiPlatform, true) }}:
+      # Publica um artefato por plataforma para download individual
+      - ${{ each platform in parameters.targetPlatforms.platforms }}:
+        - task: PublishPipelineArtifact@1
+          displayName: 'Publish Artifact (${{ platform.os }}-${{ platform.arch }})'
+          condition: succeeded()
+          inputs:
+            targetPath: '${{ parameters.workingDirectory }}/bin/${{ platform.os }}-${{ platform.arch }}'
+            artifact: 'go-binary-${{ platform.os }}-${{ platform.arch }}'
+            publishLocation: 'pipeline'
+
+    - ${{ else }}:
+      - task: PublishPipelineArtifact@1
+        displayName: 'Publish Go Binary Artifact (Pipeline)'
+        condition: succeeded()
+        inputs:
+          targetPath: '${{ parameters.workingDirectory }}/bin'
+          artifact: 'go-binary'
+          publishLocation: 'pipeline'
+
+# ==================================================================
+# Stage 2: SecurityAnalysis - Análise de Segurança SAST e SCA
+# Descrição: Executa análise de segurança estática (SAST) com Fortify ScanCentral e 
+#            análise de composição (SCA) com Dependency Track.
+#            Gates de segurança são controlados pelo AppSec via AppConfig.
+# ==================================================================
+- stage: SecurityAnalysis
+  displayName: 'Security Analysis'
+  dependsOn:
+  - GoBuild
+  condition: succeeded()
+  jobs:
+
+  - job: AppSecConfigKeys
+    displayName: 'Get AppSec Config Keys'
+    pool: ${{ parameters.agentPool }}
+    steps:
+    - script: |
+        if [ -d vendor ]; then
+          echo "##[debug] Removendo pasta vendor para evitar análise..."
+          rm -rf vendor
+          echo "##[debug] Pasta vendor removida com sucesso."
+        else
+          echo ""
+        fi
+        if [[ ${SYSTEM_DEBUG,,} == "true" ]]; then
+          echo "##[debug] Listando arquivos no diretório após remoção:"
+          ls -la
+        fi
+      workingDirectory: ${{ parameters.workingDirectory }}
+      displayName: 'Remove Build Folders from analysis'
+    - template: /security/get_appconfig_keys_framework.yml
+      parameters:
+        azureSubscription: DevOpsSharedResources
+        appConfigurationEndpoint: https://appcs-azdevops-shared.azconfig.io
+        useNetworkProxy: ${{ parameters.useNetworkProxy }}
+
+# ==================================================================
+# CAPACIDADE: FORTIFY SCAN (SAST)
+# ==================================================================
+# Descrição: Análise estática de código (SAST) usando Fortify ScanCentral e SSC
+# Documentação: https://dvps.redecorp.azr/portal/codeplay/capacidades/catalog/sast
+# ==================================================================
+
+  - job: FortifyScan
+    displayName: 'Fortify Scan'
+    dependsOn:
+    - AppSecConfigKeys
+    variables:
+      USE_FORTIFY: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.USE_FORTIFY'] ]
+      USE_CONVISO: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.USE_CONVISO'] ]
+      SKIP_SECURITY_GATE: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.SKIP_SECURITY_GATE'] ]
+    condition: and(succeeded(), eq(variables.USE_FORTIFY, 'true'))
+    pool: ${{ parameters.agentPool }}
+    steps:
+
+    - template: /security/define_appsec_app_version.yml
+
+    - template: /security/run_fortify_scan.yml
+      parameters:
+        fortifyExclusionRepository: 'FortifyExclusion'
+        enableFortifyExclusions: ${{ parameters.enableFortifyExclusions }}
+        appLanguage: 'go'
+        appVersion: "$(FORTIFY_APP_VERSION)"
+
+# ==================================================================
+# CAPACIDADE: SCA SCAN (Dependency-Track)
+# ==================================================================
+# Descrição: Análise de composição de software
+# ==================================================================
+  - job: SCAScan
+    displayName: 'SCA Scan'
+    dependsOn:
+    - AppSecConfigKeys
+    variables:
+      USE_DEPENDENCY_TRACK: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.USE_DEPENDENCY_TRACK'] ]
+    condition: and(succeeded(), eq(variables.USE_DEPENDENCY_TRACK, 'true'))
+    pool: ${{ parameters.agentPool }}
+    steps:
+    
+    # 1. Prepara o código fonte contendo o go.mod/go.sum como artefato 'app'
+    - checkout: self
+    - task: PublishBuildArtifacts@1
+      inputs:
+        pathToPublish: '$(Build.SourcesDirectory)'
+        artifactName: 'app'
+        publishLocation: 'Container'
+      displayName: 'Publicar Código Fonte para SCA'
+
+    # 2. Define a versão da aplicação
+    - template: /security/define_appsec_app_version.yml
+
+    # 3. Executa o Scan SCA no código-fonte
+    - template: /security/run_sca_scan.yml
+      parameters:
+        appVersion: "$(FORTIFY_APP_VERSION)"
+
+# ==================================================================
+# Stage 3: Publish - Publicação de Artefatos no Azure Artifacts
+# Descrição: Publica os binários compilados no Azure Artifacts como
+#            Universal Package, após aprovação dos gates de segurança.
+# ==================================================================
+- ${{ if eq(parameters.prValidationOnly, false) }}:
+  - stage: Publish
+    displayName: 'Publish Artifacts'
+    dependsOn:
+    - SecurityAnalysis
+    condition: succeeded()
+    jobs:
+    - job: PublishArtifacts
+      displayName: 'Publish to Azure Artifacts'
+      pool: ${{ parameters.agentPool }}
+      steps:
+      # ==================================================================
+      # [Versionamento] Recalcula versão para referência
+      # ==================================================================
+      - task: VersionManagerVivo@8
+        displayName: 'Next version'
+        inputs:
+          command: 'nextVersion'
+          branchingStrategy: ${{ parameters.branchingStrategy }}
+          versionFile: $(VERSION_FILE_PATH)
+          bumpMethod: 'patch'
+        name: VersionManagerVivo
+
+      # ==================================================================
+      # [Download + Publicação] Azure Artifacts (Universal Packages)
+      # ==================================================================
+      - ${{ if eq(parameters.publishMultiPlatform, true) }}:
+        # Publica um pacote por plataforma para download individual
+        - ${{ each platform in parameters.targetPlatforms.platforms }}:
+          - task: DownloadPipelineArtifact@2
+            displayName: 'Download ${{ platform.os }}-${{ platform.arch }}'
+            inputs:
+              buildType: 'current'
+              artifactName: 'go-binary-${{ platform.os }}-${{ platform.arch }}'
+              targetPath: '$(Pipeline.Workspace)/go-binary-${{ platform.os }}-${{ platform.arch }}'
+
+          - task: UniversalPackages@0
+            displayName: 'Publish ${{ platform.os }}-${{ platform.arch }}'
+            condition: succeeded()
+            inputs:
+              command: 'publish'
+              publishDirectory: '$(Pipeline.Workspace)/go-binary-${{ platform.os }}-${{ platform.arch }}'
+              feedsToUsePublish: 'internal'
+              ${{ if eq(parameters.projectScopedFeed, true) }}:
+                vstsFeedPublish: '$(System.TeamProject)/${{ parameters.feedName }}'
+              ${{ else }}:
+                vstsFeedPublish: '${{ parameters.feedName }}'
+              vstsFeedPackagePublish: '${{ parameters.packageName }}-${{ platform.os }}-${{ platform.arch }}'
+              versionOption: 'custom'
+              versionPublish: '$(VersionManagerVivo.VERSION)'
+              packagePublishDescription:  |
+                Go binary - $(Build.Repository.Name) v$(VersionManagerVivo.VERSION)
+                Documentação: $(Build.Repository.Uri)?path=/README.md
+
+      - ${{ else }}:
+        - task: DownloadPipelineArtifact@2
+          displayName: 'Download Go Binary Artifact'
+          inputs:
+            buildType: 'current'
+            artifactName: 'go-binary'
+            targetPath: '$(Pipeline.Workspace)/go-binary'
+
+        - task: UniversalPackages@0
+          displayName: 'Publish to Azure Artifacts'
+          condition: succeeded()
+          inputs:
+            command: 'publish'
+            publishDirectory: '$(Pipeline.Workspace)/go-binary'
+            feedsToUsePublish: 'internal'
+            ${{ if eq(parameters.projectScopedFeed, true) }}:
+              vstsFeedPublish: '$(System.TeamProject)/${{ parameters.feedName }}'
+            ${{ else }}:
+              vstsFeedPublish: '${{ parameters.feedName }}'
+            vstsFeedPackagePublish: '${{ parameters.packageName }}'
+            versionOption: 'custom'
+            versionPublish: '$(VersionManagerVivo.VERSION)'
+            packagePublishDescription: |
+              Go binary - $(Build.Repository.Name) v$(VersionManagerVivo.VERSION)
+              Documentação: $(Build.Repository.Uri)?path=/README.md
+
+# ==================================================================
+# Stage 4: VersionCommit - Commit e Tag da Versão de Release
+# Descrição: Atualiza versão no arquivo de versão, cria commit e tag Git
+# ==================================================================
+  - stage: VersionCommit
+    displayName: 'Commit Version'
+    dependsOn:
+    - Publish
+    jobs:
+    # ==================================================================
+    # Job 3.1: CommitVersion - Commit da Versão e Criação de Tag
+    # ==================================================================
+    - job: CommitVersion
+      displayName: 'Commit Release Version'
+      pool: ${{ parameters.agentPool }}
+      steps:
+      # ==================================================================
+      # [Git] Checkout com credenciais para push
+      # ==================================================================
+      - checkout: self
+        clean: true
+        persistCredentials: true
+        fetchDepth: 0
+
+      # ==================================================================
+      # [Versionamento] Reafirma versão e realiza commit/tag
+      # ==================================================================
+      - task: VersionManagerVivo@8
+        displayName: 'Next version'
+        inputs:
+          command: 'nextVersion'
+          branchingStrategy: ${{ parameters.branchingStrategy }}
+          versionFile: $(VERSION_FILE_PATH)
+          bumpMethod: 'patch'
+        name: VersionManagerVivo
+
+      - task: VersionManagerVivo@8
+        displayName: 'Commit and Tag Version'
+        inputs:
+          command: 'commitVersion'
+          version: '$(VersionManagerVivo.VERSION)'
+          versionFile: $(VERSION_FILE_PATH)
+          createTag: true
+          pushChanges: true

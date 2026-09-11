@@ -1,0 +1,849 @@
+# ==================================================================
+# Pipeline: CI Build Java Docker - Build, Test, Security & Docker
+# -----------------------------------------------------
+# Pipeline de Integração Contínua completo para aplicações Java com Maven.
+# Realiza build, testes unitários (JUnit) com cobertura (JaCoCo), análise de 
+# qualidade (SonarQube), verificação de segurança (Fortify SAST), build Docker
+# e versionamento automático com commit/tag.
+# -----------------------------------------------------
+# Capacidades Implementadas:
+# ✅ Build & Test com cobertura JaCoCo
+# ✅ Quality Gate SonarQube parametrizável
+# ✅ Docker Build com artefatos
+# ✅ Cache Maven para performance
+# ✅ Autenticação Nexus/Azure Artifacts flexível
+# ✅ Azure App Configuration integration
+# -----------------------------------------------------
+# TODOs Futuras Melhorias:
+# - Inclusão dos estágios de segurança
+# - Inclusão de gates
+# - Mudar versionamento para o Version Manager
+# ==================================================================
+
+parameters:
+# ==================================================================
+# Infraestrutura e Ambiente
+# ==================================================================
+- name: agentPool
+  type: string
+  default: GeneralPurposeLinuxAgentsCI
+  displayName: 'Agent Pool para execução'
+
+- name: useNetworkProxy
+  type: boolean
+  default: false
+  displayName: 'Configurar proxy de rede para acesso externo (se necessário)'
+
+# ==================================================================
+# Configurações de Java e Feed
+# ------------------------------------------------------------------
+# Para usar o Nexus a service connection DevOpsSharedResources deve estar criada
+# Método default de autenticação: Azure Artifacts (System.AccessToken)
+# Exemplo settings.xml esperado (usar AZURE_DEVOPS_PAT / System.AccessToken):
+# <settings xmlns="http://maven.apache.org/SETTINGS/1.0.0" ...>
+#   <servers>
+#     <server>
+#       <id>[SIGLA]</id>
+#       <username>telefonica-vivo-brasil</username>
+#       <password>${AZURE_DEVOPS_PAT}</password>
+#     </server>
+#   </servers>
+# </settings>
+# O Nome é AZURE_DEVOPS_PAT para deixar mais claro como desenvolvedor deve usar o arquivo para build local
+# Alem disso, o pom.xml deve ter o distributionManagement e repositories configurados (ver README.md)
+
+- name: useNexusToAuth
+  type: boolean
+  default: false
+  displayName: 'Usar autenticação com Nexus (true) além do Azure Artifacts'
+
+- name: workingDirectory
+  type: string
+  default: $(Build.SourcesDirectory)
+  displayName: 'Diretório do projeto Java (onde está o pom.xml)'
+
+# - name: fortifyScanDirectory
+#   type: string
+#   default: $(Build.SourcesDirectory)/$(Build.Repository.Name)
+#   displayName: 'Diretório scan Fortify'
+
+- name: useMavenCustomSettings
+  type: boolean
+  default: true
+  displayName: 'Usar settings.xml customizado do Maven?'
+
+- name: mavenCustomSettings
+  type: string
+  default: '.azuredevops/settings.xml'
+  displayName: 'Caminho para o settings.xml customizado do Maven'
+
+# ==================================================================
+# Configurações de Docker
+# ==================================================================
+- name: imageName
+  type: string
+  default: '$(SIGLA)/$(Build.Repository.Name)'
+  displayName: 'Nome da imagem Docker'
+
+- name: dockerfilePath
+  type: string
+  default: 'Dockerfile'
+  displayName: 'Caminho do Dockerfile'
+
+- name: registryServiceConnection
+  type: string
+  default: 'ACR-DEVOPS'
+  displayName: 'Service Connection do Registry'
+
+# ==================================================================
+# Configurações Multi-Módulo
+# ------------------------------------------------------------------
+# Para projetos Maven multi-módulo, habilite isMultiModule=true.
+# Os globs de reports (surefire, jacoco, sonar) serão ajustados
+# automaticamente para buscar em todos os sub-módulos.
+# Exemplo de uso:
+#   isMultiModule: true
+#   deployableArtifactPattern: '*.war'          # ou '*.jar'
+#   deployableArtifactName: 'my-app-$(VERSION).war'
+# ==================================================================
+- name: isMultiModule
+  type: boolean
+  default: false
+  displayName: 'Projeto Maven multi-módulo?'
+
+- name: deployableArtifactPattern
+  type: string
+  default: '*.jar'
+  displayName: 'Padrão glob do artefato deployável (*.jar, *.war ou *.jar,*.war)'
+
+- name: deployableArtifactName
+  type: string
+  default: '$(Build.Repository.Name)-$(VersionManagerVivo.VERSION).jar'
+  displayName: 'Nome completo do artefato para o Dockerfile (ex: my-app-1.0.0.war)'
+
+# ==================================================================
+# Configurações de component_test
+# ==================================================================
+
+- name: runComponentTest
+  type: boolean
+  default: false
+  displayName: 'Executar testes de componentes (Docker Compose)'
+
+- name: componentTestsDirectory
+  type: string
+  default: '$(Build.SourcesDirectory)/component-tests'
+  displayName: 'Diretório dos testes de componente'
+
+- name: componentTestsComposeProjectName
+  type: string
+  default: '$(Build.BuildId)'
+  displayName: 'Nome do projeto Docker Compose para testes de componente'
+
+- name: componentTestsComposeMainService
+  type: string
+  default: 'app-under-test'
+  displayName: 'Serviço principal do Docker Compose para testes de componente'
+
+- name: componentTestsComposeFilePath
+  type: string
+  default: '$(Build.SourcesDirectory)/docker-compose.test.yml'
+  displayName: 'Caminho do arquivo docker-compose para testes de componente'
+
+- name: componentTestsResultDirectory
+  type: string
+  default: '$(Build.SourcesDirectory)/component-tests/results'
+  displayName: 'Diretório para resultados dos testes de componente'
+
+# ==================================================================
+# Controle de Fluxo e Capacidades
+# ------------------------------------------------------------------
+# Se cobertura estiver habilitada, os testes também serão executados.
+# Para configurar o Jacoco, adicione o plugin no pom.xml:
+# <plugin>
+#   <groupId>org.jacoco</groupId>
+#   <artifactId>jacoco-maven-plugin</artifactId>
+#   <version>0.8.8</version>
+#   <executions>
+#     <execution><goals><goal>prepare-agent</goal></goals></execution>
+#     <execution><id>report</id><phase>test</phase><goals><goal>report</goal></goals></execution>
+#   </executions>
+# </plugin>
+- name: prValidationOnly
+  type: boolean
+  default: false
+  displayName: 'Executa apenas a validação, não publica nem gera versão'
+
+- name: enableCache
+  type: boolean
+  default: true
+  displayName: 'Habilitar cache de dependências Maven'
+
+- name: enableTest
+  type: boolean
+  default: true
+  displayName: 'Executar testes unitários'
+
+- name: runQualityGate
+  type: boolean
+  default: true
+  displayName: 'Executar Quality Gate (SonarQube)'
+
+# ==================================================================
+# Configurações de Segurança
+# ==================================================================
+# - name: fortifyScanDirectory
+#   type: string
+#   default: $(Build.SourcesDirectory)
+#   displayName: 'Diretório scan Fortify'
+- name: enableFortifyExclusions
+  displayName: 'Faz checkout do repositório Fortify Exclusions'
+  type: boolean
+  default: false
+# Se enableFortifyExclusions, mude fortifyScanDirectory para $(Build.SourcesDirectory)/$(Build.Repository.Name)
+- name: convisoCompany
+  type: string
+  default: '430'
+  displayName: 'Conviso Company ID'
+
+# ==================================================================
+# Configurações de Versionamento
+# ==================================================================
+
+- name: versionFile
+  type: string
+  default: 'pom.xml'
+  displayName: 'Arquivo de versionamento (pom.xml)'
+
+- name: branchingStrategy
+  type: string
+  default: 'trunkbased'
+  displayName: 'Estratégia de versionamento'
+  values:
+    - 'trunkbased'
+    - 'vivoflow'
+    - 'releaseflow'
+    - 'gitlabflow'
+    - 'gitlabflow-semantic'
+    - 'custom'
+    - 'monorepo'
+
+# ==================================================================
+# Configurações do Sonar
+# ==================================================================
+
+- name: useSonarConfigFile
+  type: boolean
+  default: true
+  displayName: 'Usar arquivo de configuração do SonarQube?'
+
+- name: sonarConfigFilePath
+  type: string
+  default: '.azuredevops/sonar-project.properties'
+  displayName: 'Caminho do arquivo de configuração do SonarQube'
+
+- name: sonarPollingTimeoutSec
+  type: string
+  default: '300'
+  displayName: 'Timeout do Polling SonarQube (s)'
+
+- name: sonarJavaVersion
+  type: string
+  default: 'openjdk-17.0.2'
+  displayName: 'Versão do Java para análise SonarQube'
+  values:
+    - 'openjdk-21.0.2'
+    - 'openjdk-17.0.2'
+    - 'openjdk-11.0.2'
+
+- name: sonarServiceConnection
+  type: string
+  default: 'VIVO_SONARQUBE'
+  displayName: 'Service Connection do SonarQube'
+
+- name: sonarQualityGate
+  type: string
+  default: 'AzureDevOps-Default'
+  displayName: 'Quality Gate do SonarQube'
+
+- name: sonarScannerMode
+  type: string
+  default: 'cli'
+  displayName: 'Modo do scanner SonarQube'
+  values:
+    - 'cli'
+    - 'dotnet'
+
+- name: sonarProjectKey
+  type: string
+  default: '$(System.TeamProject)-$(Build.Repository.Name)'
+  displayName: 'Chave do projeto no SonarQube'
+
+- name: sonarProjectName
+  type: string
+  default: '$(System.TeamProject)-$(Build.Repository.Name)'
+  displayName: 'Nome do projeto no SonarQube'
+
+# ==================================================================
+# Configurações de App Configuration
+# ==================================================================
+- name: useAppConfig
+  type: boolean
+  default: true
+  displayName: 'Usar Azure App Configuration para SonarQube'
+
+variables:
+  SIGLA: $[ lower(split(variables['System.TeamProject'],' ')[0]) ]
+  POM_FILE_PATH: ${{ parameters.workingDirectory }}/${{ parameters.versionFile }}
+  MAVEN_CACHE_FOLDER: $(Pipeline.Workspace)/.m2/repository
+  MAVEN_OPTS: '-Dmaven.repo.local=$(MAVEN_CACHE_FOLDER)'
+
+  ${{ if eq(parameters.useMavenCustomSettings, true) }}:
+    MAVEN_CUSTOM_SETTINGS: ${{ parameters.workingDirectory }}/${{ parameters.mavenCustomSettings }}
+  ${{ if eq(parameters.useMavenCustomSettings, false) }}:
+    MAVEN_CUSTOM_SETTINGS: '/home/svc_devopscorp/.m2/settings.xml'
+
+  ${{ if eq(parameters.enableCache, true) }}:
+    MAVEN_REPO_LOCAL: $(MAVEN_CACHE_FOLDER)
+  ${{ if eq(parameters.enableCache, false) }}:
+    MAVEN_REPO_LOCAL: '/home/svc_devopscorp/.m2/repository'
+
+  # Multi-módulo: globs expandidos para buscar reports em sub-módulos
+  ${{ if eq(parameters.isMultiModule, true) }}:
+    TEST_RESULTS_GLOB: '${{ parameters.workingDirectory }}/**/target/surefire-reports/*.xml'
+    JACOCO_SUMMARY_GLOB: '${{ parameters.workingDirectory }}/**/target/site/jacoco/jacoco.xml'
+    JACOCO_REPORT_DIR: '${{ parameters.workingDirectory }}'
+    SONAR_JACOCO_GLOB: '${{ parameters.workingDirectory }}/**/target/site/jacoco/jacoco.xml'
+    SONAR_BINARIES_GLOB: '${{ parameters.workingDirectory }}/**/target/classes'
+  ${{ else }}:
+    TEST_RESULTS_GLOB: '${{ parameters.workingDirectory }}/target/surefire-reports/*.xml'
+    JACOCO_SUMMARY_GLOB: '${{ parameters.workingDirectory }}/target/site/jacoco/jacoco.xml'
+    JACOCO_REPORT_DIR: '${{ parameters.workingDirectory }}/target/site/jacoco'
+    SONAR_JACOCO_GLOB: '${{ parameters.workingDirectory }}/target/site/jacoco/jacoco.xml'
+    SONAR_BINARIES_GLOB: '${{ parameters.workingDirectory }}/target/classes'
+
+  # Configurações de segurança
+  DOCKER_BUILDKIT: 1
+  BUILDKIT_PROGRESS: plain
+
+  # Variáveis utilizadas por templates de Segurança (Fortify/SCA)
+  CACORP_LOCATION: $(Agent.HomeDirectory)/../../certs/CACORP.pem
+  FORTIFY_APP_DEFAULT_VERSION: DevSecOps
+  APP_LANGUAGE: 'java'
+  DOCKER_SERVICE_CONNECTION: ${{ parameters.registryServiceConnection }}
+
+  # Configurações de KeyVault para Segurança
+  AKV_DEVOPS_NAME: 'kv-azdevops-shared'
+
+  # Variables for Proxy
+  PROXY_NSKP_SERVER: "nskp.redecorp.br:8080"
+  PROXY_SQUID_SERVER: "10.240.58.39:3128"
+  PROXY_AGENT_HTTP: "http://$(PROXY_NSKP_SERVER)"
+  PROXY_AGENT_HTTPS: "http://$(PROXY_NSKP_SERVER)"
+  PROXY_AGENT_NO_PROXY: "localhost,0.0.0.0,127.0.0.1,10.244.0.0/16,192.168.0.0/16,10.129.178.173,nexus.telefonica.com.br,acrsharedservices01.azurecr.io,appcs-azdevops-shared.azconfig.io,scm.azurewebsites.net"
+
+# ==================================================================
+# Estágios do Pipeline
+# ==================================================================
+stages:
+# ==================================================================
+# Stage 1: JavaBuild - Compilação, Testes e Análise de Qualidade
+# Descrição: Compila aplicação Java com Maven, executa testes unitários (JUnit),
+#            gera relatório de cobertura (JaCoCo) e executa análise SonarQube
+# ==================================================================
+- stage: JavaBuild
+  displayName: 'Build & Test Java Application'
+  condition: succeeded()
+  jobs:
+  - job: JavaBuild
+    displayName: 'Java Build & Test'
+    pool: ${{ parameters.agentPool }}
+    
+    steps:
+    # ==================================================================
+    # [Configuração Inicial] Checkout do código
+    # ==================================================================
+    - checkout: self
+
+    # ==================================================================
+    # [Observabilidade] Exibe parâmetros quando em modo debug
+    # ==================================================================
+    - task: VivoUtilsFromVivo@1
+      displayName: 'Show Pipeline Parameters'
+      condition: eq(variables['System.Debug'], 'true')
+      inputs:
+        command: 'show-pipeline-parameters'
+        parameters: '${{ convertToJson(parameters) }}'
+
+    # ==================================================================
+    # [Compliance] Verifica se o repositório está em conformidade com as políticas de configuração
+    # ==================================================================
+    - task: VivoDevOpsConfigCompliance@1
+      displayName: 'Check DevOps Config Compliance'
+      inputs:
+        workDir: ${{ parameters.workingDirectory }}
+        policySets: |
+          image-definition-files
+
+    # ==================================================================
+    # [Autenticação Opcional] Nexus via Azure Key Vault
+    # ==================================================================
+    - ${{ if eq(parameters.useNexusToAuth, true) }}:
+      - task: AzureKeyVault@2
+        displayName: 'Secrets from AKV'
+        inputs:
+          azureSubscription: "DevOpsSharedResources"
+          KeyVaultName: "kv-azdevops-shared"
+          SecretsFilter: >-
+            NEXUS-DEPS-USR, NEXUS-DEPS-PSW
+
+    # ==================================================================
+    # [Performance] Cache Maven (dependências)
+    # ==================================================================
+    - ${{ if eq(parameters.enableCache, true) }}:
+      # Cache do Maven para melhor performance
+      - task: Cache@2
+        displayName: 'Cache Maven dependencies'
+        inputs:
+          key: 'maven | "$(Agent.OS)" | **/pom.xml'
+          restoreKeys: |
+            maven | "$(Agent.OS)"
+            maven
+          path: $(MAVEN_CACHE_FOLDER)
+
+    # ==================================================================
+    # [Versionamento] Definição da versão (VersionManager)
+    # ==================================================================
+      - task: VersionManagerVivo@8
+        displayName: 'Next version'
+        inputs:
+          command: 'nextVersion'
+          branchingStrategy: ${{ parameters.branchingStrategy }}
+          versionFile: $(POM_FILE_PATH)
+          bumpMethod: 'patch'
+          passthroughVersion: ${{ parameters.prValidationOnly }}
+        name: VersionManagerVivo
+
+    # ==================================================================
+    # [Java via ASDF] Resolve Java conforme .tool-versions do projeto
+    # ==================================================================
+    - script: |
+        set -euo pipefail
+        JAVA_HOME_ASDF="$(asdf where java)"
+        echo "##[debug]JAVA_HOME_ASDF: $JAVA_HOME_ASDF"
+        echo "##vso[task.setvariable variable=JAVA_HOME_ASDF]$JAVA_HOME_ASDF"
+      displayName: 'Resolve Java via asdf'
+      workingDirectory: ${{ parameters.workingDirectory }}
+
+    # ==================================================================
+    # [Build] Compilação e empacotamento (pula testes nesta fase)
+    # ==================================================================
+    - task: Maven@4
+      displayName: "Build"
+      inputs:
+        goals: clean compile package
+        options: >-
+          -s $(MAVEN_CUSTOM_SETTINGS)
+          -Dmaven.repo.local=$(MAVEN_REPO_LOCAL)
+          -Dmaven.test.skip=true
+        mavenPomFile: $(POM_FILE_PATH)
+        mavenOptions: "-Xmx3072m"
+        mavenVersionOption: 'Path'
+        mavenDirectory: /home/svc_devopscorp/.asdf/installs/maven/3.9.9
+        javaHomeOption: 'Path'
+        jdkDirectory: '$(JAVA_HOME_ASDF)'
+        publishJUnitResults: false
+        workingDirectory: ${{ parameters.workingDirectory }}
+      env:
+        MAVEN_CUSTOM_SETTINGS: $(MAVEN_CUSTOM_SETTINGS)
+        NEXUS_DEPS_USR: $(NEXUS-DEPS-USR)
+        NEXUS_DEPS_PSW: $(NEXUS-DEPS-PSW)
+        AZURE_DEVOPS_PAT: $(System.AccessToken) # O Nome é AZURE_DEVOPS_PAT para deixar mais claro como desenvolvedor deve usar o arquivo para build local
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+        VERSION: $(VersionManagerVivo.VERSION)
+
+# ==================================================================
+# CAPACIDADE: TESTES UNITÁRIOS + COBERTURA (condicional enableTest)
+# Descrição: Executa testes (JUnit) e gera cobertura (JaCoCo)
+# Documentação: https://dvps.redecorp.azr/portal/codeplay/capacidades/catalog/testes-unitarios
+# Pré-requisitos: plugins Surefire + JaCoCo configurados no pom.xml
+# Artefatos: relatórios JUnit XML + cobertura HTML/XML
+# ==================================================================
+    - ${{ if eq(parameters.enableTest, true) }}:
+      # ==================================================================
+      # [Testes & Cobertura] Execução de Testes Unitários e Análise JaCoCo
+      # ==================================================================
+      - task: Maven@4
+        displayName: 'Run Tests with Coverage'
+        inputs:
+          goals: 'test jacoco:report'
+          options: >-
+            -B
+            -s $(MAVEN_CUSTOM_SETTINGS)
+            -Dmaven.repo.local=$(MAVEN_REPO_LOCAL)
+          mavenPomFile: $(POM_FILE_PATH)
+          mavenOptions: "-Xmx3072m"
+          mavenVersionOption: 'Path'
+          mavenDirectory: /home/svc_devopscorp/.asdf/installs/maven/3.9.9
+          javaHomeOption: 'Path'
+          jdkDirectory: '$(JAVA_HOME_ASDF)'
+          publishJUnitResults: false
+          workingDirectory: ${{ parameters.workingDirectory }}
+        env:
+          MAVEN_CUSTOM_SETTINGS: $(MAVEN_CUSTOM_SETTINGS)
+          NEXUS_DEPS_USR: $(NEXUS-DEPS-USR)
+          NEXUS_DEPS_PSW: $(NEXUS-DEPS-PSW)
+          AZURE_DEVOPS_PAT: $(System.AccessToken) # O Nome é AZURE_DEVOPS_PAT para deixar mais claro como desenvolvedor deve usar o arquivo para build local
+          SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+          
+      # ==================================================================
+      # [Publicação] Relatórios de Testes JUnit
+      # ==================================================================
+      - task: PublishTestResults@2
+        displayName: 'Publish Test Results'
+        condition: succeededOrFailed()
+        inputs:
+          testResultsFormat: 'JUnit'
+          testResultsFiles: '$(TEST_RESULTS_GLOB)'
+          failTaskOnFailedTests: true
+          mergeTestResults: true
+
+      # ==================================================================
+      # [Publicação] Relatório de Cobertura JaCoCo
+      # ==================================================================
+      - task: PublishCodeCoverageResults@2
+        displayName: 'Publish Code Coverage'
+        condition: succeededOrFailed()
+        inputs:
+          codeCoverageTool: 'JaCoCo'
+          summaryFileLocation: '$(JACOCO_SUMMARY_GLOB)'
+          reportDirectory: '$(JACOCO_REPORT_DIR)'
+
+#############################################################################
+# CAPACIDADE: QUALITY GATE (SONARQUBE)
+#############################################################################
+# Descrição: Análise estática de código e quality gate
+# Documentação: https://dvps.redecorp.azr/portal/codeplay/capacidades/catalog/quality-gate
+# Pré-requisitos:
+#   - Service Connection 'SonarQube' configurada
+#   - Projeto configurado no SonarQube
+#   - Quality Gate definido no SonarQube
+# Configuração: Parâmetro 'runQualityGate' = true
+# Observações: Não executa em Pull Requests
+#############################################################################
+    - ${{ if eq(parameters.runQualityGate, true) }}:
+      # ==================================================================
+      # [SonarQube] Análise Completa de Qualidade de Código
+      # ==================================================================
+      - task: SonarAnalysisFromVivo@2
+        displayName: 'SonarQube Full Analysis'
+        inputs:
+          command: 'analysis'
+          SonarQube: ${{ parameters.sonarServiceConnection }}
+          scannerMode: ${{ parameters.sonarScannerMode }}
+          ${{ if eq(parameters.useSonarConfigFile, true) }}:
+            configFile: ${{ parameters.sonarConfigFilePath }}
+          cliProjectKey: ${{ parameters.sonarProjectKey }}
+          cliProjectName: ${{ parameters.sonarProjectName }}
+          cliProjectVersion: $(VersionManagerVivo.VERSION)
+          qualityGate: ${{ parameters.sonarQualityGate }}
+          acronym: $(SIGLA)
+          reportPath: '$(Agent.TempDirectory)/sonar/$(Build.BuildId)/report-task.txt'
+          pollingTimeoutSec: ${{ parameters.sonarPollingTimeoutSec }}
+          useAppConfig: ${{ parameters.useAppConfig }}
+          azureSubscription: DevOpsSharedResources
+          appConfigurationEndpoint: 'https://appcs-azdevops-shared.azconfig.io'
+          extraProperties: |
+            sonar.coverage.jacoco.xmlReportPaths=$(SONAR_JACOCO_GLOB)
+            sonar.java.binaries=$(SONAR_BINARIES_GLOB)
+            sonar.scanner.metadataFilePath=$(Agent.TempDirectory)/sonar/$(Build.BuildId)/report-task.txt
+            sonar.qualitygate.wait=false
+            sonar.qualitygate.timeout=${{ parameters.sonarPollingTimeoutSec }}
+        env:
+          ASDF_JAVA_VERSION: ${{ parameters.sonarJavaVersion }}
+
+    # ==================================================================
+    # [Publicação] Artefatos para Próximos Stages (JAR/WAR)
+    # ==================================================================
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish Build Artifacts'
+      condition: succeeded()
+      inputs:
+        targetPath: '${{ parameters.workingDirectory }}/target'
+        artifact: 'java-artifacts'
+        #artifact: 'target'
+        publishLocation: 'pipeline'
+        parallel: true
+        pattern: '${{ parameters.deployableArtifactPattern }}'
+
+# ==================================================================
+# Stage 2: ComponentTest - Testes de Integração com Docker Compose
+# Descrição: Executa testes de integração da aplicação com componentes externos
+#            (banco de dados, cache, filas, etc.) usando Docker Compose.
+#            Baixa os artefatos JAR compilados e roda os testes em containers.
+# ==================================================================
+- ${{ if eq(parameters.runComponentTest, true) }}:
+  - stage: ComponentTest
+    displayName: 'Component Tests'
+    dependsOn:
+    - JavaBuild
+    condition: succeeded()
+    jobs:
+    - job: ComponentTest
+      displayName: 'Run Component Tests'
+      pool: ${{ parameters.agentPool }}
+      steps:
+      # ==================================================================
+      # [Configuração Inicial] Checkout do código
+      # ==================================================================
+      - checkout: self
+
+      # ==================================================================
+      # [Download] Baixa artefatos JAR do stage anterior
+      # ==================================================================
+      - task: DownloadPipelineArtifact@2
+        displayName: 'Download Java Artifacts'
+        inputs:
+          buildType: 'current'
+          artifactName: 'java-artifacts'
+          targetPath: '$(System.ArtifactsDirectory)/java-artifacts'
+
+      # ==================================================================
+      # [Preparação] Cria artefato compactado para o template
+      # ==================================================================
+      - task: ArchiveFiles@2
+        displayName: 'Create app.tar'
+        inputs:
+          rootFolderOrFile: '$(System.ArtifactsDirectory)/java-artifacts'
+          includeRootFolder: false
+          archiveType: 'tar'
+          archiveFile: '$(Build.ArtifactStagingDirectory)/app.tar'
+
+      - task: PublishPipelineArtifact@1
+        displayName: 'Publish app artifact'
+        inputs:
+          targetPath: '$(Build.ArtifactStagingDirectory)/app.tar'
+          artifact: 'app'
+          publishLocation: 'pipeline'
+
+      # ==================================================================
+      # [Component Test] Executa testes via Docker Compose
+      # ==================================================================
+      - template: /framework/templates/component_test.yml
+        parameters:
+          akvDevopsName: 'kv-azdevops-shared'
+          registryServiceConnection: ${{ parameters.registryServiceConnection }}
+          componentTestsWorkingDirectory: '$(Build.SourcesDirectory)'
+          componentTestsComposeProjectName: '${{ parameters.componentTestsComposeProjectName }}'
+          componentTestsComposeMainService: '${{ parameters.componentTestsComposeMainService }}'
+          componentTestsComposeFilePath: '${{ parameters.componentTestsComposeFilePath }}'
+          componentTestsResultDirectory: '${{ parameters.componentTestsResultDirectory }}'
+          componentTestsJarExtractPath: '${{ parameters.workingDirectory }}/target'
+# ==================================================================
+# Stage 3: SecurityAnalysis - Análise de Segurança SAST
+# Descrição: Executa análise de segurança estática (SAST) com Fortify ScanCentral.
+#            Gates de segurança (bloqueio ou não do pipeline) são realizados pelo
+#            time de AppSec via chaves de configuração recuperadas do AppConfig corporativo.
+# ==================================================================
+- stage: SecurityAnalysis
+  displayName: 'Security Analysis'
+  dependsOn:
+  - JavaBuild
+  condition: succeeded()
+  jobs:
+
+  - job: AppSecConfigKeys
+    displayName: 'Get AppSec Config Keys'
+    pool: ${{ parameters.agentPool }}
+    steps:
+    - template: /security/get_appconfig_keys_framework.yml
+      parameters:
+        azureSubscription: DevOpsSharedResources
+        appConfigurationEndpoint: https://appcs-azdevops-shared.azconfig.io
+        useNetworkProxy: ${{ parameters.useNetworkProxy }}
+
+# ==================================================================
+# CAPACIDADE: FORTIFY SCAN (SAST)
+# ==================================================================
+# Descrição: Análise estática de código (SAST) usando Fortify ScanCentral e SSC, com integração à Conviso e publicação de artefatos.
+# Documentação: https://dvps.redecorp.azr/portal/codeplay/capacidades/catalog/sast
+# Observações: Exporta variáveis e publica artefatos para uso no Security Gate.
+# ==================================================================
+
+  - job: FortifyScan
+    displayName: 'Fortify Scan'
+    dependsOn: 
+    - AppSecConfigKeys
+    variables:
+      USE_FORTIFY: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.USE_FORTIFY'] ]
+      USE_CONVISO: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.USE_CONVISO'] ]
+      SKIP_SECURITY_GATE: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.SKIP_SECURITY_GATE'] ]
+      FORTIFY_LOCAL_SCANCENTRAL_VERSION: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.FORTIFY_LOCAL_SCANCENTRAL_VERSION'] ]
+    condition: and(succeeded(), eq(variables.USE_FORTIFY, true))
+    pool: ${{ parameters.agentPool }}
+    steps:
+
+    - template: /security/define_appsec_app_version.yml
+
+    - template: /security/run_fortify_scan.yml
+      parameters:
+        fortifyExclusionRepository: 'FortifyExclusion'
+        enableFortifyExclusions:  ${{ parameters.enableFortifyExclusions }}
+        appLanguage: 'java'
+        appVersion: "$(FORTIFY_APP_VERSION)" # OBS: A variável FORTIFY_APP_VERSION é definida no template /security/define_appsec_app_version.yml
+        convisoCompany: ${{ parameters.convisoCompany }}
+
+# ==================================================================
+# Stage 4: DockerBuild - Construção da Imagem Docker
+# Descrição: Baixa artefatos Java, constrói imagem Docker com aplicação,
+#             executa análise SCA (Dependency Track) se habilitado pelo AppSec
+#            e publica no Azure Container Registry
+# ==================================================================
+- stage: DockerBuild
+  displayName: 'Docker Build'
+  dependsOn: 
+  - SecurityAnalysis
+  condition: succeeded()
+  jobs:
+  # ==================================================================
+  # Job 3.1: DockerBuild - Construção e Publicação da Imagem Docker
+  # Descrição: Baixa JARs, copia para contexto Docker, constrói e publica imagem
+  # ==================================================================
+  - job: DockerBuild
+    displayName: 'Build Docker Image'
+    pool: ${{ parameters.agentPool }}
+    variables:
+      USE_DT_DOCKER: $[ stageDependencies.SecurityAnalysis.AppSecConfigKeys.outputs['evaluate_flags.USE_DT_DOCKER'] ]
+      USE_CONVISO: $[ stageDependencies.SecurityAnalysis.AppSecConfigKeys.outputs['evaluate_flags.USE_CONVISO'] ]
+      SKIP_SECURITY_GATE_SCA: $[ stageDependencies.SecurityAnalysis.AppSecConfigKeys.outputs['evaluate_flags.SKIP_SECURITY_GATE_SCA'] ]
+    steps:
+    # ==================================================================
+    # [Configuração Inicial] Checkout e Download de Artefatos
+    # ==================================================================
+    - checkout: self
+
+    - task: DownloadPipelineArtifact@2
+      displayName: 'Download Java Artifacts'
+      inputs:
+        buildType: 'current'
+        artifactName: 'java-artifacts'
+        targetPath: '$(System.ArtifactsDirectory)/java-artifacts'
+
+    # ==================================================================
+    # [Versionamento] Definição da versão (VersionManager)
+    # ==================================================================
+    - task: VersionManagerVivo@8
+      displayName: 'Next version'
+      inputs:
+        command: 'nextVersion'
+        branchingStrategy: ${{ parameters.branchingStrategy }}
+        versionFile: $(POM_FILE_PATH)
+        bumpMethod: 'patch'
+        passthroughVersion: ${{ parameters.prValidationOnly }}
+      name: VersionManagerVivo
+
+    # ==================================================================
+    # [Versão Efetiva] Resolve ${revision} → valor real (CI-Friendly)
+    # ==================================================================
+    - script: |
+        set -eo pipefail
+        RAW='$(VersionManagerVivo.VERSION)'
+        echo "VersionManagerVivo output: $RAW"
+        if echo "$RAW" | grep -q '^\$'; then
+          RESOLVED=$(grep -oP '(?<=<revision>)[^<]+' $(POM_FILE_PATH))
+          echo "##[warning]VersionManagerVivo retornou '$RAW' (CI-Friendly). Resolvido via <revision>: $RESOLVED"
+        else
+          RESOLVED="$RAW"
+        fi
+        echo "##vso[task.setvariable variable=EFFECTIVE_VERSION]$RESOLVED"
+        echo "Effective version: $RESOLVED"
+      displayName: 'Resolve CI-Friendly version'
+
+    # ==================================================================
+    # [Preparação Docker] Cópia dos artefatos para Contexto de Build
+    # ==================================================================
+    - task: CopyFiles@2
+      displayName: 'Copy build artifacts'
+      inputs:
+        sourceFolder: '$(System.ArtifactsDirectory)/java-artifacts'
+        contents: |
+          **/*.jar
+          **/*.war
+        targetFolder: '${{ parameters.workingDirectory }}/target'
+        flattenFolders: false
+    - script: | 
+        ls -la target
+        echo "##[group] Full"
+        ls -laR
+        echo "##[endgroup]"
+      condition: eq(variables['System.Debug'], 'true')
+      displayName: 'List build artifacts'
+
+    # ==================================================================
+    # [Docker Build & Push] Construção da Imagem com Template Central
+    # ==================================================================
+    - ${{ if eq(parameters.prValidationOnly, false) }}:
+      - template: /framework/templates/docker-build-and-push.yaml
+        parameters:
+          imageName: ${{ parameters.imageName }}
+          imageTag: '$(EFFECTIVE_VERSION)'
+          registryServiceConnection: '${{ parameters.registryServiceConnection }}'
+          buildArgs:
+            - 'APPLICATION_NAME=$(Build.Repository.Name)'
+            - 'APP_VERSION=$(EFFECTIVE_VERSION)'
+            - 'JAR_NAME=${{ parameters.deployableArtifactName }}'
+            - 'APPLICATION_PATH=target'
+            - 'VERSION=$(EFFECTIVE_VERSION)'
+          dockerfilePath: ${{ parameters.dockerfilePath }}
+          buildContext: '${{ parameters.workingDirectory }}'
+          loginRegistryServiceConnections:
+            - ${{ parameters.registryServiceConnection }}
+          convisoCompany: ${{ parameters.convisoCompany }}
+
+# ==================================================================
+# Stage 5: VersionCommit - Commit e Tag da Versão de Release
+# Descrição: Atualiza versão no pom.xml, cria commit e tag Git
+#            Executa apenas na master, quando não é PR de validação e quando Docker push está habilitado
+# ==================================================================
+- ${{ if eq(parameters.prValidationOnly, false) }}:
+  - stage: VersionCommit
+    displayName: 'Commit Version'
+    dependsOn: 
+    - DockerBuild
+    jobs:
+    # ==================================================================
+    # Job 4.1: CommitVersion - Commit da Versão e Criação de Tag
+    # Descrição: Faz checkout com credenciais, atualiza versão e cria tag Git
+    # ==================================================================
+    - job: CommitVersion
+      displayName: 'Commit Release Version'
+      pool: ${{ parameters.agentPool }}
+      steps:
+      # ==================================================================
+      # [Git] Checkout com credenciais para push
+      # ==================================================================
+      - checkout: self
+        clean: true
+        persistCredentials: true
+        fetchDepth: 0
+
+      # ==================================================================
+      # [Versionamento] Reafirma versão e realiza commit/tag
+      # ==================================================================
+      - task: VersionManagerVivo@8
+        displayName: 'Next version'
+        inputs:
+          command: 'nextVersion'
+          branchingStrategy: ${{ parameters.branchingStrategy }}
+          versionFile: $(POM_FILE_PATH)
+          bumpMethod: 'patch'
+        name: VersionManagerVivo
+
+      - task: VersionManagerVivo@8
+        displayName: 'Commit and Tag Version'
+        inputs:
+          command: 'commitVersion'
+          version: '$(VersionManagerVivo.VERSION)'
+          versionFile: $(POM_FILE_PATH)
+          createTag: true
+          pushChanges: true

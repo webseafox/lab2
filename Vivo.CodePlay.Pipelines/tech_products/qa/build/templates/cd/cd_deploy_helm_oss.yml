@@ -1,0 +1,247 @@
+parameters:
+- name: environment
+- name: infrastructureType
+
+stages:
+- stage: cd_deploy
+  displayName: "CD - Deploy"  
+  pool:
+    name: $(PRIVATE_AGENT_DEFAULT)
+  dependsOn:   
+  - environment_init
+  - ci_build
+  - ci_publish
+  - ci_package
+  - deploy_environment_init
+  condition: succeeded()
+
+  ## -> Loads variables from other stages.
+  variables:    
+
+  - name: ARTIFACT_NAME
+    value: $[ stageDependencies.ci_build.build.outputs['artifact_name.ARTIFACT_NAME'] ]
+  - name: DOCKER_IMAGE_NAME
+    value: $[ stageDependencies.ci_package.package.outputs['docker_metadata.DOCKER_IMAGE_NAME'] ]
+  - name: DOCKER_IMAGE_TAG
+    value: $[ stageDependencies.ci_package.package.outputs['docker_metadata.DOCKER_IMAGE_TAG'] ]
+  - name: DOCKER_REGISTRY_USERNAME
+    value: $[ stageDependencies.deploy_environment_init.environment.outputs['credentials.DOCKER_REGISTRY_USERNAME'] ]    
+  - name: DOCKER_REGISTRY_PASSWORD
+    value: $[ stageDependencies.deploy_environment_init.environment.outputs['credentials.DOCKER_REGISTRY_PASSWORD'] ] 
+
+  - template: /tech_products/oss/initialize/variables_catalog_info.yml
+
+  jobs:
+
+  - deployment: deploy
+    displayName: 'Deploy'
+    condition: succeeded()
+    environment:
+      name: $(DEPLOY_ENVIRONMENT_LIB)
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+
+          ## -> Download Artifacts
+          - download: none
+        
+          ## -> Clean the pipeline workspace and checkout the code.
+          ## -> 6d15af64-176c-496d-b583-fd2ae21d4df4 is the decorator for checkout.
+          - task: 6d15af64-176c-496d-b583-fd2ae21d4df4@1
+            displayName: Checkout Code
+            name: checkout_code 
+            inputs:
+              repository: OSSDevOps
+              persistCredentials: "true"
+              clean: true
+
+          ## -> Download and uncompress the downloaded artifact.          
+          - task: DownloadBuildArtifacts@1
+            displayName: 'Download Build Artifacts'
+            inputs:
+              artifactName: $(ARTIFACT_NAME)
+              cleanDestinationFolder: false
+              extractTars: true
+              parallelizationLimit: 8
+              downloadPath: $(System.ArtifactsDirectory)
+
+          ## -> Download kube config 
+          - task: DownloadSecureFile@1
+            displayName: 'Download Kube Config'
+            condition: succeeded()
+            continueOnError: true
+            name: secureFile
+            inputs:
+              secureFile: kube-${{ parameters.infrastructureType }}-$(Build.SourceBranchName)
+
+          ## -> Set HELM variables and K8S namespaces
+          - task: Bash@3
+            displayName: 'Set variables for deploy'
+            condition: succeeded()
+            inputs:            
+              targetType: inline
+              script: |                   
+
+                selected_var="K8S_NAMESPACE_$(Build.SourceBranchName)"
+                NAMESPACE=${!selected_var}
+                                
+                if [ -z "$NAMESPACE" ] && [ ! -z "$(K8S_NAMESPACE)" ]; then
+                  NAMESPACE=$(K8S_NAMESPACE)
+                fi
+
+                echo "##[debug] NAMESPACE: $NAMESPACE"
+
+                if [[ -z "$NAMESPACE" ]]; then
+                  echo "##[error] Não foi possível identificar o ambiente de deploy, entre em contato com admnistrador do pipeline."
+                  exit 1;
+                fi
+
+                echo "##vso[task.setvariable variable=NAMESPACE;]$NAMESPACE"
+          
+          - task: Bash@3
+            displayName: 'Create helm chart package '
+            condition: succeeded()
+            inputs:
+              targetType: inline
+              script: |              
+
+                echo "##[debug] Creating helm package..."                
+                helmChart=$(helm package .)
+                echo "##[debug] $helmChart"
+                 
+                helmChartPackage=$(ls | grep -E "\.tgz$" | head -n 1)          
+                echo "##[debug] Helm chart package: $helmChartPackage"
+                echo "##vso[task.setvariable variable=HELM_CHART_PACKAGE;]$helmChartPackage"
+
+          - task: Bash@3
+            displayName: 'Verify Namespace'
+            condition: succeeded()
+            inputs:
+              targetType: inline
+              script: |
+                echo "##[debug]Check if namespace [$(NAMESPACE)] exists"
+
+                NAMESPACES=$(kubectl get ns -o json --kubeconfig=$(secureFile.secureFilePath) --insecure-skip-tls-verify)
+
+                echo "##[group] Namespaces in cluster"
+                echo "##[debug] ${NAMESPACES}"
+                echo "##[endgroup]"
+
+                NS=$(echo $NAMESPACES | jq -c '.items[].metadata | select(.name=="$(NAMESPACE)")' | jq -r '.name')
+
+                if [ "$NS" = "$(NAMESPACE)" ]; then
+                  echo "##[debug] Namespace [$(NAMESPACE)] OK."
+                else 
+                  echo "##[error] Namespace [$(NAMESPACE)] not found."
+                  exit 1;
+                fi
+
+          - task: Bash@3
+            displayName: 'Create docker registry secret '
+            condition: succeeded()
+            inputs:
+              targetType: inline
+              script: |
+
+                dockerSecretName=$(echo $(DOCKER_SERVICE_CONNECTION) | tr A-Z a-z)
+                
+                echo "##[debug] Searching secrets..."
+                kubectl get secrets $dockerSecretName \
+                  -n $(NAMESPACE) \
+                  --kubeconfig=$(secureFile.secureFilePath) \
+                  --insecure-skip-tls-verify
+
+                if [ $? -gt 0 ]; then
+                  echo "##[debug] Setup docker registry."                                    
+
+                  kubectl create secret docker-registry $dockerSecretName \
+                    --docker-server=$(DOCKER_REGISTRY) \
+                    --docker-username=$(DOCKER_REGISTRY_USERNAME) \
+                    --docker-password=$(DOCKER_REGISTRY_PASSWORD) \
+                    --docker-email=$(DOCKER_REGISTRY_EMAIL) \
+                    -n $(NAMESPACE) \
+                    --kubeconfig=$(secureFile.secureFilePath) \
+                    --insecure-skip-tls-verify
+                    
+                  if [ $? -gt 0 ]; then
+                    echo "##[error] Error create docker registry $dockerSecretName"
+                    exit 1;
+                  else
+                    echo "##[debug] Docker registry $dockerSecretName configured success!"
+                  fi
+                else
+                  echo "##[debug] Registry $dockerSecretName exists!"
+                fi
+
+                echo "##vso[task.setvariable variable=IMAGE_REPOSITORY_SECRET_NAME;]$dockerSecretName"
+            
+          - task: Bash@3
+            displayName: "Deploy Application through helm"
+            condition: succeeded()           
+            inputs:
+              targetType: inline
+              script: |
+                echo "##[section] HELM upgrade:"
+
+                echo "##[debug] Using helm chart at $(HELM_CHART_PACKAGE)"
+                
+                helm upgrade $(APP_NAME) \
+                  $(HELM_CHART_PACKAGE) \
+                  -f "$(DEFAULT_WORKDIR_ARTIFACTS)/$(ARTIFACT_NAME)/.azuredevops/config/$(Build.SourceBranchName)/values.yml" \
+                  --kubeconfig $(secureFile.secureFilePath) \
+                  --namespace $(NAMESPACE) \
+                  --install \
+                  --insecure-skip-tls-verify \
+                  --wait \
+                  --timeout $(HELM_UPGRADE_TIMEOUT) \
+                  --set "image.repository=$(DOCKER_IMAGE_NAME)" \
+                  --set "image.tag=$(DOCKER_IMAGE_TAG)" \
+                  --set "imagePullSecrets[0].name=$(IMAGE_REPOSITORY_SECRET_NAME)" \
+                  --output table \
+                  --history-max $(HELM_UPGRADE_HISTORY_MAX) \
+                  --atomic \
+                  --debug
+       
+        on:
+          success:
+            steps:
+            - task: Bash@3
+              displayName: Lib Publish Success
+              name: t_success_message
+              inputs:
+                targetType: inline
+                script: |
+                  echo "##[section] ================================================================================================================================="
+                  echo "##[section]                                                      DEPLOY WAS SUCCESSFUL! "
+                  echo "##[section] ================================================================================================================================="
+                  echo "##[section] Parabéns sua aplicação foi implantada com sucesso no ambiente de runtime." 
+                  echo "##[section] Acesse a url da sua aplicação e valide  se sua nova versão foi entregue com sucesso."
+                  echo "##[section] "
+                  echo "##[section] $(ALERT_MESSAGE_ARROW) Sua aplicação foi implantada com sucesso no ambiente."
+                  echo "##[section] $(ALERT_MESSAGE_ARROW) Verifique com o responsável técnico como acessar acessar a sua aplicação."
+                  echo "##[section] $(ALERT_MESSAGE_ARROW) Caso não esteja conseguindo acessar a sua aplicação entre em contato com suporte."
+                  echo "##[section] "
+                  echo "##[section] Caso tenha dúvidas sobre essa fase do pipeline acesse a nossa documentação: $(CORPORATE_WIKI_DOC_URL)"
+                  echo "##[section]================================================================================================================================="
+
+          failure:
+            steps:
+            - task: Bash@3
+              displayName: Lib Publish Failure
+              name: t_failure_message
+              inputs:
+                targetType: inline
+                script: |
+                  echo "##[error] ================================================================================================================================="
+                  echo "##[error]                                                    DEPLOY WAS NOT SUCCESSFUL! "
+                  echo "##[error] ================================================================================================================================="
+                  echo "##[error] Se está vendo essa mensagem é porque aconteceu algo erro durante a impplantação da sua apliação."
+                  echo "##[error] "
+                  echo "##[error] Segue abaixo umas dicas para o Troubleshooting:"
+                  echo "##[error] $(ALERT_MESSAGE_ARROW) Consulte o log do estágio de deploy da aplicação."
+                  echo "##[error] $(ALERT_MESSAGE_ARROW) Verifique com o responsável técnico como proceder em caso de falha de ambiente."                  
+                  echo "##[error] "
+                  echo "##[error] Caso tenha dúvidas sobre essa fase do pipeline acesse a nossa documentação: $(CORPORATE_WIKI_DOC_URL)"
+                  echo "##[error] ================================================================================================================================="              
+            

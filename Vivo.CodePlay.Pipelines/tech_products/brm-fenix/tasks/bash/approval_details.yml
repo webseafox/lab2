@@ -1,0 +1,121 @@
+# This YAML file defines a pipeline task that retrieves approval details for a build stage and sets them as output variables.
+
+parameters:
+  - name: withEnvironmentApproval
+    default: false
+
+steps:
+  - ${{ if eq(parameters.withEnvironmentApproval, false) }}:
+      - task: PowerShell@2
+        name: details
+        displayName: "Approval Details"
+        inputs:
+          targetType: "inline"
+          script: |
+            # Variables to store approval details
+            $approverEmail=""
+            $approverName =""
+            $approvalComment=""
+            $approvalStatusID=0
+            $approvalStatus=""
+
+            try {
+                # Determine the stage ID
+                $uri = "$(System.CollectionUri)$(System.TeamProject)/_apis/build/builds/$(Build.BuildId)/timeline?api-version=6.0"
+              
+                # Set up authentication headers
+                $basicAuth = ("{0}:{1}" -f "", $env:SYSTEM_ACCESSTOKEN)
+                $basicAuth = [System.Text.Encoding]::UTF8.GetBytes($basicAuth)
+                $basicAuth = [System.Convert]::ToBase64String($basicAuth)
+                $headers = @{Authorization=("Basic {0}" -f $basicAuth)}
+                
+                # Get the build timeline
+                $Response = Invoke-RestMethod -Uri "$uri" -headers $headers -Method 'get'          
+                
+                # Find the current stage
+                $stage = $response.records | where-object -property identifier -eq "$(System.StageName)"
+              
+                # Retrieve the approval details
+                $uri = "$(System.CollectionUri)/_apis/Contribution/HierarchyQuery/project/$(System.TeamProjectId)?api-version=6.1-preview.1"
+                $payload = "{`"contributionIds`":[`"ms.vss-build-web.checks-panel-data-provider`"],`"dataProviderContext`":{`"properties`":{`"buildId`":`"$(Build.BuildId)`",`"stageIds`":`"$($stage.id)`",`"checkListItemType`":2,`"sourcePage`":{`"url`":`"$(System.CollectionUri)/$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)&view=results`",`"routeId`":`"ms.vss-build-web.ci-results-hub-route`",`"routeValues`":{`"project`":`"$(System.TeamProject)`",`"viewname`":`"build-results`",`"controller`":`"ContributedPage`",`"action`":`"Execute`",`"serviceHost`": `"594961c2-ead9-4053-bef9-52498ac587fd (sdl)`"}}}}}"
+              
+                $Response = Invoke-RestMethod -Uri "$uri" -headers $headers -Method 'Post' -Body $payload -ContentType "application/json"
+
+                # Extract the approval details from the response
+                $approver=$response.dataProviders."ms.vss-build-web.checks-panel-data-provider"[0].manualValidations[0].steps[0].actualApprover
+                $approverEmail = $approver.uniqueName
+                $approverName = $approver.displayName
+                $approvalComment = $response.dataProviders."ms.vss-build-web.checks-panel-data-provider"[0].manualValidations[0].steps[0].comment
+                $approvalStatusID = $response.dataProviders."ms.vss-build-web.checks-panel-data-provider"[0].manualValidations[0].steps[0].status
+
+                # Determine the approval status
+                if ($approvalStatusID -eq 8) {
+                    $approvalStatus="Rejected"
+                }
+
+                if ($approvalStatusID -eq 4) {
+                    $approvalStatus="Approved"
+                }
+
+                # Output the approval details
+                Write-Output "Approver: $approverName `($approverEmail`)"
+                Write-Output "Status:  $approvalStatus `($approvalStatusID`)"
+                Write-Output "Comment:  $approvalComment "
+
+            } catch {
+              write-warning ("Cannot find the approver: " + $_) 
+            }
+
+            # Debug output for approval details
+            echo "##[debug] APPROVAL APPROVER NAME .........................: $approverName"
+            echo "##[debug] APPROVAL APPROVER EMAIL ........................: `($approverEmail`)"
+            echo "##[debug] APPROVAL STATUS ................................: $approvalStatus"
+            echo "##[debug] APPROVAL COMMENT ...............................: $approvalComment"
+
+            # Set the approval details as output variables
+            echo "##vso[task.setvariable variable=APPROVAL_APPROVER_NAME;isoutput=true]$approverName"
+            echo "##vso[task.setvariable variable=APPROVAL_APPROVER_EMAIL;isoutput=true]`($approverEmail`)"
+            echo "##vso[task.setvariable variable=APPROVAL_STATUS;isoutput=true]$approvalStatus"
+            echo "##vso[task.setvariable variable=APPROVAL_COMMENT;isoutput=true]$approvalComment"
+          pwsh: true
+        env:
+          SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+  - ${{ if eq(parameters.withEnvironmentApproval, true) }}:
+      - task: CmdLine@2
+        name: details
+        displayName: "Approval Informations"
+        inputs:
+          script: |
+            uri="$(System.CollectionUri)$(System.TeamProjectId)/_apis/pipelines/approvals?\$expand=steps&api-version=7.1-preview.1"
+
+            response=$(curl -s -X GET -u :$SYSTEM_ACCESSTOKEN $uri)
+
+            approver_displayName=$(echo $response | jq '.value[] | select(.pipeline.owner.id==$(Build.BuildId))' | jq -r '.steps[].actualApprover.displayName')
+            approver_uniqueName=$(echo $response | jq '.value[] | select(.pipeline.owner.id==$(Build.BuildId))' | jq -r '.steps[].actualApprover.uniqueName')
+            approver_status=$(echo $response | jq '.value[] | select(.pipeline.owner.id==$(Build.BuildId))' | jq -r '.steps[].status')
+            approver_comment=$(echo $response | jq '.value[] | select(.pipeline.owner.id==$(Build.BuildId))' | jq -r '.steps[].comment')
+
+            if [[ -z $approver_comment || $approver_comment == "null" ]]; then
+              approver_comment="-"
+            fi
+
+            if [[ $approver_status == "" ]]; then
+              approver_status="Automatic Approval. $(ENVIRONMENT) is not a controlled environment."
+              approver_displayName="-"
+              approver_uniqueName="-"
+              approver_comment="-"
+            fi
+
+            echo "##[debug] APPROVAL STATUS ................................: $approver_status"
+            echo "##[debug] APPROVAL APPROVER NAME .........................: $approver_displayName"
+            echo "##[debug] APPROVAL APPROVER EMAIL ........................: $approver_uniqueName"
+            echo "##[debug] APPROVAL COMMENT ...............................: $approver_comment"
+            echo "##[debug] URI ............................................: $uri"
+
+            # Set the approval details as output variables
+            echo "##vso[task.setvariable variable=DEPLOY_APPROVAL_APPROVER_NAME;isoutput=true]$approver_displayName"
+            echo "##vso[task.setvariable variable=DEPLOY_APPROVAL_APPROVER_EMAIL;isoutput=true]$approver_uniqueName"
+            echo "##vso[task.setvariable variable=DEPLOY_APPROVAL_STATUS;isoutput=true]$approver_status"
+            echo "##vso[task.setvariable variable=DEPLOY_APPROVAL_COMMENT;isoutput=true]$approver_comment"
+        env:
+          SYSTEM_ACCESSTOKEN: $(System.AccessToken)

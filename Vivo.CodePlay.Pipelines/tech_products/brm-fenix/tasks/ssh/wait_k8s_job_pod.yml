@@ -1,0 +1,77 @@
+parameters:
+  - name: resource # pods or jobs
+  - name: sshEndpoint
+  - name: timeout
+
+steps:
+  - task: SSH@0
+    displayName: "Waiting ${{ parameters.resource }} ..."
+    continueOnError: true
+    inputs:
+      sshEndpoint: ${{ parameters.sshEndpoint }}
+      runOptions: "inline"
+      inline: |
+        printf "##[debug] RESOURCE ..........................................: ${{ parameters.resource }}\n"
+        printf "##[debug] SSH ENDPOINT ......................................: ${{ parameters.sshEndpoint }}\n"
+        printf "##[debug] TIMEOUT ...........................................: ${{ parameters.timeout }}\n"
+
+        ERR="false"
+
+        printf "\n##[group]Start ${{ parameters.resource }} Status"
+        printf "\n##[command]kubectl get ${{ parameters.resource }} -o wide\n"
+        ALL_RESOURCES=$(kubectl get ${{ parameters.resource }} -o wide)
+        printf "$ALL_RESOURCES" | column -t
+        printf "##[endgroup]"
+
+        TIMEOUT=$(echo "${{ parameters.timeout }}" | sed 's/s$//')
+        ELAPSED=0
+        INTERVAL=10
+
+        printf "\n##[group]${{ parameters.resource }} Status Check [Timeout ${TIMEOUT}s] ..."
+        printf "\n>>>>>>>>>> Waiting for all ${{ parameters.resource }} to be Running, Succeeded or Completed ...\n"
+
+        while [ $ELAPSED -lt $TIMEOUT ]; do
+          NON_OK_RESOURCES=""
+          if [ "${{ parameters.resource }}" = "pods" ]; then
+            NON_OK_RESOURCES=$(kubectl get pods --no-headers -o custom-columns=":metadata.name,:status.phase" | grep -v -E "Running|Succeeded|Completed" | grep -v '^pdc-idp-loader-job' || true)
+          elif [ "${{ parameters.resource }}" = "jobs" ]; then
+            NON_OK_RESOURCES=$(kubectl get jobs --no-headers -o custom-columns=":metadata.name,:status.conditions[?(@.type=='Complete')].status" | grep -v "True" | grep -v '^pdc-idp-loader-job' || true)
+          fi
+
+          if [ -z "$NON_OK_RESOURCES" ]; then
+            printf "\n✅ All ${{ parameters.resource }} have reached the expected status. \n"
+            break
+          fi
+
+          printf "\n>>> (Elapsed: ${ELAPSED}s / Timeout: ${TIMEOUT}s) ${{ parameters.resource }} not ready yet: $(echo "$NON_OK_RESOURCES" | wc -l). Waiting ...\n"
+          printf "$NON_OK_RESOURCES\n"
+
+          sleep $INTERVAL
+          ELAPSED=$((ELAPSED + INTERVAL))
+        done
+        printf "##[endgroup]"
+
+        printf "\n##[group]Final ${{ parameters.resource }} Status"
+        printf "\n##[command]kubectl get ${{ parameters.resource }} -o wide\n"
+        kubectl get ${{ parameters.resource }} -o wide | column -t
+        printf "##[endgroup]"
+
+        if [ $ELAPSED -ge $TIMEOUT ]; then
+          ERR="true"
+          printf "\n##vso[task.logissue type=error;]❌ timeout reached, the ${{ parameters.resource }} did not reach the expected status.\n"
+          printf "\n${{ parameters.resource }}:"
+
+          if [ "${{ parameters.resource }}" = "pods" ]; then
+            kubectl get pods -o wide | grep -v -E "Running|Succeeded|Completed" || true
+          elif [ "${{ parameters.resource }}" = "jobs" ]; then
+            kubectl get jobs --no-headers -o custom-columns=":metadata.name,:status.conditions[?(@.type=='Complete')].status,:status.conditions[?(@.type=='Failed')].status" | awk '$2!="True" || $3=="True"' || true
+          fi
+        else
+          printf "\n✅ All ${{ parameters.resource }} are in the expected status.\n"
+        fi
+
+        if [ "$ERR" = "true" ]; then
+          exit 1
+        fi
+      readyTimeout: "20000"
+      failOnStdErr: false

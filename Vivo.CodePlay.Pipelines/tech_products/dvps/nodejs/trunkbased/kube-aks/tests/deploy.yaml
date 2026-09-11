@@ -1,0 +1,364 @@
+parameters:
+- name: variable_groups
+  displayName: Lista de Variables Groups para complementar variaveis e segredos.
+  default: []
+  type: object
+
+- name: environment
+  displayName: 'Ambiente padrao para implantacao.'
+  type: string
+  default: dev
+  # values:
+  # - dev
+  # - esteira1
+  # - esteira2
+  # - esteira3
+  # - preprod
+  # - production
+  # - prodlike
+
+
+- name: kubernetes_connection
+  displayName: 
+    Service connection do AKS ex 'aks-[app_acronym]-brsouth-[environment]'
+  type: string
+
+- name: resource_group
+  displayName: 
+    Resrouce Group da Azure ex 'rg-[app_acronym]-brsouth-[environment]'
+  type: string
+
+- name: vivonow_chg
+  displayName: 'Numero CHG do VivoNow, somente para "production"'
+  default: CHG0000001
+
+variables:
+- name: System.debug
+  value: 'true'
+- ${{ each group_name in parameters.variable_groups }}:
+  - group: ${{ group_name }}
+
+stages:
+- stage:
+  displayName: 'Deploy on (${{ parameters.environment }})'
+  pool: GeneralPurposeLinuxAgentsCI
+  variables:
+  - name: System.debug
+    value: "true"
+  - name: DOCKER_TAG_SUFIX
+    ${{ if eq('${{ parameters.environment }}', 'production') }}:
+      value: 'RELEASE'
+    ${{ else }}:
+      value: 'SNAPSHOT'
+  jobs:
+  - deployment:
+    displayName: 'Deploy on (${{ parameters.environment }})'
+    # creates an environment if it doesn't exist
+    environment:
+      name: 'deploy-${{ parameters.environment }}'
+    # variables:
+    #   - name: HELM_EXPERIMENTAL_OCI
+    #     value: 1
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+            persistCredentials: true
+            fetchDepth: 1
+
+          - task: DownloadBuildArtifacts@1
+            displayName: 'Download generated files'
+            inputs:
+              buildType: 'specific'
+              project: '2775aacd-f72a-43ca-afa7-bc7d0ff21411'
+              pipeline: '34574'
+              buildVersionToDownload: 'specific'
+              buildId: '898520'
+              artifactName: 'generated-sources'
+              downloadPath: $(System.ArtifactsDirectory)
+          
+          - task: CopyFiles@2
+            displayName: Overwrite generated sources
+            inputs:
+              SourceFolder: '$(System.ArtifactsDirectory)/generated-sources'
+              Contents: '**'
+              TargetFolder: './'
+              OverWrite: true
+
+          - task: JsonParseFromVivo@4
+            displayName: 'Get package.json info'
+            inputs:
+              type: 'file'
+              origin: 'package.json'
+              jpaths: |
+                var PACKAGE_JSON_VERSION = .version
+
+          - task: YamlParseFromVivo@4
+            displayName: 'Get Metadata Info'
+            inputs:
+              type: 'file'
+              origin: catalog-info.yaml
+              jpaths: |-
+                var CATALOG_YAML_NAME = .metadata.name
+                var CATALOG_YAML_K8S_NS = .metadata.annotations['vivo.io/kubernetes-k8s-namespace-${{ parameters.environment }}']
+                
+          - task: TypescriptRunner@4
+            displayName: 'Extract variables'
+            inputs:
+              script: |- # typescript
+                const [ ,GOV_APP_ACRONYM ] = '${{ parameters.kubernetes_connection }}'.split('-');
+                set_variable('GOV_APP_ACRONYM', GOV_APP_ACRONYM);
+
+          - task: AzureKeyVault@2
+            displayName: 'Getting AKV credentials'
+            timeoutInMinutes: 1
+            retryCountOnTaskFailure: 5
+            inputs:
+              azureSubscription: DevOpsSharedResources
+              KeyVaultName: kv-azdevops-shared
+              SecretsFilter: >-
+                NEXUS-DEPS-USR, NEXUS-DEPS-PSW,
+                HELM-REGISTRY-NEXUS-USERNAME, HELM-REGISTRY-NEXUS-PASSWORD,
+                DOCKER-REGISTRY-ACR-USERNAME, DOCKER-REGISTRY-ACR-PASSWORD
+
+          - task: PlaceInFiles@4 
+            displayName: "Apply config variables"
+            inputs:
+              globPattern: ".azuredevops/config/${{ parameters.environment }}/*.y*ml"
+              regex: '/\$\(([^\)]+)\)/gmi'
+          
+          - task: AzureCLI@2
+            inputs:
+              azureSubscription: ${{ parameters.kubernetes_connection }}
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: | # shell
+                
+                az aks get-credentials \
+                --resource-group ${{ parameters.resource_group }} \
+                --name ${{ parameters.kubernetes_connection }}
+                
+                kubelogin convert-kubeconfig -l azurecli
+
+                az acr helm install-cli --yes
+
+                az acr helm repo add devops-helm \
+                "https://nexus.telefonica.com.br/repository/devops-helm" \
+                --force-update \
+                --insecure-skip-tls-verify \
+                --username "$(HELM-REGISTRY-NEXUS-USERNAME)" \
+                --password "$(HELM-REGISTRY-NEXUS-PASSWORD)"
+
+                az acr helm repo repo update
+
+                # helm upgrade \
+                # --install \
+                # --namespace $(CATALOG_YAML_K8S_NS) \
+                # --set nameOverride=$(CATALOG_YAML_NAME) \
+                # --set fullnameOverride=$(CATALOG_YAML_NAME) \
+                # --set containerName=$(CATALOG_YAML_NAME) \
+                # --set image.repository=acrsharedservices01.azurecr.io/$(GOV_APP_ACRONYM)/$(CATALOG_YAML_NAME) \
+                # --set image.tag=$(PACKAGE_JSON_VERSION)-$(DOCKER_TAG_SUFIX) \
+                # --install \
+                # --insecure-skip-tls-verify \
+                # --timeout 300s \
+                # -f "$(Build.SourcesDirectory)/.azuredevops/config/${{ parameters.environment }}/values.yml" \
+                # -f "$(Build.SourcesDirectory)/.azuredevops/config/${{ parameters.environment }}/environments_variables.yml" \
+                # -f "$(Build.SourcesDirectory)/.azuredevops/config/${{ parameters.environment }}/secrets.yaml" \
+                # --output table \
+                # --history-max 2 \
+                # --debug \
+                # --atomic \
+                # --wait \
+                # $(CATALOG_YAML_NAME) \
+                # devops-helm/generic-java-microservice \
+                # --version \
+                # 1.0.27
+
+          - task: TypeScriptRunner@4
+            displayName: 'Helm upgrade on (${{ parameters.environment }})'
+            inputs:
+              script: | # typescript
+                const existDeployment = !process.env.EXISTING_DEPLOYMENT
+
+                const helmUpgradeCommand = [
+                  `az acr helm upgrade`,
+                  `--install`,
+                  `--namespace $(CATALOG_YAML_K8S_NS)`,
+                  `--set nameOverride=$(CATALOG_YAML_NAME)`,
+                  `--set fullnameOverride=$(CATALOG_YAML_NAME)`,
+                  `--set containerName=$(CATALOG_YAML_NAME)`,
+                  `--set image.repository=acrsharedservices01.azurecr.io/$(GOV_APP_ACRONYM)/$(CATALOG_YAML_NAME)`,
+                  `--set image.tag=$(PACKAGE_JSON_VERSION)-$(DOCKER_TAG_SUFIX)`,
+                  `--install`,
+                  `--insecure-skip-tls-verify`,
+                  `--timeout 300s`,
+                  `-f "$(Build.SourcesDirectory)/.azuredevops/config/${{ parameters.environment }}/values.yml"`,
+                  `-f "$(Build.SourcesDirectory)/.azuredevops/config/${{ parameters.environment }}/environments_variables.yml"`,
+                  `-f "$(Build.SourcesDirectory)/.azuredevops/config/${{ parameters.environment }}/secrets.yaml"`,
+                  `--output table`,
+                  `--history-max 2`,
+                  `--debug`,
+                  `--atomic`,
+                  `--wait`,
+                  `$(CATALOG_YAML_NAME)`,
+                  `devops-helm/generic-java-microservice`,
+                  `--version`,
+                  `1.0.27`,
+                ].join(' ');
+
+                const kubelogs = [
+                  'kubectl logs',
+                  'deployment/$(CATALOG_YAML_NAME)',
+                  '-f',
+                  '--all-containers=true',
+                  '--namespace "$(CATALOG_YAML_K8S_NS)"',
+                  '--insecure-skip-tls-verify',
+                ].join(' ')
+
+                const kubeevents = [
+                  'kubectl events',
+                  'deployment/$(CATALOG_YAML_NAME)',
+                  '-w',
+                  '--namespace "$(CATALOG_YAML_K8S_NS)"',
+                  '--insecure-skip-tls-verify',
+                ].join(' ')
+
+                const cwd = process.cwd();
+                const pid1out = [];
+                const pid2out = [];
+
+                const pid1 = sh.exec(kubeevents, { cwd, async: true, silent: true });
+                pid1.stdout.on('data', (chunk) => pid1out.push(chunk))
+                pid1.stderr.on('data', (chunk) => pid1out.push(chunk))
+
+                const pid2 = sh.exec(kubelogs, { cwd, async: true, silent: true });
+                pid2.stdout.on('data', (chunk) => pid2out.push(chunk))
+                pid2.stderr.on('data', (chunk) => pid2out.push(chunk))
+
+                const pid = sh.exec(helmUpgradeCommand, { cwd }, (code, stdout, stderr) => {
+                  consola.info('kube events!')
+                  consola.log(pid1out.join('') || 'No events!');
+
+                  consola.info('kube logs!')
+                  consola.box(pid2out.join('') || 'No logs');
+
+                  process.exit(code);
+                });
+                
+
+
+          # - task: HelmDeploy@0
+          #   displayName: 'Add devops-helm repo from (Nexus)'
+          #   inputs:
+          #     azureSubscription: ${{ parameters.kubernetes_connection }}
+          #     azureResourceGroup: ${{ parameters.resource_group }}
+          #     kubernetesCluster: ${{ parameters.kubernetes_connection }}
+          #     command: 'repo'
+          #     arguments: >-
+          #       add devops-helm
+          #       "https://nexus.telefonica.com.br/repository/devops-helm"
+          #       --force-update
+          #       --insecure-skip-tls-verify
+          #       --username "$(HELM-REGISTRY-NEXUS-USERNAME)"
+          #       --password "$(HELM-REGISTRY-NEXUS-PASSWORD)"
+
+          # - task: HelmDeploy@0
+          #   displayName: 'Helm upgrade on (${{ parameters.environment }})'
+          #   inputs:
+          #     azureSubscription: ${{ parameters.kubernetes_connection }}
+          #     azureResourceGroup: ${{ parameters.resource_group }}
+          #     kubernetesCluster: ${{ parameters.kubernetes_connection }}
+          #     namespace: $(CATALOG_YAML_K8S_NS)
+          #     command: upgrade
+          #     chartName: 'devops-helm/generic-java-microservice'
+          #     chartVersion: '1.0.27'
+          #     releaseName: $(CATALOG_YAML_NAME)
+          #     overrideValues: |
+          #       nameOverride=$(CATALOG_YAML_NAME)
+          #       fullnameOverride=$(CATALOG_YAML_NAME)
+          #       containerName=$(CATALOG_YAML_NAME)
+          #       image.repository=acrsharedservices01.azurecr.io/$(GOV_APP_ACRONYM)/$(CATALOG_YAML_NAME)
+          #       image.tag=$(PACKAGE_JSON_VERSION)-$(DOCKER_TAG_SUFIX)
+          #     valueFile: .azuredevops/config/${{ parameters.environment }}/values.yml
+          #     arguments: >-
+          #       --install
+          #       --insecure-skip-tls-verify
+          #       --timeout 300s
+          #       -f "$(Build.SourcesDirectory)/.azuredevops/config/${{ parameters.environment }}/environments_variables.yml"
+          #       -f "$(Build.SourcesDirectory)/.azuredevops/config/${{ parameters.environment }}/secrets.yaml"
+          #       --output table
+          #       --history-max 2
+          #       --debug
+          #       --atomic
+          #       --wait
+
+        on:
+          success:
+            steps:
+            - checkout: self
+              fetchDepth: 1
+
+            - task: JsonParseFromVivo@4
+              displayName: 'Get package.json info'
+              inputs:
+                type: 'file'
+                origin: $(Build.SourcesDirectory)/package.json
+                jpaths: |
+                  var PACKAGE_JSON_VERSION = .version
+
+            - task: LoadFile@4
+              displayName: 'Load catalog-info.yaml'
+              inputs:
+                script: |
+                  CATALOG_YAML_CONTENT = $(Build.SourcesDirectory)/catalog-info.yaml
+
+            - task: YamlParseFromVivo@4
+              displayName: 'Get Metadata Info'
+              inputs:
+                type: 'file'
+                origin: $(Build.SourcesDirectory)/catalog-info.yaml
+                jpaths: |
+                  var CATALOG_YAML_NAME = .metadata.name
+                  var CATALOG_YAML_K8S_NS = .metadata.annotations['vivo.io/kubernetes-k8s-namespace-${{ parameters.environment }}']
+
+            - task: CatchLogsToLocalDirectoryFromVivo@4
+              displayName: 'Dump logs and metas'
+              inputs:
+                dumpDir: $(Build.ArtifactStagingDirectory)/audit
+
+            - task: PublishBuildArtifacts@1
+              displayName: 'Push Logs to Artifacts'
+              inputs:
+                ArtifactName: audit
+                PathtoPublish: $(Build.ArtifactStagingDirectory)/audit
+
+            - task: VivoGovernance@1
+              displayName: 'Gov Notify "deploy"'
+              inputs:
+                breakglass: false
+                serverEndpoint: 'governanceapi'
+                operation: 'deploy'
+                component: $(CATALOG_YAML_NAME)
+                version: $(PACKAGE_JSON_VERSION)
+                cluster: ${{ parameters.kubernetes_connection }}
+                namespace: $(CATALOG_YAML_K8S_NS)
+                deployment: $(CATALOG_YAML_NAME)
+                environment: ${{ parameters.environment }}
+                catalogInfo: $(CATALOG_YAML_CONTENT)
+
+          failure:
+            steps:
+            - checkout: none
+            - task: CatchLogsToLocalDirectoryFromVivo@4
+              displayName: 'Dump logs and metas'
+              inputs:
+                dumpDir: $(Build.ArtifactStagingDirectory)/audit
+
+            - task: PublishBuildArtifacts@1
+              displayName: 'Push Logs to Artifacts'
+              inputs:
+                ArtifactName: audit
+                PathtoPublish: $(Build.ArtifactStagingDirectory)/audit
+

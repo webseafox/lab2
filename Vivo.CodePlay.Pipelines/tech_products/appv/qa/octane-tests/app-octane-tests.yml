@@ -1,0 +1,102 @@
+trigger: none
+pr: none
+
+resources:
+  repositories:
+    - repository: CodePlay
+      name: DevOps/Vivo.CodePlay.Pipelines
+      type: git
+      ref: refs/heads/master
+      endpoint: CodePlay
+    - repository: CorePipelines
+      name: DevOps/Vivo.Core.Pipelines
+      type: git
+      ref: refs/tags/latest
+      endpoint: CorePipelines
+
+parameters:
+  - name: repositoryName
+    type: string
+    displayName: 'Nome do Repositório'
+    default: 'framework-brasil-archetype-spa-front'
+  - name: version
+    type: string
+    displayName: 'Versão do Relatório'
+    default: '1.0.123'
+  - name: filterScenarios
+    type: boolean
+    displayName: 'Filtrar Cenários'
+    default: true
+  - name: acceptanceCriteria
+    type: string
+    displayName: 'Critérios de Aceitação'
+  - name: octaneSharedSpaceId
+    type: string
+    displayName: 'Id do Shared Space no Octane'
+    default: '522001'
+  - name: octaneWorkspaceId
+    type: string
+    displayName: 'Id do Workspace no Octane'
+    default: '28001'
+  - name: octaneReleaseId
+    type: string
+    displayName: 'Id da release no Octane'
+    default: ''
+  - name: octaneSprintId
+    type: string
+    displayName: 'Id da sprint no Octane'
+    default: ''
+
+pool:
+  name: GeneralPurposeLinuxAgentsCI
+
+variables:
+  - template: /tech_products/appv/global/variables/shared.yml@CodePlay
+  - template: /tech_products/appv/global/initialize/octane-credentials.yml@CodePlay
+
+stages:
+  - template: /tech_products/appv/global/initialize/nodejs-environment.yml@CodePlay
+  - stage: ProcessTests
+    displayName: Process Component Tests for Octane
+    dependsOn: environment_init
+    jobs:
+      - job: DownloadAndFilter
+        displayName: Download and Filter Tests
+        variables:
+          - name: NEXUS_DEPS_USR
+            value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEPS_USR'] ]
+          - name: NEXUS_DEPS_PSW
+            value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEPS_PSW'] ]
+        steps:
+          - checkout: CodePlay
+            fetchDepth: 1
+          - template: templates/ci/download-nexus.yml
+            parameters:
+              repositoryName: ${{ parameters.repositoryName }}
+              version: ${{ parameters.version }}
+          - template: templates/ci/parse-filter.yml
+            parameters:
+              jsonPath: $(Build.ArtifactStagingDirectory)/cucumber-report.json
+              filterScenarios: ${{ parameters.filterScenarios }}
+              acceptanceCriteria: ${{ parameters.acceptanceCriteria }}
+          - task: component-tests@1
+            displayName: Execute Component Pipeline Task for Octane
+            inputs:
+              repositoryName: ${{ parameters.repositoryName }}
+              version: ${{ parameters.version }}
+              filteredJsonPath: $(Build.ArtifactStagingDirectory)/cucumber-report.filtered.json
+              octaneHost: $(OCTANE_HOST)
+              octaneClientId: $(OCTANE_CLIENT_ID)
+              octaneClientSecret: $(OCTANE_CLIENT_SECRET)
+              octaneSharedSpaceId: ${{ parameters.octaneSharedSpaceId }}
+              octaneWorkspaceId: ${{ parameters.octaneWorkspaceId }}
+              octaneReleaseId: ${{ parameters.octaneReleaseId }}
+              octaneSprintId: ${{ parameters.octaneSprintId }}
+            condition: succeeded()
+          - task: PublishBuildArtifacts@1
+            displayName: Publish Artifacts
+            inputs:
+              PathtoPublish: $(Build.ArtifactStagingDirectory)
+              ArtifactName: 'OctaneTestResults'
+              publishLocation: 'Container'
+            condition: always()

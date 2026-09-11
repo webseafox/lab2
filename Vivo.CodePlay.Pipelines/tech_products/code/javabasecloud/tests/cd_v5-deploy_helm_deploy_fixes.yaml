@@ -1,0 +1,214 @@
+parameters:
+- name: environment
+  displayName: Escolha o ambiente para publicar
+  type: string
+  default: dev
+  values:
+  - dev
+  - preprod
+  - prod
+
+- name: vivonow_chg
+  displayName: Numero CHG do VivoNow, somente para 'prod'
+  default: CHG0000001
+
+# Parametro adicinado para reduzir o uso de VariableGroups
+# para baixar o SecretFile do kube.config a validacao ocorre em tempo de template.
+- name: sigla_bu
+  default: 'techarch'
+  displayName: Sigla BU 'techarch', 'mvpk', 'oss'...
+
+variables:
+- name: System.debug
+  value: "true"
+
+stages:
+- stage: stage_recreate_acr_secret
+  displayName: "FIX: Recreate ACR Secret on (${{ parameters.environment }})"
+  pool: DefaultDevopsAgents
+  jobs:
+  - job: job_recreate_acr_secret
+    displayName: Recreate ACR Secret on (${{ parameters.environment }})
+    steps:
+    - checkout: self
+      fetchDepth: 1
+
+    - task: YamlParseFromVivo@4
+      displayName: Get Metadata Info
+      name: catalog_info
+      inputs:
+        type: 'file'
+        origin: catalog-info.yaml
+        jpaths: |-
+          var CATALOG_YAML_NAME = .metadata.name
+          var CATALOG_YAML_ACRONYM = .metadata.annotations['techarch.governance-app.acronym']
+          var CATALOG_YAML_K8S_NS = .metadata.annotations['vivo.io/kubernetes-k8s-namespace-${{ parameters.environment }}']
+
+    - task: NunjucksInline@4
+      displayName: Bind Variables
+      inputs:
+        sourceType: 'text'
+        source: |
+          var HELM_REPO_PREFIX = {{ CATALOG_YAML_ACRONYM or 'devops'}}
+
+    - task: AzureKeyVault@2  
+      displayName: 'Getting AKV credentials'
+      timeoutInMinutes: 1
+      retryCountOnTaskFailure: 5  
+      inputs:    
+        azureSubscription: DevOpsSharedResources    
+        KeyVaultName: kv-azdevops-shared
+        SecretsFilter: >- 
+          DOCKER-REGISTRY-ACR-USERNAME, DOCKER-REGISTRY-ACR-PASSWORD,
+          HELM-REGISTRY-NEXUS-USERNAME, HELM-REGISTRY-NEXUS-PASSWORD,
+          HELM-REGISTRY-ACR-USERNAME, HELM-REGISTRY-ACR-PASSWORD,
+          NEXUS-DEPS-USR, NEXUS-DEPS-PSW
+
+    - task: DownloadSecureFile@1
+      name: kubeconfig
+      displayName: 'Download config from (${{parameters.environment}})'
+      inputs:
+        # secureFile: 'aks-${{parameters.sigla_bu}}-${{parameters.environment}}'
+        secureFile: 'kube-${{parameters.environment}}'
+
+    # - script: >-
+    #     kubectl delete ns "$(CATALOG_YAML_K8S_NS)"
+    #     --kubeconfig="$(kubeconfig.secureFilePath)"
+    #     --insecure-skip-tls-verify
+    #   displayName: DELETE NAMESPACE
+
+    - script: |-
+        kubectl delete secrets acr-$(CATALOG_YAML_ACRONYM) \
+        -n $(CATALOG_YAML_K8S_NS) \
+        --kubeconfig="$(kubeconfig.secureFilePath)" \
+        --insecure-skip-tls-verify
+      displayName: DELETE SECRET VAULT
+
+    # - script: >-
+    #     kubectl delete secret docker-registry acr-$(CATALOG_YAML_ACRONYM)
+    #     -n $(CATALOG_YAML_K8S_NS)
+    #     --kubeconfig="$(kubeconfig.secureFilePath)"
+    #     --insecure-skip-tls-verify
+    #   displayName: DELETE ONE SECRET
+
+    - script: >-
+        kubectl create secret docker-registry acr-$(CATALOG_YAML_ACRONYM) 
+        --docker-server="acrsharedservices01.azurecr.io" 
+        --docker-username="$(DOCKER-REGISTRY-ACR-USERNAME)" 
+        --docker-password="$(DOCKER-REGISTRY-ACR-PASSWORD)" 
+        --docker-email='arquiteturati@telefonica.com.br' 
+        -n $(CATALOG_YAML_K8S_NS) 
+        --kubeconfig="$(kubeconfig.secureFilePath)" 
+        --insecure-skip-tls-verify
+      continueOnError: false
+      displayName: CREATE ACR SECRETS
+
+    # - script: >-
+    #     kubectl create secret docker-registry acr-$(CATALOG_YAML_ACRONYM) 
+    #     --docker-server="https://acrsharedservices01.azurecr.io/" 
+    #     --docker-username="$(HELM-REGISTRY-ACR-USERNAME)" 
+    #     --docker-password="$(HELM-REGISTRY-ACR-PASSWORD)" 
+    #     --docker-email='arquiteturati@telefonica.com.br' 
+    #     -n $(CATALOG_YAML_K8S_NS) 
+    #     --kubeconfig="$(kubeconfig.secureFilePath)" 
+    #     --insecure-skip-tls-verify
+    #   continueOnError: false
+    #   displayName: CREATE ACR SECRETS
+      
+    
+    # - task: Bash@3
+    #   displayName: 'Rollback last on (${{ parameters.environment }})'
+    #   condition: and(succeeded(), not(eq(variables['DEPLOYMENT_STATUS'], 'deployed')))
+    #   continueOnError: false
+    #   inputs:
+    #     workingDirectory: $(Build.SourcesDirectory)
+    #     targetType: inline
+    #     script: >-
+    #       helm rollback $(CATALOG_YAML_NAME)
+    #       --kubeconfig $(kubeconfig.secureFilePath)
+    #       --namespace $(CATALOG_YAML_K8S_NS)
+    #       --debug
+
+# - stage: stage_delete_namespace
+#   displayName: "FIX: Delete namespace on (${{ parameters.environment }})"
+#   pool: DefaultDevopsAgents
+#   jobs:
+#   - job: job_delete_namespace
+#     displayName: Delete namespace on (${{ parameters.environment }})
+#     steps:
+#     - checkout: self
+#       fetchDepth: 1
+
+#     - task: YamlParseFromVivo@4
+#       displayName: Get Metadata Info
+#       name: catalog_info
+#       inputs:
+#         type: 'file'
+#         origin: catalog-info.yaml
+#         jpaths: |-
+#           var CATALOG_YAML_K8S_NS = .metadata.annotations['vivo.io/kubernetes-k8s-namespace-${{ parameters.environment }}']
+
+#     - task: DownloadSecureFile@1
+#       name: kubeconfig
+#       displayName: 'Download config from (${{parameters.environment}})'
+#       inputs:
+#         secureFile: 'aks-${{parameters.sigla_bu}}-${{parameters.environment}}'
+
+#     - script: >-
+#         kubectl delete ns "$(CATALOG_YAML_K8S_NS)"
+#         --kubeconfig="$(kubeconfig.secureFilePath)"
+#         --insecure-skip-tls-verify
+#       displayName: DELETE NAMESPACE
+
+- stage: stage_rollback_deploy
+  displayName: "FIX: Rollback deploy on (${{ parameters.environment }})"
+  pool: DefaultDevopsAgents
+  jobs:
+  - job: job_rollback_deploy
+    displayName: Recreate ACR Secret on (${{ parameters.environment }})
+    steps:
+    - checkout: self
+      fetchDepth: 1
+
+    - task: YamlParseFromVivo@4
+      displayName: Get Metadata Info
+      name: catalog_info
+      inputs:
+        type: 'file'
+        origin: catalog-info.yaml
+        jpaths: |-
+          var CATALOG_YAML_NAME = .metadata.name
+          var CATALOG_YAML_ACRONYM = .metadata.annotations['techarch.governance-app.acronym']
+          var CATALOG_YAML_K8S_NS = .metadata.annotations['vivo.io/kubernetes-k8s-namespace-${{ parameters.environment }}']
+
+    - task: AzureKeyVault@2  
+      displayName: 'Getting AKV credentials'
+      timeoutInMinutes: 1
+      retryCountOnTaskFailure: 5  
+      inputs:    
+        azureSubscription: DevOpsSharedResources    
+        KeyVaultName: kv-azdevops-shared
+        SecretsFilter: >- 
+          DOCKER-REGISTRY-ACR-USERNAME, DOCKER-REGISTRY-ACR-PASSWORD,
+          HELM-REGISTRY-NEXUS-USERNAME, HELM-REGISTRY-NEXUS-PASSWORD,
+          HELM-REGISTRY-ACR-USERNAME, HELM-REGISTRY-ACR-PASSWORD,
+          NEXUS-DEPS-USR, NEXUS-DEPS-PSW
+
+    - task: DownloadSecureFile@1
+      name: kubeconfig
+      displayName: 'Download config from (${{parameters.environment}})'
+      inputs:
+        secureFile: 'aks-${{parameters.sigla_bu}}-${{parameters.environment}}'
+    
+    ## TODO: Step Commented by security
+    # - task: Bash@3
+    #   displayName: 'Rollback Deploy on (${{ parameters.environment }})'
+    #   continueOnError: false
+    #   inputs:
+    #     workingDirectory: $(Build.SourcesDirectory)
+    #     targetType: inline
+    #     script: >-
+    #       helm rollback $(CATALOG_YAML_NAME)
+    #       --kubeconfig $(kubeconfig.secureFilePath)
+    #       --namespace $(CATALOG_YAML_K8S_NS)
+    #       --debug

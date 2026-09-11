@@ -1,0 +1,204 @@
+stages:
+- stage: repo_validations
+  displayName: "Project validations"
+  pool: $(PRIVATE_AGENT_DEFAULT)
+  jobs:
+    - job: "project_validations"
+      displayName: "Start validations"
+      steps:
+        - checkout: CorePipelinesScripts
+          persistCredentials: true
+          fetchDepth: 1
+        - checkout: self
+          fetchDepth: 1
+        
+        - template: /tech_products/srus/tasks/catalog_info/extract_variables.yml
+
+        - task: PipAuthenticate@1
+          displayName: 'Pip Authenticate'
+          inputs:
+            artifactFeeds: $(AZURE_ARTIFACTS_FEED)
+          env:
+            http_proxy: $(PROXY_AGENT_HTTP)
+            https_proxy: $(PROXY_AGENT_HTTPS)
+            no_proxy: $(PROXY_AGENT_NO_PROXY)
+          condition: and(
+                      succeeded(),
+                      or(
+                        eq(variables.DEVFLOW_VALIDATE_STANDARDS, true),
+                        eq(variables.DEVFLOW_VALIDATE_JIRA_ISSUE, true)
+                      ),
+                      eq(variables.flowIsMain, true)
+                    )
+        
+        - bash: |
+            echo "##[debug] Instalando requirements.txt"
+            cd $(Build.SourcesDirectory)/Vivo.Core.Pipelines.Scripts
+            pip install -r requirements.txt
+          condition: and(
+                      succeeded(),
+                      or(
+                        eq(variables.DEVFLOW_VALIDATE_STANDARDS, true),
+                        eq(variables.DEVFLOW_VALIDATE_JIRA_ISSUE, true)
+                      ),
+                      ne(variables.flowIsMain, true)
+                    )
+          displayName: "Install Python packages"
+
+        - bash: |
+            echo "##[debug] Skipando validações por ser ambiente de DEV ou a branch é main/master"
+            echo "##[debug] Variável DEVELOPMENT_ENVIRONMENT_FLOW está com o valor = false"
+          condition: or(ne(variables.DEVELOPMENT_ENVIRONMENT_FLOW, true), ne(variables.flowIsMain, true))
+          displayName: "Validate Standards Branches and Variables"
+
+        - bash: |
+            echo "##[debug] Etapa de validação de branch e commits"
+            echo "##[debug] Essa etapa valida os padrões de commit bem como a nomenclatura de branches"              
+          condition: and(
+                        eq(variables.DEVFLOW_VALIDATE_STANDARDS, true),
+                        or(
+                          eq(variables.DEVFLOW_VALIDATE_BRANCH, true),
+                          eq(variables.DEVFLOW_VALIDATE_COMMIT, true)
+                        ),
+                        ne(variables.flowIsMain, true)
+                    )
+          displayName: "Validate Standards Enabled/Disabled"
+
+        - bash: |
+            echo "##[debug] Skipando validação de branch e commits"
+            echo "##[debug] Variáveis DEVFLOW_VALIDATE_STANDARDS, DEVFLOW_VALIDATE_BRANCH ou DEVFLOW_VALIDATE_COMMIT não estão com valor = true ou a branch é main/master"
+          condition: or(
+                      ne(variables.DEVFLOW_VALIDATE_STANDARDS, true),
+                      ne(variables.DEVFLOW_VALIDATE_BRANCH, true), 
+                      ne(variables.DEVFLOW_VALIDATE_COMMIT, true),
+                      eq(variables.flowIsMain, true)
+                    )
+          displayName: "Validate Standards Enabled/Disabled"
+
+        - bash: |
+            echo "##[debug] Validação de branch e commits"
+            cd $(Build.SourcesDirectory)/$(Build.Repository.Name)
+            python $(Build.SourcesDirectory)/Vivo.Core.Pipelines.Scripts/app.py --branch-commit
+          condition: and(
+                      succeeded(),
+                      eq(variables.DEVFLOW_VALIDATE_STANDARDS, true),
+                      ne(variables.flowIsMain, true),
+                      or(
+                        eq(variables.DEVFLOW_VALIDATE_BRANCH, true),
+                        eq(variables.DEVFLOW_VALIDATE_COMMIT, true)
+                      )
+                    )
+          env:
+            SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+          displayName: "Validate branch/commits"
+
+        - bash: |
+            echo "##[debug] Etapa de validação de issue no Jira"
+            echo "##[debug] Essa etapa valida se a issue que foi passada no commit é válida"              
+          condition: and(
+                      eq(variables.DEVFLOW_VALIDATE_JIRA_ISSUE, true),
+                      ne(variables.flowIsMain, true)
+                    )
+          displayName: "Validate Jira Issue Enabled/Disabled"
+
+        - bash: |
+            echo "##[debug] Skipando validação de issue no Jira"
+            echo "##[debug] Variável DEVFLOW_VALIDATE_JIRA_ISSUE não está com valor = true ou a branch é main/master"
+          condition: or(ne(variables.DEVFLOW_VALIDATE_JIRA_ISSUE, true), eq(variables.flowIsMain, true))
+          displayName: "Validate Jira Issue Enabled/Disabled"        
+
+        - bash: |
+            echo "##[debug] Validação de Issue no Jira"
+            cd $(Build.SourcesDirectory)/$(Build.Repository.Name)
+            python $(Build.SourcesDirectory)/Vivo.Core.Pipelines.Scripts/app.py --jira
+          condition: and(
+                      succeeded(),
+                      eq(variables.DEVFLOW_VALIDATE_JIRA_ISSUE, true),
+                      ne(variables.flowIsMain, true)
+                    )
+          env:
+            SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+          displayName: "Validate Issue Jira"
+                
+        - bash: |
+            echo "##[debug] Etapa de criação feature flag automática"
+            echo "##[debug] Essa etapa cria a feature flag (desabilitada) no Hobknob"
+          condition: and(
+                      eq(variables.DEVFLOW_VALIDATE_STANDARDS, true),
+                      eq(variables.DEVFLOW_VALIDATE_FEATURE_FLAGS_HOBKNOB, true),
+                      ne(variables.flowIsMain, true)
+                    )
+          displayName: "Create Feature Flag automaticaly"
+        
+        - bash: |
+            echo "##[debug] Skipando criação feature flag automática"
+          condition: or(
+                      ne(variables.DEVFLOW_VALIDATE_STANDARDS, true),
+                      ne(variables.DEVFLOW_VALIDATE_FEATURE_FLAGS_HOBKNOB, true),
+                      eq(variables.flowIsMain, true)
+                    )
+          displayName: "Validate environment to feature flag"
+        
+        - bash: |
+            echo "##[debug] Criação/verificação de feature flag automática na Api do Hobknob"
+            cd $(Build.SourcesDirectory)/$(Build.Repository.Name)
+            export WIKI_FILE=wiki-data.html
+            
+            python $(Build.SourcesDirectory)/Vivo.Core.Pipelines.Scripts/app.py --feature-flags --wiki-data-file "$WIKI_FILE"
+            
+            if [ ! -f $WIKI_FILE ]; then
+              echo "##[error] Não foi possível recuperar a descricão do Pull Request ou algum outro erro na verificação de feature flag ocorreu. "
+              exit 1        
+            fi
+          condition: and(
+                      succeeded(),
+                      eq(variables.DEVFLOW_VALIDATE_STANDARDS, true),
+                      eq(variables.DEVFLOW_VALIDATE_FEATURE_FLAGS_HOBKNOB, true),
+                      ne(variables.flowIsMain, true)
+                    )
+          env:
+            SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+          displayName: "Create/check feature flags"
+
+        - bash: |
+            echo "##[debug] Etapa de envio dos dados do Pull Request para a api para posterior gravação no Confluence"
+
+            cd $(Build.SourcesDirectory)/$(Build.Repository.Name)
+            unset RESPONSE HTTP_STATUS_CODE RESPONSE_BODY
+            
+            if [ ! -f wiki-data.html ]; then
+              echo "##[error] Não foi possível recuperar a descricão do Pull Request ou algum outro erro na verificação de feature flag ocorreu. "
+              exit 1        
+            fi
+
+            DESCRIPTION=$(cat "wiki-data.html")
+            
+            BODY=$(jq --null-input \
+                        --arg description "$DESCRIPTION" \
+                        --argjson  pull_request_id $SYSTEM_PULLREQUEST_PULLREQUESTID \
+                        --arg component_name "$APP_NAME" \
+                        --arg owner "$SYSTEM_TEAMPROJECT" \
+                        '{"description": $description, "merge_request_id": $pull_request_id, "component_name": $component_name, "owner": $owner}')
+            RESPONSE=$(curl -s -w "\n%{http_code}" -X POST -H 'Content-Type: application/json'  "$DEVFLOW_API_PRE_WRITE" --data-raw "$BODY" )
+            RESPONSE=(${RESPONSE[@]})
+            HTTP_STATUS_CODE=${RESPONSE[-1]}
+            RESPONSE_BODY=${RESPONSE[@]::${#RESPONSE[@]}-1}
+           
+            if [[ "$HTTP_STATUS_CODE" != "201" ]]; then
+              echo "##[error] Não foi possível gravar os dados na api"
+              echo "##[error] Código http $HTTP_STATUS_CODE"
+              echo "##[error] Abaixo está o retorno da api"
+              echo "$RESPONSE_BODY"
+              exit 1        
+            fi
+
+            echo "##[debug] Dados do pull request gravados"
+            unset RESPONSE HTTP_STATUS_CODE RESPONSE_BODY
+
+          displayName: "Save pull request data"
+          condition: and(
+                      succeeded(),
+                      eq(variables.DEVFLOW_VALIDATE_STANDARDS, true),
+                      eq(variables.DEVFLOW_PUBLISH_CONFLUENCE, true),
+                      ne(variables.flowIsMain, true)
+                    )

@@ -1,0 +1,303 @@
+###
+### ISTO NAO E UM TEMPLATE 
+###
+### E UM TESTE PARA SCAN DO SONAR
+###
+
+trigger:
+  branches:
+    include:
+      - '*'
+  paths:
+    include:
+      - '*'
+    exclude:
+      - docs/*
+ 
+# pr:
+#   branches:
+#     include:
+#       - master
+#       - main
+#   paths:
+#     include:
+#       - '*'
+#     exclude:
+#       - docs/*
+  
+parameters:
+- name: skipTest
+  displayName: Nao Testar (skipTest)
+  type: boolean
+  default: true
+  
+- name: deploy
+  displayName: Publicar (Deploy)
+  type: boolean
+  default: True
+
+- name: useMavenCache
+  displayName: Usar cache do maven
+  type: boolean
+  default: True
+
+- name: setEnvironment
+  displayName: Escolha a esteira de QA para para deploy
+  type: string
+  default: dev
+  values:
+  - dev
+  - esteira1
+  - esteira2
+  - preprod
+  - prodlike
+  - producao-master-impar
+  - producao-master-par
+  - producao-slave-impar
+  - producao-slave-par
+  - producao-background-impar
+  - producao-background-par
+ 
+#Incluir Variaveis da Library
+variables:
+  - name: ASDF_JDK_8
+    value: "adoptopenjdk-8.0.352+8"
+  - name: ASDF_JDK_11
+    value: "openjdk-11.0.2"
+  - name: System.debug
+    value: "true"
+  - name: USE_MAVEN_CACHE
+    ${{ if not(not(parameters.useMavenCache)) }}:
+      value: ''
+    ${{ if not(parameters.useMavenCache) }}:
+      value: '-U'  
+  - group: ci.ci-gps2-resources-creds
+
+  - name: SONARQUBE_CONNECTION_NAME
+    value: VIVO_SONARQUBE
+  - name: SONARQUBE_CONFIG_FILE
+    value: "$(Build.SourcesDirectory)/$(Build.Repository.Name)/.azuredevops/sonar-project.properties"
+  - name: SONARQUBE_PROJECTKEY
+    value: br.com.vivo.gps4:app-gps-convergente
+  - name: SONARQUBE_URL
+    value: http://sonar.devops.redecorp.br
+  - name: SONARQUBE_PROJECT_NAME
+    value: $(System.TeamProject)-$(Build.Repository.Name)
+
+
+  # proxy
+  # - name: HTTP_PROXY
+  #   value: "10.240.58.39:3128" # proxy Squid para evitar erros de timeout do proxy NetSkope.
+  # - name: HTTPS_PROXY
+  #   value: "10.240.58.39:3128" # proxy Squid para evitar erros de timeout do proxy NetSkope.
+
+  - name: PROXY_SQUID_SERVER
+    value: "10.240.58.39:3128" # proxy Squid para evitar erros de timeout do proxy NetSkope.
+  - name: PROXY_NSKP_SERVER
+    value: "nskp.redecorp.br:8080"
+  - name: PROXY_AGENT_HTTP
+    value: "http://$(PROXY_SQUID_SERVER)"
+  - name: PROXY_AGENT_HTTPS
+    value: "http://$(PROXY_SQUID_SERVER)"
+  - name: PROXY_AGENT_NO_PROXY
+    value: "localhost,0.0.0.0,127.0.0.1,10.244.0.0/16,192.168.0.0/16,10.129.178.173,nexus.telefonica.com.br,acrsharedservices01.azurecr.io,appcs-azdevops-shared.azconfig.io,scm.azurewebsites.net"
+  - name: PROXY_ADDL_NO_PROXY
+    value: ""
+
+  # # sonar
+  # - name: SONARQUBE_URL
+  #   value: "http://sonar.devops.redecorp.br"
+  # - name: SONARQUBE_DEFAULT_QUALITYGATE
+  #   value: "AzureDevOps-Default"
+  # - name: SONARQUBE_PROJECT_QUALITYGATE
+  #   value: ""
+  # - name: SONAR_SCANNER_TEMP_CACHE
+  #   value: "$(Agent.HomeDirectory)/.sonar"
+  # - name: PUBLISH_TEST_RESULT_FORMAT
+  #   value: JUnit
+  # - name: PUBLISH_TEST_RESULT_FILES
+  #   value: target/site/jacoco/jacoco.xml
+  # - name: PUBLISH_TEST_HTML_REPORT
+  #   value: target/site/jacoco/index.html
+  # - name: PUBLISH_TEST_COVERAGE_TOOL
+  #   value: jacoco
+  # - name: PUBLISH_TEST_COVERAGE_PATH_TO_SOURCES
+  #   value: target
+  # - name: SONARQUBE_SERVICE_CONNECTION_NAME
+  #   value: VIVO_SONARQUBE
+  # - name: SONARQUBE_CONFIG_FILE
+  #   value: "$(DEFAULT_WORKDIR_ARTIFACTS)/.azuredevops/sonar-project.properties"
+  # - name: SONARQUBE_PROJECTKEY
+  #   value: ""
+
+stages:
+- stage: gates
+  displayName: Gates
+  # condition: ${{ not(not(parameters.deploy)) }}
+  # dependsOn:
+  #   - build
+  jobs:
+  - job: sonar
+    displayName: Sonar
+    pool: DefaultDevOpsAgents
+    steps:
+
+    - checkout: self
+
+    - task: AzureKeyVault@2  
+      displayName: 'Getting AKV credentials'
+      timeoutInMinutes: 1
+      retryCountOnTaskFailure: 5  
+      inputs:    
+        azureSubscription: 'DevOpsSharedResources'
+        KeyVaultName: 'kv-azdevops-shared'
+        SecretsFilter: 'SONARQUBE-TOKEN'
+    
+    
+    - task: SonarQubePrepare@5
+      inputs:
+        SonarQube: $(SONARQUBE_CONNECTION_NAME)
+        scannerMode: 'CLI'
+        # configFile Não funciona no scannerMode Other, apenas CLI (https://learn.microsoft.com/pt-br/azure/devops/pipelines/tasks/reference/sonar-qube-prepare-v5?view=azure-pipelines)
+        configFile: $(SONARQUBE_CONFIG_FILE)
+        extraProperties: |
+          sonar.scm.disabled=True
+          sonar.projectBaseDir=$(Build.SourcesDirectory)
+          sonar.inclusions=**
+          sonar.projectKey=$(SONARQUBE_PROJECTKEY)
+          sonar.projectName=$(SONARQUBE_PROJECT_NAME)
+          sonar.projectVersion=$(new_version.NEW_VERSION)
+          sonar.analysis.repositoryName=$(Build.Repository.Name)
+          sonar.analysis.buildId=$(Build.BuildId)
+          sonar.analysis.repositoryId=$(Build.Repository.ID)
+          sonar.analysis.projectName=$(System.TeamProject)
+          sonar.analysis.projectId=$(System.TeamProjectId)
+          sonar.links.homepage=$(System.TeamFoundationCollectionUri)$(System.TeamProject)
+          sonar.links.ci=$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)&_a=summary
+          sonar.links.issue=$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_workitems
+          sonar.links.scm=$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_git/$(Build.Repository.Name)
+          sonar.scanner.metadataFilePath=$(Agent.TempDirectory)/sonar/$(Build.BuildId)/report-task.txt
+          sonar.qualitygate.wait=true
+          sonar.qualitygate.timeout=300
+      env:
+        NODE_EXTRA_CA_CERTS: $(CACORP_LOCATION)
+
+    # - task: AxiosFromVivo@4
+    #   name: sonarExists
+    #   displayName: Check Project Exists
+    #   inputs:
+    #     type: 'text'
+    #     origin: |
+    #       var options = {
+    #         auth: {
+    #           username: '$(SONARQUBE-TOKEN)',
+    #           password: ''
+    #         },
+    #         method: 'GET',
+    #         url: 'api/projects/search',
+    #         baseURL: 'http://sonar.devops.redecorp.br',
+    #         params: {projects: '$(SONARQUBE_PROJECTKEY)'}
+    #       };
+    #     variablePrefix: 'SONAR_EXISTS_'
+    #   env:
+    #     NODE_EXTRA_CA_CERTS: $(CACORP_LOCATION)
+
+    # - task: JsonParseFromVivo@4
+    #   inputs:
+    #     type: 'text'
+    #     origin: $(SONAR_EXISTS_BODY)
+    #     jpaths: var EXISTS = $.components.length
+
+    # - task: AxiosFromVivo@4
+    #   name: sonarRegister
+    #   displayName: Register project on sonar
+    #   condition: not(eq(variables['EXISTS'], 1))
+    #   inputs:
+    #     type: 'text'
+    #     origin: |
+    #       var options = {
+    #         auth: {
+    #           username: '$(SONARQUBE-TOKEN)',
+    #           password: ''
+    #         },
+    #         method: 'POST',
+    #         url: 'api/projects/create',
+    #         baseURL: 'http://sonar.devops.redecorp.br',
+    #         params: {name: '$(SONARQUBE_PROJECT_NAME)', project: '$(SONARQUBE_PROJECTKEY)', visibility: 'public'}
+    #       };
+    #     variablePrefix: 'SONAR_CREATE_'
+    #   env:
+    #     NODE_EXTRA_CA_CERTS: $(CACORP_LOCATION)
+
+
+    # - task: AxiosFromVivo@4
+    #   name: sonarBind
+    #   displayName: Bind project to gate
+    #   inputs:
+    #     type: 'text'
+    #     origin: |
+    #       var options = {
+    #         auth: {
+    #           username: '$(SONARQUBE-TOKEN)',
+    #           password: ''
+    #         },
+    #         method: 'POST',
+    #         url: 'api/qualitygates/select',
+    #         baseURL: 'http://sonar.devops.redecorp.br',
+    #         params: {gateName: 'AzureDevOps-Default', projectKey: '$(SONARQUBE_PROJECTKEY)'}
+    #       };
+    #     variablePrefix: 'SONAR_BIND_'
+    #   env:
+    #     NODE_EXTRA_CA_CERTS: $(CACORP_LOCATION)
+
+    - task: SonarQubeAnalyze@5
+      displayName: 'Run Code Analysis'
+      continueOnError: true
+      env:
+        ASDF_JAVA_VERSION: $(ASDF_JDK_11)
+
+    # - script: |
+    #     echo "##[debug] REPORT_TASK_NAME....: $(pwd)/${REPORT_TASK_NAME}"
+    #     cat ${REPORT_TASK_NAME}
+
+    #     SONAR_TASK_ID="$(cat ${REPORT_TASK_NAME} | grep -o 'ceTaskId=[^,]*' | awk -F= '{print $2}')"
+    #     echo "##[debug] SONAR_TASK_ID.......: ${SONAR_TASK_ID}"
+
+    #     echo "##vso[task.setvariable variable=SONAR_TASK_ID;isOutput=true]${SONAR_TASK_ID}"
+    #   displayName: Get Sonar TaskId
+    #   name: sonar_task_id
+    #   workingDirectory: $(Agent.TempDirectory)/sonar/$(Build.BuildId)
+    #   env:
+    #     REPORT_TASK_NAME: "report-task.txt"
+
+    # - task: SonarQubePublish@5
+    #   displayName: 'Publish Quality Gate Result'
+    #   continueOnError: true
+    #   inputs:
+    #       pollingTimeoutSec: '300'
+    #   env:
+    #     NODE_EXTRA_CA_CERTS: $(CACORP_LOCATION)
+
+    # - script: |
+    #     echo "##[debug] SONAR_TASK_ID...............: ${SONAR_TASK_ID}"
+        
+    #     SONAR_TASK_URL="${SONARQUBE_URL}/api/ce/task?id=${SONAR_TASK_ID}"
+    #     echo "##[debug] SONAR_TASK_URL..............: ${SONAR_TASK_URL}"
+    #     ANALYSIS_ID="$(curl -s -u "$(SONARQUBE-TOKEN):" "${SONAR_TASK_URL}" | jq -r '.task.analysisId')"
+    #     echo "##[debug] ANALYSIS_ID.................: ${ANALYSIS_ID}"
+
+    #     SONAR_PROJECT_STATUS_URL="${SONARQUBE_URL}/api/qualitygates/project_status?analysisId=${ANALYSIS_ID}"
+    #     echo "##[debug] SONAR_PROJECT_STATUS_URL....: ${SONAR_PROJECT_STATUS_URL}"
+    #     ANALYSIS_STATUS="$(curl -s -u "$(SONARQUBE-TOKEN):" "${SONAR_PROJECT_STATUS_URL}" | jq -r '.projectStatus.status')"
+    #     echo "##[debug] ANALYSIS_STATUS.............: ${ANALYSIS_STATUS}"
+
+    #     if [[ "${ANALYSIS_STATUS}" == "ERROR" ]]; then
+    #       echo "##vso[task.logissue type=error;] Sonar Quality Gate status is ERROR - View details on step Run Code Analysis."
+    #       echo "##vso[task.complete result=Failed;]"
+    #     fi
+    #   displayName: 'Break build on quality gate failure'
+    #   continueOnError: true
+    #   env:
+    #     SONARQUBE_TOKEN: $(SONARQUBE-TOKEN)
+    #     SONARQUBE_URL: $(SONARQUBE_URL)
+    #     SONAR_TASK_ID: $(sonar_task_id.SONAR_TASK_ID)

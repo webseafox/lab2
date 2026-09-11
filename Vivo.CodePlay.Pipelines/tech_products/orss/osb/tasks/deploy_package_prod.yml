@@ -1,0 +1,76 @@
+parameters:
+- name: preserve
+  type: string
+
+stages:
+- stage: Deploy_Producao
+  displayName: Deploy Producao
+  pool: $(PRIVATE_AGENT_DEFAULT_CD)
+  jobs:
+  - deployment: DeployProducao
+    displayName: Deploy Producao
+    environment: 
+      name: 'deploy-producao'
+    strategy:
+      runOnce:
+        deploy:
+          steps:  
+            - task: Docker@2
+              displayName: "Login ACR"
+              inputs:
+                containerRegistry: 'ACR-DEVOPS'
+                command: 'login'
+            - task: DownloadPackage@1
+              displayName: "Download OSB Builder"
+              inputs:
+                packageType: 'upack'
+                feed: '/3d53bc62-8749-4931-ae46-a443b73bc87a'
+                view: 
+                definition: '$(OSB_BUILDER_ARTIFACTID).jar'
+                version: '$(OSB_BUILDER_VERSION)'
+                downloadPath: '$(Build.SourcesDirectory)'
+            - task: DownloadArtifactsNexusMavenRepositoryV3@3
+              displayName: "Download SBConfig"
+              inputs:
+                NexusConnection: 'NEXUS-DEVOPS'
+                RepositoryId: $(NEXUS_PUBLISH_REPOSITORY)
+                GroupId: $(NEXUS_PUBLISH_REPOSITORY_GROUP_ID)
+                ArtifactId: sbconfig_partial
+                BaseVersion: $(Build.SourceBranchName)
+                Packaging: jar
+                DownloadPath: $(Build.SourcesDirectory)
+            - bash: |
+                  mv sbconfig_partial-$(Build.SourceBranchName).jar sbconfig.jar
+                  IFS=',' read -ra LISTENER_LIST <<< "$(PRODUCAO_LISTENER_IP)"
+                  ADD_HOSTS=""
+                  for listener_ip in "$LISTENER_LIST"; do
+                    ADD_HOSTS+="--add-host=$listener_ip"
+                  done
+                  echo "$ADD_HOSTS"
+                  docker run --rm --entrypoint sh \
+                    -v $(Build.SourcesDirectory):/builds \
+                    -w /builds \
+                    --hostname azdevops-daet \
+                    --dns=$(PRIMARY_DNS) \
+                    --dns=$(SECONDARY_DNS) \
+                    --dns-search=redecorp.br \
+                    -e host_list="$(PRODUCAO_DEPLOY_HOST_PORT)" \
+                    $ADD_HOSTS \
+                    $(JAVA_IMAGE) \
+                    -c '
+                        for host_port in $(echo "$host_list" | tr "," "\n"); do
+                          host=$(echo "$host_port" | cut -d: -f1)
+                          port=$(echo "$host_port" | cut -d: -f2)
+                          echo "----------DEPLOY ENVIRONMENT $host_port----------"
+                          java -jar $(OSB_BUILDER_ARTIFACTID).jar \
+                            -a osb-deploy \
+                            -i sbconfig.jar \
+                            -dh $host \
+                            -dp $port \
+                            -c $(Build.SourceBranchName) \
+                            -u $(PRODUCAO_USER_DEPLOYER) \
+                            -p $(PRODUCAO_PASSWORD_DEPLOYER) \
+                            -preserve ${{ parameters.preserve }} | tee deploy.log
+                        done'
+                  if grep -q Exception $(Build.SourcesDirectory)/deploy.log; then echo "##vso[task.complete result=Failed;]"; fi
+              displayName: "Deploy to OSB PROD"

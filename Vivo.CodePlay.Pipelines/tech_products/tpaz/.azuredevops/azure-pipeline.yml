@@ -1,0 +1,125 @@
+name: '$(Date:yyyyMMdd)$(Rev:.r)'
+
+
+trigger:
+  branches:
+    include:
+    - master
+
+pool:
+  name: DevOpsPrivateAgents
+
+variables:
+- template: /global/variables/pipeline.yml
+- group: "${{ variables['Build.DefinitionName'] }}"
+
+stages:
+  - stage: create_new_tag
+    displayName: Create New Tag
+    dependsOn: []
+    condition: and(eq(variables['Build.SourceBranchName'], 'master'), eq(variables['Build.Reason'], 'IndividualCI'))
+    jobs:
+      - job: individual_ci_tag
+        displayName: 'Create new tag'
+        steps:
+          - checkout: self
+            persistCredentials: true
+            fetchTags: true
+          - template: /tasks/commitzen/bump_push.yml
+ 
+  - stage: perform_pipeline_tests
+    displayName: Perform Pipeline Tests
+    dependsOn: []
+    condition: and(eq(variables['Build.SourceBranchName'], 'master'), eq(variables['Build.Reason'], 'Manual'))
+    jobs:
+      - job: run_performance_tests
+        displayName: Perform Pipeline Tests
+        condition: ne(variables['SKIP_PIPELINES_TEST'], 'true')
+        steps:
+          - bash: |
+              echo ${TOKEN} | az devops login --organization ${ORGANIZATION}
+            displayName: 'Azure Cli Login'
+            env:
+              TOKEN: $(TOKEN)
+              ORGANIZATION: $(ORGANIZATION)
+  
+          - bash: |
+              AZ_EXTENSION_CHECK=$(az extension list | jq '.[] | select(.name=="azure-devops") | .name + ":" + .version')
+              if [[ -z "${AZ_EXTENSION_CHECK}" ]];then
+                  echo "##[section]Installing azure-devops extension..."
+                  echo "##[command]az extension add --name azure-devops"
+                  az extension add --name azure-devops
+              else
+                  echo -e "##[section]The extension ${AZ_EXTENSION_CHECK} is already installed.\n"
+              fi
+            displayName: 'Install DevOps Extension'
+  
+          - bash: |
+              run_pipeline_id=()
+              pipelines_json='[]'
+              IFS=', ' read -ra pipelines <<< "${MODEL_PIPELINES_TEST}"
+              
+              for pipeline in ${pipelines[@]};do
+                run_pipeline_id+=($(az pipelines run --name ${pipeline} --org ${ORGANIZATION} --project ${PROJECT} | jq '.id'))
+              done
+
+              check_pipeline_status() {
+                local pipeline_id=$1
+                local status=$(az pipelines build show --id ${pipeline_id} --org ${ORGANIZATION} --project ${PROJECT} | jq -r '{pipeline: (.definition.name), result: (.result), status: (.status)}')
+                echo ${status}
+              }
+
+              while true; do
+                for pipelineCheck in "${run_pipeline_id[@]}"; do
+                  new_pipeline=$(check_pipeline_status $pipelineCheck)
+                  pipelines_json=$(echo "$pipelines_json" | jq --argjson new_pipeline "$new_pipeline" '. + [$new_pipeline]')
+                done
+
+                if echo "$pipelines_json" | jq -e 'map(.status == "completed") | all' | grep -q true; then
+                  echo -e "##[section]All pipelines have been completed.Waitting for the result\n"
+                  sleep 10
+                    if echo "$pipelines_json" | jq -e 'map(.result == "succeeded") | all' | grep -q true; then
+                      echo "##[section]All pipelines completed successfully!"
+                      echo $pipelines_json | jq -r '.[] | "status: \(.status) | result: \(.result) -> \(.pipeline)"'
+                      break
+                    else
+                      echo "##vso[task.logissue type=error;]One or more pipelines did not complete successfully!"
+                      echo $pipelines_json | jq -r '.[] | select(.result == "failed" or .result == "partiallySucceeded" or .result == "canceled") | "status: \(.status) | result: \(.result) -> \(.pipeline)"'
+                      echo "##vso[task.complete result=Failed;]"
+                      exit
+                    fi
+                else
+                  echo -e "##[warning]Waiting for all pipelines to be completed..."
+                  echo $pipelines_json | jq -r '.[] | "status: \(.status) | result: \(.result) -> \(.pipeline)"'
+                  sleep 10
+                  echo -e "\n"
+                fi
+                pipelines_json='[]'
+              done
+            displayName: 'Run Pipelines Tests'
+            env:
+              MODEL_PIPELINES_TEST: $(MODEL_PIPELINES_TEST)
+              ORGANIZATION: $(ORGANIZATION)
+              PROJECT: $(PROJECT)
+
+  - stage: update_latest_tag
+    displayName: Update v1/latest Tag
+    dependsOn: [perform_pipeline_tests]
+    condition: and(succeeded(), eq(variables['Build.SourceBranchName'], 'master'), eq(variables['Build.Reason'], 'Manual'))
+    jobs:
+      - deployment: manual_tag
+        displayName: 'Update tag v1/latest'
+        environment: vivo-core-pipelines-approval
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                  persistCredentials: true
+                  fetchTags: true
+                - template: /tasks/bash/git_tag_push.yml
+                  parameters:
+                    tagName: "v1"
+                - template: /tasks/bash/git_tag_push.yml
+                  parameters:
+                    tagName: "latest"

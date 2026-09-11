@@ -1,0 +1,66 @@
+## -> Parameters:
+parameters:
+  - name: environment
+    type: string
+    default: "dev"
+  - name: packageVersion
+    type: string
+    default: "latest"
+  - name: kubernetesServiceConnectionEnabled
+    default: false
+    
+## -> CD
+stages:
+  ## -> Initialize Enviroment
+  - template: /tech_products/hrcl/templates/common/stages/initialize/environment.yml
+    parameters:
+      packageVersion: ${{ parameters.packageVersion }}
+      
+  - stage: Deploy
+    dependsOn:
+      - environment_init
+    pool:
+      name: GeneralPurposeLinuxAgentsCD
+    variables:
+      # -> Catalog Info Variables
+      - template: /tech_products/hrcl/templates/common/initialize/variables_catalog_info.yml
+      - template: /tech_products/hrcl/templates/common/initialize/variables_helm.yml
+      - template: /tech_products/hrcl/templates/common/initialize/variables_global.yml
+        parameters:
+          environment: "${{ parameters.environment }}"
+    jobs:
+      - deployment: deploy_${{ parameters.environment }}
+        displayName: "Deploy"
+        environment: deploy-${{ parameters.environment }}
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - template: /tech_products/hrcl/templates/common/initialize/deploy_environment.yml
+                  parameters:
+                    environment: "${{ parameters.environment }}"
+                - template: /tech_products/hrcl/templates/common/cd/cd_deploy.yml
+                  parameters:
+                    environment: "${{ parameters.environment }}"
+                    packageVersion: "${{ parameters.packageVersion }}"
+                    kubernetesServiceConnectionEnabled: ${{ parameters.kubernetesServiceConnectionEnabled }}
+            on:
+              success:
+                steps:
+                  ## -> Validate the application on Governance App
+                  - template: /tech_products/hrcl/templates/common/gates/gov_app/gov_app.yml
+                    parameters:
+                      environment: "${{ parameters.environment }}"
+                      operation: "deploy"
+                      version: ${{ parameters.packageVersion }}
+              failure:
+                steps:
+                  - task: CatchLogsToLocalDirectoryFromVivo@4
+                    displayName: Dump logs and metas
+                    inputs:
+                      dumpDir: $(Build.ArtifactStagingDirectory)/audit
+                  - task: PublishBuildArtifacts@1
+                    displayName: "Push Logs to Artifacts"
+                    inputs:
+                      ArtifactName: audit
+                      PathtoPublish: $(Build.ArtifactStagingDirectory)/audit

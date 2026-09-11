@@ -1,0 +1,133 @@
+parameters:
+- name: envs
+  type: object
+  default: {}
+- name: branching_strategy
+  type: string
+  default: 'stb'
+
+jobs:
+- job: package
+  pool: GeneralPurposeLinuxAgentsCI
+  workspace:
+    clean: all
+  variables:
+    # Precisa importar de novo, do contrário não funciona
+    - template: ./variables.yaml
+      parameters:
+          envs: ${{ parameters.envs }}
+    - ${{ if and(eq( parameters.branching_strategy, 'gitlabflow'), ne(variables['Build.SourceBranchName'], '')) }}:
+      - template: ./variables/${{ variables['Build.SourceBranchName'] }}.yaml
+        parameters:
+            envs: ${{ parameters.envs }}
+  steps:
+
+  - task: DownloadBuildArtifacts@0
+    inputs:
+      buildType: 'current'
+      downloadType: 'single'
+      artifactName: 'build'
+      downloadPath: $(System.DefaultWorkingDirectory)
+  - script: cp -rf $(System.DefaultWorkingDirectory)/build/* $(Build.SourcesDirectory)
+    displayName: Copy build artifacts to sources directory
+
+  - task: DownloadSecureFile@1
+    name: securitysettings
+    displayName: 'Download custom security.xml from secure file'
+    inputs:
+      secureFile: 'settings-security.xml'
+
+  - script: echo "##vso[task.setvariable variable=MAVEN_SETTINGS_SECURITY]$(securitysettings.secureFilePath)"
+    displayName: Set MAVEN_SETTINGS_SECURITY Var
+
+  - task: DownloadSecureFile@1
+    name: CustomSettings
+    displayName: 'Download custom settings.xml from secure file'
+    inputs:
+      secureFile: settings.xml
+  - script: echo "##vso[task.setvariable variable=MAVEN_SETTINGS]$(CustomSettings.secureFilePath)"
+    displayName: Set MAVEN_SETTINGS Var
+    
+  - template: /tech_products/hdop/templates/steps/version_update.yaml
+
+  - task: Cache@2
+    displayName: Cache task
+    inputs:
+      key: 'docker | "$(Agent.OS)" | cache'
+      path: $(Pipeline.Workspace)/docker
+      cacheHitVar: CACHE_RESTORED 
+
+  - script: |
+      docker load -i $(Pipeline.Workspace)/docker/cache.tar
+    displayName: Docker restore
+    condition: and(not(canceled()), eq(variables.CACHE_RESTORED, 'true'))
+
+  - task: Docker@2
+    name: login_devops
+    displayName: 'Login to Docker Registry'
+    continueOnError: true
+    inputs:
+      containerRegistry: ACR-DEVOPS
+      displayName: 'Login to Docker Registry'
+      command: 'login'
+  - task: Docker@2
+    displayName: Docker Login
+    inputs:
+      containerRegistry: ${{ variables.IMAGE_REGISTRY_CONNECTION }}
+      displayName: 'Login to Docker Registry'
+      command: 'login'
+  - script: ls -la
+    displayName: 'List files in the workspace'
+  # ==================================================================
+  # [Compliance] Verifica se o repositório está em conformidade com as políticas de configuração
+  # ==================================================================
+  - task: VivoDevOpsConfigCompliance@1
+    displayName: 'Check DevOps Config Compliance'
+    inputs:
+      workDir: $(Build.SourcesDirectory)
+      policySets: |
+        image-definition-files
+  - task: Docker@2
+    displayName: Docker Build
+    inputs:
+      containerRegistry: ${{ variables.IMAGE_REGISTRY_CONNECTION }}
+      repository: ${{ variables.IMAGE_NAME }}
+      displayName: 'Docker Build with Cache'
+      command: 'build'
+      Dockerfile: ${{ variables.DOCKERFILE_PATH }}
+      tags: $(set_version.version)
+      arguments: '--build-arg BUILDKIT_INLINE_CACHE=1'
+  - script: |
+      FULL_IMAGE_NAME=$(docker images --format '{{.Repository}}:{{.Tag}}' | grep "${IMAGE_NAME}:${IMAGE_TAG}")
+      echo "##[debug] FULL_IMAGE_NAME: $FULL_IMAGE_NAME"
+      echo "##vso[task.setvariable variable=FULL_IMAGE_NAME;isOutput=true]${FULL_IMAGE_NAME}"
+    displayName: 'Extract Docker Image Name to SCA'
+    name: get_image
+    env:
+      IMAGE_NAME: ${{ variables.IMAGE_NAME }}
+      IMAGE_TAG: $(set_version.version)
+
+  - bash: |
+      mkdir -p $(Pipeline.Workspace)/docker
+      docker save -o $(Pipeline.Workspace)/docker/cache.tar ${FULL_IMAGE_NAME}
+    displayName: Docker save
+    condition: and(not(canceled()), not(failed()), ne(variables.CACHE_RESTORED, 'true'))
+    env:
+      FULL_IMAGE_NAME: $(get_image.FULL_IMAGE_NAME)
+    
+  - template: /tech_products/hdop/templates/steps/execute_sca.yaml
+    parameters:
+      scaAnalysisType: 'image'
+      fullImageName: $(get_image.FULL_IMAGE_NAME)
+
+  - task: Docker@2
+    displayName: Docker Publish
+    inputs:
+      containerRegistry: ${{ variables.IMAGE_REGISTRY_CONNECTION }}
+      repository: ${{ variables.IMAGE_NAME }}
+      displayName: 'Docker Publish'
+      command: 'push'
+      addPipelineData: true
+      addBaseImageData: true
+      Dockerfile: ${{ variables.DOCKERFILE_PATH }}
+      tags: $(set_version.version)

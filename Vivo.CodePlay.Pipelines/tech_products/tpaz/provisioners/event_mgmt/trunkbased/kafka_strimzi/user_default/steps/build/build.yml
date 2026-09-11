@@ -1,0 +1,62 @@
+parameters:
+- name: srcPath
+- name: patchesPath
+
+steps:
+- script: |
+    echo "Starting Build Phase"
+  displayName: Starting Build Phase
+
+- task: DownloadSecureFile@1
+  name: adminUserCrtDev
+  displayName: 'Download CA Certificate'
+  inputs:
+    secureFile: 'admin-user-crt-staging.crt'
+
+- task: DownloadSecureFile@1
+  name: adminUserKeyDev
+  displayName: 'Download User Key'
+  inputs:
+    secureFile: 'admin-user-key-staging.key'
+
+- task: DownloadSecureFile@1
+  name: kubeApiServerCaDev
+  displayName: 'Download API Server Certificate'
+  inputs:
+    secureFile: 'kube-apiserver-ca-staging.crt'
+
+- script: |
+    set -e
+    echo Setting Up Kubernetes Development Context
+    kubectl config set-cluster kafka-cluster --server=${KUBE_API_SERVER_ENDPOINT} --certificate-authority=$(kubeApiServerCaDev.secureFilePath) --embed-certs=true
+    kubectl config set-credentials kafka-admin --client-certificate=$(adminUserCrtDev.secureFilePath) --client-key=$(adminUserKeyDev.secureFilePath) --embed-certs=true
+    kubectl config set-context kafka-admin@kafka-cluster --cluster=kafka-cluster --user=kafka-admin
+    kubectl config use-context kafka-admin@kafka-cluster
+    kubectl get ns
+    echo Dev Context Successfully Set!
+  displayName: Kubernetes Context Setup
+  workingDirectory: ${{ parameters.srcPath }}
+  env:
+    KUBE_API_SERVER_ENDPOINT: $(KUBE_API_SERVER_ENDPOINT)
+
+- script: |
+    set -e
+    echo Patching user manifest with the environment data...
+    kubectl patch --filename ${{ parameters.srcPath }}/${USER_DEFAULT_FILE_NAME} --patch-file ${{ parameters.patchesPath }}/dev/strimzi-metadata.yml --local=true --type merge --output yaml > ${{ parameters.srcPath }}/patched-user.yaml
+    echo Done!
+  displayName: Patching User
+
+- script: |
+    set -e
+    echo Running Dry-Run... 
+    kubectl apply --dry-run=server --filename ${{ parameters.srcPath }}/patched-user.yaml --namespace desenvolvimento
+    echo Dry-Run Successfully Executed!
+  displayName: Dry Running User
+
+- script: |
+    set -e
+    echo Deploying User...
+    kubectl apply --filename ${{ parameters.srcPath }}/patched-user.yaml --namespace desenvolvimento
+    echo Deploy Succeeded!
+  condition: succeeded()
+  displayName: Deploying User in Dev Environment

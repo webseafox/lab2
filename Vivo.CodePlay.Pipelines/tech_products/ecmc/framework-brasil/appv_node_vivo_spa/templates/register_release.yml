@@ -1,0 +1,125 @@
+parameters:
+  - name: BUNDLE_NAME
+    type: string
+  - name: MANUAL_BUNDLE_VERSION
+    type: string
+  - name: AZURE_BLOB_CONTAINER_URL
+    type: string
+  - name: ROUTE_ORCHESTRATOR_URL
+    type: string
+  - name: skipReleaseCreation
+    type: boolean
+  - name: skipReleaseUpdate
+    type: boolean
+  - name: RELEASE_ENABLED_FLAG
+    type: boolean
+  - name: RELEASE_PREFETCH_FLAG
+    type: boolean
+  - name: qa_environment
+    type: string
+  - name: canaryRelease
+    displayName: Canary Release (publicar sem ativar versão)
+    type: string
+    default: "Não"
+    values:
+      - "Sim"
+      - "Não"
+
+stages:
+  - stage: RegisterRelease
+    displayName: Register Release
+    pool:
+      name: GeneralPurposeLinuxAgentsCI
+    dependsOn:
+      - PublishRelease
+      - KeycloakAuth
+      - ci_build
+    condition: |
+      and(
+        in(dependencies.KeycloakAuth.result, 'Succeeded'),
+        in(dependencies.ci_build.result, 'Succeeded'),
+        in(dependencies.PublishRelease.result, 'Succeeded', 'Skipped')
+      )
+
+    variables:
+      - name: BUNDLE_VERSION
+        ${{ if ne(parameters.MANUAL_BUNDLE_VERSION, '') }}:
+          value: ${{ parameters.MANUAL_BUNDLE_VERSION }}
+        ${{ else }}:
+          value: $[ stageDependencies.ci_build.build.outputs['new_version.NEW_VERSION'] ]
+      
+      - name: KEYCLOAK_TOKEN
+        value: $[ stageDependencies.KeycloakAuth.GetKeycloakToken.outputs['CallKeycloakApi.KEYCLOAK_TOKEN'] ]
+      - name: BUNDLE_SIZE
+        value: $[ stageDependencies.ci_build.build.outputs['build_version.BUNDLE_SIZE'] ]
+
+    jobs:
+      - job: CreateModuleAndRelease
+        displayName: Create Module and Release
+
+        steps:
+          - task: DownloadBuildArtifacts@1
+            displayName: "Download bundle artifact"
+            condition: and( succeeded(), eq('${{ parameters.skipReleaseCreation }}', false ))
+            inputs:
+              artifactName: ${{parameters.BUNDLE_NAME}}-$(BUNDLE_VERSION)
+              cleanDestinationFolder: false
+              parallelizationLimit: 8
+              downloadPath: $(Build.SourcesDirectory)
+
+          - task: framework-brasil-archetype-vivo-spa-front-create-module@0
+            displayName: Create Module
+            inputs:
+              AZURE_BLOB_CONTAINER_URL: ${{parameters.AZURE_BLOB_CONTAINER_URL}}
+              BUNDLE_NAME: ${{parameters.BUNDLE_NAME}}
+              KEYCLOAK_JWT: $(KEYCLOAK_TOKEN)
+              ROUTE_ORCHESTRATOR_URL: ${{parameters.ROUTE_ORCHESTRATOR_URL}}
+              NODE_TLS_REJECT_UNAUTHORIZED: "0"
+
+          - task: framework-brasil-archetype-vivo-spa-front-create-release@0
+            condition: and(succeeded(), eq('${{ parameters.skipReleaseCreation }}', false))
+            displayName: Create Release
+            inputs:
+              AZURE_BLOB_CONTAINER_URL: ${{parameters.AZURE_BLOB_CONTAINER_URL}}
+              BUILD_SOURCESDIRECTORY: $(Build.SourcesDirectory)
+              BUNDLE_NAME: ${{parameters.BUNDLE_NAME}}
+              BUNDLE_VERSION: $(BUNDLE_VERSION)
+              BUNDLE_SIZE: $(BUNDLE_SIZE)
+              ENVIRONMENT: ${{parameters.qa_environment}}
+              GIT_PROJECT_DIR: /
+              KEYCLOAK_JWT: $(KEYCLOAK_TOKEN)
+              ROUTE_ORCHESTRATOR_URL: ${{parameters.ROUTE_ORCHESTRATOR_URL}}
+              NODE_TLS_REJECT_UNAUTHORIZED: "0"
+
+      - deployment: EnableRelease
+        condition: and(succeeded(), eq('${{ parameters.skipReleaseUpdate }}', false), ne('${{ parameters.canaryRelease }}', 'Sim'))
+        displayName: Enable release
+        dependsOn: CreateModuleAndRelease
+        ${{if eq(parameters.qa_environment, 'prod')}}: 
+            environment: $(DEPLOY_ENVIRONMENT_PROD)
+        ${{if ne(parameters.qa_environment, 'prod')}}:
+            environment: $(DEPLOY_ENVIRONMENT_LIB)
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+              - checkout: self
+                displayName: Checkout Source Code
+                name: checkout_source_code
+                clean: true
+                path: sourcecode
+                submodules: recursive
+                
+              - task: framework-brasil-archetype-vivo-spa-front-update-release@0
+                displayName: Update release
+                inputs:
+                  BUILD_SOURCESDIRECTORY: $(Build.SourcesDirectory)
+                  BUNDLE_NAME: ${{parameters.BUNDLE_NAME}}
+                  BUNDLE_VERSION: $(BUNDLE_VERSION)
+                  ENVIRONMENT: ${{parameters.qa_environment}}
+                  GIT_PROJECT_DIR: /
+                  KEYCLOAK_JWT: $(KEYCLOAK_TOKEN)
+                  ROUTE_ORCHESTRATOR_URL: ${{parameters.ROUTE_ORCHESTRATOR_URL}}
+                  ENABLED: ${{parameters.RELEASE_ENABLED_FLAG}}
+                  PREFETCH: ${{parameters.RELEASE_PREFETCH_FLAG}}
+                  NODE_TLS_REJECT_UNAUTHORIZED: "0"

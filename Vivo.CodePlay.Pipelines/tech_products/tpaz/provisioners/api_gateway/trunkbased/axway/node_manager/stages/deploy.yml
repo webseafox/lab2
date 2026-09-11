@@ -1,0 +1,57 @@
+parameters:
+- name: environment
+- name: dependsOn
+  type: object
+  default: []
+
+stages:
+- stage: stage_deploy_${{ parameters.environment }}
+  pool: $(PRIVATE_AGENT_DEFAULT)
+  displayName: "Deploy ${{ parameters.environment }}"
+  dependsOn: ${{ parameters.dependsOn }}
+  jobs:
+  - deployment: deploy
+    displayName: "Deploy - ${{ parameters.environment }}"
+    environment: deploy-nodemanager-${{ parameters.environment }}
+    variables:
+      VERSION_CURRENT: $[ coalesce(variables.VERSION_PARAMETER, stageDependencies.stage_build.job_set_version.outputs['set_version.APP_VERSION'], variables.VERSION_FILE) ]
+      DEPLOY_NAMESPACE: $(PREFIX_NAMESPACE)${{ parameters.environment }}-emt
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+          - download: none
+          - template: /tasks/nexus/download_file.yml
+            parameters:
+              repository: $(HELM_REPOSITORY)
+              remoteFileLocation: "$(HELM_CHART_NAME)-$(HELM_CHART_VERSION).tgz"
+              displayName: "Download helm package"
+              localFileLocation: $(Agent.TempDirectory)
+          - task: ExtractFiles@1
+            displayName: Extract helm package
+            inputs:
+              archiveFilePatterns: "$(Agent.TempDirectory)/$(HELM_CHART_NAME)-$(HELM_CHART_VERSION).tgz"
+              destinationFolder: $(Agent.TempDirectory)
+              cleanDestinationFolder: false
+          - script: |
+              echo "##[debug] DEPLOY_NAMESPACE................: $(DEPLOY_NAMESPACE)"
+              echo "##[debug] HELM_CHART_NAME.................: $(HELM_CHART_NAME)"
+              echo "##[debug] HELM_CHART_VERSION..............: $(HELM_CHART_VERSION)"
+              echo "##[debug] HELM_RELEASE_NAME...............: $(HELM_RELEASE_NAME)"
+              echo "##[debug] ANM_IMAGE_TAG...................: $(VERSION_CURRENT)"
+            displayName: Show variables
+          - task: HelmDeploy@0
+            displayName: Helm upgrade
+            inputs:
+              connectionType: 'Kubernetes Service Connection'
+              kubernetesServiceConnection: $(GATEWAY_K8S_SERVICE_CONNECTION_${{ upper(parameters.environment) }})
+              command: upgrade
+              namespace: $(DEPLOY_NAMESPACE)
+              chartName: "$(Agent.TempDirectory)/$(HELM_CHART_NAME)"
+              chartVersion: $(HELM_CHART_VERSION)
+              releaseName: $(HELM_RELEASE_NAME)
+              overrideValues: 'anm.image.tag=$(VERSION_CURRENT)'
+              valueFile: .azuredevops/env/${{ parameters.environment }}/values.yaml
+              arguments: '--install --debug'
+              waitForExecution: false

@@ -1,0 +1,147 @@
+parameters:
+- name: repoName
+  type: string
+- name: branchSourceRef
+  type: string
+- name: mergeBranches
+  type: string
+- name: workingDirectory
+  type: string
+  default: "$(Build.SourcesDirectory)"
+- name: displayName
+  type: string
+  default: "Merge tombamento esteiras"
+
+# Faz o merge forçado para cada branch de destino informada.
+# Se o merge falhar avisa via ChatOps (dependendo da configuração) e continua o processo para as demais branches.
+# Uso - repositório único (useSubModules = false):
+#   - template: /tech_products/ecmc/shared/tasks/git/merge_forced.yaml
+#     parameters:
+#       repoName: ${{ parameters.targetRepo }}
+#       branchSourceRef: ${{ parameters.branchSourceRef }}
+#       mergeBranches: ${{ parameters.mergeBranches }}
+#
+# Uso - com submódulos (dentro de ${{ each repoItem in parameters.repositoriesSubModules }}):
+#   - template: /tech_products/ecmc/shared/tasks/git/merge_forced.yaml
+#     parameters:
+#       repoName: ${{ repoItem.name }}
+#       branchSourceRef: ${{ parameters.branchSourceRef }}
+#       mergeBranches: ${{ parameters.mergeBranches }}
+#       workingDirectory: $(Pipeline.Workspace)/${{ repoItem.name }}
+#       displayName: "Merge tombamento esteiras ${{ repoItem.name }}"
+
+steps:
+- bash: |
+    BRANCH_SOURCE_REF="${BRANCH_SOURCE_REF#refs/heads/}"
+
+    MERGE_BRANCHES_ARRAY=(${MERGE_BRANCHES//;/ })
+
+    echo "[section]__________________________________________________________________________________"
+    echo "[section]Variável FORCE_MERGE .........: ${FORCE_MERGE}"
+    echo "[section]Se FORCE_MERGE for false, merges de tombamento não serão realizados."
+    echo "[section]Se FORCE_MERGE for true, merges de tombamento entre a branch atual do build em produção e as demais branches de esteira serão realizados."
+    echo "[section]__________________________________________________________________________________"
+
+    for MERGE_BRANCH in "${MERGE_BRANCHES_ARRAY[@]}"; do
+      # Ignora quando branch de destino for igual à de origem
+      if [ "${MERGE_BRANCH}" == "${BRANCH_SOURCE_REF}" ]; then
+        continue
+      fi
+
+      HAS_CONFLICTS="false"
+      MERGE_BRANCH="${MERGE_BRANCH#refs/heads/}"
+      echo "[section]MERGE_BRANCH ...............: ${MERGE_BRANCH}"
+      echo "[section]BRANCH_SOURCE_REF ..........: ${BRANCH_SOURCE_REF}"
+
+      git fetch origin "${MERGE_BRANCH}"
+      git fetch origin "${BRANCH_SOURCE_REF}"
+
+      git checkout "${BRANCH_SOURCE_REF}"
+      echo "[section]Checkout na branch ${BRANCH_SOURCE_REF}"
+
+      ACTUAL_DATE=$(date +'%Y%m%d-%H%M')
+      ACTUAL_DATE_HUMAN=$(date +'%d/%m/%Y às %H:%M')
+
+      TMP_BRANCH="tmp-${BRANCH_SOURCE_REF}-${ACTUAL_DATE}"
+
+      echo "[command]Realizando merge entre ${BRANCH_SOURCE_REF} e ${MERGE_BRANCH}."
+      echo "[section]Iniciando checkout na branch ${MERGE_BRANCH}"
+      git checkout $MERGE_BRANCH
+
+      TAG_BACKUP_BRANCH="backup/${MERGE_BRANCH}-${ACTUAL_DATE}"
+      git tag -a "${TAG_BACKUP_BRANCH}" -m "Tag de backup antes do merge entre a branch ${MERGE_BRANCH} e ${BRANCH_SOURCE_REF} (criado em ${ACTUAL_DATE_HUMAN})"
+      git push origin refs/tags/$TAG_BACKUP_BRANCH
+
+      echo "[section]Branch ${MERGE_BRANCH} tagueada com ${TAG_BACKUP_BRANCH} para backup antes do merge forçado."
+      git push origin "${TAG_BACKUP_BRANCH}"
+
+      # Merge sem commitar automaticamente (mantém marcadores se houver conflitos)
+      git merge --no-commit "${BRANCH_SOURCE_REF}"
+
+      # detecta conflitos de merge
+      if [ -n "$(git ls-files -u)" ]; then
+        echo "[warning]Conflitos detectados na branch ${MERGE_BRANCH}"
+        HAS_CONFLICTS="true"
+      fi
+
+      if [ "${SHOULD_FORCE_MERGE_WITH_CONFLICTS}" == "false" ] && [ "${HAS_CONFLICTS}" == "true" ]; then
+        echo "[warning]Conflitos detectados na branch ${MERGE_BRANCH}."
+        echo "[warning]A variável SHOULD_FORCE_MERGE_WITH_CONFLICTS está definida como false. Abortando merge."
+
+        git merge --abort
+
+        MESSAGE_DATA="<h1 style='font-size:18px;text-align:center;'>⚠️ <strong style='color:#ff1700;'>Tombamento automático para ${REPO_NAME} falhou</strong></h1><br> \
+        <h2 style='font-size:16px;'>Conflitos detectados na branch ${MERGE_BRANCH} ​</h2><br> \
+        <p style='font-size:14px;'><strong>O tombamento automático falhou. Como a variável SHOULD_FORCE_MERGE_WITH_CONFLICTS estava com o valor false, será necessária a realização manual do merge entre as branches ${BRANCH_SOURCE_REF} (que contém o build atual em produção com o commit hash ${COMMIT_HASH}) e ${MERGE_BRANCH}.</strong></p>"
+
+      else
+        git add -A
+        git commit -m "[CI SKIP] Automated merge ${BRANCH_SOURCE_REF} with ${MERGE_BRANCH} after deploy production (${ACTUAL_DATE})" || true
+        git push origin ${MERGE_BRANCH}
+
+        COMMIT_HASH=$(git log -n 1 --pretty=format:%H)
+        TEAM_PROJECT=$(echo "$(System.TeamProject)" | sed "s/ /%20/g")
+        URL_COMMIT="https://dev.azure.com/telefonica-vivo-brasil/${TEAM_PROJECT}/_git/${REPO_NAME}/commit/${COMMIT_HASH}"
+
+        if [ "${HAS_CONFLICTS}" == "true" ]; then
+          MESSAGE_DATA="<h1 style='font-size:18px;text-align:center;'>⚠️ <strong style='color:#ff1700;'>Tombamento automático para ${REPO_NAME}</strong></h1><br> \
+          <h2 style='font-size:16px;'>Conflitos detectados na branch ${MERGE_BRANCH} ​</h2><br> \
+          <p style='font-size:14px;'><strong>A resolução manual dos conflitos será necessária.</strong><br> \
+          <a href='${URL_COMMIT}'>Clique aqui para ver o commit</a></p>"
+        else
+          echo "[section]Merge realizado com sucesso entre ${BRANCH_SOURCE_REF} e ${MERGE_BRANCH}."
+          MESSAGE_DATA="<h1 style='font-size:18px;text-align:center;'>✅ <strong style='color:#ff1700;'>Tombamento automático para ${REPO_NAME}</strong></h1><br> \
+          <h2 style='font-size:16px;'>Merge realizado com sucesso entre ${BRANCH_SOURCE_REF} e ${MERGE_BRANCH}.</h2><br> \
+          <a href='${URL_COMMIT}'>Clique aqui para ver o commit</a></p>"
+        fi
+      fi
+
+      echo "[warning]Notificando via ChatOps"
+
+      BODY_DATA=$(jq -n --arg content "${MESSAGE_DATA}" \
+            --arg chatId "${CHAT_MESSAGE_ID_TOMBAMENTO}" \
+            --arg source "MERGE_TOMBAMENTO_SAP" \
+            '{content: $content, chatId: $chatId, source: $source}' \
+            )
+
+      curl -s -X POST --location "${CHATOPS_NOTIFICATION_URL}" \
+      --header 'Content-Type: application/json' \
+      --data-raw "${BODY_DATA}" | jq .
+
+    done
+
+  displayName: ${{ parameters.displayName }}
+  workingDirectory: ${{ parameters.workingDirectory }}
+  condition: and(succeeded(), eq(variables['FORCE_MERGE'], 'true'))
+  env:
+    REPO_NAME: ${{ parameters.repoName }}
+    BRANCH_SOURCE_REF: ${{ parameters.branchSourceRef }}
+    MERGE_BRANCHES: ${{ parameters.mergeBranches }}
+    API_BASE: "$(System.CollectionUri)$(System.TeamProjectId)/_apis/git/repositories/${{ parameters.repoName }}"
+    AUTH_HEADER: "Authorization: Bearer $(System.AccessToken)"
+    CONTENT_HEADER: "Content-Type: application/json"
+    PR_TOMBAMENTO_VERIFY_COMMIT_HASH_EXISTS: $(PR_TOMBAMENTO_VERIFY_COMMIT_HASH_EXISTS)
+    FORCE_MERGE: $(FORCE_MERGE)
+    CHAT_MESSAGE_ID_TOMBAMENTO: $(CHAT_MESSAGE_ID_TOMBAMENTO)
+    CHATOPS_NOTIFICATION_URL: $(CHATOPS_NOTIFICATION_URL)
+    SHOULD_FORCE_MERGE_WITH_CONFLICTS: $(SHOULD_FORCE_MERGE_WITH_CONFLICTS)

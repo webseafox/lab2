@@ -1,0 +1,104 @@
+parameters:
+- name: scaAnalysisType
+  type: string
+  default: 'filesystem'
+  values:
+  - filesystem
+  - image
+- name: fullImageName
+  type: string
+  default: ''
+- name: sgcliArgs
+  type: string
+  default: ''
+
+steps:
+  # 1. Preparacao de Infra (Comum para Filesystem e Image)
+  - script: |
+      SIGLA=$(echo $(System.TeamProject) | cut -d' ' -f1)
+      COMPANY_ID=430
+      
+      echo "##vso[task.setvariable variable=DYNAMIC_COMPANY_ID]${COMPANY_ID}"
+      echo "##vso[task.setvariable variable=AKV_DEVOPS_NAME]kv-azdevops-shared"
+      
+      echo "##vso[task.setvariable variable=PROXY_AGENT_HTTPS]"
+      echo "##vso[task.setvariable variable=PROXY_AGENT_HTTP]"
+      echo "##vso[task.setvariable variable=http_proxy]"
+      echo "##vso[task.setvariable variable=https_proxy]"
+      
+      echo "##vso[task.setvariable variable=no_proxy]$(PROXY_AGENT_NO_PROXY),.evn-viv.cc,sca.evn-viv.cc"
+      echo "##vso[task.setvariable variable=NO_PROXY]$(PROXY_AGENT_NO_PROXY),.evn-viv.cc,sca.evn-viv.cc"
+      
+      mkdir -p /devops/vsts-agent/certs
+      touch /devops/vsts-agent/certs/CACORP.pem
+      echo "insecure" > ~/.curlrc
+      echo "noproxy = .evn-viv.cc,sca.evn-viv.cc" >> ~/.curlrc
+      
+    displayName: 'Setup de Infra para CodePlay (SCA)'
+
+  # 2. Abre o Cofre: Essa etapa precisa funcionar para o script não usar o fallback
+  - template: /security/get_appconfig_keys.yml@CodePlay
+    parameters:
+      repositoryName: $(Build.Repository.Name)
+      azureSubscription: "DevOpsSharedResources"
+      appConfigurationEndpoint: "https://appcs-azdevops-shared.azconfig.io"
+
+  # =================================================================
+  # 3. DEFINE A VERSÃO DINÂMICA (INLINE & BLINDADO)
+  # =================================================================
+  - task: Bash@3
+    displayName: "Defining App Security Asset Version (Inline)"
+    inputs:
+      targetType: 'inline'
+      script: |
+        if [[ "$(Build.Reason)" == "PullRequest" ]]; then
+          BRANCH_NAME="${PR_TARGET_BRANCH#refs/heads/}"
+        else
+          BRANCH_NAME="${SOURCE_BRANCH#refs/heads/}"
+        fi
+
+        # TRAVA DE SEGURANÇA: Se o cofre não trouxer a variável, usa o DevSecOps como padrão
+        DEFAULT_VER="${FORTIFY_APP_DEFAULT_VERSION}"
+        if [[ "$DEFAULT_VER" == '$(FORTIFY_APP_DEFAULT_VERSION)' ]] || [[ -z "$DEFAULT_VER" ]]; then
+          echo "##[warning] A variável FORTIFY_APP_DEFAULT_VERSION não foi carregada. Usando nome do repositório como fallback."
+          DEFAULT_VER="DevSecOps"
+        fi
+
+        if [[ "$BRANCH_NAME" =~ ^(master|main)$ ]]; then
+          APP_VERSION="${DEFAULT_VER}"
+        elif [[ "$BRANCH_NAME" =~ release ]]; then
+          APP_VERSION="${DEFAULT_VER}-release"
+        else
+          APP_VERSION="${DEFAULT_VER}-${BRANCH_NAME}"
+        fi
+
+        echo "##vso[task.setvariable variable=FORTIFY_APP_VERSION]$APP_VERSION"
+        echo "Exportando a Versão '${APP_VERSION}' da aplicação para variável FORTIFY_APP_VERSION."
+    env:
+      SOURCE_BRANCH: "$(Build.SourceBranch)"
+      PR_TARGET_BRANCH: "$(System.PullRequest.TargetBranch)"
+      FORTIFY_APP_DEFAULT_VERSION: "$(FORTIFY_APP_DEFAULT_VERSION)"
+
+  # =================================================================
+  # ROTA A: SCA DE CODIGO FONTE (Filesystem)
+  # =================================================================
+    
+  - task: PublishPipelineArtifact@1
+    displayName: 'Gera Artefato app provisorio (Filesystem)'
+    inputs:
+      targetPath: '$(Build.SourcesDirectory)'
+      artifactName: 'app'
+      publishLocation: 'pipeline'
+
+  - script: |
+      echo "##[section] Iniciando SCA"
+      echo "##vso[task.setvariable variable=USE_DEPENDENCY_TRACK]true"
+      echo "##vso[task.setvariable variable=USE_CONVISO]true"
+    displayName: 'Force Flags'
+
+  - template: /security/run_sca_scan.yml@CodePlay
+    parameters:
+      repositoryName: $(Build.Repository.Name)
+      convisoCompany: $(DYNAMIC_COMPANY_ID)
+      appVersion: "$(FORTIFY_APP_VERSION)" 
+      vivoFlow: "master,main,develop,dev,preprod,homolog,staging,prodlike,release,br"

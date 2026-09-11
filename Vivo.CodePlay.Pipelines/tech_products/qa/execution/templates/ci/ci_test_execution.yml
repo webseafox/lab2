@@ -1,0 +1,194 @@
+parameters:
+- name: cenario
+  type: string
+- name: optionals
+  type: string
+- name: docker_image
+  type: string
+- name: test_environment
+  type: string
+- name: framework
+  type: string
+- name: fail_pipeline
+  type: boolean
+- name: project_id
+  type: string
+- name: enable_collect_metric
+  type: boolean
+- name: extra_env
+  displayName: Variáveis de ambiente extras para execução dos testes
+  type: object
+  default: {}
+# Atalho para extra_env: lista de NOMES de variaveis. O template gera o
+# mapeamento $(NOME) sozinho, evitando repetir o nome duas vezes. Funciona
+# tambem para variaveis secretas, porque gera o mesmo mapeamento explicito.
+- name: extra_env_names
+  displayName: Nomes de variaveis do pipeline a repassar ao container
+  type: object
+  default: []
+- name: maven_debug
+  displayName: Habilita o modo debug do Maven (-X)
+  type: boolean
+  default: false
+
+stages:
+- stage: ci_test_execution
+  displayName: "CI - Test Execution"
+  dependsOn:
+    - ci_environment
+
+  variables:
+    - name: NEXUS_DEPS_USR
+      value: $[ stageDependencies.ci_environment.environment.outputs['credentials.NEXUS_DEPS_USR'] ]
+    - name: NEXUS_DEPS_PSW
+      value: $[ stageDependencies.ci_environment.environment.outputs['credentials.NEXUS_DEPS_PSW'] ]
+    - name: SCRIPTS_FOLDER
+      value: $(Agent.BuildDirectory)/checkout_env/Vivo.CodePlay.Pipelines/tech_products/qa/execution/scripts
+    - name: CONTAINER_IMAGE
+      ${{ if eq(parameters.docker_image, 'selenium') }}:
+        value: acrsharedservices01.azurecr.io/base/qa/selenium-junit/oraclient/runtime:1.0.1
+      ${{ elseif eq(parameters.docker_image, 'selenium-v2') }}:
+        value: acrsharedservices01.azurecr.io/base/qa/selenium-junit/oraclient/runtime:2.0.0
+      ${{ elseif eq(parameters.docker_image, 'selenium-xfcb-chrome') }}:
+        value: acrsharedservices01.azurecr.io/base/qa/selenium-xvfb/chrome/runtime:1.0.2
+      ${{ elseif eq(parameters.docker_image, 'selenium-xfcb-edge') }}:
+        value: acrsharedservices01.azurecr.io/base/qa/selenium-xvfb/edge/runtime:1.0.2
+      ${{ elseif eq(parameters.docker_image, 'selenium-xfcb-firefox') }}:
+        value: acrsharedservices01.azurecr.io/base/qa/selenium-xvfb/firefox/runtime:1.0.2
+      ${{ elseif eq(parameters.docker_image, 'uftdeveloper') }}:
+        value: acrsharedservices01.azurecr.io/base/qa/uftdeveloper/chrome/runtime:1.0.2
+      
+  jobs:
+  - job: ci_test_execution
+    timeoutInMinutes: 120
+    cancelTimeoutInMinutes: 2
+    displayName: "Execução da(s) classe(s) ${{ parameters.cenario }}"
+    pool:
+      name: $(PRIVATE_AGENT_QA)
+      ${{ if eq(variables['Build.Reason'], 'Schedule') }}:
+        demands:
+        - scheduled_pipes
+    steps:
+    # Registra os valores de extra_env para mascaramento no log. Roda como
+    # primeiro step para que as mascaras ja estejam ativas antes de qualquer
+    # saida posterior - inclusive o dump de ambiente do agente quando
+    # system.debug esta ligado e o stream de "docker logs -f" do container.
+    - ${{ if or(gt(length(parameters.extra_env), 0), gt(length(parameters.extra_env_names), 0)) }}:
+      - task: Bash@3
+        displayName: "Mask extra env values"
+        inputs:
+          targetType: 'inline'
+          script: |
+            for var_name in $(compgen -v | grep '^EXTRA_VAR_'); do
+              var_value="${!var_name}"
+              [ "${var_value:0:2}" = '$(' ] && continue
+              [ ${#var_value} -ge 4 ] && echo "##vso[task.setsecret]${var_value}"
+            done
+            echo "##[section]Valores de extra_env registrados para mascaramento."
+        env:
+          ${{ each var in parameters.extra_env }}:
+            EXTRA_VAR_${{ var.key }}: ${{ var.value }}
+          ${{ each name in parameters.extra_env_names }}:
+            EXTRA_VAR_${{ name }}: ${{ format('$({0})', name) }}
+
+    - task: Bash@3 
+      displayName: "DEBUG"
+      inputs:
+        targetType: 'inline'
+        script: |
+          echo 'ls Build.SourcesDirectory: ' && ls -lha $(Build.SourcesDirectory)
+
+    - checkout: self
+      clean: true
+
+    # Download the checkout_env artifact to get the context.
+    - download: current
+      artifact: 'checkout_env'
+      displayName: Download checkout_env Artifact
+
+    - task: Docker@2
+      displayName: 'Auth for Azure Container Registry'
+      inputs:
+        command: 'login'
+        containerRegistry: ACR-DEVOPS
+        timeoutInMinutes: 90
+
+    - task: Bash@3
+      displayName: "Set execute permissions for scripts"
+      inputs:
+        targetType: 'inline'
+        script: |
+          chmod +x $(SCRIPTS_FOLDER)/*
+          ls -lha $(SCRIPTS_FOLDER)
+
+    - task: Bash@3 
+      displayName: "DEBUG"
+      inputs:
+        targetType: 'inline'
+        script: |
+          docker ps
+          docker stats --no-stream
+          echo 'ls Build.SourcesDirectory: ' && ls -lha $(Build.SourcesDirectory)
+
+    - task: Bash@3 
+      displayName: "Executing scenario(s)"
+      inputs:
+        targetType: 'inline'
+        script: exec $(SCRIPTS_FOLDER)/build_scenario.sh
+      env:
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+        NEXUS_DEPS_USR: $(NEXUS_DEPS_USR)
+        NEXUS_DEPS_PSW: $(NEXUS_DEPS_PSW)
+        DEFAULT_MAX_MEMORY_BUILD: "$DEFAULT_MAX_MEMORY_BUILD"
+        ENVIRONMENT: ${{ parameters.test_environment }}
+        SCENARIOS: ${{ parameters.cenario }}
+        OPTIONALS: ${{ parameters.optionals }}
+        FRAMEWORK: ${{ parameters.framework }}
+        DOCKER_IMAGE: ${{ parameters.docker_image }}
+        CONTAINER_IMAGE: $(CONTAINER_IMAGE)
+        SCRIPTS_FOLDER: $(SCRIPTS_FOLDER)
+        AGENT_TMP_DIRECTORY: $(Agent.TempDirectory)
+        ALM_USER: $(ALM_USER)
+        ALM_PASSWORD: $(ALM_PASSWORD)
+        PROJECT_ID: ${{ parameters.project_id }}
+        ENABLE_COLLECT_METRIC: ${{ parameters.enable_collect_metric }}
+        MAVEN_DEBUG: ${{ parameters.maven_debug }}
+        SYSTEM_DEBUG: $(System.Debug)
+        # Variaveis extras (parametro extra_env). Sao mapeadas aqui com o
+        # prefixo EXTRA_VAR_ e repassadas ao container pelo build_scenario.sh,
+        # que remove o prefixo. O mapeamento explicito neste bloco "env" e
+        # obrigatorio para variaveis marcadas como secret - inclusive as vindas
+        # de variable groups - porque elas nao entram no ambiente do agente
+        # automaticamente, so via $(nome) em "env" ou "inputs".
+        ${{ each var in parameters.extra_env }}:
+          EXTRA_VAR_${{ var.key }}: ${{ var.value }}
+        ${{ each name in parameters.extra_env_names }}:
+          EXTRA_VAR_${{ name }}: ${{ format('$({0})', name) }}
+
+    - task: Bash@3 
+      displayName: "DEBUG"
+      inputs:
+        targetType: 'inline'
+        script: |
+          echo 'ls Build.SourcesDirectory: ' && ls -lha $(Build.SourcesDirectory)
+          echo 'ls RunResults: ' && ls -lha $(Build.SourcesDirectory)/RunResults
+
+    - publish: $(Agent.TempDirectory)
+      displayName: Publish logs
+      artifact: logs
+      condition: always()
+
+    - publish: $(Build.SourcesDirectory)/RunResults
+      displayName: Publish RunResults
+      artifact: RunResults
+      condition: always()
+
+    - task: Bash@3 
+      displayName: "Checking for failed tests"
+      condition: ${{ eq(parameters.fail_pipeline, true) }}
+      inputs:
+        targetType: 'targetPath'
+        script: $(SCRIPTS_FOLDER)/check_for_failed_tests.sh
+      env:
+        FAIL_PIPELINE: ${{ parameters.fail_pipeline }}
+        BUILD_SOURCESDIRECTORY: $(Build.SourcesDirectory)

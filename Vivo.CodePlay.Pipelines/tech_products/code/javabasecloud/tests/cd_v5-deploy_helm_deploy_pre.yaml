@@ -1,0 +1,182 @@
+parameters:
+- name: environment
+  displayName: Escolha o ambiente para publicar
+  type: string
+  default: dev
+  values:
+  - dev
+  - preprod
+  - prod
+
+- name: vivonow_chg
+  displayName: Numero CHG do VivoNow, somente para 'prod'
+  default: CHG0000001
+
+# Parametro adicinado para reduzir o uso de VariableGroups
+# para baixar o SecretFile do kube.config a validacao ocorre em tempo de template.
+- name: sigla_bu
+  default: 'techarch'
+  displayName: Sigla BU 'techarch', 'mvpk', 'oss'...
+
+variables:
+- name: System.debug
+  value: "true"
+
+stages:
+- stage: pre_deploy_kube
+  displayName: Pre Deploy on (${{ parameters.environment }})
+  # pool: VivoAzureCloudSharedAgents
+  pool: 
+    name: DefaultDevopsAgents
+    demands:
+    - Agent.Name -equals BRTAZLTS0085CO.azagent004
+  jobs:
+  - job: pre_deploy_on_kube
+    variables:
+      - name: DOCKER_TAG_SUFIX
+        ${{ if eq('${{ parameters.environment }}', 'prod') }}:
+          value: 'RELEASE'
+        ${{ else }}:
+          value: 'SNAPSHOT'
+    displayName: Rollback on (${{ parameters.environment }})
+    steps:
+    - checkout: self
+      fetchDepth: 1
+
+    - task: XmlParseFromVivo@4
+      displayName: Get Main Info
+      name: pom_info
+      inputs:
+        type: 'file'
+        origin: pom.xml
+        jpaths: |
+          var POM_XML_VERSION = .project.version._text
+    
+    - task: YamlParseFromVivo@4
+      displayName: Get Metadata Info
+      name: catalog_info
+      inputs:
+        type: 'file'
+        origin: catalog-info.yaml
+        jpaths: |-
+          var CATALOG_YAML_NAME = .metadata.name
+          var CATALOG_YAML_ACRONYM = .metadata.annotations['techarch.governance-app.acronym']
+          var CATALOG_YAML_K8S_NS = .metadata.annotations['vivo.io/kubernetes-k8s-namespace-${{ parameters.environment }}']
+
+    - task: NunjucksInline@4
+      displayName: Bind Variables
+      inputs:
+        sourceType: 'text'
+        source: |
+          var HELM_REPO_PREFIX = {{ CATALOG_YAML_ACRONYM or 'devops'}}
+
+    - task: AzureKeyVault@2  
+      displayName: 'Getting AKV credentials'
+      timeoutInMinutes: 1
+      retryCountOnTaskFailure: 5  
+      inputs:    
+        azureSubscription: DevOpsSharedResources    
+        KeyVaultName: kv-azdevops-shared
+        SecretsFilter: >- 
+          DOCKER-REGISTRY-ACR-USERNAME, DOCKER-REGISTRY-ACR-PASSWORD,
+          HELM-REGISTRY-NEXUS-USERNAME, HELM-REGISTRY-NEXUS-PASSWORD,
+          HELM-REGISTRY-ACR-USERNAME, HELM-REGISTRY-ACR-PASSWORD,
+          NEXUS-DEPS-USR, NEXUS-DEPS-PSW
+
+    - task: DownloadSecureFile@1
+      name: kubeconfig
+      displayName: 'Download config from (${{parameters.environment}})'
+      inputs:
+        secureFile: 'aks-${{parameters.sigla_bu}}-${{parameters.environment}}'
+
+    - script: |-
+        kubectl get ns \
+        -o json \
+        --kubeconfig="$(kubeconfig.secureFilePath)" \
+        --insecure-skip-tls-verify \
+        > existing-namespaces.json
+      displayName: Fetch namespaces
+
+    - task: JsonParseFromVivo@4
+      displayName: Query for Namespace
+      name: query_namespace
+      continueOnError: true
+      inputs:
+        type: file
+        origin: existing-namespaces.json
+        jpaths: |-
+          var EXISTING_NAMESPACES = $.items[?(@.metadata.name.match(/$(CATALOG_YAML_K8S_NS)/i))].metadata.name
+
+    - script: >-
+        kubectl create ns "$(CATALOG_YAML_K8S_NS)"
+        --kubeconfig="$(kubeconfig.secureFilePath)"
+        --insecure-skip-tls-verify
+      displayName: Create Namespace
+      condition: not(variables['EXISTING_NAMESPACES'])
+
+    - script: |-
+        kubectl get secrets acr-$(CATALOG_YAML_ACRONYM) \
+        -n $(CATALOG_YAML_K8S_NS) \
+        --kubeconfig="$(kubeconfig.secureFilePath)" \
+        --insecure-skip-tls-verify
+
+        echo "##vso[task.setvariable variable=EXISTING_SECRETS]$?"
+      displayName: Fetch Docker Secret
+
+    - script: exit 1
+      condition: not(variables['EXISTING_SECRETS'])
+      continueOnError: false
+      displayName: Test Docker Secret Match
+
+    # TODO: nao recriar a secret somente validar, se nao existir interromper a esteira
+    # - script: >-
+    #     kubectl create secret docker-registry acr-$(CATALOG_YAML_ACRONYM)
+    #       --docker-server=https://acrsharedservices01.azurecr.io/
+    #       --docker-username=$(DOCKER-REGISTRY-USERNAME)
+    #       --docker-password=$(DOCKER-REGISTRY-PASSWORD)
+    #       --docker-email='arquiteturati@telefonica.com.br'
+    #       -n $(CATALOG_YAML_K8S_NS)
+    #       --kubeconfig="$(kubeconfig.secureFilePath)"
+    #       --insecure-skip-tls-verify
+    #   condition: not(variables['EXISTING_SECRETS'])
+    #   continueOnError: false
+    #   displayName: Create Docker Secret
+
+    # - task: Bash@3
+    #   displayName: Get Deployment Status on (${{ parameters.environment }})
+    #   continueOnError: false
+    #   condition: succeeded()
+    #   inputs:
+    #     targetType: inline
+    #     script: |-
+    #       export DEPLOYMENT_STATUS_JSON=$(\
+    #         helm \
+    #         --kubeconfig $(kubeconfig.secureFilePath) \
+    #         status $(CATALOG_YAML_NAME) \
+    #         --namespace $(CATALOG_YAML_K8S_NS) \
+    #         --output json \
+    #       )
+    #       echo "##vso[task.setvariable variable=DEPLOYMENT_STATUS_JSON]${DEPLOYMENT_STATUS_JSON}"
+
+    # - task: JsonParseFromVivo@4
+    #   displayName: Parse Deployment Status
+    #   name: deployment_status
+    #   continueOnError: false
+    #   inputs:
+    #     type: var
+    #     origin: DEPLOYMENT_STATUS_JSON
+    #     jpaths: |-
+    #       var DEPLOYMENT_STATUS = .status
+    
+    # - task: Bash@3
+    #   displayName: 'Rollback last on (${{ parameters.environment }})'
+    #   condition: and(succeeded(), not(eq(variables['DEPLOYMENT_STATUS'], 'deployed')))
+    #   continueOnError: false
+    #   inputs:
+    #     workingDirectory: $(Build.SourcesDirectory)
+    #     targetType: inline
+    #     script: >-
+    #       helm rollback $(CATALOG_YAML_NAME)
+    #       --kubeconfig $(kubeconfig.secureFilePath)
+    #       --namespace $(CATALOG_YAML_K8S_NS)
+    #       --debug

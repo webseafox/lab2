@@ -1,0 +1,244 @@
+parameters:
+  - name: packageName
+  - name: packageVersion
+  - name: environment
+
+stages:
+  - stage: cd_deploy
+    displayName: "CD - Deploy ${{ parameters.environment }}"
+    condition: succeeded()
+    pool:
+      $(PRIVATE_AGENT_IAC)
+
+    jobs:
+      - deployment: deploy
+        displayName: Deploy
+        condition: succeeded()
+        environment:
+          name: deploy-${{ parameters.environment }}
+        continueOnError: false
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+              ## -> Download Artifacts
+              - download: none
+
+              ## -> Faz o checkout dos scripts utilizados no deploy
+              - task: 6d15af64-176c-496d-b583-fd2ae21d4df4@1
+                displayName: Checking Out Scripts
+                name: checkout_scripts
+                inputs:
+                  repository: GDOCScripts
+                  persistCredentials: "true"
+                  clean: true
+                  path: scripts
+
+              ## -> Realiza o download do pacote do feed de pacotes
+              - task: UniversalPackages@0
+                displayName: Downloading Package
+                condition: succeeded()
+                continueOnError: false
+                inputs:
+                  command: 'download'
+                  downloadDirectory: '$(System.DefaultWorkingDirectory)/package'
+                  feedsToUse: 'internal'
+                  vstsFeed: "3d53bc62-8749-4931-ae46-a443b73bc87a"
+                  vstsFeedPackage: "${{ parameters.packageName }}"
+                  vstsPackageVersion: "${{ parameters.packageVersion }}"
+
+              # -> Transfere os scripts para a pasta compartilhada no NAS
+              - task: LegacyCopyFilesOverSSH@0
+                displayName: Transfering Scripts to Remote Server
+                condition: succeeded()
+                inputs:
+                  sshEndpoint: gedoc_${{ parameters.environment }}
+                  sourceFolder: '$(System.DefaultWorkingDirectory)/scripts'
+                  contents: '**'
+                  overwrite: true
+                  targetFolder: '/VIVOGED01/deploy/azure_deployment'
+                  readyTimeout: '20000'
+
+              # -> Transfere o pacote para a pasta compartilhada no NAS
+              - task: LegacyCopyFilesOverSSH@0
+                displayName: Transfering Package to Remote Server
+                condition: succeeded()
+                inputs:
+                  sshEndpoint: gedoc_${{ parameters.environment }}
+                  sourceFolder: '$(System.DefaultWorkingDirectory)/package'
+                  contents: '**'
+                  overwrite: true
+                  targetFolder: '/VIVOGED01/deploy/azure_deployment'
+                  readyTimeout: '20000'
+
+              ## -> Checa se os artefatos foram copiados corretamente
+              - task: LegacySSH@0
+                displayName: Checking Scripts
+                condition: succeeded()
+                continueOnError: false
+                inputs:
+                  sshEndpoint: gedoc_${{ parameters.environment }}
+                  runOptions: 'inline'
+                  inline: |
+                    ls -ltha /VIVOGED01/deploy/azure_deployment
+                  readyTimeout: '20000'
+
+              ## -> Ajusta os permissionamentos
+              - task: LegacySSH@0
+                displayName: Setting Permissions
+                condition: succeeded()
+                continueOnError: false
+                inputs:
+                  sshEndpoint: gedoc_${{ parameters.environment }}
+                  runOptions: 'inline'
+                  inline: |
+                    chmod -R 777 /VIVOGED01/deploy/azure_deployment
+                  readyTimeout: '20000'
+
+              ## -> Realiza o stop do apache
+              - task: LegacySSH@0
+                displayName: Stopping Servers
+                condition: succeeded()
+                continueOnError: false 
+                inputs:
+                  sshEndpoint: gedoc_${{ parameters.environment }}
+                  runOptions: 'inline'
+                  inline: |
+                    /VIVOGED01/deploy/azure_deployment/stop.sh /VIVOGED01/deploy/azure_deployment/servers.lst
+                  readyTimeout: '20000'
+
+              ## -> Checa o status após o stop
+              - task: LegacySSH@0
+                displayName: Checking Status
+                condition: succeeded()
+                continueOnError: false
+                inputs:
+                  sshEndpoint: gedoc_${{ parameters.environment }}
+                  runOptions: 'inline'
+                  inline: |
+                    /VIVOGED01/deploy/azure_deployment/status.sh /VIVOGED01/deploy/azure_deployment/servers.lst
+                  readyTimeout: '20000'
+
+              ## -> Realiza o Backup da Aplicação
+              - task: LegacySSH@0
+                displayName: Running Backup
+                condition: succeeded()
+                continueOnError: false
+                inputs:
+                  sshEndpoint: gedoc_${{ parameters.environment }}
+                  runOptions: 'inline'
+                  inline: |
+                    nohup /VIVOGED01/deploy/azure_deployment/installer.sh /VIVOGED01/deploy/azure_deployment/servers.lst backup &
+                  readyTimeout: '20000'
+
+              ## -> Confere o Backup da Aplicação
+              - task: LegacySSH@0
+                displayName: Checking Backup
+                condition: succeeded()
+                continueOnError: false
+                inputs:
+                  sshEndpoint: gedoc_${{ parameters.environment }}
+                  runOptions: 'inline'
+                  inline: |
+                    nohup /VIVOGED01/deploy/azure_deployment/installer.sh /VIVOGED01/deploy/azure_deployment/servers.lst check_backup &
+                  readyTimeout: '20000'
+
+              ## -> Realiza o deploy
+              - task: LegacySSH@0
+                displayName: Deploying Package
+                condition: succeeded()
+                continueOnError: false
+                inputs:
+                  sshEndpoint: gedoc_${{ parameters.environment }}
+                  runOptions: 'inline'
+                  inline: |
+                    nohup /VIVOGED01/deploy/azure_deployment/installer.sh /VIVOGED01/deploy/azure_deployment/servers.lst deploy &
+                  readyTimeout: '20000'
+
+              ## -> Inicia os servidores
+              - task: LegacySSH@0
+                displayName: Starting Servers
+                condition: succeeded()
+                continueOnError: false
+                inputs:
+                  sshEndpoint: gedoc_${{ parameters.environment }}
+                  runOptions: 'inline'
+                  inline: |
+                    /VIVOGED01/deploy/azure_deployment/start.sh /VIVOGED01/deploy/azure_deployment/servers.lst
+                  readyTimeout: '20000'
+
+              ## -> Checa o status após o start
+              - task: LegacySSH@0
+                displayName: Checking Status After Start
+                condition: succeeded()
+                continueOnError: false
+                inputs:
+                  sshEndpoint: gedoc_${{ parameters.environment }}
+                  runOptions: 'inline'
+                  inline: |
+                    /VIVOGED01/deploy/azure_deployment/status.sh /VIVOGED01/deploy/azure_deployment/servers.lst
+                  readyTimeout: '20000'
+
+              ## -> Limpa todos os arquivos do workspace
+              - task: DeleteFiles@1
+                displayName: "Cleaning Up Workspace"
+                condition: always()
+                inputs:
+                  sourcefolder: $(System.DefaultWorkingDirectory)
+                  contents: '**/*' 
+
+              ## -> Checa se os artefatos foram apagados corretamente
+              - task: LegacySSH@0
+                displayName: Cleaning Remote Workspace
+                condition: always()
+                continueOnError: false
+                inputs:
+                  sshEndpoint: gedoc_${{ parameters.environment }}
+                  runOptions: 'inline'
+                  inline: |
+                    rm -rf /VIVOGED01/deploy/azure_deployment
+                  readyTimeout: '20000'
+            on:
+              success:
+                steps:
+                - task: Bash@3
+                  displayName: Deploy Success
+                  name: success_message
+                  inputs:
+                    targetType: inline
+                    script: |
+                      echo "##[section] ================================================================================================================================="
+                      echo "##[section]                                                      DEPLOY WAS SUCCESSFUL! "
+                      echo "##[section] ================================================================================================================================="
+                      echo "##[section] Parabéns! Sua aplicação foi implantada com sucesso no ambiente."
+                      echo "##[section] Acesse a url da sua aplicação e valide se sua nova versão foi entregue com sucesso."
+                      echo "##[section] "
+                      echo "##[section] $(ALERT_MESSAGE_ARROW) Sua aplicação foi implantada com sucesso no ambiente."
+                      echo "##[section] $(ALERT_MESSAGE_ARROW) Verifique com o responsável técnico como acessar acessar a sua aplicação."
+                      echo "##[section] $(ALERT_MESSAGE_ARROW) Caso não esteja conseguindo acessar a sua aplicação entre em contato com o suporte."
+                      echo "##[section] "
+                      echo "##[section]================================================================================================================================="
+
+                      ## -> Set Pipeline Tag on success
+                      echo "##vso[build.addbuildtag]deploy-${{ parameters.environment }}=succeeded"
+              failure:
+                steps:
+                - task: Bash@3
+                  displayName: Deploy Failure
+                  name: failure_message
+                  inputs:
+                    targetType: inline
+                    script: |
+                      echo "##[error] ================================================================================================================================="
+                      echo "##[error]                                                    DEPLOY WAS NOT SUCCESSFUL! "
+                      echo "##[error] ================================================================================================================================="
+                      echo "##[error] Se está vendo essa mensagem é porque aconteceu algo errado durante a implantação da sua aplicação."
+                      echo "##[error] "
+                      echo "##[error] Segue abaixo umas dicas para o Troubleshooting:"
+                      echo "##[error] $(ALERT_MESSAGE_ARROW) Consulte o log do estágio de deploy da aplicação."
+                      echo "##[error] $(ALERT_MESSAGE_ARROW) Verifique com o responsável técnico como proceder em caso de falha de ambiente."
+                      echo "##[error] "
+                      echo "##[error] ================================================================================================================================="
+
+                      ## -> Set Pipeline Tag on failure
+                      echo "##vso[build.addbuildtag]deploy-${{ parameters.environment }}=failed"

@@ -1,0 +1,78 @@
+parameters:
+- name: operation
+- name: pricingConfigComponentsToDeploy
+- name: xmlLogsFile
+- name: xmlCommandsTranspiledFilePrefix
+
+steps: 
+- task: SSH@0
+  displayName: "${{ parameters.operation }} XML Files"
+  continueOnError: true
+  inputs:
+    sshEndpoint: BRM_BASTION_$(ENVIRONMENT)
+    runOptions: 'inline'
+    inline: |
+      echo "##[debug] ACTION.................................................: ${{ parameters.operation }}"
+      echo "##[debug] PRICING CONFIG COMPONENTS TO DEPLOY....................: ${{ parameters.pricingConfigComponentsToDeploy }}"
+      echo "##[debug] XML LOGS FILE..........................................: ${{ parameters.xmlLogsFile }}"
+
+      LOGS=""
+
+      IFS=',' read -ra ADDR <<< "${{ parameters.pricingConfigComponentsToDeploy }}"
+      for component in "${ADDR[@]}"; do
+        arrIN=(${component//_/ })
+        export COMPONENT=${arrIN[1]}
+
+        echo ">>>>> $COMPONENT >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>"
+        XML_COMMANDS_TRANSPILED_FILE_NAME=${{ parameters.xmlCommandsTranspiledFilePrefix }}_$COMPONENT
+        XML_COMMANDS_TRANSPILED_PATH=$(OPERATION_HOST_COMMANDS_PATH)/$XML_COMMANDS_TRANSPILED_FILE_NAME
+        echo "##[debug] XML COMMANDS TRANSPILED FILE NAME....................: $XML_COMMANDS_TRANSPILED_FILE_NAME"
+        echo "##[debug] XML COMMANDS TRANSPILED PATH.........................: $XML_COMMANDS_TRANSPILED_PATH"
+
+        if [ "${#LOGS}" -gt 0 ]; then
+          LOGS+=";>>>>> $COMPONENT >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>"
+        else
+          LOGS+=">>>>> $COMPONENT >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>"
+        fi
+
+        echo "##[command]cat $XML_COMMANDS_TRANSPILED_PATH | bash |& tee ${{ parameters.xmlLogsFile }}.txt"
+        cat $XML_COMMANDS_TRANSPILED_PATH | bash |& tee ${{ parameters.xmlLogsFile }}.txt
+
+        while IFS= read -r line || [[ -n "$line" ]]; do
+          read -r line <<<"${line//[$'\t\r\n']}"
+          
+          trim () {
+            local str ellipsis_utf8
+            local -i maxlen
+
+            # use explaining variables; avoid magic numbers        
+            str="$*"
+            maxlen="2000"
+            ellipsis_utf8=$'\u2026'
+
+            # only truncate $str when longer than $maxlen
+            if (( "${#str}" > "$maxlen" )); then
+              printf "%s%s\n" "${str:0:$maxlen}" " ${ellipsis_utf8}"
+            else
+              printf "%s\n" "$str"
+            fi
+          }
+
+          line=$(trim $line)
+
+          if [ "${#LOGS}" -gt 0 ]; then
+            LOGS+=";$line"
+          else
+            LOGS+="$line"
+          fi
+        done < ${{ parameters.xmlLogsFile }}.txt
+
+        echo "##[command]rm -rv $XML_COMMANDS_TRANSPILED_PATH"
+        rm -rv $XML_COMMANDS_TRANSPILED_PATH
+
+        unset COMPONENT
+      done
+
+      echo "##vso[task.setvariable variable=LOGS;]$LOGS"
+    readyTimeout: '20000'
+    failOnStdErr: false

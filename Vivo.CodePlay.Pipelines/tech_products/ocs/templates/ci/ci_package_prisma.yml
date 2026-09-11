@@ -1,0 +1,118 @@
+
+stages:
+
+- stage: package
+  dependsOn:
+  - build_test
+  - gates
+  - security
+  displayName: "Package & Publish"
+  pool: $(PRIVATE_AGENT_DEFAULT)
+  jobs:
+  - job: Tag
+    displayName: "Update Version & TAG"
+    variables:
+    - name: APP_VERSION
+      value: $[ stageDependencies.build_test.bump_version.outputs['component_bump_version.APP_NEW_VERSION'] ]        
+    condition: and(succeeded(), eq(variables.flowIsTagging, false))
+    steps:
+    - download: none 
+    - checkout: self  
+      persistCredentials: "true"
+      clean: true
+
+    - task: DownloadBuildArtifacts@1
+      displayName: 'Download Build Artifact'
+      inputs:
+        buildType: current
+        artifactName: 'app'
+        downloadPath: '$(System.ArtifactsDirectory)'    
+        extractTars: true       
+
+    - task: CopyFiles@2
+      displayName: Copy Files Staging Directory
+      inputs:
+        SourceFolder: '$(DEFAULT_WORKDIR_ARTIFACTS)'
+        Contents: '**/*'
+        TargetFolder: '$(build.sourcesdirectory)'
+        OverWrite: true
+        flattenFolders: false
+
+    - task: Bash@3
+      name: export_current_version
+      displayName: Extract App Version
+      condition: succeeded()
+      inputs:
+        targetType: inline
+        script: |
+          version=$(grep version il-gtw/pom.xml | grep -v '<?xml' | grep '<version>'|head -n 1|awk '{print $1}'| cut -d'>' -f 2 | cut -d'<' -f 1)
+          echo "##vso[task.setvariable variable=APP_CURRENT_VERSION]$version"
+          echo "##[debug] Exporting variable 'APP_CURRENT_VERSION': $version"
+ 
+    - task: Bash@3
+      name: tag
+      displayName: 'Updating Version Master & Tag'
+      condition: succeeded()
+      inputs:
+        targetType: inline
+        script: |
+          current_branch=$(echo "$BUILD_SOURCEBRANCH" | awk -F/ '{print $NF}')
+          echo "##[debug] Current branch is: $current_branch"
+          echo "##[debug] Comment is: $BUILD_SOURCEVERSIONMESSAGE"
+          
+          new_tag=$(echo "$BUILD_SOURCEVERSIONMESSAGE" | sed -n 's/.*\(\P\K\G_\V[0-9][0-9][0-9]\L\?\T\?\_[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_[A-Z]*_[A-Z]*_[A-Z]*\).*/\1/p')
+          if [ -z "$new_tag" ]; then
+            new_tag="$(Build.BuildId)"
+          fi    
+          echo "##[debug] New tag is: $new_tag"
+          
+          ## Criar arquivo contendo o buildId
+          yq e '.buildId = $(Build.BuildId)' -n > $(Build.SourcesDirectory)/.azuredevops/build.yaml
+
+          if [ "$current_branch" == "master" ]; then
+
+            git add il-gtw/pom.xml
+            git commit -m "Bump version to $new_version [skip ci]"
+            echo "##[debug] Commit success"
+            git remote -v
+
+            echo "##[debug] Publishing master"
+            if git push origin HEAD:master; then
+              echo "##[debug] Changes pushed successfully"
+            else
+              echo "##[error] Changes pushed with error"
+              echo "##vso[task.complete result=Failed;]"
+            fi
+
+            echo "##[debug] Publishing Tag $new_tag"
+
+            git add $(Build.SourcesDirectory)/.azuredevops/build.yaml
+            git commit -m "build.yaml [skip ci]"
+
+            git tag -a $new_tag -m "New version $(APP_VERSION)"
+            
+            if git push origin $new_tag; then
+              echo "##[debug] Published Tag $new_tag"
+            else
+              echo "##[error] Tag pushed with error"
+              echo "##vso[task.complete result=Failed;]"
+            fi
+        
+          else
+      
+            echo "##[debug] Publishing Tag $new_tag"
+
+            git add $(Build.SourcesDirectory)/.azuredevops/build.yaml
+            git commit -m "build [skip ci]"
+
+            git tag -a $new_tag -m "Current version $(APP_CURRENT_VERSION)"
+            
+            if git push origin $new_tag; then
+              echo "##[debug] Published Tag $new_tag"
+            else
+              echo "##[error] Tag pushed with error"
+              echo "##vso[task.complete result=Failed;]"
+            fi
+
+          fi
+      continueOnError: true

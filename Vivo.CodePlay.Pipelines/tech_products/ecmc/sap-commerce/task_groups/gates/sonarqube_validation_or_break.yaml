@@ -1,0 +1,124 @@
+steps:
+  - bash: |
+      echo "##[debug]Parâmetro JACOCO_EXEC: $(JACOCO_EXEC)"
+
+      if [[ "$(JACOCO_EXEC)" != "True" ]]; then
+        echo "⚠️  ATENÇÃO: A execução dos testes foi pulada, portanto a validação de testes não será aplicada."
+        exit 0
+      fi
+      
+      BRANCH=""
+      if [[ "$(SONAR_SELF_HOSTED)" == "true" ]]; then
+        SONARQUBE_TOKEN="${SONARQUBE_TOKEN_SELF_HOSTED}"
+      fi
+
+      if [[ $(Build.Reason) == "PullRequest" ]]; then
+        SONAR_PROJECT_STATUS_URL="${SONARQUBE_URL}/api/qualitygates/project_status?projectKey=${SONAR_PROJECT_KEY}&pullRequest=$(System.PullRequest.PullRequestId)"
+      else
+        BRANCH=$(echo "$(Build.SourceBranch)" | sed 's/refs\/heads\///g')
+        SONAR_PROJECT_STATUS_URL="${SONARQUBE_URL}/api/qualitygates/project_status?projectKey=${SONAR_PROJECT_KEY}&branch=$BRANCH"
+      fi
+
+      echo "##[debug]URL do Relatório do Sonar: ${SONAR_PROJECT_STATUS_URL}"
+
+      #SONAR_ANALYSIS_REPORT=$(curl -k --insecure --max-time $(CURL_HTTP_TIMEOUT) -s -u $TOKEN: "${SONAR_PROJECT_STATUS_URL}")
+      ANALYSIS_STATUS=$(curl -k --max-time $CURL_HTTP_TIMEOUT  -s -u "${SONARQUBE_TOKEN}:" "${SONAR_PROJECT_STATUS_URL}")
+      ALL_DATA=$(jq '.' <<< $ANALYSIS_STATUS)
+      MIN_COVERAGE=$(SONAR_MIN_COVERAGE)
+
+      echo "##[section]..............................................................................."
+      echo "##[section]Métricas extraídas do relatório"
+      echo "##[section]..............................................................................."
+      echo "${ALL_DATA}" | jq .
+      echo "##[section]..............................................................................."
+
+      ## SHOW ITEMS FROM RESPONSE SONAR REQUEST
+      projectStatus=$(echo "$ALL_DATA" | jq -r .projectStatus.status)
+
+      hasCoverage=""
+
+      if [[ -n $projectStatus && "$projectStatus" != "null" ]]; then
+        ## SHOW ITEMS FROM RESPONSE SONAR REQUEST
+        while read data; do
+          while read conditions; do
+            # METRIC KEY
+            METRIC_KEY=$(echo "$conditions" | jq -r .metricKey)
+            if [[ $METRIC_KEY == "new_coverage" ]]; then
+              hasCoverage="true"
+              ACTUAL_VALUE=$(echo "$conditions" | jq -r .actualValue)
+              SET_MSG="O valor mínimo de cobertura deve ser $MIN_COVERAGE e o valor atual é $ACTUAL_VALUE"
+
+              echo "##[section]................................... RESULTS ..................................."
+              echo "##[debug]Cobertura mínima exigida: ${MIN_COVERAGE}"
+              echo "##[debug]Valor atual encontrado: ${ACTUAL_VALUE}"
+              echo "##[debug]Break if error -> ${BREAK_IF_COVERAGE_ERROR}"
+              echo "##[section]..............................................................................."
+              
+              if (( $(echo "$MIN_COVERAGE > $ACTUAL_VALUE" | bc -l) )) && [ "${BREAK_IF_COVERAGE_ERROR}" == "true" ];then
+                echo "##vso[task.setvariable variable=CODE_COVERAGE_HAS_ERROR]TRUE"
+                echo "##[error]$SET_MSG"
+                echo "##vso[task.logissue type=warning;]$SET_MSG"
+                echo "##vso[task.setvariable variable=ACTUAL_VALUE]${ACTUAL_VALUE}"
+                echo "##vso[task.setvariable variable=SET_MSG]${SET_MSG}"
+                exit 1
+              else
+                echo "##[section]$SET_MSG"
+              fi
+
+              echo -n "________________________________________________"
+              echo -e "\n"
+            fi
+          done < <(echo "$data" | jq -c '.conditions[]')
+        done < <(echo "$ALL_DATA" | jq -c '.[]')
+      else
+        SET_MSG="Erro ao pegar informações do projeto no Sonar: [$projectStatus]"
+        echo "##[command]$SET_MSG"
+        echo "##vso[task.logissue type=warning;]$SET_MSG"
+        if [[ "${BREAK_IF_COVERAGE_ERROR}" == "true" && "${BUILD_REASON}" == "PullRequest"  ]]; then
+          echo "##vso[task.setvariable variable=SONAR_CODE_COVERAGE_FAILED]TRUE"
+        fi
+      fi
+
+      if [[ -z hasCoverage ]]; then
+        SET_MSG="Métricas de cobertura de código não encontradas no relatório"
+        echo "##[command]$SET_MSG"
+        echo "##vso[task.logissue type=warning;]$SET_MSG"
+        echo "##vso[task.setvariable variable=SONAR_CODE_COVERAGE_FAILED]TRUE"
+      fi
+    displayName: "Code Coverage Report"
+    condition: and(eq(variables.SONAR_IS_ENABLED, True), ne(variables['flowIsPRStageWithMasterSapCommerce'], 'true'))
+    continueOnError: true
+    env:
+      SONARQUBE_TOKEN: $(SONARQUBE-TOKEN)
+      SONARQUBE_TOKEN_SELF_HOSTED: $(SONARQUBE_TOKEN_SELF_HOSTED)
+      SONARQUBE_TOKEN_TAG_SELF_HOSTED: $(SONARQUBE_TOKEN_TAG_SELF_HOSTED)
+      BREAK_IF_COVERAGE_ERROR: $(BREAK_IF_COVERAGE_ERROR)
+
+  - template: /tech_products/ecmc/sap-commerce/tasks/store-logs/send-data-for-api-log.yaml
+    parameters:
+      condition: and(
+                    eq(variables.flowIsPullRequest, True), 
+                    or(
+                        eq(variables.CODE_COVERAGE_HAS_ERROR, 'TRUE'), 
+                        eq(variables.SONAR_CODE_COVERAGE_FAILED, 'TRUE')
+                    ), 
+                    ne(variables.flowIsPRStageWithMasterSapCommerce, true)
+                 ) 
+      msg: "$(SET_MSG)"
+      coverage: "$(ACTUAL_VALUE)"
+
+  - bash: |
+      echo "##[error]Errors found in SonarQube analysis. Pipeline stopped."
+      echo "##[error]View details on \"Break build on quality gate failure\"."
+      echo "##[debug]Agent.JobStatus: .............................: $(Agent.JobStatus)"
+      echo "##[debug]SONAR_BREAK_ENABLED ..........................: $SONAR_BREAK_ENABLED"
+      echo "##[debug]Build.SourceBranch ...........................: $(Build.SourceBranch)"
+      exit 1
+    displayName: "Info about Code Analysis Break"
+    condition: and(
+        in(variables['Agent.JobStatus'], 'SucceededWithIssues', 'Failed'),
+        and(eq(variables.SONAR_BREAK_ENABLED, true), ne(variables.SONAR_BREAK_TEMPORARY_DISABLED, true)),
+        eq(variables.flowIsPullRequest, True),
+        ne(variables.flowIsPRStageWithMasterSapCommerce, true)
+      )
+

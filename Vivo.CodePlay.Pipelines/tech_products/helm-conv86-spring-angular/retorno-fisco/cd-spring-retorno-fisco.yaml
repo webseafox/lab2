@@ -1,0 +1,169 @@
+
+
+trigger: none
+
+parameters:
+- name: environment
+  displayName: Escolha o ambiente para publicar
+  type: string
+  default: dev
+  values:
+  - dev
+  - preprod
+  - prod
+
+resources:
+  repositories:
+  - repository: Deploy
+    name: MIGR-Conv86/deploy.deploy-retorno-fisco-spring-batch
+    type: git
+    ref: refs/heads/master
+  
+  - repository: Helm
+    name: MIGR-Conv86/package.package-helm-retorno
+    type: git
+    ref: refs/heads/codeplay
+
+#Incluir Variaveis da Library
+variables:
+- name: ASDF_JDK_11
+  value: "openjdk-11.0.2"
+- name: System.debug
+  value: "true"
+
+stages:
+- stage: deploy_kube
+  displayName: Deploy Kubernetes
+  jobs:
+  - job: deploy_on_kube
+    continueOnError: False
+    condition: succeeded()
+    displayName: Deploy on Kubernetes
+    pool: GeneralPurposeLinuxAgentsCD
+    steps:
+
+    - checkout: self
+      fetchDepth: 1
+
+    - checkout: Deploy
+      fetchDepth: 1
+
+    - checkout: Helm
+      fetchDepth: 1
+
+    - task: AzureKeyVault@2  
+      displayName: 'Getting AKV credentials'
+      timeoutInMinutes: 1
+      retryCountOnTaskFailure: 5  
+      inputs:    
+        azureSubscription: DevOpsSharedResources    
+        KeyVaultName: kv-azdevops-shared
+        SecretsFilter: >- 
+          DOCKER-REGISTRY-USERNAME, DOCKER-REGISTRY-PASSWORD,
+          HELM-REGISTRY-NEXUS-USERNAME, HELM-REGISTRY-NEXUS-PASSWORD,
+          HELM-REGISTRY-ACR-USERNAME, HELM-REGISTRY-ACR-PASSWORD,
+          NEXUS-DEPS-USR, NEXUS-DEPS-PSW
+
+    - task: DownloadSecureFile@1
+      name: kubeconfig
+      displayName: 'Download kube-${{parameters.environment}}'
+      inputs:
+        secureFile: 'kube-${{parameters.environment}}'
+
+    - task: XmlParseFromVivo@4
+      displayName: Get Main Info
+      name: pom_info
+      inputs:
+        type: 'file'
+        origin: $(Build.SourcesDirectory)/src.src-retorno-fisco-spring-batch/pom.xml
+        jpaths: |
+          var POM_XML_VERSION = .project.version._text
+          var POM_XML_ARTIFACT_ID = .project.artifactId._text
+          var POM_XML_GROUP_ID = .project.groupId._text
+    
+    - task: YamlParseFromVivo@4
+      displayName: Get Helm/Kube Info
+      name: deploy_helm_kube_info
+      inputs:
+        type: 'file'
+        origin: $(Build.SourcesDirectory)/deploy.deploy-retorno-fisco-spring-batch/pipeline/properties.yaml
+        jpaths: |
+          # default
+          var KUBE_NAMESPACE = .kubernetes.namespace.${{parameters.environment}}
+                        
+          # "3.5.3"
+          var HELM_VERSION = helm.VERSION
+          # "conv86-helm"
+          var HELM_CHART_REPOSITORY = helm.CHART_REPOSITORY
+          # "helm-conv86"
+          var HELM_CHART_NAME = helm.CHART_NAME
+          # "1.0.79"
+          var HELM_CHART_VERSION = helm.CHART_VERSION
+          # "micro-service-conv86-spring-boot"
+          var HELM_APPLICATION_NAME = helm.APPLICATION_NAME
+          # "30s"
+          var HELM_WAIT_TIMEOUT = helm.WAIT_TIMEOUT
+
+    - task: YamlParseFromVivo@4
+      displayName: Get Env Info
+      name: deploy_env_info
+      inputs:
+        type: 'file'
+        origin: $(Build.SourcesDirectory)/deploy.deploy-retorno-fisco-spring-batch/env/${{parameters.environment}}.yaml
+        jpaths: |          
+          var DOCKER_REGISTRY = .global.imageRegistry
+          var DOCKER_REPOSITORY = .image.repository
+
+    - task: YamlParseFromVivo@4
+      displayName: Get Helm Chart Info
+      name: deploy_helm_chart_info
+      inputs:
+        type: 'file'
+        origin: $(Build.SourcesDirectory)/package.package-helm-retorno/Chart.yaml
+        jpaths: |
+          var CHART_VERSION = .version
+          var CHART_NAME = .name
+
+    - script: |
+        echo CHART_VERSION: $(CHART_VERSION)
+        echo CHART_NAME: $(CHART_NAME)
+    
+    - task: Bash@3
+      displayName: Download Charts
+      continueOnError: False
+      inputs:
+          targetType: inline
+          script: |
+            curl --user $(NEXUS-DEPS-USR):$(NEXUS-DEPS-PSW) https://nexus.telefonica.com.br/repository/conv86-helm/$(CHART_NAME)-$(CHART_VERSION).tgz -O
+            tar -zxvf $(CHART_NAME)-$(CHART_VERSION).tgz
+            rm $(CHART_NAME)-$(CHART_VERSION).tgz
+
+    - task: Bash@3
+      displayName: 'Create helm chart status '
+      condition: succeeded()
+      inputs:
+        targetType: inline
+        script: |              
+          helm --kubeconfig $(kubeconfig.secureFilePath) status retorno-fisco-spring-batch --namespace default
+
+    - task: Bash@3
+      displayName: 'Create helm chart upgrade '
+      condition: succeeded()
+      inputs:
+        targetType: inline
+        script: |        
+          helm repo add --force-update conv86-helm https://nexus.telefonica.com.br/repository/conv86-helm/ \
+          --insecure-skip-tls-verify \
+          --username $(NEXUS-DEPS-USR) \
+          --password $(NEXUS-DEPS-PSW) \
+          --kubeconfig $(kubeconfig.secureFilePath)
+
+          helm repo update --kubeconfig $(kubeconfig.secureFilePath)      
+          
+          helm \
+          --kubeconfig $(kubeconfig.secureFilePath) upgrade retorno-fisco-spring-batch \
+          --install helm-retorno -f $(Build.SourcesDirectory)/deploy.deploy-retorno-fisco-spring-batch/env/${{ parameters.environment }}.yaml \
+          --namespace default \
+          --wait \
+          --timeout 30s \
+          --set image.tag=$(POM_XML_VERSION)

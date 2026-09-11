@@ -1,0 +1,66 @@
+parameters:
+  - name: downloadSettings
+    type: boolean
+    default: false
+jobs:
+  - job: version_update
+    pool: GeneralPurposeLinuxAgentsCI
+    workspace:
+      clean: all
+    steps:
+    - task: AzureKeyVault@2
+      displayName: 'Getting AKV Credentials'
+      timeoutInMinutes: 1
+      retryCountOnTaskFailure: 5
+      inputs:
+        azureSubscription: 'DevOpsSharedResources'
+        KeyVaultName: 'kv-azdevops-shared'
+        SecretsFilter: 'NEXUS-DEPS-USR, NEXUS-DEPS-PSW, NEXUS-DEFAULT-USR, NEXUS-DEFAULT-PSW'
+    - script: echo "##vso[task.setvariable variable=NEXUS_DEFAULT_USR]$(NEXUS-DEPS-USR)"
+      displayName: Set NEXUS_DEFAULT_USR Var
+    - script: echo "##vso[task.setvariable variable=NEXUS_DEFAULT_PSW]$(NEXUS-DEPS-PSW)"
+      displayName: Set NEXUS_DEFAULT_PSW Var
+    - task: 6d15af64-176c-496d-b583-fd2ae21d4df4@1
+      displayName: Checkout Code
+      name: checkout_code 
+      inputs:
+        repository: self
+        persistCredentials: "true"
+        clean: true
+    - template: /tech_products/azr4/templates/steps/version_update.yaml
+      parameters:
+        downloadSettings: ${{ parameters.downloadSettings }}
+    - bash: |
+        echo "##[debug] TAG_REPO.....: ${TAG_REPO}"
+        if [[ "${FULL_BRANCH_NAME}" =~ .*/release/.* ]]; then
+          echo "##[debug] Branch is a release branch"
+          export BRANCH_NAME=release/${BRANCH_NAME}
+        fi
+        echo "##[debug] BRANCH_NAME.....: ${BRANCH_NAME}"
+        git config user.email "azuredevops@telefonica.com"
+        git config user.name "Azure DevOps"
+        git branch -a
+        git fetch --all
+        git checkout ${BRANCH_NAME}
+        git add ${VERSION_FILE_PATH}
+        git commit -m "[CI SKIP] Project version has been updated. Released version '${SET_VERSION_VERSION}'" --author="$BUILD_REQUESTEDFOR <$BUILD_REQUESTEDFOREMAIL>"
+
+        git tag ${SET_VERSION_VERSION} -m "[CI SKIP] Version: ${SET_VERSION_VERSION}, build: ${BUILD_BUILDID}"
+
+        git status
+        echo "##[command] git push origin ${BRANCH_NAME} --follow-tags"
+        git push origin ${BRANCH_NAME} --follow-tags
+
+        if [ $? -ne 0 ]; then 
+          echo "##vso[task.logissue type=error;] Git push failed. Permission denied"
+          echo "##vso[task.complete result=Failed;]"
+          exit 1
+        fi  
+
+        echo "##vso[task.setvariable variable=SET_VERSION_VERSION;isOutput=true]$SET_VERSION_VERSION"
+        echo "##[debug] Version updated to ${SET_VERSION_VERSION}"
+      env:
+        BRANCH_NAME: "$(Build.SourceBranchName)"
+        FULL_BRANCH_NAME: "$(Build.SourceBranch)"
+      name: commit_version
+      displayName: 'Commit Version'

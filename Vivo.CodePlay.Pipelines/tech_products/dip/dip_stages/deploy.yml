@@ -1,0 +1,99 @@
+parameters:
+- name: private_agent_pool
+- name: environment
+- name: kubeconfig
+- name: git_tag
+- name: helm_release_name_prefix
+- name: skip_deploy
+  default: false
+- name: useExternalEnv
+  default: false
+- name: azureServiceConnectionEnabled
+  default: false
+- name: kubernetesServiceConnectionEnabled
+  default: false
+- name: useArgoRolloutsDeploys
+  default: false
+- name: deployStrategy
+  default: ''
+
+stages:
+- stage: deploy
+  dependsOn:
+  - validation
+  pool: ${{ parameters.private_agent_pool }}
+  displayName: "Deploy ${{ parameters.environment }}"
+  jobs:
+  - deployment: ${{ parameters.environment }}
+    condition: and(always(), eq(variables.flowIsTagging, false), eq(variables.flowIsMain, true))
+    workspace:
+      clean: all
+    displayName: Deploy
+    environment: "deploy-${{ parameters.environment }}"
+    strategy:
+      runOnce:      
+        deploy:
+          steps:
+          - checkout: self
+          - template: /tasks/git/checkout_master_deploy.yml@CorePipelines
+          - template: /tasks/helm/utils.yml@CorePipelines
+            parameters:
+              environment: ${{parameters.environment}}
+          - template: /tech_products/dip/dip_stages/gov_app_ns_transform.yml
+            parameters:
+              namespace: $(K8S_NAMESPACE)
+              namespaceVariableOut: "X_K8S_NAMESPACE"
+              govAppAcronymEnv: $(GOV_APP_ACRONYM_NS)
+          - ${{ if or(eq(parameters.azureServiceConnectionEnabled, true), eq(parameters.kubernetesServiceConnectionEnabled, true)) }}:
+            - template: /task_groups/deploy/run_deploy_with_service_connection.yml@CorePipelines
+              parameters:
+                useArgoRolloutsDeploys: ${{ parameters.useArgoRolloutsDeploys }}
+                environment: ${{ parameters.environment }}
+                helmReleaseNamePrefix: ${{ parameters.helm_release_name_prefix }}
+                useExternalEnv: ${{ parameters.useExternalEnv }}
+                azureServiceConnectionEnabled: ${{ parameters.azureServiceConnectionEnabled }}
+                kubernetesServiceConnectionEnabled: ${{ parameters.kubernetesServiceConnectionEnabled }}
+                k8sNamespace: $(X_K8S_NAMESPACE)
+                deployStrategy: ${{ parameters.deployStrategy }}
+          - ${{ else }}:
+            - template: /task_groups/deploy/run_deploy.yml@CorePipelines
+              parameters:
+                useArgoRolloutsDeploys: ${{ parameters.useArgoRolloutsDeploys }}
+                environment: ${{ parameters.environment }}
+                kubeconfig: ${{ parameters.kubeconfig }}
+                helmReleaseNamePrefix: ${{ parameters.helm_release_name_prefix }}
+                useExternalEnv: ${{ parameters.useExternalEnv }}
+                k8sNamespace: $(X_K8S_NAMESPACE)
+                deployStrategy: ${{ parameters.deployStrategy }}
+          - template: /task_groups/deploy/eventhub_register_deploy_taskgroup.yml@CorePipelines
+            parameters:
+              eventHubConnection: 'EVHCodeProd'
+              componentVersion: $(HELM_IMAGE_TAG)
+              deployArtifactName: '$(HELM_IMAGE_REPOSITORY):$(HELM_IMAGE_TAG)'
+              deployArtifactType: 'container'
+              deployEnvironmentType: 'kubernetes'
+              deployEnvironmentName: ${{ parameters.environment }}
+              deployEnvironmentCluster: $(ExtractClusterInfo.K8S_CLUSTER_NAME)
+              deployEnvironmentNamespace: $(X_K8S_NAMESPACE)
+              deployEnvironmentAccessUrl: $(ExtractUrls.K8S_APP_URL_LIST)
+              annotations: 'helm-chart=$(DEFAULT_GENERIC_JAVA_CHART_NAME),helm-release=$(HELM_RELEASE_NAME),helm-chart-version=$(DEFAULT_GENERIC_JAVA_CHART_VERSION)'
+              pipelineType: 'vivo-codeplay-pipelines/dip/deploy-helm-java'
+              deployStrategy: ${{ parameters.deployStrategy }}
+        on:
+          success:
+            steps:
+            - ${{ if and( not(startsWith(variables['Build.SourceBranch'], 'refs/tags')), eq(parameters.git_tag, 'true') ) }}:
+              - template: /task_groups/deploy/run_pos_deploy_success.yml@CorePipelines
+                parameters:
+                  environment: ${{ parameters.environment }}
+            - template: /task_groups/governance/check_govapp_policies.yml@CorePipelines
+              parameters:
+                govAppBreakglass: false
+                govAppOperation: "deploy"
+                continueOnError: false
+                environment: ${{ parameters.environment }}
+                stack: "JAVA"
+              
+          failure:
+            steps:
+            - template: /task_groups/deploy/run_pos_deploy_failure.yml@CorePipelines

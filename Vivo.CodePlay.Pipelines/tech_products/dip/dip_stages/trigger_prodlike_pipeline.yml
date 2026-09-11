@@ -1,0 +1,74 @@
+parameters: []
+
+steps:
+- bash: |
+    echo "##[group]Triggering Prod-Like Pipeline"
+
+    TAG="$(Build.SourceBranchName)"
+    DEFINITION_ID="$(System.DefinitionId)"
+    COLLECTION_URI="$(System.CollectionUri)"
+    PROJECT="$(System.TeamProject)"
+    TOKEN="$(System.AccessToken)"
+
+    echo "Tag: $TAG"
+    echo "Definition ID: $DEFINITION_ID"
+    echo "Collection URI: $COLLECTION_URI"
+    echo "Project: $PROJECT"
+
+    # Validate inputs
+    [ -z "$TAG" ]            && echo "##[error]Build.SourceBranchName is empty."  && exit 1
+    [ -z "$DEFINITION_ID" ]  && echo "##[error]System.DefinitionId is empty."     && exit 1
+    [ -z "$COLLECTION_URI" ] && echo "##[error]System.CollectionUri is empty."    && exit 1
+    [ -z "$PROJECT" ]        && echo "##[error]System.TeamProject is empty."      && exit 1
+    [ -z "$TOKEN" ]          && echo "##[error]System.AccessToken is empty."      && exit 1
+
+    # Prepare REST API body
+    # templateParameters only accepts parameters declared at the pipeline's top-level YAML.
+    # Parameters inside extended templates (useExternalEnv, ACRAsDefaultDockerRegistry, etc.)
+    # are not exposed to the REST API — they use their values already set in the pipeline config.
+    BODY=$(cat <<EOF
+    {
+      "resources": { "repositories": { "self": { "refName": "refs/tags/$TAG" } } },
+      "templateParameters": {
+        "qa_environment": "prodlike"
+      }
+    }
+    EOF
+    )
+
+    PROJECT_ENCODED="${PROJECT// /%20}"
+    URI="${COLLECTION_URI}${PROJECT_ENCODED}/_apis/pipelines/${DEFINITION_ID}/runs?api-version=7.0"
+
+    echo "Request Body: $BODY"
+    echo "POST $URI"
+
+    RESPONSE=$(curl -s -w "\n%{http_code}" \
+      -X POST "$URI" \
+      -H "Authorization: Bearer $SYSTEM_ACCESSTOKEN" \
+      -H "Content-Type: application/json" \
+      -d "$BODY" \
+      --max-time 30)
+
+    HTTP_STATUS=$(echo "$RESPONSE" | tail -1)
+    BODY_RESPONSE=$(echo "$RESPONSE" | head -n -1)
+
+    echo "HTTP Status: $HTTP_STATUS"
+    echo "Response: $BODY_RESPONSE"
+
+    if [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 300 ]; then
+      BUILD_ID=$(echo "$BODY_RESPONSE" | grep -o '"id":[0-9]*' | head -1 | grep -o '[0-9]*')
+      BUILD_URL=$(echo "$BODY_RESPONSE" | grep -o '"url":"[^"]*"' | head -1 | cut -d'"' -f4)
+      echo "##[section]Prod-Like pipeline triggered successfully!"
+      echo "New Build ID: $BUILD_ID"
+      echo "Build URL: $BUILD_URL"
+      echo "##vso[task.setvariable variable=PRODLIKE_BUILD_ID]$BUILD_ID"
+    else
+      echo "##[error]Failed to trigger Prod-Like pipeline. HTTP Status: $HTTP_STATUS"
+      echo "##[error]Response: $BODY_RESPONSE"
+      exit 1
+    fi
+
+    echo "##[groupEnd]"
+  displayName: 'Trigger Prod-Like Pipeline via REST API'
+  env:
+    SYSTEM_ACCESSTOKEN: $(System.AccessToken)

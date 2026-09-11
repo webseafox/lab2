@@ -1,0 +1,254 @@
+parameters:
+- name: base_repository_with_package_json
+  type: string
+  default: $(Build.SourcesDirectory)/$(Build.Repository.Name)
+
+stages:
+- stage: repo_finalize_validations
+  dependsOn:
+  - package
+  displayName: "Finalize project validations"
+  pool: $(PRIVATE_AGENT_DEFAULT)
+  jobs:
+    - job: "project_validations"
+      displayName: "Finalize"
+      steps:
+      - checkout: CorePipelinesScripts
+        persistCredentials: true
+        fetchDepth: 1
+      - checkout: self
+        fetchDepth: 1
+
+      - template: /tasks/catalog_info/extract_variables.yml
+
+      - bash: |
+          echo "##[debug] Skipando de envio dos dados do Pull Request a Wiki do Confluence"
+          echo "##[debug] Variável DEVFLOW_PUBLISH_CONFLUENCE não está com valor = true ou a branch é main/master"
+        displayName: "Send to Wiki Enabled/Disabled"
+        condition: and(
+                    succeeded(),        
+                    or(
+                      ne(variables.DEVFLOW_PUBLISH_CONFLUENCE, true),
+                      ne(variables.flowIsMain, true)
+                    )          
+                  )
+      
+      - bash: |
+          verify_and_stop_if_error() {
+            if [[ $? != 0 ]]; then
+              exit 1
+            fi
+          }
+          cd $(Build.SourcesDirectory)/$(Build.Repository.Name)
+          SCRIPT_PATH=$(Agent.TempDirectory)/devflow_finalize_validations.py
+          SCRIPT_PATH_UPDATE_IDS=$(Agent.TempDirectory)/devflow_finalize_validations_update.py
+          export JSON_FILE_WITH_IDS=$(Agent.TempDirectory)/ids.json
+          export APP_NAME=$(sed -r 's/(-)(\w)/-\U\2/g' <<<"${APP_NAME^}")
+          export APP_NAME_TEMP=$APP_NAME
+          export BASE_REST_API_URL=$(echo "$SYSTEM_TEAMFOUNDATIONCOLLECTIONURI" | sed  "s/https:\/\///")          
+          export TEXT_WIKI="$(Build.SourcesDirectory)/$(Build.Repository.Name)/text-wiki.html"
+          export DATETIME_FOR_API="$(date '+%F %T' -u)"
+          PACKAGE_JSON_FILE=${{ parameters.base_repository_with_package_json }}/package.json
+          export APP_GET_VERSION=$(jq -r .version $PACKAGE_JSON_FILE)
+          verify_and_stop_if_error $(echo $?)
+          echo "##[debug] Etapa de envio dos dados do Pull Request para a Wiki do Confluence $DEVFLOW_API_PRE_WRITE"
+
+          # Cria Script de busca de dados caso não exista
+          if [ ! -f $SCRIPT_PATH ]; then
+            cat <<EOF > $SCRIPT_PATH
+          # -*- coding: utf-8 -*-
+          #!/usr/bin/env python
+          import json
+          import os
+          import sys
+          import requests
+          import urllib.parse
+          requests.packages.urllib3.disable_warnings()
+          from requests.auth import HTTPBasicAuth
+
+          def get_pull_request_data_from_custom_api():
+            """"Retorna os dados enviados para a api \"Pre-write\" """
+            try:
+              datetime_for_api=urllib.parse.quote(os.getenv('DATETIME_FOR_API'))
+              team_project = urllib.parse.quote(os.getenv('SYSTEM_TEAMPROJECT'))
+              devflow_api_pre_write = os.getenv('DEVFLOW_API_PRE_WRITE')
+              app_name = os.getenv('APP_NAME_TEMP')
+              url_base_url_api = f'{devflow_api_pre_write}/{app_name}?datetime={datetime_for_api}&owner={team_project}'
+              headers = {'Content-Type': 'application/json'}
+              print(f'##[debug] Buscando dados através da url {url_base_url_api}')
+
+              data_from_api_custom  = requests.get(url_base_url_api,
+                                                  headers=headers,
+                                                  proxies={'http': '','https': ''},
+                                                  verify=False
+                                              )            
+              if not data_from_api_custom.status_code == 200:
+                  print(f'##[error] Não foi possível retornar os dados da API url {url_base_url_api}')
+                  sys.exit(1)
+              
+              data_from_api_custom = data_from_api_custom.json()
+              if len(data_from_api_custom):
+                  return data_from_api_custom
+              
+              print(f'##[debug] Não foram encontrados dados para enviar para a Wiki')
+              return []
+                
+            except Exception as e:
+              print(f'## [debug] Exception')
+              print('##[debug] Um erro ao tentar retornar os dados')
+              sys.exit(1)
+
+          def get_pull_request_data_from_azure(pull_request_id):
+            """Retorna dados do Pull request na api da Azure"""
+            try:
+              auth_org_name = os.getenv('REST_ORG_NAME')
+              auth_api_rest_token = os.getenv("SYSTEM_ACCESSTOKEN")
+              base_rest_api_url = os.getenv('SYSTEM_TEAMFOUNDATIONCOLLECTIONURI', '').replace('https://','')
+              team_project = urllib.parse.quote(os.getenv('SYSTEM_TEAMPROJECT'))
+              rest_azure_api_version = os.getenv('REST_AZURE_API_VERSION')
+              url_base_url_api = f'https://{auth_org_name}:{auth_api_rest_token}@{base_rest_api_url}{team_project}/_apis/git/pullrequests/{pull_request_id}?api-version={rest_azure_api_version}'
+              headers = {'Content-Type': 'application/json'}
+              
+              pull_request_data  = requests.get(url_base_url_api,
+                                              headers=headers,
+                                              auth=HTTPBasicAuth(auth_org_name, auth_api_rest_token),
+                                              proxies={'http': os.getenv('HTTP_PROXY'), 'https': os.getenv('HTTP_PROXY')},
+                                              verify=False
+                                            )            
+              print(pull_request_data)
+              if not pull_request_data.status_code == 200:
+                print(f'##[error] Não foi possível retornar os dados do Pull request na url {url_base_url_api}')
+                sys.exit(1)
+
+              pull_request_data = pull_request_data.json()
+              if pull_request_data.get('status', '') == 'completed' and pull_request_data.get('mergeStatus', '') == 'succeeded':
+                return pull_request_data
+              
+              return []
+                
+            except Exception as e:
+              print(f'## [debug] Exception')
+              print('##[debug] Houve um erro ao tentar atualizar os dados')
+              sys.exit(1)
+
+          app_get_version = os.getenv('APP_GET_VERSION')
+          text_wiki_file  = os.getenv('TEXT_WIKI')
+          data_from_api_pre_write = get_pull_request_data_from_custom_api()
+          
+          if len(data_from_api_pre_write):
+            ids_for_update = []
+            text_wiki = ''
+            final_text_wiki = ''
+            for item in data_from_api_pre_write:
+              item_id = item.get('id')
+              item_description = item.get('description')
+              item_pull_request_id = item.get('merge_request_id')
+              
+              data_azure = get_pull_request_data_from_azure(item_pull_request_id)
+              
+              if not len(data_azure):
+                print(f'## [error] Sem dados para publicar na Wiki para o Pull Request {item_pull_request_id} com  status=completed e mergeStatus=succeeded')
+                continue
+             
+              ids_for_update.append(f"{item_id}")
+
+              reviewers = data_azure.get('reviewers', [])
+              if not len(reviewers):
+                print(f'## [error] Não foi possível obter a lista de revisores/aprovadores')
+                sys.exit(1)
+              
+              text_wiki += '<h4>Aprovadores 👍</h4>'
+              for reviewer in reviewers:
+                reviewer_name = reviewer.get('displayName')
+                reviewer_email = reviewer.get('uniqueName')
+                text_wiki += f'<p>{reviewer_name} {reviewer_email}</p>'
+
+              #Adicionando a descrição (recuperada da api pre-write)
+              print(item_description)           
+              text_wiki += f'{item_description} <br/>'
+
+            file_is_ok = False
+            if len(text_wiki):
+              file_is_ok = False
+              final_text_wiki = f'<h2>Versão: {app_get_version}</h2> <br/> {text_wiki} <hr/>'  
+
+              try:
+                final_text_wiki = final_text_wiki.replace('\n', '')
+                f = open(text_wiki_file, 'w')
+                f.write(final_text_wiki)
+                f.close() 
+                file_is_ok = True
+              except Exception as e:
+                print(f'## [debug] {e}')
+                sys.exit(1)
+            
+            if file_is_ok:
+              with open(os.getenv('JSON_FILE_WITH_IDS') , 'w' ) as write_data: 
+                json.dump(ids_for_update , write_data ) 
+          EOF
+          fi 
+
+          # Cria Script de atualização de dados caso não exista
+          if [ ! -f $SCRIPT_PATH_UPDATE_IDS ]; then
+            cat <<EOF > $SCRIPT_PATH_UPDATE_IDS
+          # -*- coding: utf-8 -*-
+          #!/usr/bin/env python
+          import json
+          import os
+          import sys
+          import requests
+          import urllib.parse
+          requests.packages.urllib3.disable_warnings()
+
+          def update_items_by_array_of_ids(ids):
+            """Atualiza o status published para 1 de acordo com os ids ex [\"1as-addd-dd112\", \"asdf-123-1dd2\"]"""
+            try:
+              headers = {'Content-Type': 'application/json'}
+              owner = urllib.parse.quote(os.getenv('SYSTEM_TEAMPROJECT'))
+              url_base_url_api = os.getenv('DEVFLOW_API_PRE_WRITE')
+              url_base_url_api = f'{url_base_url_api}?owner={owner}'
+              
+              print(f'##[debug] Enviando requisição PUT para {url_base_url_api}')
+              put_data = requests.put(url_base_url_api, json=ids, headers=headers, proxies={'http': '','https': ''},)
+
+              if put_data.status_code == 200:
+                  print(f'🥳 ❤️ Dados atualizados ❤️ 🥳')  
+                  return True
+
+              error_msg = f'## [debug] Não foi possível atualizar o status dos ids informados (http code {put_data.status_code})'
+              print(error_msg)
+              print('##[debug] Isso não é um problema mas poderá gerar conteúdo redundante na Wiki do Confluence')
+            except Exception as e:
+              print(f'## [debug] Exception')
+              print('##[debug] Um erro ao tentar atualizar os dados')
+              sys.exit(1)
+
+          ids_for_update = []
+          with open(os.getenv('JSON_FILE_WITH_IDS') , 'r' ) as read_data: 
+            ids_for_update = json.load(read_data)
+          print('##[debug] Atualizando registros na api Pre-write')
+          update_items_by_array_of_ids(ids_for_update)
+          EOF
+          fi
+
+          python $SCRIPT_PATH
+
+          verify_and_stop_if_error $(echo $?)
+          
+          if [ -f $JSON_FILE_WITH_IDS ]; then
+            python $(Build.SourcesDirectory)/Vivo.Core.Pipelines.Scripts/app.py --call-wiki-confluence --wiki-confluence-file $TEXT_WIKI
+            verify_and_stop_if_error $(echo $?)
+            python $SCRIPT_PATH_UPDATE_IDS
+          fi
+        displayName: "Send to Wiki"
+        env:
+          SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+          http_proxy: $(PROXY_AGENT_HTTP)
+          https_proxy: $(PROXY_AGENT_HTTPS)
+          no_proxy: $(PROXY_AGENT_NO_PROXY)
+        condition: and(
+                  succeeded(),
+                  eq(variables.DEVFLOW_PUBLISH_CONFLUENCE, true),
+                  eq(variables.flowIsMain, true)
+                )
+      

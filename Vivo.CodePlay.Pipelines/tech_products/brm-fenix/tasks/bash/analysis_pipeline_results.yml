@@ -1,0 +1,80 @@
+# This YAML file defines a pipeline task for analyzing the results of a pipeline run.
+# It takes two parameters: stagesCompleted and stagesInProgress, which are lists of stages and their corresponding results.
+# The task consists of two steps:
+# 1. The first step uses the CmdLine task to process the stagesCompleted parameter.
+#    It iterates over each stage in the list and checks its result.
+#    Depending on the result, it prints a debug message or logs an error.
+#    If any stage fails, it sets the PIPELINE_FAILED variable and marks the task as failed.
+# 2. The second step does the same for the stagesInProgress parameter, but also includes job names.
+
+parameters:
+- name: stagesCompleted
+- name: stagesInProgress
+
+steps:
+- task: CmdLine@2
+  displayName: "Analysis Results"
+  name: stage_result
+  continueOnError: true
+  inputs:
+    script: |
+      # Process the stagesCompleted parameter
+      STAGES_COMPLETED="${{ parameters.stagesCompleted }}"
+      STAGES_INPROGRESS="${{ parameters.stagesInProgress }}"
+
+      STAGE_FAILED=""
+
+      # Split the stagesCompleted parameter into an array and process each stage
+      IFS=';' read -ra ADDR <<< "$STAGES_COMPLETED"
+      for i in "${ADDR[@]}"; do
+        IFS=$',' read -ra arr -d '' <<<"$i"
+        STAGE_NAME=${arr[0]}
+        STAGE_RESULT=$(echo ${arr[2]} | xargs)
+        
+        # Check the result of each stage and print a debug message or log an error
+        if [ "$STAGE_RESULT" == "succeeded" ]; then
+          printf "##[debug] %-50s: Succeeded\n" "$STAGE_NAME"
+        elif [ "$STAGE_RESULT" == "skipped" ]; then
+          printf "##[debug] %-50s: Skipped\n" "$STAGE_NAME"
+        elif [ "$STAGE_RESULT" == "failed" ]; then
+          printf "##vso[task.logissue type=error;] %-50s: Failed\n" "$STAGE_NAME"
+
+          STAGE_FAILED=$STAGE_NAME
+        else
+          printf "##[debug] %-50s: %s\n" "$STAGE_NAME" "$STAGE_RESULT"
+        fi
+      done
+      
+      # Split the stagesInProgress parameter into an array and process each stage and job
+      IFS=';' read -ra ADDR <<< "$STAGES_INPROGRESS"
+      for i in "${ADDR[@]}"; do
+        IFS=$',' read -ra arr -d '' <<<"$i"
+        STAGE_NAME=${arr[0]}
+        JOB_NAME=${arr[1]}
+        JOB_RESULT=$(echo ${arr[2]} | xargs)
+
+        # Check the result of each job and print a debug message or log an error
+        if [ "$JOB_RESULT" == "succeeded" ]; then
+          printf "##[debug] %-50s: Succeeded\n" "$STAGE_NAME >> $JOB_NAME"
+        elif [ "$JOB_RESULT" == "skipped" ]; then
+          printf "##[debug] %-50s: Skipped\n" "$STAGE_NAME >> $JOB_NAME"
+        elif [ "$JOB_RESULT" == "failed" ]; then
+          printf "##[debug] %-50s: Failed\n" "$STAGE_NAME >> $JOB_NAME"
+
+          STAGE_FAILED="$STAGE_NAME >> $JOB_NAME"
+        else
+          printf "##[debug] %-50s: inProgress\n" "$STAGE_NAME >> $JOB_NAME"
+        fi
+      done
+
+      # If any stage failed, set the PIPELINE_RESULT variable and mark the task as failed
+      if [ "$STAGE_FAILED" != "" ]; then
+        echo "##vso[task.setvariable variable=PIPELINE_STAGE_FAILED;isoutput=true]$STAGE_FAILED"
+        echo "##vso[task.setvariable variable=PIPELINE_RESULT;isoutput=true]Failed"
+
+        echo "##vso[task.logissue type=error;]There was an error in stage [$STAGE_FAILED] !!"
+        echo "##vso[task.complete result=Failed;]"
+      else
+        echo "##vso[task.setvariable variable=PIPELINE_STAGE_FAILED;isoutput=true]No failure"
+        echo "##vso[task.setvariable variable=PIPELINE_RESULT;isoutput=true]Finish"
+      fi

@@ -1,0 +1,119 @@
+parameters:
+- name: enableFortifyExclusions
+  type: boolean
+  default: false
+
+jobs:
+# =================================================================
+# JOB 1: PEGA AS CHAVES (AGORA SEM O PROXY BLOQUEANDO)
+# =================================================================
+- job: AppSecConfigKeys
+  displayName: 'Get AppSec Config Keys'
+  pool:
+    name: 'GeneralPurposeLinuxAgentsCI'
+  # Removido o bloco "variables:" de proxy que estava causando o timeout!
+  steps:
+    - script: |
+        # FIX: Limpa proxy antes do cofre para não dar Timeout
+        echo "##vso[task.setvariable variable=PROXY_AGENT_HTTPS]"
+        echo "##vso[task.setvariable variable=PROXY_AGENT_HTTP]"
+        echo "##vso[task.setvariable variable=http_proxy]"
+        echo "##vso[task.setvariable variable=https_proxy]"
+      displayName: 'Limpa Proxy para o Cofre'
+
+    - template: /security/get_appconfig_keys.yml@CodePlay
+      parameters:
+        repositoryName: $(Build.Repository.Name)
+        azureSubscription: "DevOpsSharedResources"
+        appConfigurationEndpoint: "https://appcs-azdevops-shared.azconfig.io"
+
+# =================================================================
+# JOB 2: ANÁLISE FORTIFY
+# =================================================================
+- job: FortifyAnalysis
+  displayName: 'Security Analysis - Fortify SAST'
+  dependsOn: AppSecConfigKeys
+  variables:
+    USE_FORTIFY: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.USE_FORTIFY'] ]
+  condition: and(succeeded(), eq(variables.USE_FORTIFY, 'true'))
+  pool:
+    name: 'GeneralPurposeLinuxAgentsCI'
+    
+  steps:
+    - script: |
+        echo "##[section] Configurando Flags de Segurança (Fortify/Conviso)"
+        
+        SIGLA=$(echo $(System.TeamProject) | cut -d' ' -f1)
+        COMPANY_ID=430
+        
+        echo "##vso[task.setvariable variable=DYNAMIC_COMPANY_ID]${COMPANY_ID}"
+        echo "##vso[task.setvariable variable=CONVISO_COMPANY_ID]${COMPANY_ID}"
+        echo "##vso[task.setvariable variable=convisoCompanyId]${COMPANY_ID}"
+        echo "##vso[task.setvariable variable=USE_CONVISO]true"
+        echo "##vso[task.setvariable variable=AKV_DEVOPS_NAME]kv-azdevops-shared"
+        
+        # FIX DE REDE: Mantém a limpeza do proxy aqui também
+        echo "##vso[task.setvariable variable=PROXY_AGENT_HTTPS]"
+        echo "##vso[task.setvariable variable=PROXY_AGENT_HTTP]"
+        echo "##vso[task.setvariable variable=http_proxy]"
+        echo "##vso[task.setvariable variable=https_proxy]"
+        echo "##vso[task.setvariable variable=no_proxy]localhost,127.0.0.1,.evn-viv.cc,sca.evn-viv.cc"
+        
+        mkdir -p /devops/vsts-agent/certs
+        touch /devops/vsts-agent/certs/CACORP.pem
+        echo "insecure" > ~/.curlrc
+        echo "noproxy = .evn-viv.cc,sca.evn-viv.cc" >> ~/.curlrc
+        
+        echo "##vso[task.setvariable variable=prepare_fortify.PROJECT_ID]$(FORTIFY_PROJECT_ID)"
+
+      displayName: 'Setup Fortify & Conviso Flags'
+
+    # --- NOVO: ABRINDO O COFRE NO JOB DO FORTIFY ---
+    # Isso garante que a variável da versão nasça dentro deste Job!
+    - template: /security/get_appconfig_keys.yml@CodePlay
+      parameters:
+        repositoryName: $(Build.Repository.Name)
+        azureSubscription: "DevOpsSharedResources"
+        appConfigurationEndpoint: "https://appcs-azdevops-shared.azconfig.io"
+
+    # =================================================================
+    # DEFINE A VERSÃO DINÂMICA (INLINE FIX)
+    # Substitui o template defeituoso do CodePlay para Pull Requests
+    # =================================================================
+    - task: Bash@3
+      displayName: "Defining App Security Asset Version (Local Fix)"
+      inputs:
+        targetType: 'inline'
+        script: |
+          if [[ "$(Build.Reason)" == "PullRequest" ]]; then
+            # CORRIGIDO: Agora pega a branch de origem do PR
+            BRANCH_NAME="${PR_SOURCE_BRANCH#refs/heads/}"
+          else
+            BRANCH_NAME="${SOURCE_BRANCH#refs/heads/}"
+          fi
+
+          if [[ "$BRANCH_NAME" =~ ^(master|main)$ ]]; then
+            APP_VERSION="${FORTIFY_APP_DEFAULT_VERSION}"
+          elif [[ "$BRANCH_NAME" =~ release ]]; then
+            APP_VERSION="${FORTIFY_APP_DEFAULT_VERSION}-release"
+          else
+            APP_VERSION="${FORTIFY_APP_DEFAULT_VERSION}-${BRANCH_NAME}"
+          fi
+
+          # Exportando a versão da aplicação
+          echo "##vso[task.setvariable variable=FORTIFY_APP_VERSION]$APP_VERSION"
+          echo "Exportando a Versão '${APP_VERSION}' da aplicação para variável FORTIFY_APP_VERSION."
+      env:
+        SOURCE_BRANCH: "$(Build.SourceBranch)"
+        PR_SOURCE_BRANCH: "$(System.PullRequest.SourceBranch)"
+        FORTIFY_APP_DEFAULT_VERSION: "$(FORTIFY_APP_DEFAULT_VERSION)"
+
+    # --- CHAMA O SCAN COM A VERSÃO CORRETA ---
+    - template: /security/run_fortify_scan.yml@CodePlay
+      parameters:
+        repositoryName: $(Build.Repository.Name)
+        enableFortifyExclusions: ${{ parameters.enableFortifyExclusions }}
+        fortifyExclusionRepository: 'FortifyExclusion'
+        convisoCompany: $(DYNAMIC_COMPANY_ID)
+        appVersion: "$(FORTIFY_APP_VERSION)" 
+        vivoFlow: "master,main,develop,homolog,melhorias"

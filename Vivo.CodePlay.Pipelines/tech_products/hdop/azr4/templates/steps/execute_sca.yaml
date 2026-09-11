@@ -1,0 +1,230 @@
+parameters:
+- name: scaAnalysisType
+  type: string
+  default: 'filesystem'
+  values:
+  - filesystem
+  - image
+- name: fullImageName
+  type: string
+  default: ''
+
+steps:
+- script: |
+    set -e
+    if [[ "${SCA_ANALYSIS_TYPE}" == 'filesystem' ]]; then
+      echo "##[debug] Running filesystem SCA analysis"
+      FEATURE_FLAG_PATH="op-sca/dependency-track"
+      REPOSITORY_KEY="${REPOSITORY_KEY}"
+      CONTAINER_TYPE_ARG=""
+      FF_STAGE="DEPENDENCY_TRACK"
+    elif [[ "${SCA_ANALYSIS_TYPE}" == 'image' ]]; then
+      echo "##[debug] Running image SCA analysis"
+      FEATURE_FLAG_PATH="op-container/dependency-track"
+      REPOSITORY_KEY="${REPOSITORY_KEY}-docker"
+      CONTAINER_TYPE_ARG="--container"
+      FF_STAGE="DT_DOCKER"
+    else
+      echo "##[error] Error: SCA_ANALYSIS_TYPE must be 'filesystem' or 'image'"
+      exit 1
+    fi
+    echo "##vso[task.setvariable variable=FEATURE_FLAG_PATH;isOutput=true]${FEATURE_FLAG_PATH}"
+    echo "##vso[task.setvariable variable=REPOSITORY_KEY;isOutput=true]${REPOSITORY_KEY}"
+    echo "##vso[task.setvariable variable=CONTAINER_TYPE_ARG;isOutput=true]${CONTAINER_TYPE_ARG}"
+    echo "##vso[task.setvariable variable=FF_STAGE;isOutput=true]${FF_STAGE}"
+    echo "##[debug] FEATURE_FLAG_PATH: ${FEATURE_FLAG_PATH}, REPOSITORY_KEY: ${REPOSITORY_KEY}, CONTAINER_TYPE_ARG: ${CONTAINER_TYPE_ARG}, FF_STAGE: ${FF_STAGE}"
+  displayName: 'Define Variables'
+  name: define_sca_vars
+  env:
+    REPOSITORY_KEY: $(System.TeamProject)-$(Build.Repository.Name)
+    SCA_ANALYSIS_TYPE: ${{ parameters.scaAnalysisType }}
+# Por algum motivo as vezes o pipeline nao encontra o binario, por isso o download e feito novamente
+- template: /tech_products/hdop/templates/steps/download_nexus_artifact.yaml
+  parameters:
+    file: 'securitygatecli-linux-amd64'
+    folder: 'devops'
+    outputFilePath: 'securitygatecli'
+    version: $(SECURITY_GATE_CLI_VERSION)
+    chmod: 755
+- script: |
+    #!/bin/bash
+    if [[ "${DEVOPS_EXECUTE_SCA}" == "false" ]]; then
+      echo "##[debug] SCA is disabled by devops"
+      echo "##vso[task.setvariable variable=SCA_ENABLED;isOutput=true]false"
+      exit 0
+    fi
+    echo '##[debug] Checking if fortify analysis is enabled'
+    ./securitygatecli --version
+    echo "##[command] ./securitygatecli ff --project '${AZDO_PROJECT}' --project-id ${PROJECT_ID} --id ${COMPONENT_ID} --name '${COMPONENT_NAME}' --stage ${FEATURE_STAGE} ${SECURITY_GATE_CLI_ARGS}"
+    shouldExecute=$(./securitygatecli ff --project "${AZDO_PROJECT}" --project-id ${PROJECT_ID} --id ${COMPONENT_ID} --name "${COMPONENT_NAME}" --stage ${FEATURE_STAGE} ${SECURITY_GATE_CLI_ARGS})
+    shouldExecute=$(echo $shouldExecute | xargs) # Trim whitespace
+    echo "##[debug] shouldExecute: $shouldExecute"
+    if [[ "$shouldExecute" == "false" ]]; then
+      echo "##[debug] SCA analysis is not enabled"
+      echo "##vso[task.setvariable variable=SCA_ENABLED;isOutput=true]false"
+    else
+      echo "##[debug] SCA analysis is enabled"
+      echo "##vso[task.setvariable variable=SCA_ENABLED;isOutput=true]true"
+    fi
+  displayName: 'Check if SCA Analysis is Enabled'
+  name: check_ff
+  env:
+    AZURE_APP_CONFIG_CONNECTION_STRING: $(AZURE_APP_CONFIG_CONNECTION_STRING)
+    AZDO_PROJECT: $(System.TeamProject)
+    COMPONENT_NAME: $(Build.Repository.Name)
+    PROJECT_ID: $(System.TeamProjectId)
+    COMPONENT_ID: $(Build.Repository.ID)
+    FEATURE_STAGE: $(define_sca_vars.FF_STAGE)
+    SECURITY_GATE_CLI_ARGS: "--debug"
+    DEVOPS_EXECUTE_SCA: true
+- bash: |
+    echo "##[debug]Getting SYFT Tool..."
+    curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /devops/syft
+
+    echo "##[debug]SYFT Version: "
+    /devops/syft/syft --version
+
+    echo "##[debug]Running syft for repo ..."
+    TMPDIR=$(Agent.TempDirectory) /devops/syft/syft scan dir:. --verbose -o cyclonedx-json=raw_cyclonedx_report.json
+
+    jq '.components |= unique_by(.name,.version)' raw_cyclonedx_report.json > sbom.json
+
+    if [ -e "sbom.json" ]; then
+      echo "##[debug]Scan completed."
+    else
+      echo "##[debug]Scan fail."
+      exit 1
+    fi
+  displayName: 'Run Filesystem SCA Analysis'
+  condition: and(succeeded(), eq(variables['check_ff.SCA_ENABLED'], 'true'), ${{ eq(parameters.scaAnalysisType, 'filesystem') }})
+
+- script: |
+    echo "##[debug] Running Image SCA Analysis"
+    TMPDIR=$(Agent.TempDirectory) /devops/syft/syft scan image:${FULL_IMAGE_NAME} --verbose -o cyclonedx-json=raw_cyclonedx_report.json
+
+    jq '.components |= unique_by(.name,.version)' raw_cyclonedx_report.json > sbom.json
+
+    if [ -e "sbom.json" ]; then
+      echo "##[debug]Scan completed."
+    else
+      echo "##[debug]Scan fail."
+      exit 1
+    fi
+  displayName: 'Run Image SCA Analysis'
+  condition: and(succeeded(), eq(variables['check_ff.SCA_ENABLED'], 'true'), ${{ eq(parameters.scaAnalysisType, 'image') }})
+  env:
+    FULL_IMAGE_NAME: ${{ parameters.fullImageName }}
+    TMPDIR: /devops
+- script: |
+    echo "##[debug] Publishing SBOM to Dependency Track ${REPOSITORY_KEY}"
+    curl -X "POST" "https:///sca.redecorp.br/api/v1/bom" \
+          -H 'Content-Type: multipart/form-data' \
+          -H "X-Api-Key: ${DT_API_KEY}" \
+          -F "autoCreate=true" \
+          -F "projectName=${REPOSITORY_KEY}" \
+          -F "projectVersion=DevSecOps" \
+          -F "tags=[{\"name\": \"4p\"}]" \
+          -F "bom=@sbom.json"
+  displayName: 'Publish to Dependency Track'
+  condition: and(succeeded(), eq(variables['check_ff.SCA_ENABLED'], 'true'))
+  env:
+    DT_API_KEY: $(DT_API_KEY)
+    REPOSITORY_KEY: $(define_sca_vars.REPOSITORY_KEY)
+# Por algum motivo as vezes o pipeline nao encontra o binario, por isso o download e feito novamente
+- template: /tech_products/hdop/templates/steps/download_nexus_artifact.yaml
+  parameters:
+    file: 'securitygatecli-linux-amd64'
+    folder: 'devops'
+    outputFilePath: 'securitygatecli'
+    version: $(SECURITY_GATE_CLI_VERSION)
+    chmod: 755
+- script: |
+    SIGLA=$(echo ${AZDO_PROJECT} | cut -d' ' -f1)
+    if [[ "${SIGLA}" == "VVMY" ]]; then
+      echo "##[debug] SIGLA: ${SIGLA} -> Setting COMPANY_ID to 639."
+      export COMPANY_ID='639'
+    elif [[ "${SIGLA}" == "VLSS" ]]; then
+      echo "##[debug] SIGLA: ${SIGLA} -> Setting COMPANY_ID to 862."
+      export COMPANY_ID=862
+    fi
+    echo "##[debug] Syncing DT with Covisio platform ${REPOSITORY_KEY}, Company ID: ${COMPANY_ID}"
+    echo "##[command]
+      ./securitygatecli sync \
+      --iterations ${CONVISO_SYNC_ITERATION} \
+      --project \"${AZDO_PROJECT}\" \
+      --project-id ${PROJECT_ID} \
+      --id ${COMPONENT_ID} \
+      --name \"${COMPONENT_NAME}\" \
+      --company-id ${COMPANY_ID} \
+      --dependency-track \
+      ${CONTAINER_TYPE_ARG} ${SECURITY_GATE_CLI_ARGS}
+    "
+    ./securitygatecli sync \
+      --iterations ${CONVISO_SYNC_ITERATION} \
+      --project "${AZDO_PROJECT}" \
+      --project-id ${PROJECT_ID} \
+      --id ${COMPONENT_ID} \
+      --name "${COMPONENT_NAME}" \
+      --company-id ${COMPANY_ID} \
+      --dependency-track \
+      ${CONTAINER_TYPE_ARG} ${SECURITY_GATE_CLI_ARGS}
+  displayName: 'Sync DT and Conviso Platform'
+  condition: and(succeeded(), eq(variables['check_ff.SCA_ENABLED'], 'true'))
+  env:
+    DT_API_KEY: $(DT_API_KEY)
+    API_KEY: $(CONVISO_API_KEY)
+    AZURE_APP_CONFIG_CONNECTION_STRING: $(AZURE_APP_CONFIG_CONNECTION_STRING)
+    AZDO_PROJECT: $(System.TeamProject)
+    COMPONENT_NAME: $(Build.Repository.Name)
+    PROJECT_ID: $(System.TeamProjectId)
+    COMPONENT_ID: $(Build.Repository.ID)
+    COMPANY_ID: '439'
+    SECURITY_GATE_CLI_ARGS: '--debug'
+    CONVISO_SYNC_ITERATION: '10'
+    CONTAINER_TYPE_ARG: $(define_sca_vars.CONTAINER_TYPE_ARG)
+    REPOSITORY_KEY: $(define_sca_vars.REPOSITORY_KEY)
+# Por algum motivo as vezes o pipeline nao encontra o binario, por isso o download e feito novamente
+- template: /tech_products/hdop/templates/steps/download_nexus_artifact.yaml
+  parameters:
+    file: 'securitygatecli-linux-amd64'
+    folder: 'devops'
+    outputFilePath: 'securitygatecli'
+    version: $(SECURITY_GATE_CLI_VERSION)
+    chmod: 755
+- script: |
+    SIGLA=$(echo ${AZDO_PROJECT} | cut -d' ' -f1)
+    if [[ "${SIGLA}" == "VVMY" ]]; then
+      echo "##[debug] SIGLA: ${SIGLA} -> Setting COMPANY_ID to 639."
+      export COMPANY_ID=639
+    elif [[ "${SIGLA}" == "VLSS" ]]; then
+      echo "##[debug] SIGLA: ${SIGLA} -> Setting COMPANY_ID to 862."
+      export COMPANY_ID=862
+    fi
+    echo "##[debug] Executing Security Gates. Company ID: ${COMPANY_ID}"
+    echo "##[command]
+        ./securitygatecli verify \
+      --project \"${AZDO_PROJECT}\" \
+      --project-id ${PROJECT_ID} \
+      --id ${COMPONENT_ID} \
+      --name \"${COMPONENT_NAME}\" \
+      --company-id ${COMPANY_ID} \
+      ${SECURITY_GATE_CLI_ARGS}
+    "
+    ./securitygatecli verify \
+      --project "${AZDO_PROJECT}" \
+      --project-id ${PROJECT_ID} \
+      --id ${COMPONENT_ID} \
+      --name "${COMPONENT_NAME}" \
+      --company-id ${COMPANY_ID} \
+      ${SECURITY_GATE_CLI_ARGS}
+  displayName: 'Verify Image Securtiy Gates'
+  condition: and(succeeded(), eq(variables['check_ff.SCA_ENABLED'], 'true'), ${{ eq(parameters.scaAnalysisType, 'image') }})
+  env:
+    API_KEY: $(CONVISO_API_KEY)
+    AZURE_APP_CONFIG_CONNECTION_STRING: $(AZURE_APP_CONFIG_CONNECTION_STRING)
+    AZDO_PROJECT: $(System.TeamProject)
+    COMPONENT_NAME: $(Build.Repository.Name)
+    PROJECT_ID: $(System.TeamProjectId)
+    COMPONENT_ID: $(Build.Repository.ID)
+    COMPANY_ID: '439'
+    SECURITY_GATE_CLI_ARGS: '--debug'

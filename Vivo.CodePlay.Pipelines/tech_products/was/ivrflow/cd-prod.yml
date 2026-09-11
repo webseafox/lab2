@@ -1,0 +1,93 @@
+parameters:
+  - name: chg
+    displayName: 'Número da CHG'
+    type: string
+  - name: isRollback
+    displayName: 'Executar Rollback'
+    type: boolean
+    default: false
+  - name: environment
+    displayName: 'Ambiente de destino'
+    default: producao
+    values:
+    - producao
+    - dev 
+
+stages:
+- stage: Deploy
+  displayName: '🚀 Deploy to ${{ parameters.environment }}'
+  jobs:
+    - deployment: Deploy
+      environment: 'deploy-${{ parameters.environment }}'
+      displayName: '🚀 Deploy to ${{ parameters.environment }}'
+      pool: GeneralPurposeLinuxAgentsCD
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+            - script: |
+                echo "=== CONFIGURAÇÃO DE DEPLOY ==="
+                echo "CHG: ${{ parameters.chg }}"
+                echo "Ambiente: ${{ parameters.environment }}"
+                echo "É Rollback: ${{ parameters.isRollback }}"
+                echo "SSH Endpoint: $(SSH)"
+                echo "Diretório de destino: $(PROD_DIR)"
+                echo "Feed Package: $(FEED_PACKAGE)"
+                
+                if [ "${{ parameters.isRollback }}" == "True" ]; then
+                  PACKAGE_NAME="$(FEED_PACKAGE).${{ parameters.chg }}-rollback"
+                  echo "TIPO: Rollback"
+                else
+                  PACKAGE_NAME="$(FEED_PACKAGE).${{ parameters.chg }}"
+                  echo "TIPO: Deploy"
+                fi
+                
+                echo "Pacote a ser baixado: $PACKAGE_NAME"
+                echo "Feed ID: 3d53bc62-8749-4931-ae46-a443b73bc87a"
+              displayName: '🔍 Debug Deploy Configuration'
+              
+            - task: UniversalPackages@0
+              ${{ if eq(parameters.isRollback, true) }}:
+                displayName: '⬇️ Download Rollback Package'
+              ${{ else }}:
+                displayName: '⬇️ Download Deploy Package'
+              inputs:
+                command: 'download'
+                downloadDirectory: '$(Pipeline.Workspace)/fluxos'
+                feedsToUse: 'internal'
+                vstsFeed: '3d53bc62-8749-4931-ae46-a443b73bc87a'
+                ${{ if eq(parameters.isRollback, true) }}:
+                  vstsFeedPackage: '$(FEED_PACKAGE).${{ parameters.chg }}-rollback'
+                ${{ else }}:
+                  vstsFeedPackage: '$(FEED_PACKAGE).${{ parameters.chg }}'
+                vstsPackageVersion: '*'
+
+            - script: ls -R $(Pipeline.Workspace)
+              displayName: '📋 Lista Pipeline Workspace (debug)'
+            - script: ls -R $(Build.ArtifactStagingDirectory)
+              displayName: '📋 Lista ArtifactStagingDirectory (debug)'
+            - task: CopyFilesOverSSH@0
+              displayName: '📤 Copy Files to $(SSH) -> $(PROD_DIR)'
+              inputs:
+                sshEndpoint: '$(SSH)'
+                sourceFolder: '$(Pipeline.Workspace)/fluxos'
+                contents: '**/*.json'
+                targetFolder: '$(PROD_DIR)'
+                readyTimeout: '20000' # string. Required. SSH handshake timeout. Default: 20000.
+            
+            # Registro de deploy no Event Hub
+            - task: VivoEventHubTools@3
+              displayName: 'Registro de deploy no Event Hub'
+              condition: always() # A task passa o status do deploy
+              continueOnError: true
+              inputs:
+                command: 'deploy'
+                eventHubConnection: 'EVHCodeProd'
+                componentVersion: '$(Build.BuildId)'
+                deployArtifactName: '$(FEED_PACKAGE)'
+                deployArtifactType: 'package'
+                deployEnvironmentType: 'ssh'
+                deployEnvironmentName: '${{ parameters.environment }}'
+                deployEnvironmentAccessUrl: '$(APPLICATION_URL)'
+                annotations: 'chg=${{ parameters.chg }},isRollback=${{ parameters.isRollback }},deployment-path=$(PROD_DIR)'
+                pipelineType: 'framework/deploy-ssh'

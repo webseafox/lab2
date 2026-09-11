@@ -1,0 +1,56 @@
+parameters:
+  - name: enableFortifyExclusions
+    displayName: 'Faz checkout do repositório Fortify Exclusions'
+    type: boolean
+    default: false
+
+variables:
+  - template: /tech_products/tpaz/global/variables/pipeline.yml
+
+stages:
+  - stage: security_scan
+    pool: $(PRIVATE_AGENT_SHARED)
+    displayName: Security Scan
+    jobs:
+    - job: AppSecConfigKeys
+      displayName: 'Get AppSec Config Keys'
+      steps:
+      - template: /security/get_appconfig_keys_framework.yml
+        parameters:
+          azureSubscription: DevOpsSharedResources
+          appConfigurationEndpoint: https://appcs-azdevops-shared.azconfig.io
+
+    - job: run_fortify
+      displayName: Run Fortify
+      dependsOn: AppSecConfigKeys
+      variables:
+        USE_FORTIFY: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.USE_FORTIFY'] ]
+        USE_CONVISO: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.USE_CONVISO'] ]
+        SKIP_SECURITY_GATE: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.SKIP_SECURITY_GATE'] ]
+        FORTIFY_APP_VERSION: $[ dependencies.AppSecConfigKeys.outputs['scan_version_name.FORTIFY_APP_VERSION'] ]
+      condition: and(succeeded(), eq(variables.USE_FORTIFY, 'true'))
+      steps:
+      - template: /security/define_appsec_app_version.yml
+
+      - template: /security/run_fortify_scan.yml
+        parameters:
+          fortifyExclusionRepository: 'FortifyExclusion'
+          enableFortifyExclusions: ${{ parameters.enableFortifyExclusions }}
+          appLanguage: 'java'
+          appVersion: "$(FORTIFY_APP_VERSION)" # OBS: A variável FORTIFY_APP_VERSION é definida no template /security/define_appsec_app_version.yml
+          convisoCompany: 1345
+
+
+  - stage: bump
+    pool: $(PRIVATE_AGENT_SHARED)
+    displayName: Bump Version
+    condition: eq(variables.flowIsMain, 'true')
+    dependsOn:
+      - security_scan
+    jobs:
+      - job: job_bump
+        displayName: Bump Version
+        steps:
+          - checkout: self
+            persistCredentials: true
+          - template: /tech_products/tpaz/tasks/commitzen/bump_push.yml

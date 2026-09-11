@@ -1,0 +1,155 @@
+# Template: Train models using auracog_pipelines.train
+# Computes OAI/CLU CI user, PROMOTE flag based on branch and runs the training command.
+# Usage:
+#  - template: /tech_products/azr4/templates/train.yml
+#    parameters: {}
+
+parameters:
+  - name: projectName
+    type: string
+    default: ''
+  - name: packageName
+    type: string
+    default: ''
+    
+steps:
+  - bash: |
+      #!/bin/bash
+      set -e
+      set -x
+
+      if [ -z "$(AURA_VENVBASE)" ]; then
+        echo "AURA_VENVBASE not set; ensure createVirtualenv ran earlier"
+        exit 1
+      fi
+
+      export LANG_COUNTRY="pt-br"
+
+      source "$(AURA_VENVBASE)/bin/activate"
+
+      BRANCH_NAME="$(Build.SourceBranchName)"
+      PROJECT_NAME="${{ parameters.projectName }}"
+
+      # Compute external service CI user name
+      OAI_USER="ci_${PROJECT_NAME}"
+      CLU_USER="$OAI_USER"
+
+      # Decide promote flag: true for non-PR and for production-like branches
+      PROMOTE="''"
+      if [ "$BUILD_REASON" != "PullRequest" ]; then
+        if [ "$BRANCH_NAME" = "master" ] || [[ "$BRANCH_NAME" =~ ^release/ ]] || [[ "$BRANCH_NAME" =~ ^main/ ]] || [[ "$BRANCH_NAME" =~ ^fasttrack/ ]] || [[ "$BRANCH_NAME" =~ ^hotfix/ ]]; then
+          PROMOTE="TRUE"
+        fi
+      fi
+
+      #echo "OAI_USER=$OAI_USER"
+      #echo "CLU_USER=$CLU_USER"
+      #echo "PROMOTE=$PROMOTE"
+
+      # Export for downstream steps in same job
+      echo "##vso[task.setvariable variable=OAI_USER]$OAI_USER"
+      echo "##vso[task.setvariable variable=CLU_USER]$CLU_USER"
+      echo "##vso[task.setvariable variable=PROMOTE]$PROMOTE"
+
+      # Strip any leading/trailing single or double quotes that may be stored in the variable group
+      # (a stray quote char causes 401 — the key passed to CLU is corrupted)
+      CLU_SUBSCRIPTION_KEYS="${CLU_SUBSCRIPTION_KEYS//\'/}"
+      CLU_SUBSCRIPTION_KEYS="${CLU_SUBSCRIPTION_KEYS//\"/}"
+      CLU_STORAGE_SUBSCRIPTION_KEYS="${CLU_STORAGE_SUBSCRIPTION_KEYS//\'/}"
+      CLU_STORAGE_SUBSCRIPTION_KEYS="${CLU_STORAGE_SUBSCRIPTION_KEYS//\"/}"
+
+      #find . -path ./venv -prune -o -print | sed 's/[^\/]*\//|   /g;s/|   \([^|]\)/+--- \1/'
+
+      #cat "${NLP_CONFIG}"
+      
+      # Run the training command with retries.
+      # NOTE: auracog_pipelines exits 0 even on CLU failure — detect failure via output patterns.
+      MAX_RETRIES=3
+      BACKOFF=5
+      attempt=1
+      last_output_file="$(mktemp)"
+
+      while [ $attempt -le $MAX_RETRIES ]; do
+        echo "##[section]Attempt $attempt/$MAX_RETRIES: starting training..."
+        set +e
+        python3 -m auracog_pipelines.training.pipeline.train \
+          --task "train" \
+          --path "tmp/config" \
+          --config "nlp" \
+          --ob "BR" \
+          --OaiSubscriptionId "${OAI_ID_SUBSCRIPTION}" \
+          --OaiResourceGroup "${OAI_RESOURCE_GROUP}" \
+          --OaiAccountName "${OAI_ACCOUNT_NAME}" \
+          --OaiAzureTokenClientId "${OAI_AZURE_TOKEN_CLIENT_ID}" \
+          --OaiAzureTokenClientSecret "${OAI_AZURE_TOKEN_CLIENT_SECRET}" \
+          --OaiAzureTokenTenant "${OAI_AZURE_TOKEN_TENANT}" \
+          --OaiUser "${OAI_USER}" \
+          --CluSubscriptionKeys "${CLU_SUBSCRIPTION_KEYS}" \
+          --CluStorageSubscriptionKeys "${CLU_STORAGE_SUBSCRIPTION_KEYS}" \
+          --CluUser "${CLU_USER}" \
+          --autoConfig "${AUTO_CONFIG}" \
+          --test True \
+          --workingDirectory "${WORKINGDIRECTORY}" \
+          --dataSourceDirectory "${DATA_FOLDER}" \
+          --modelResourcesDirectory "${MODELS_FOLDER}" \
+          --trainedModelsDirectory "${TMP_TRAINED_MODELS_FOLDER}" \
+          --resultsDirectory "${RESULTS_FOLDER}" \
+          --nlpConfigPath "${NLP_CONFIG}" \
+          --logName "nlp" \
+          --logKPIName "recognizer_kpi" \
+          --forceTraining True 2>&1 | tee "$last_output_file"
+        proc_status=${PIPESTATUS[0]}
+        set -e
+
+        # auracog_pipelines may exit 0 even on CLU errors — detect via log output
+        if grep -qiE "Invalid response code [0-9]+|Training fail|Train failed|Error getting CLU" "$last_output_file"; then
+          clu_error=1
+          # Extract the HTTP status code from the output for reporting
+          clu_http_code=$(grep -oiE "Invalid response code [0-9]+" "$last_output_file" | grep -oE "[0-9]+" | tail -1)
+        else
+          clu_error=0
+          clu_http_code=""
+        fi
+
+        # Treat as success only if exit code is 0 AND no CLU error in output
+        if [ $proc_status -eq 0 ] && [ $clu_error -eq 0 ]; then
+          echo "##[section]Training succeeded on attempt $attempt."
+          rm -f "$last_output_file"
+          break
+        fi
+
+        effective_status=$(( proc_status != 0 ? proc_status : 1 ))
+
+        if [ $attempt -lt $MAX_RETRIES ]; then
+          sleep_time=$((BACKOFF * attempt))
+          echo "##[warning]Training failed (exit=$proc_status, clu_error=$clu_error, http=${clu_http_code:-n/a}). Retrying in ${sleep_time}s..."
+          sleep $sleep_time
+        else
+          echo "##[error]Training failed after $MAX_RETRIES attempts (exit=$proc_status, clu_error=$clu_error, http=${clu_http_code:-n/a})."
+          rm -f "$last_output_file"
+          exit "$effective_status"
+        fi
+
+        attempt=$((attempt + 1))
+      done
+
+      
+
+    displayName: 'Train models'
+    env:
+      OAI_ID_SUBSCRIPTION: c22caac5-0134-4ffe-9394-5a7bcda1cb44
+      OAI_RESOURCE_GROUP: openai-br-pre
+      OAI_ACCOUNT_NAME: openai-br-pre
+      OAI_AZURE_TOKEN_CLIENT_ID: df5db762-dca1-436c-bb49-de59d9d20524
+      OAI_AZURE_TOKEN_CLIENT_SECRET: $(OAI_AZURE_TOKEN_CLIENT_SECRET)
+      OAI_AZURE_TOKEN_TENANT: 0fce1554-ffcc-4e69-aa8d-9334eb2d8fd7
+      AUTO_CONFIG: tmp/recognizer/nlp.json
+      TMP_FOLDER: tmp
+      DATA_FOLDER: data
+      MODELS_FOLDER: tmp/models
+      TMP_TRAINED_MODELS_FOLDER: tmp/trained_models
+      NLP_CONFIG: tmp/config/etc/nlp_config/nlp.json
+      PLATFORM: "BR"
+      WORKINGDIRECTORY: tmp
+      CLU_SUBSCRIPTION_KEYS: $(CLU_SUBSCRIPTION_KEYS)
+      CLU_STORAGE_SUBSCRIPTION_KEYS: $(CLU_STORAGE_SUBSCRIPTION_KEYS)

@@ -1,0 +1,300 @@
+parameters:
+- name: environment
+  type: string
+  default: ''
+- name: infrastructureType
+  type: string
+  default: ''
+- name: namespace
+  type: string
+  default: 'default'
+- name: deploymentName
+  type: string
+  default: ''
+
+## -> Initialize global variables
+variables:
+
+- template: /tech_products/oss/initialize/variables_global.yml
+
+- name: CORPORATE_WIKI_DOC_URL
+  value: "TBD"
+
+stages:
+
+- stage: cd_clear_path
+  displayName: "CD - Clear Path - ${{ parameters.environment }}"
+  pool:
+    name: $(AGENT_POOL_CD)
+  condition: succeeded()
+
+  jobs:
+
+  - deployment: clear
+    displayName: 'Clear Path'
+    environment:
+      name: deploy-${{ parameters.environment }}
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+
+          ## -> Download Artifacts
+          - download: none
+
+          ## -> Log in to kubernetes
+          - task: Kubernetes@1
+            displayName: Kubernetes Cluster Login
+            inputs:
+              connectionType: 'Kubernetes Service Connection'
+              kubernetesServiceEndpoint: 'kube-${{ parameters.infrastructureType }}-${{ parameters.environment }}'
+              command: 'login'
+
+          ## ->K8S Namespace Check
+          - task: Bash@3
+            displayName: 'Verify Namespace'
+            condition: succeeded()
+            inputs:
+              targetType: inline
+              script: |
+                namespace="${{ parameters.namespace }}"
+                echo "##[debug]Check if namespace [$namespace] exists"
+
+                # Fetch namespaces using kubectl
+                namespaces=$(kubectl get ns -o json --insecure-skip-tls-verify)
+
+                echo "##[group] Namespaces in cluster"
+                echo "##[debug] ${namespaces}"
+                echo "##[endgroup]"
+
+                # Use jq to select the namespace
+                selectedNamespace=$(echo "$namespaces" | jq -c ".items[].metadata | select(.name==\"$namespace\")" | jq -r '.name')
+
+                # Compare the selected namespace to the input
+                if [ "$selectedNamespace" = "$namespace" ]; then
+                  echo "##[debug] Namespace [$namespace] OK."
+                else
+                  echo "##[error] Namespace [$namespace] not found."
+                  exit 1;
+                fi
+
+          ## -> Get Deployment Details
+          - task: Bash@3
+            displayName: 'Check Deployment Version'
+            condition: succeeded()
+            inputs:
+              targetType: inline
+              script: |
+                deploymentName="${{ parameters.deploymentName }}"
+                namespace="${{ parameters.namespace }}"
+
+                echo "##[debug] Fetching details for deployment [$deploymentName] in namespace [$namespace]..."
+
+                # Fetch the deployment details
+                deploymentDetails=$(kubectl get deployment $deploymentName -n $namespace -o yaml --insecure-skip-tls-verify)
+
+                if [ -z "$deploymentDetails" ]; then
+                  echo "##[warning] Deployment [$deploymentName] not found in namespace [$namespace]."
+                else
+                  echo "##[group] Deployment Details"
+                  echo "$deploymentDetails"
+                  echo "##[endgroup]"
+                fi
+
+          ## -> Backup Helm Release (if exists)
+          - task: Bash@3
+            displayName: 'Backup Release Manifest'
+            condition: succeeded()
+            inputs:
+              targetType: inline
+              script: |
+                deploymentName="${{ parameters.deploymentName }}"
+                namespace="${{ parameters.namespace }}"
+
+                echo "##[debug] Checking for Helm release [$deploymentName] in namespace [$namespace]..."
+
+                # Check if the Helm release exists
+                helmStatus=$(helm status $deploymentName -n $namespace 2>&1)
+
+                if echo "$helmStatus" | grep -q "not found"; then
+                  echo "##[warning] Helm release [$deploymentName] not found in namespace [$namespace]."
+                else
+                  echo "##[group] Helm BACKUP manifest [$deploymentName]:"
+                  helm get manifest $deploymentName -n $namespace
+                  echo "##[endgroup]"
+                fi
+
+                allResources=$(kubectl api-resources --verbs=delete -o name | paste -sd, -)
+
+                echo "##[group] Backup via kubectl by NAME"
+                echo "#######################################################"
+                kubectl describe "$allResources" $deploymentName 2>/dev/null || true
+                echo "#######################################################"
+                echo "##[endgroup]"
+
+                echo "##[group] Backup via kubectl by LABEL app"
+                echo "#######################################################"
+                kubectl describe "$allResources" -l app=$deploymentName 2>/dev/null || true
+                echo "#######################################################"
+                echo "##[endgroup]"
+
+                echo "##[group] Backup via kubectl by LABEL name"
+                echo "#######################################################"
+                kubectl describe "$allResources" -l name=$deploymentName 2>/dev/null || true
+                echo "#######################################################"
+                echo "##[endgroup]"
+
+          ## ->K8S Clean up process
+          - task: Bash@3
+            displayName: 'Clean up process'
+            condition: succeeded()
+            inputs:
+              targetType: inline
+              script: |
+
+                ## -> Function to cleanup Kubernetes resources
+                delete_k8s_resource() {
+                    local resourceType=$1
+                    local selectType=$2
+                    local val=$3
+
+                    if [ "$selectType" == "name" ]; then
+                        echo "##[debug] Attempting to delete $resourceType named $val in namespace $namespace..."
+
+                        kubectl delete \
+                          "$resourceType" "$val" -n "$namespace" --insecure-skip-tls-verify 2>&1 | grep -v "NotFound" || echo "$val $deploymentName not found, skipping..."
+
+                    elif [ "$selectType" == "label" ]; then
+                        echo "##[debug] Attempting to delete ${resourceType%%.*} with label $val in namespace $namespace..."
+
+                        kubectl delete \
+                          "$resourceType" -l "$val" -n "$namespace" --insecure-skip-tls-verify 2>&1 | grep -v "No resources found" || echo "No $resourceType with label $val found, skipping..."
+                    fi
+                }
+
+                ## -> Change the permissions of the Kubernetes config file to be read/write by the owner only
+                ## -> This change avoid warnings in the console
+                chmod 600 $(Agent.TempDirectory)/kube-${{ parameters.infrastructureType }}-${{ parameters.environment }}
+
+                ## -> Check if deploymentName or namespace contains spaces
+                if [[ "${{ parameters.deploymentName }}" =~ \  ]] || [[ "${{ parameters.namespace }}" =~ \  ]]; then
+                    echo "##[error] Deployment Name or Namespace contain spaces. Please remove spaces and try again."
+                    exit 1
+                fi
+
+                ## -> Define your deployment and Helm release names
+                deploymentName=${{ parameters.deploymentName }}
+                namespace=${{ parameters.namespace }}
+
+                ## -> Attempt Helm uninstall and capture the exit status
+                echo "##[debug] Attempting to uninstall Helm release $deploymentName in namespace $namespace..."
+
+                helmList="$(helm list -n $namespace)"
+
+                echo "##[group] Helm List"
+                echo "$helmList"
+                echo "##[endgroup]"
+
+                helm uninstall $deploymentName -n $namespace
+                helmUninstallExitStatus=$?
+
+                ## -> Check the exit status of the Helm uninstall command
+                if [ $helmUninstallExitStatus -eq 0 ]; then
+                    echo "##[debug] Helm release $deploymentName successfully uninstalled."
+                else
+                    echo "##[warning] Helm uninstall failed or release $deploymentName not found."
+                fi
+
+                echo ""
+                echo "##[debug] 💪 Proceeding with manual cleanup of Kubernetes resources..."
+
+                resourceNames="deployment,svc,secrets,virtualservices,ing,pvc,configmap,job,cronjob,daemonset,statefulset,replicaset,serviceaccount,role,rolebinding,destinationrules,gateways,serviceentries,peerauthentications,authorizationpolicies,requestauthentications,NetworkPolicies"
+                allresources=$(kubectl api-resources --verbs=delete -o name | paste -sd, -)
+
+                echo "##[group] Resource types to be deleted:"
+                  for resource in ${resourceNames//,/ }; do
+                    echo "$(echo ${resource%%.*} | tr '[:lower:]' '[:upper:]')"
+                  done
+                echo "##[endgroup]"
+
+                echo "##[section]---------- DELETE BY NAME ----------"
+                ## -> Delete HPA first
+                delete_k8s_resource "hpa" "name" "$deploymentName"
+
+                ## -> Delete listed resources by name
+                for resource in ${resourceNames//,/ }; do
+                    delete_k8s_resource "$resource" "name" "$deploymentName"
+                done
+
+                echo ""
+                echo "##[section]---------- DELETE BY THE LABEL APP ----------"
+                ## -> Delete HPA first
+                delete_k8s_resource "hpa" "label" "app=$deploymentName"
+
+                ## -> Delete listed resources by label app
+                for resource in ${resourceNames//,/ }; do
+                    delete_k8s_resource "$resource" "label" "app=$deploymentName"
+                done
+
+                echo ""
+                echo "##[section]---------- DELETE BY THE LABEL NAME ----------"
+                ## -> Delete HPA first
+                delete_k8s_resource "hpa" "label" "name=$deploymentName"
+
+                ## -> Delete listed resources by label name
+                for resource in ${resourceNames//,/ }; do
+                    delete_k8s_resource "$resource" "label" "name=$deploymentName"
+                done
+
+                echo "##[section] ---------- Check If Any Resources Remain ----------"
+                remainingResourcesName=$(kubectl get $allresources $deploymentName -n $namespace --ignore-not-found 2>/dev/null || true)
+                remainingResourcesLabelApp=$(kubectl get $allresources -l app=$deploymentName -n $namespace --ignore-not-found 2>/dev/null || true)
+                remainingResourcesLabelName=$(kubectl get $allresources -l name=$deploymentName -n $namespace --ignore-not-found 2>/dev/null || true)
+
+                if [ -z "$remainingResourcesName" ] && [ -z "$remainingResourcesLabelApp" ] && [ -z "$remainingResourcesLabelName" ]; then
+                    echo "##[debug] All resources associated with $deploymentName have been successfully deleted."
+                else
+                    echo "##[warning] Some resources associated with $deploymentName still remain:"
+                    echo "$remainingResourcesName"
+                    echo "$remainingResourcesLabelApp"
+                    echo "$remainingResourcesLabelName"
+                    echo "##vso[task.complete result=SucceededWithIssues;]"
+                fi
+
+          ## -> Logout of kubernetes
+          - task: Kubernetes@1
+            displayName: Kubernetes Cluster Logout
+            condition: always()
+            continueOnError: true
+            timeoutInMinutes: 1
+            inputs:
+              command: 'logout'
+        on:
+          success:
+            steps:
+            - task: Bash@3
+              displayName: Cleanup Success
+              name: t_success_message
+              inputs:
+                targetType: inline
+                script: |
+                  echo "##[section] ================================================================================================================================="
+                  echo "##[section]                                                      CLEAN UP WAS SUCCESSFUL! "
+                  echo "##[section] ================================================================================================================================="
+
+                  ## -> Set Pipeline Tag on success
+                  echo "##vso[build.addbuildtag]deploy-${{parameters.environment}}=succeeded"
+          failure:
+            steps:
+            - task: Bash@3
+              displayName: Cleanup Failure
+              name: t_failure_message
+              inputs:
+                targetType: inline
+                script: |
+                  echo "##[error] ================================================================================================================================="
+                  echo "##[error]                                                    CLEAN UP WAS NOT SUCCESSFUL! "
+                  echo "##[error] ================================================================================================================================="
+
+                  ## -> Set Pipeline Tag on success
+                  echo "##vso[build.addbuildtag]deploy-${{parameters.environment}}=failed"

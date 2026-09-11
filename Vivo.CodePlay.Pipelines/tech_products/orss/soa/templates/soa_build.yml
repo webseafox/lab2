@@ -1,0 +1,79 @@
+steps:
+  - task: DownloadSecureFile@1
+    name: DownloadSettings
+    displayName: 'Download SOA settings XML'
+    condition: in(variables['PROJECT_TYPE'], 'COMPOSITE')
+    inputs:
+      secureFile: $(COMPONENT_SETTINGS)
+  
+  - task: AzureKeyVault@2  
+    displayName: 'Getting AKV credentials'
+    timeoutInMinutes: 1
+    retryCountOnTaskFailure: 5  
+    inputs:    
+      azureSubscription: DevOpsSharedResources    
+      KeyVaultName: kv-azdevops-shared
+      SecretsFilter: 'NEXUS-DEPS-USR, NEXUS-DEPS-PSW'
+
+  - task: Bash@3
+    displayName: 'Getting composite version'
+    condition: in(variables['PROJECT_TYPE'], 'COMPOSITE')
+    inputs:
+      targetType: 'inline'
+      script: |
+        cd $PARTITION/$PROJECT
+        COMPOSITE_VERSION=`find . -name composite.xml -exec grep -Po '(?<=revision=\")([0-9.]+)' {} \;`
+        echo "##vso[task.setvariable variable=COMPOSITE_VERSION;isOutput=true]$COMPOSITE_VERSION"
+
+  - task: Bash@3
+    displayName: 'Build SOA Composite'
+    condition: in(variables['PROJECT_TYPE'], 'COMPOSITE')
+    inputs:
+      targetType: 'inline'
+      script: |
+        docker run --rm --entrypoint bash \
+          -v $(Build.SourcesDirectory):/builds \
+          -v $(Agent.TempDirectory):/settings \
+          -w /builds \
+          -e COMPONENT_SETTINGS=$(COMPONENT_SETTINGS) \
+          -e PARTITION=$(PARTITION) \
+          -e PROJECT=$(PROJECT) \
+          -e COMPOSITE_VERSION=$(COMPOSITE_VERSION) \
+          -e NEXUS_DEPS_USR="$NEXUS_DEPS_USR" \
+          -e NEXUS_DEPS_PSW="$NEXUS_DEPS_PSW" \
+          $(DOCKER_IMAGE) \
+          -c "cd /;
+              chmod +x /build.sh;
+              ./build.sh"
+
+        if grep -q '[ERROR]' $(Build.SourcesDirectory)/build.log
+        then
+          echo "##vso[task.complete result=Failed;]"
+        else
+          mv $(Build.SourcesDirectory)/soaconfig.jar soaconfig-$(System.PullRequest.PullRequestId).jar
+          mv $(Build.SourcesDirectory)/changes.txt soaconfig-$(System.PullRequest.PullRequestId).txt
+        fi
+    env:
+          NEXUS_DEPS_USR: $(NEXUS-DEPS-USR)
+          NEXUS_DEPS_PSW: $(NEXUS-DEPS-PSW)
+
+  - task: Bash@3
+    displayName: 'Building MDS'
+    condition: in(variables['PROJECT_TYPE'], 'METADATA_STORE')
+    inputs:
+      targetType: 'inline'
+      script: |
+        mkdir $(Build.SourcesDirectory)/oramds_build_tmp
+        IFS='|'
+        for file in $FILES
+        do
+          cp -Rva --parents $file $(Build.SourcesDirectory)/oramds_build_tmp
+        done
+        cd $(Build.SourcesDirectory)/oramds_build_tmp/$PARTITION/$PROJECT/apps
+        zip -r oramds-$(System.PullRequest.PullRequestId).jar *
+        mv oramds-$(System.PullRequest.PullRequestId).jar $(Build.SourcesDirectory)
+        cd $(Build.SourcesDirectory)/oramds_build_tmp/$PARTITION/$PROJECT
+        zip -r oramds-$(System.PullRequest.PullRequestId).zip ./apps
+        mv oramds-$(System.PullRequest.PullRequestId).zip $(Build.SourcesDirectory)
+        rm -rf $(Build.SourcesDirectory)/oramds_build_tmp
+        mv $(Build.SourcesDirectory)/changes.txt $(Build.SourcesDirectory)/oramds-$(System.PullRequest.PullRequestId).txt

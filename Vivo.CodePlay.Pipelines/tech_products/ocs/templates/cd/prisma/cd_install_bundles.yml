@@ -1,0 +1,97 @@
+parameters:
+- name: version_to_install
+- name: service_connection
+- name: deploy_app_folder
+
+steps:
+  - ${{ if or(eq(parameters.service_connection, 'esteira1'), eq(parameters.service_connection, 'esteira2'), eq(parameters.service_connection, 'preprod'), eq(parameters.service_connection, 'prodlike')) }}:
+    - task: GetCredentialsSenhaSegura@1
+      displayName: 'Get Credentials Senha Segura'
+      name: get_credentials
+      inputs:
+       clientId: ${{variables.CLIENT_ID}}
+       clientSecret: ${{variables.CLIENT_SECRET}}
+       credentialId: ${{variables.CREDENTIAL_ID}}
+       SenhaSeguraEndpoint: 'https://10.238.69.35'
+       #SenhaSeguraEndpoint: 'https://10.128.62.35'
+       #SenhaSeguraEndpoint: 'https://10.243.17.35'
+       #SenhaSeguraEndpoint: 'https://urano.redecorp.br'
+       usernameVariable: 'SENHA_SEGURA_USERNAME'
+       passwordVariable: 'SENHA_SEGURA_PASSWORD'
+       env:
+        NODE_EXTRA_CA_CERTS: $(CACORP_LOCATION)
+        #HTTPS_PROXY: "http://10.240.58.39:3128"
+
+    - task: DownloadSecureFile@1
+      name: senhaSeguraKey
+      displayName: Download Smart Key
+      inputs:
+        secureFile: ${{variables.SMARTKEY}}
+
+    - task: Bash@3
+      displayName: 'Decrypt Password'
+      name: get_token
+      continueOnError: true
+      inputs:
+        targetType: inline
+        script: |
+          echo "Username: $(get_credentials.SENHA_SEGURA_USERNAME)"
+          DECRYPTED_PASSWORD=$(echo -n $(get_credentials.SENHA_SEGURA_PASSWORD) | base64 -d --ignore-garbage | openssl rsautl -decrypt -inkey $(senhaSeguraKey.secureFilePath) -oaep)
+          echo "##vso[task.setvariable variable=DECRYPTED_PASSWORD;]$DECRYPTED_PASSWORD"
+              
+              
+    - task: Bash@3
+      displayName: 'Show Password'
+      name: show_password
+      continueOnError: true
+      inputs:
+        targetType: inline
+        script: |
+          echo "Decrypted password: $(DECRYPTED_PASSWORD)"
+              
+              
+    - task: UpdateCredentialsEndpointSshFromVivo@4
+      displayName: "Update Service Connection"
+      inputs:
+        sshEndpoint: ${{ variables.SERVICE_CONNECTION }}
+        username: $(get_credentials.SENHA_SEGURA_USERNAME)
+        password: $(DECRYPTED_PASSWORD)
+        env:
+          HTTPS_PROXY: "http://10.240.58.39:3128"
+          PAT: $(AZURE_DEVOPS_PAT)
+              
+              
+    - task: Bash@3
+      displayName: 'Delay for 5 seconds'    
+      inputs:
+        targetType: inline
+        script: |
+          echo "Waiting for 5 seconds..."
+          sleep 5  
+
+    - task: CopyFilesOverSSH@0
+      displayName: 'Copy Package to Server'
+      inputs:
+        sshEndpoint: ${{ variables.SERVICE_CONNECTION }}
+        sourceFolder: $(System.ArtifactsDirectory)/bundles
+        contents: 'bundles.tar'
+        targetFolder: '${{ variables.TARGET_FOLDER }}'
+
+  - ${{ if not(or(eq(parameters.service_connection, 'esteira1'), eq(parameters.service_connection, 'esteira2'), eq(parameters.service_connection, 'preprod'), eq(parameters.service_connection, 'prodlike'))) }}:
+    # Substitui o bloco "else"
+    - task: CopyFilesOverSSH@0
+      displayName: "Copy Package to Server"
+      inputs:
+        sshEndpoint: ${{ parameters.service_connection }}
+        sourceFolder: $(System.ArtifactsDirectory)/bundles
+        contents: "bundles.tar"
+        targetFolder: "$(deploy_app_folder)/azure_binarios"
+
+    - task: SSH@0
+      displayName: "Execute install bundle"
+      inputs:
+        sshEndpoint: ${{ parameters.service_connection }}
+        runOptions: inline
+        failOnStdErr: false
+        inline: |
+          $(deploy_app_folder)/prisma_azuredevops_deploy.sh ${{parameters.version_to_install}} $(deploy_app_folder)/azure_binarios

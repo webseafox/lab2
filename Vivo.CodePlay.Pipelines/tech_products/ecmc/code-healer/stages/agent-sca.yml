@@ -1,0 +1,194 @@
+parameters:
+  - name: branch
+    type: string
+    default: "master"
+  - name: repoName
+    type: string
+    default: ""
+
+steps:
+  - task: Docker@2
+    displayName: Docker login
+    inputs:
+      containerRegistry: $(DOCKER_ACR_REGISTRY_SERVICE_CONNECTION_NAME)
+      command: login
+
+  - task: PipAuthenticate@1
+    displayName: "Pip Authenticate (feed interno DevOps)"
+    inputs:
+      artifactFeeds: DevOps
+    env:
+      http_proxy: $(HTTP_PROXY)
+      https_proxy: $(HTTPS_PROXY)
+      no_proxy: $(NO_PROXY)
+
+  - task: AzureKeyVault@2
+    displayName: "Getting AKV credentials"
+    timeoutInMinutes: 1
+    retryCountOnTaskFailure: 5
+    inputs:
+      azureSubscription: DevOpsSharedResources
+      KeyVaultName: $(AKV_DEVOPS_NAME)
+      SecretsFilter: "NEXUS-DEPS-USR, NEXUS-DEPS-PSW, CONVISO-API-KEY"
+
+  - bash: |
+      echo "##[section]#################### UV INSTALL ####################"
+      if ! command -v uv &> /dev/null; then
+        python -m pip install --upgrade pip
+        echo "##[debug] uv not found, installing..."
+        echo "##[debug] Installing uv==$(UV_VERSION)"
+        pip install uv==$(UV_VERSION)
+      fi
+    displayName: "Install uv"
+    env:
+      UV_VERSION: $(UV_VERSION)
+      http_proxy: $(HTTP_PROXY)
+      https_proxy: $(HTTPS_PROXY)
+      no_proxy: $(NO_PROXY)
+
+  - bash: |
+      echo "##[section]#################### SCA AGENT DEPENDENCIES INSTALL ####################"
+      ls -la
+      uv sync --no-dev --no-cache
+    displayName: "Install SCA Agent dependencies"
+    workingDirectory: "$(Build.SourcesDirectory)"
+
+  - bash: |
+      echo "##[section]#################### CAT SBOM ####################"
+      SBOM_PATH="$REPOSITORY/cyclonedx_report.json"
+      if [ -f "$SBOM_PATH" ]; then
+        echo "##[debug] Arquivo SBOM encontrado. Repassando para o code healer."
+        echo "##[group]Conteúdo do SBOM"
+        cat "$SBOM_PATH" | jq .
+        echo "##[endgroup]"
+      fi
+    displayName: "Cat SBOM"
+    workingDirectory: "$(Build.SourcesDirectory)"
+    condition: and(succeeded(), eq(variables['VERSION_OK'], 'true'))
+    env:
+      REPOSITORY: ${{ parameters.repoName }}
+
+  - bash: |
+      echo "##[section]#################### SCA AGENT EXECUTION ####################"
+
+      set -e
+      mkdir -p sca-workdir
+
+      BRANCH_ARG=""
+      if [ -n "$DEFAULT_BRANCH" ] && [ "$DEFAULT_BRANCH" != "master" ]; then
+        BRANCH_ARG="--branch $DEFAULT_BRANCH"
+      fi
+
+      SBOM_ARG=""
+      SBOM_PATH="$REPOSITORY/cyclonedx_report.json"
+      if [ -f "$SBOM_PATH" ]; then
+        SBOM_ARG="--sbom $SBOM_PATH"
+      fi
+
+      echo "##[debug] Running SCA Agent for repository: $REPOSITORY, branch: $BRANCH_ARG"
+
+      echo "##[command] uv run python -m src.main --repo $REPOSITORY $BRANCH_ARG $SBOM_ARG"
+      uv run python -m src.main --repo $REPOSITORY $BRANCH_ARG $SBOM_ARG
+    displayName: "Run SCA Agent"
+    workingDirectory: "$(Build.SourcesDirectory)"
+    condition: and(succeeded(), eq(variables['VERSION_OK'], 'true'))
+    env:
+      OUTPUT_DIR: $(Build.ArtifactStagingDirectory)
+      REPOSITORY: ${{ parameters.repoName }}
+      DEFAULT_BRANCH: ${{ parameters.branch }}
+      CONVISO_API_KEY: $(CONVISO-API-KEY)
+      CONVISO_COMPANY_ID: $(CONVISO_COMPANY_ID)
+      CONVISO_STATUSES: $(CONVISO_STATUSES)
+      AZURE_ORG_URL: $(System.CollectionUri)
+      AZURE_PROJECT: $(System.TeamProject)
+      AZURE_TOKEN: $(AZURE_TOKEN)
+      COPILOT_URL: $(COPILOT_URL)
+      COPILOT_API_KEY: $(COPILOT_API_KEY)
+      ARCANE_TEAMS_URL: $(ARCANE_TEAMS_URL)
+      TEAMS_CHAT_SCA_ID: $(TEAMS_CHAT_SCA_ID)
+      CHATOPS_ENABLED: $(CHATOPS_ENABLED)
+      NEXUS_USERNAME: $(NEXUS-DEPS-USR)
+      NEXUS_PASSWORD: $(NEXUS-DEPS-PSW)
+      SCA_BRANCH_PREFIX: "fix/sca-vulnerability"
+      GIT_TARGET_BRANCH: "master"
+      COMMIT_TICKET: $(COMMIT_TICKET)
+      CMD_INSTALL: $(CMD_INSTALL)
+      CMD_BUILD: $(CMD_BUILD)
+      CMD_TEST: $(CMD_TEST)
+      CMD_RUN: $(CMD_RUN)
+      CMD_INSTALL_TIMEOUT: "$(CMD_INSTALL_TIMEOUT)"
+      CMD_BUILD_TIMEOUT: "$(CMD_BUILD_TIMEOUT)"
+      CMD_TEST_TIMEOUT: "$(CMD_TEST_TIMEOUT)"
+      CMD_RUN_TIMEOUT: "$(CMD_RUN_TIMEOUT)"
+      CMD_RUN_FATAL_PATTERNS: $(CMD_RUN_FATAL_PATTERNS)
+      CORRECTION_ATTEMPT_LIMIT: $(MAX_EXECUTIONS_LIMIT)
+      COMMIT_ON_FAILED: $(COMMIT_ON_FAILED)
+      OVERRIDE_STRATEGY_GLOBAL: $(OVERRIDE_STRATEGY_GLOBAL)
+      ENVIRONMENT: $(ENVIRONMENT)
+      SSL_VERIFY: $(SSL_VERIFY)
+      HTTP_PROXY: "$(HTTP_PROXY)"
+      HTTPS_PROXY: "$(HTTPS_PROXY)"
+      NO_PROXY: $(NO_PROXY)
+      DOCKER_TMPDIR: sca-workdir
+      COPILOT_PROVIDER: $(COPILOT_PROVIDER)
+      MODEL_NAME: $(MODEL_NAME)
+      DOCKERFILE_PATH: $(DOCKERFILE_PATH)
+
+  - bash: |
+      echo "##[section]#################### VALIDATE JSON OUTPUT ####################"
+      if [ ! -f "$(Build.ArtifactStagingDirectory)/sca_output.json" ]; then
+        echo "##[error] Arquivo JSON de saída não encontrado."
+        exit 1
+      fi
+      jq . $(Build.ArtifactStagingDirectory)/sca_output.json
+    displayName: "Validate JSON output"
+    condition: and(succeeded(), eq(variables['VERSION_OK'], 'true'))
+
+  - bash: |
+      echo "##[section]#################### Trigger N8N Workflow ####################"
+
+      SCA_OUTPUT_FILE="$(Build.ArtifactStagingDirectory)/sca_output.json"
+      SOURCE_BRANCH=$(jq -r '.sourceBranch' "$SCA_OUTPUT_FILE")
+      TOTAL_FIXES=$(jq -r '.totalFixes' "$SCA_OUTPUT_FILE")
+
+      echo "##[debug] sourceBranch=$SOURCE_BRANCH totalFixes=$TOTAL_FIXES"
+
+      if [ "$SOURCE_BRANCH" != "master" ] || [ "$TOTAL_FIXES" -eq 0 ]; then
+        echo "##[warning] Pulando publicação do n8n webhook, pois não há correções aplicadas ou o branch de origem $SOURCE_BRANCH não é master."
+        exit 0
+      fi
+
+      REQUESTED_FOR_EMAIL="$(Build.RequestedForEmail)"
+      PAYLOAD=$(jq --arg email "$REQUESTED_FOR_EMAIL" '{
+        username: "CODE HEALER SCA",
+        name: "CODE HEALER SCA",
+        email: $email,
+        reason: "Correção automática de vulnerabilidades pelo Code Healer SCA.",
+        termsAccepted: true,
+        linkpr: .prUrl
+      }' "$SCA_OUTPUT_FILE")
+
+      RESPONSE_FILE=$(mktemp)
+      HTTP_CODE=$(curl --noproxy "*" \
+        -s \
+        -o "$RESPONSE_FILE" \
+        -w "%{http_code}" \
+        -X POST "$N8N_HOST_URL/webhook/bypass/requisition" \
+        -H "Content-Type: application/json" \
+        -d "$PAYLOAD")
+
+      CURL_EXIT_CODE=$?
+      echo "##[debug] n8n response status: HTTP $HTTP_CODE"
+      if [ "$CURL_EXIT_CODE" -ne 0 ] || { [ "$HTTP_CODE" -ne 200 ] && [ "$HTTP_CODE" -ne 201 ]; }; then
+        echo "##[error] n8n webhook falhou com curl exit code $CURL_EXIT_CODE e HTTP $HTTP_CODE"
+        if [ -s "$RESPONSE_FILE" ]; then
+          echo "##[error] response body:"
+          cat "$RESPONSE_FILE"
+        fi
+        exit 1
+      fi
+      echo "##[debug] n8n webhook executado com sucesso"
+    displayName: "Trigger N8N Workflow"
+    condition: and(succeeded(), eq(variables['VERSION_OK'], 'true'), eq(variables['N8N_REQUEST_BYPASS_AI_SCA_ENABLED'], 'true'))
+    env:
+      N8N_HOST_URL: $(N8N_HOST_URL)

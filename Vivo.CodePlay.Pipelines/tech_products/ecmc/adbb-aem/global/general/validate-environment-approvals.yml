@@ -1,0 +1,44 @@
+steps:
+
+- bash: |
+    SCRIPT_PATH=$(Agent.TempDirectory)/verify_stage_approvers.py
+
+    # Cria Script caso não exista
+
+    if [ ! -f $SCRIPT_PATH ]
+    then
+      cat <<EOF > $SCRIPT_PATH
+
+    # -*- coding: utf-8 -*-
+    #!/usr/bin/env python
+    import json
+    import optparse
+    import sys
+    parser = optparse.OptionParser()
+    parser.add_option('-s', '--stage', action="store", dest="stage_id",
+        help="id do stage", default="0000000000000000000000000000000")
+    parser.add_option('-j', '--json',
+        action="store", dest="timeline_json",
+        help="json da timeline api", default="{}")
+    options, args = parser.parse_args()
+    import json
+    data = json.loads(options.timeline_json)
+    CHECKPOINT_IDS=[d['id'] for d in data['records'] if d['type'] == 'Checkpoint' if d['parentId'] == options.stage_id]
+    CHECKPOINT_APPROVALS=[d for d in data['records'] if d['type'] == 'Checkpoint.Approval' if d['parentId'] in CHECKPOINT_IDS]
+    #print(len(CHECKPOINT_APPROVALS) >0)
+    if len(CHECKPOINT_APPROVALS) < 1:
+        sys.exit(1)
+
+    EOF
+    fi
+
+    # Executa o Script
+
+    BASE64_TOKEN=$(echo -n ":$(system.accesstoken)" | base64 | tr '\n' ' ')
+    AUTHORIZATION_HEADER="Authorization: Basic $BASE64_TOKEN"
+    URL_TIMELINE="$(System.CollectionUri)$(System.TeamProjectId)/_apis/build/builds/$(Build.BuildID)/Timeline?api-version=5.1"
+    curl -L -H "$AUTHORIZATION_HEADER" "$URL_TIMELINE" > $(Agent.TempDirectory)/timeline.json
+    cat $(Agent.TempDirectory)/timeline.json
+    python3 $(Agent.TempDirectory)/verify_stage_approvers.py -j "$(cat $(Agent.TempDirectory)/timeline.json)" -s "$(System.StageID)" && exit 0 || echo "##vso[task.logissue type=warning;]Configure um aprovador para entregas neste environment ($(Environment.Name)), veja como em: https://docs.microsoft.com/en-us/azure/devops/pipelines/process/approvals?view=azure-devops&tabs=check-pass#approvals" && echo "##vso[task.complete result=Failed;]DONE"
+
+  displayName: "check environment approver(s)"

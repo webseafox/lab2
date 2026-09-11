@@ -1,0 +1,107 @@
+# Task group dedicado ao deploy de helm charts para BRM 15.
+# Faz checkout do repo (que é o próprio helm chart), comprime e transfere
+# para /tmp/<BUILD_NUMBER> no bastion, onde o deploy_commands será executado.
+
+parameters:
+  - name: helmChartName
+  - name: sshEndpoint
+  - name: buildNumber
+
+steps:
+  - script: |
+      echo "##[debug] helmChartName...........................................: ${{ parameters.helmChartName }}"
+      echo "##[debug] sshEndpoint.............................................: ${{ parameters.sshEndpoint }}"
+      echo "##[debug] buildNumber.............................................: ${{ parameters.buildNumber }}"
+      echo "##[debug] TMP_PATH................................................: /tmp/${{ parameters.buildNumber }}"
+    displayName: "Helm Preparation Show Parameters"
+
+  - template: ../../task_groups/checkout/checkout.yml
+    parameters:
+      repository: self
+      path: ${{ parameters.helmChartName }}
+
+  - task: CmdLine@2
+    displayName: "Compress Helm Chart [${{ parameters.helmChartName }}]"
+    inputs:
+      workingDirectory: $(Agent.BuildDirectory)
+      script: |
+        set -euo pipefail
+
+        echo "##[command]ls -la ${{ parameters.helmChartName }}/"
+        ls -la ${{ parameters.helmChartName }}/
+
+        echo "##[command]test -f ${{ parameters.helmChartName }}/.helmignore"
+        if [ ! -f "${{ parameters.helmChartName }}/.helmignore" ]; then
+          echo "##[error]Arquivo .helmignore nao encontrado em ${{ parameters.helmChartName }}/"
+          exit 1
+        fi
+
+        echo "##[command]tar -czf ${{ parameters.helmChartName }}.tar.gz --exclude='.git' ${{ parameters.helmChartName }}/"
+        tar -czf ${{ parameters.helmChartName }}.tar.gz --exclude='.git' ${{ parameters.helmChartName }}/
+
+        VERIFY_TMP_DIR="$(mktemp -d)"
+        echo "##[command]tar -xzf ${{ parameters.helmChartName }}.tar.gz -C ${VERIFY_TMP_DIR}"
+        tar -xzf ${{ parameters.helmChartName }}.tar.gz -C "${VERIFY_TMP_DIR}"
+
+        echo "##[command]test -f ${VERIFY_TMP_DIR}/${{ parameters.helmChartName }}/.helmignore"
+        if [ ! -f "${VERIFY_TMP_DIR}/${{ parameters.helmChartName }}/.helmignore" ]; then
+          echo "##[debug] Conteudo do arquivo compactado:"
+          tar -tzf ${{ parameters.helmChartName }}.tar.gz | head -200
+          echo "##[error].helmignore nao foi incluido no arquivo ${{ parameters.helmChartName }}.tar.gz"
+          rm -rf "${VERIFY_TMP_DIR}"
+          exit 1
+        fi
+
+        echo "##[command]rm -rf ${VERIFY_TMP_DIR}"
+        rm -rf "${VERIFY_TMP_DIR}"
+
+        echo "##[command]tar -tzf ${{ parameters.helmChartName }}.tar.gz | awk 'NR<=20 {print}'"
+        tar -tzf ${{ parameters.helmChartName }}.tar.gz | awk 'NR<=20 {print}'
+
+  - task: SSH@0
+    displayName: "Create /tmp/${{ parameters.buildNumber }} on Bastion"
+    inputs:
+      sshEndpoint: ${{ parameters.sshEndpoint }}
+      runOptions: inline
+      inline: |
+        TMP_PATH="/tmp/${{ parameters.buildNumber }}"
+        echo "##[command]mkdir -p ${TMP_PATH}"
+        mkdir -p ${TMP_PATH}
+      readyTimeout: "20000"
+      failOnStdErr: false
+
+  - task: CopyFilesOverSSH@0
+    displayName: "Transfer Helm Chart to /tmp/${{ parameters.buildNumber }}"
+    inputs:
+      sshEndpoint: ${{ parameters.sshEndpoint }}
+      sourceFolder: $(Agent.BuildDirectory)
+      contents: "${{ parameters.helmChartName }}.tar.gz"
+      targetFolder: /tmp/${{ parameters.buildNumber }}
+      cleanTargetFolder: false
+      readyTimeout: "20000"
+      failOnEmptySource: true
+
+  - task: SSH@0
+    displayName: "Extract Helm Chart on /tmp/${{ parameters.buildNumber }}"
+    inputs:
+      sshEndpoint: ${{ parameters.sshEndpoint }}
+      runOptions: inline
+      inline: |
+        set -euo pipefail
+
+        TMP_PATH="/tmp/${{ parameters.buildNumber }}"
+        echo "##[command]tar -xzf ${TMP_PATH}/${{ parameters.helmChartName }}.tar.gz -C ${TMP_PATH}/"
+        tar -xzf ${TMP_PATH}/${{ parameters.helmChartName }}.tar.gz -C ${TMP_PATH}/
+
+        echo "##[command]test -f ${TMP_PATH}/${{ parameters.helmChartName }}/.helmignore"
+        if [ ! -f "${TMP_PATH}/${{ parameters.helmChartName }}/.helmignore" ]; then
+          echo "##[error].helmignore nao encontrado apos extracao em ${TMP_PATH}/${{ parameters.helmChartName }}/"
+          exit 1
+        fi
+
+        echo "##[command]rm -f ${TMP_PATH}/${{ parameters.helmChartName }}.tar.gz"
+        rm -f ${TMP_PATH}/${{ parameters.helmChartName }}.tar.gz
+        echo "Files in ${TMP_PATH}:"
+        ls -la ${TMP_PATH}/
+      readyTimeout: "20000"
+      failOnStdErr: false

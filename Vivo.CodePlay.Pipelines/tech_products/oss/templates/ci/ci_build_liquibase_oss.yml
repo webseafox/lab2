@@ -1,0 +1,421 @@
+parameters:
+- name: enableRollback
+- name: clearCheckSums
+
+stages:
+- stage: ci_build
+  displayName: "CI - Build"
+  pool:
+    name: $(AGENT_POOL_CD)
+
+  jobs:
+
+  - job: build
+    displayName: Build and Check
+    steps:
+    ## -> Checkout the code
+    - checkout: self
+      displayName: Checkout Code
+      name: checkout_code
+      submodules: true
+      persistCredentials: true
+
+    ## -> Checkout the last commit that was pushed to the repository.
+    ## -> Set last commit HASH to a variable.
+    - task: Bash@3
+      displayName: Checkout Last Commit
+      name: checkout_last_commit
+      inputs:
+        targetType: inline
+        script: |
+          echo "##[debug] Checkout last commit from '$(Build.SourceBranchName)'"
+
+          git config pull.rebase true
+          git fetch -f --depth 50 origin $(Build.SourceBranchName):$(Build.SourceBranchName)
+          git checkout -f $(Build.SourceBranchName)
+
+          ## -> Ignore commits that only change .azuredevops/ content
+          lastCommit=$(git log --format=%H -- . ':!'".azuredevops/" | head -n 1)
+          lastCommitHash=$(git rev-parse --short=6 $lastCommit)
+
+          echo "##[debug] Last commit short hash '$lastCommitHash'"
+          echo "##vso[task.setvariable variable=SHORT_HASH]$lastCommitHash"
+
+    ## -> Start of Bump Version section
+    ## -> If branch is master, use numeric system. e.g: 0.0.1, 2.0.0;
+    ## -> If branch is NOT master, use branch name + last commit hash. e.g: dev-1a2b;
+
+    ## -> Get current version and set to variables.
+    ## -> For master, set a variable to increment version further on.
+    - task: CmdLine@2
+      displayName: Get Current Version
+      name: current_version
+      inputs:
+        targetType: inline
+        script: |
+
+          currentVersion=$(DOCKER_CMD_EXTRACT_POM_XML_VERSION)
+          echo "##[debug] Source CURRENT_VERSION: '$currentVersion' "
+          echo "##vso[task.setvariable variable=CURRENT_VERSION;isOutput=true]$currentVersion"
+
+          incrementVersion=$(echo $currentVersion | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+          if [[ -n $incrementVersion ]]; then
+            echo "##vso[task.setvariable variable=INCREMENT_VERSION;]$incrementVersion"
+          else
+            echo "##[error] Version in the pom.xml is not following semantic versioning."
+            echo "##[error] Verify if the version contains the pattern: <major>.<minor>.<patch>; e.g: 0.0.1, 1.0.0-branch, 1.1.0-branch+hash, 0.0.1-SNAPSHOT; "
+            exit 1
+          fi
+
+    ## -> Bump/Increment version and update increment variable.
+    ## -> Only allows this for master and QA branch and in CI steps. Do not allow manual pushes.
+    ## -> To disable set BUMP_VERSION_ENABLED in pipeline's library.
+    - task: semver-bump@1
+      displayName: Bump Version
+      condition: and(succeeded(),
+                  ne(variables['Build.Reason'], 'Manual'),
+                  in(variables['Build.SourceBranchName'],'master','main','dev','esteira1','esteira2','preprod','prodlike','producao' )
+                  )
+      name: bump_version
+      inputs:
+        VersionVariable: 'INCREMENT_VERSION'
+        IncrementLevel: 'patch'
+        targetType: inline
+
+    ## -> Set the new version to a variable. This allows it to be used in other stages, jobs or tasks.
+    - task: Bash@3
+      displayName: 'Set New Version'
+      name: new_version
+      inputs:
+        targetType: inline
+        script: |
+          echo "##[debug] Source CURRENT_VERSION: '$(current_version.CURRENT_VERSION)'"
+
+          if [[ '$(Build.SourceBranchName)' == 'master' || '$(Build.SourceBranch)' == refs/tags* ]]; then
+            echo "##[debug] Source NEW_VERSION: '$(INCREMENT_VERSION)'"
+            echo "##vso[task.setvariable variable=NEW_VERSION;isOutput=true]$(INCREMENT_VERSION)"
+          else
+            newVersion=$(INCREMENT_VERSION)-$(Build.SourceBranchName).$(SHORT_HASH)
+            echo "##[debug] Source NEW_VERSION: $newVersion"
+            echo "##vso[task.setvariable variable=NEW_VERSION;isOutput=true]$newVersion"
+          fi
+
+    ## -> Login to docker registry
+    - task: Docker@2
+      displayName: "Docker login VCR"
+      inputs:
+        containerRegistry: "VCR-DOCKER"
+        command: login
+
+    ## -> Build Liquibase docker image
+    - task: Bash@3
+      displayName: 'Build Liquibase Image'
+      continueOnError: false
+      inputs:
+        targetType: inline
+        script: |
+            ## -> Set pipeline tag for ENVIRONMENT
+            echo "##vso[build.addbuildtag]environment=$(ENVIRONMENT)"
+
+            echo "##[group] Show Dockerfile"
+            cat .azuredevops/builder.Dockerfile
+            echo "##[endgroup]"
+
+            echo "##[debug] Building the docker image from .azuredevops/builder.Dockerfile"
+            docker build -t "builder/java" -f .azuredevops/builder.Dockerfile .
+
+    ## -> Clear the checksums if the variable CLEAR_CHECKSUM enable it
+    - task: LiquibaseMvnVivoLiquibase@4
+      displayName: 'Clear CheckSums'
+      condition: and(succeeded(), eq(${{ parameters.clearCheckSums }}, true))
+      inputs:
+        goal: 'clearCheckSums'
+
+    ## -> Checks your changelog and identifies any possible errors with Liquibase syntax that may cause the update command to fail.
+    - task: LiquibaseMvnVivoLiquibase@4
+      displayName: 'Validate Changelogs'
+      inputs:
+        goal: 'validate'
+
+    ## -> Checks if there is any changesets to deploy.
+    - task: LiquibaseMvnVivoLiquibase@4
+      displayName: 'List Changesets to be deployed'
+      continueOnError: 'true'
+      inputs:
+        goal: 'verifyDbStatus'
+        extraAttributes: >-
+          -Dliquibase.command.status.contextFilter=$(ENVIRONMENT)
+          -Dliquibase.labels=$(LIQUIBASE_LABELS)
+          -Dliquibase.logLevel=WARNING
+
+    ## -> Install Liquibase
+    - task: ToolInstall@5
+      displayName: Install Liquibase CLI
+      condition: and(succeeded(),
+                  ne(variables.ENABLE_SNAPSHOT_COMPARE, false),
+                  ne(variables.SKIP_DEPLOY, true))
+      inputs:
+        toolUrl: 'https://github.com/liquibase/liquibase/releases/download/v4.30.0/liquibase-4.30.0.tar.gz'
+
+    ## -> Snapshot the data base if the variable is set to true
+    - task: LiquibaseMvnVivoLiquibase@4
+      displayName: 'Snapshot Target Database'
+      condition: and(succeeded(),
+                  ne(variables.ENABLE_SNAPSHOT_COMPARE, false),
+                  ne(variables.SKIP_DEPLOY, true))
+      inputs:
+        goal: 'snapshot'
+        extraAttributes: --defaults-file=.azuredevops/liquibase/liquibase.properties
+
+    ## -> Set artifact information to variables. This allows it to be used in other stages, jobs or tasks.
+    - task: CmdLine@2
+      name: artifact_name
+      displayName: 'Set Artifact Name'
+      inputs:
+        targetType: inline
+        script: |
+          echo "##[debug] Extracting the artifact ID from pom.xml"
+          artifactId=$(DOCKER_CMD_EXTRACT_ARTIFACT_ID)
+
+          echo "##[debug] Extracting the artifact version from pom.xml"
+          artifactVersion=$(new_version.NEW_VERSION)
+
+          artifactName="$artifactId-$artifactVersion"
+
+          echo "##[debug] Project Artifact Name : $artifactName"
+          echo "##vso[task.setvariable variable=ARTIFACT_NAME;isOutput=true]$artifactName"
+
+    ## -> Copy files to staging area
+    - task: CopyFiles@2
+      name: t_copy_file
+      displayName: 'Copy Project to Staging Directory'
+      inputs:
+        TargetFolder: '$(Build.ArtifactStagingDirectory)'
+        OverWrite: true
+        CleanTargetFolder: true
+        Contents: >
+          **/*
+
+          !.git/**/*
+
+          !?/**/*
+
+          !**/*.log
+
+    ## -> Compress artifacts into tar. This allows to use less space and to be used in other stages, jobs or tasks.
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Artifact'
+      continueOnError: false
+      inputs:
+        ArtifactName: $(artifact_name.ARTIFACT_NAME)
+        StoreAsTar: true
+
+    ## -> Generate raw SQL file for changes to inspect the raw SQL before deploy.
+    - task: LiquibaseMvnVivoLiquibase@4
+      displayName: 'Generate Deploy SQL Script'
+      continueOnError: 'true'
+      inputs:
+        goal: 'updateSQL'
+        extraAttributes: >-
+          -Dliquibase.migrationSqlOutputFile=deploy-$(artifact_name.ARTIFACT_NAME)-$(ENVIRONMENT)-$(System.JobAttempt).sql
+          -Dliquibase.contexts=$(ENVIRONMENT)
+          -Dliquibase.labels=$(LIQUIBASE_LABELS)
+
+    ## -> Publish deploy raw SQL file for changes
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Deploy SQL Script File'
+      continueOnError: true
+      inputs:
+        PathtoPublish: 'deploy-$(artifact_name.ARTIFACT_NAME)-$(ENVIRONMENT)-$(System.JobAttempt).sql'
+        ArtifactName: 'deploy_sql_scripts'
+
+    ## -> Backup the data base if the variable is set to true
+    - task: LiquibaseMvnVivoLiquibase@4
+      displayName: 'Backup Target Database'
+      condition: and(succeeded(),
+                  ne(variables.BACKUP_DATABASE, false),
+                  ne(variables.SKIP_DEPLOY, true))
+      inputs:
+        goal: 'generateChangeLog'
+        extraAttributes: >-
+          -Dliquibase.outputChangeLogFile=backup-$(artifact_name.ARTIFACT_NAME)-$(ENVIRONMENT)-$(System.JobAttempt).$(DB_TYPE).sql
+
+    ## -> Publish backup raw SQL file
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Backup SQL Script File'
+      condition: and(succeeded(),
+                  ne(variables.BACKUP_DATABASE, false),
+                  ne(variables.SKIP_DEPLOY, true))
+      continueOnError: true
+      inputs:
+        PathtoPublish: 'backup-$(artifact_name.ARTIFACT_NAME)-$(ENVIRONMENT)-$(System.JobAttempt).$(DB_TYPE).sql'
+        ArtifactName: 'database_backup'
+
+    ## -> If parameters rollback is enabled, check rollback script .
+    - ${{ if eq(parameters.enableRollback, true) }}:
+
+      ## -> Generate raw rollback SQL file for rollback to inspect the raw SQL before deploy.
+      - task: LiquibaseMvnVivoLiquibase@4
+        displayName: 'Generate Rollback Preview Scripts'
+        inputs:
+          goal: 'futureRollbackSQL'
+          extraAttributes: >-
+            -Dliquibase.outputFile=rollback-preview-$(artifact_name.ARTIFACT_NAME)-$(ENVIRONMENT)-$(System.JobAttempt).sql
+            -Dliquibase.contexts=$(ENVIRONMENT)
+            -Dliquibase.labels=$(LIQUIBASE_LABELS)
+            -Dliquibase.logLevel=FINE
+
+      ## -> Publish raw rollback SQL file
+      - task: PublishBuildArtifacts@1
+        displayName: 'Publish Rollback SQL Script File'
+        inputs:
+          PathtoPublish: rollback-preview-$(artifact_name.ARTIFACT_NAME)-$(ENVIRONMENT)-$(System.JobAttempt).sql
+          ArtifactName: 'rollback_sql_scripts'
+
+  ## -> Job for bump and commit version
+  - job: commit_version_bump
+    displayName: "Commit Version Bump"
+    dependsOn: build
+    condition: and(succeeded(),
+                  ne(variables['Build.Reason'], 'Manual'),
+                  in(variables['Build.SourceBranchName'],'master','main','dev','esteira1','esteira2','preprod','prodlike','producao' )
+                  )
+    variables:
+    - name: CURRENT_VERSION
+      value: $[ dependencies.build.outputs['current_version.CURRENT_VERSION'] ]
+    - name: NEW_VERSION
+      value: $[ dependencies.build.outputs['new_version.NEW_VERSION'] ]
+    - name: NEXUS_DEPS_USR
+      value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEPS_USR'] ]
+    - name: NEXUS_DEPS_PSW
+      value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEPS_PSW'] ]
+    - name: NEXUS_DEFAULT_USR
+      value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEFAULT_USR'] ]
+    - name: NEXUS_DEFAULT_PSW
+      value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEFAULT_PSW'] ]
+
+    steps:
+
+    # -> Clean the pipeline workspace and checkout the code.
+    # -> 6d15af64-176c-496d-b583-fd2ae21d4df4 is the decorator for checkout.
+    - task: 6d15af64-176c-496d-b583-fd2ae21d4df4@1
+      condition: and(
+        succeeded(),
+        eq(variables.BUMP_VERSION_ENABLED, 'true'))
+      inputs:
+        repository: self
+        persistCredentials: "true"
+        clean: true
+
+    ## -> Checkout the last commit that was pushed to the repository.
+    - task: Bash@3
+      displayName: Checkout Last Commit
+      name: checkout_last_commit
+      condition: and(
+        succeeded(),
+        eq(variables.BUMP_VERSION_ENABLED, 'true'))
+      inputs:
+        targetType: inline
+        script: |
+          echo "##[debug] Checkout last commit from '$(Build.SourceBranchName)'"
+
+          git config pull.rebase true
+          git fetch -f --depth 1 origin $(Build.SourceBranchName):$(Build.SourceBranchName)
+          git checkout -f $(Build.SourceBranchName)
+
+    ## -> Bump version in code
+    - task: Bash@3
+      displayName: Update Source Version
+      condition: and(
+        succeeded(),
+        eq(variables.BUMP_VERSION_ENABLED, 'true'))
+      inputs:
+        targetType: inline
+        script: |
+
+          BUILDER_IMAGE_NAME="builder/java"
+
+          docker build --no-cache --build-arg USER_ID=$(DOCKER_CMD_USERNAME) --build-arg GROUP_ID=$(DOCKER_CMD_GROUP) -t $BUILDER_IMAGE_NAME -f .azuredevops/builder.Dockerfile .
+
+          run_docker() {
+            docker run --rm \
+              --user=$(DOCKER_CMD_USERNAME):$(DOCKER_CMD_GROUP) \
+              --network host \
+              --log-driver none \
+              -e JAVA_OPTS_MEMORY_MAX=$(DEFAULT_MAX_MEMORY_BUILD) \
+              -e TZ="America/Sao_Paulo" \
+              -e SYSTEM_ACCESSTOKEN=$(System.AccessToken) \
+              -e NEXUS_DEPS_USR=$(NEXUS_DEPS_USR) \
+              -e NEXUS_DEPS_PSW=$(NEXUS_DEPS_PSW) \
+              -v $(pwd):/app \
+              -v $HOME/.m2:/.m2 \
+              -v $(DEFAULT_MAVEN_SETTINGS):/.m2/settings.xml \
+              -w $(DOCKER_WORKDIR) \
+              "$BUILDER_IMAGE_NAME" sh -c "$1"
+          }
+
+          echo "##[debug] Pushing NEW_VERSION: $(NEW_VERSION)"
+
+          run_docker "mvn -e -X $MAVEN_OPTS versions:set -DnewVersion=$(NEW_VERSION) -s /.m2/settings.xml -Dmaven.repo.local=/.m2/repository"
+
+    ## -> Push new version to git
+    - task: Bash@3
+      displayName: 'Commit Updated Version'
+      condition: and(
+        succeeded(),
+        eq(variables.BUMP_VERSION_ENABLED, 'true'))
+      inputs:
+        targetType: inline
+        script: |
+
+          ## -> Define variables
+          branchName=$(Build.SourceBranchName)
+          tagRepo=true
+
+          ## -> Set tagPushParam if tagRepo is true
+          tagPushParam=""
+          echo "##[debug] tagRepo.....: $tagRepo"
+
+          ## -> Add changes and commit
+          git add .
+          git commit -am "[CI SKIP] Project version has been updated. Released version '$(NEW_VERSION)'" --author="$BUILD_REQUESTEDFOR <$BUILD_REQUESTEDFOREMAIL>"
+
+          ## -> Tag the commit if tagRepo is true
+          if [[ "$tagRepo" == "true" ]]; then
+
+            if git rev-parse "$(NEW_VERSION)" >/dev/null 2>&1; then
+              echo "##vso[task.logissue type=warning;]Tag $(NEW_VERSION) already exists. Skipping tag creation and commit."
+            else
+              if [[ "$tagRepo" == "true" ]]; then
+                tagPushParam="--tags"
+                git tag $(NEW_VERSION)
+              fi
+            fi
+
+          fi
+
+          ## -> Show git status for debug purposes
+          git status
+
+          ## -> Attempt to push changes and tags
+          echo "##[command] git push origin $tagPushParam $branchName"
+          git push origin $tagPushParam $branchName
+
+          ## -> Check if git push succeeded
+          if [ $? -ne 0 ]; then
+            echo "##vso[task.logissue type=error;] Git push failed. Permission denied."
+            echo "##vso[task.complete result=Failed;]"
+            exit 1
+          fi
+
+          echo "##[debug] Version updated to $(NEW_VERSION)"
+          echo "##vso[build.addbuildtag]version=$(NEW_VERSION)"
+
+    - task: Bash@3
+      displayName: 'Tag Pipeline with Package Version'
+      condition: succeeded()
+      inputs:
+        targetType: inline
+        script: |
+          echo "##[debug] Adding pipeline tag with new version: $(NEW_VERSION)"
+          echo "##vso[build.addbuildtag]version=$(NEW_VERSION)"

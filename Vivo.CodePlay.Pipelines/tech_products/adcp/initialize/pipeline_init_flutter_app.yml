@@ -1,0 +1,130 @@
+parameters:
+- name: qa_environment
+- name: prod_source_branch
+  displayName: Branch autorizada a gerar a tag PRE- (origem de producao)
+  default: 'master'
+
+stages:
+
+## INIT 
+
+- stage: pipeline_init
+  displayName: "Pipeline initialization"
+  pool: $(PRIVATE_AGENT_SHARED)
+  jobs:
+  - job: prepare_pipeline
+    displayName: "Prepare"
+
+    steps:
+
+    - task: Bash@3
+      name: check_env
+      displayName: 'Check Branch/Tag & Environment'
+      inputs:
+        targetType: inline
+        script: |
+
+          # Extract the current version from the pubspec.yaml file
+          current_version=$(grep -Po '^version: \K.*' pubspec.yaml)
+          echo "##[debug]Current version is: $current_version"
+
+          current_branch=$(echo "$BUILD_SOURCEBRANCH" | awk -F/ '{print $NF}')
+          current_feature=$(echo "$BUILD_SOURCEBRANCH" | awk -F/ '{print $3}')
+          # Ref completo (refs/heads/... ou refs/tags/...). Necessario para comparar
+          # com prod_source_branch, que pode conter '/' (ex.: hotfix/abc) e portanto
+          # nao e representavel por current_branch, que guarda apenas o ultimo segmento.
+          current_ref="$BUILD_SOURCEBRANCH"
+
+          echo "##[debug]Current Branch: $current_branch"
+          echo "##[debug]Current Ref: $current_ref"
+          echo "##[debug]Environment: ${{ parameters.qa_environment }}"
+
+          if [ "$current_branch" == "master" ] && [ ${{ parameters.qa_environment }} == "preprod" ]; then
+
+            echo "##[debug]Running master & preprod"
+
+          elif [[ "$current_ref" == "refs/heads/${{ parameters.prod_source_branch }}" ]] && [[ ${{ parameters.qa_environment }} == "preprod" ]]; then
+
+            echo "##[debug]Running ${{ parameters.prod_source_branch }} (prod_source_branch) & preprod"
+
+          elif [[ "$current_branch" == "esteira1" ]] && [[ ${{ parameters.qa_environment }} == "esteira1" ]]; then
+
+            echo "##[debug]Running esteira1 & esteira1"
+
+          elif [[ "$current_feature" == "feature" ]] && [[ ${{ parameters.qa_environment }} == "esteira1" ]]; then
+
+            echo "##[debug]Running $current_branch & esteira1"
+
+          elif [[ "$current_branch" == "develop" ]] && [[ ${{ parameters.qa_environment }} == "preprod" ]]; then
+
+            echo "##[debug]Running develop & preprod"
+
+          elif [[ "$current_feature" == "feature" ]] && [[ ${{ parameters.qa_environment }} == "esteira1" ]]; then
+
+            echo "##[debug]Running $current_branch & esteira1"
+
+          elif [[ "$current_feature" == "feature" ]] && [[ ${{ parameters.qa_environment }} == "preprod" ]]; then
+
+            echo "##[debug]Running $current_branch & preprod"
+
+          elif [[ "$current_branch" == "release" ]] && [[ ${{ parameters.qa_environment }} == "preprod" ]]; then
+
+            echo "##[debug]Running release & preprod"
+
+          elif [[ "$current_branch" == RELEASE-PRE-* ]] && [[ ${{ parameters.qa_environment }} == "release" ]]; then
+
+            echo "##[debug]Running Tag RELEASE PRE & release"
+
+          elif [[ "$current_branch" == PRE-* ]] && [[ ${{ parameters.qa_environment }} == "prodlike" ]]; then
+
+            echo "##[debug]Running Tag PRE & prodlike"
+
+          elif [[ "$current_branch" == PRE-* ]] && [[ ${{ parameters.qa_environment }} == "producao" ]]; then
+
+            echo "##[debug]Running Tag PRE & producao"
+
+          else
+
+            echo "##[error]Invalid Brach/Tag & Environment!"
+            echo "##[debug]Esta pipeline aceita somente as combinações de brach/tag e environment:"
+            
+            echo "##[debug]Branch esteira1 ou feature/* & esteira1"
+            echo "##[debug]Branch develop ou feature/* & preprod"
+            echo "##[debug]Branch release & preprod"            
+            echo "##[debug]Branch master & preprod"
+            echo "##[debug]Branch ${{ parameters.prod_source_branch }} (prod_source_branch) & preprod"
+            echo "##[debug]Tags RELEASE-PRE-* & release"
+            echo "##[debug]Tags PRE-* & prodlike"
+            echo "##[debug]Tags PRE-* & producao"
+
+            exit 1
+
+          fi
+
+
+    - script: |
+        echo "##[debug] BREAK_WHEN_NOT_FOUND.....: ${BREAK_WHEN_NOT_FOUND}"
+        if [ ! -f "catalog-info.yaml" ]; then
+          if [ "$BREAK_WHEN_NOT_FOUND" = 'True' ]; then
+            echo "##vso[task.logissue type=error] Unable to find catalog-info.yaml file (path=$(pwd))."
+            exit 1
+          fi
+        fi
+      displayName: "Check for catalog-info.yml"
+      env:
+        BREAK_WHEN_NOT_FOUND: true
+
+    - task: CopyFiles@2
+      displayName: "Copy catalog-info.yaml to Staging Directory"
+      inputs:
+        TargetFolder: "$(Build.ArtifactStagingDirectory)"
+        OverWrite: true
+        CleanTargetFolder: true
+        Contents: |
+          catalog-info.yaml
+          
+    - task: PublishPipelineArtifact@1
+      displayName: "Publish catalog-info.yaml"
+      inputs:
+        artifactName: "catalog-info"
+        targetPath: "$(Build.ArtifactStagingDirectory)"

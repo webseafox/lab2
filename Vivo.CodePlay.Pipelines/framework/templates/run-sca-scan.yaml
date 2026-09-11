@@ -1,0 +1,107 @@
+parameters:
+- name: workingDirectory
+  type: string
+  default: '$(Build.SourcesDirectory)'
+  
+- name: buildArtifactName
+  type: string
+  default: ''
+  
+- name: vivoFlow
+  type: string
+  default: 'none'
+
+
+- name: convisoCompanyId
+  type: string
+  default: '430'
+  displayName: 'Conviso Company ID'
+
+steps:
+
+  - ${{ if or(eq(parameters.vivoFlow, 'none'),and(ne(parameters.vivoFlow, 'none'),or(eq(variables['Build.SourceBranchName'], 'master'),eq(variables['Build.SourceBranchName'], 'main'),startsWith(variables['Build.SourceBranchName'], 'release/'),contains(parameters.vivoFlow, variables['Build.SourceBranchName']))))}}: 
+
+    ## Download artifacts do build (se necessário)
+    - task: DownloadBuildArtifacts@1
+      displayName: 'Download Build Artifacts'
+      inputs:
+        artifactName: ${{ parameters.buildArtifactName }}
+        cleanDestinationFolder: false
+        extractTars: true
+        parallelizationLimit: 8
+        downloadPath: $(Build.SourcesDirectory)
+      condition: ne('${{ parameters.buildArtifactName }}', '')
+
+    ## -> Download Security Tokens
+    - task: AzureKeyVault@2
+      displayName: 'Getting AKV Security Credentials'
+      name: get_security_credentials
+      timeoutInMinutes: 1
+      retryCountOnTaskFailure: 5
+      inputs:
+        azureSubscription: DevOpsSharedResources
+        KeyVaultName: '$(AKV_DEVOPS_NAME)'
+        SecretsFilter: 'CONVISO-API-KEY, DEPENDENCY-TRACK-TOKEN'
+      condition: and(eq(variables['DEPENDENCY-TRACK-TOKEN'], ''), eq(variables['CONVISO-API-KEY'], ''))
+
+    - task: Bash@3
+      displayName: 'Set Security Credentials Variables'
+      name: security_credentials
+      condition: succeeded()
+      continueOnError: false
+      inputs:
+        targetType: inline
+        script: |
+          echo "##[group] Secrets for Security"
+          
+          echo "##vso[task.setvariable variable=DT_SCA_TOKEN;isSecret=true]$(DEPENDENCY-TRACK-TOKEN)"
+          echo "##vso[task.setvariable variable=CONVISO_API_KEY;isSecret=true]$(CONVISO-API-KEY)"
+
+          echo "##[endgroup]"
+          echo "##[debug] To open and check the information above, click the arrows on the left."
+
+    - task: VivoAppSecTools@1
+      displayName: 'Vivo AppSec Tools Run SCA'
+      name: run_sca
+      inputs:
+        command: 'runSca'
+        azdoProjectName: '$(System.TeamProject)-$(Build.Repository.Name)'
+        azdoProjectVersion: 'DevSecOps'
+        scaUseDockerImage: false
+        dependencyTrackToken: '$(DT_SCA_TOKEN)'
+        scanDirectory: '${{ parameters.workingDirectory }}'
+        convisoApiKey: '$(CONVISO_API_KEY)'     
+        evaluateSecurityGate: true  
+        debugLogging: true     
+        convisoCompanyId: '${{ parameters.convisoCompanyId }}'     
+
+    # Publicar artefatos condicionalmente
+    - task: PublishBuildArtifacts@1
+      condition: eq(variables['run_sca.SCA_DT_GATE_VALIDATION_BLOCKED'], 'true')
+      continueOnError: true
+      inputs:
+        pathToPublish: '$(run_sca.SCA_DT_REPORT_PATH)'
+        artifactName: 'fortify-security-report'
+      displayName: 'Publicar Relatório DT'     
+
+
+  - ${{ else }}:
+  
+    - task: Bash@3
+      displayName: 'Security Scan Skipped'
+      condition: and(succeeded(), eq(variables['run_sast.SHOULD_SKIP_SECURITY_GATE'], true))
+      inputs:
+        targetType: inline
+        script: |
+          YELLOW='\033[1;33m'
+          BLUE='\033[0;34m'
+          NC='\033[0m' # No Color
+          echo -e "${YELLOW}==================================[ AÇÃO: SCAN IGNORADO (SKIPPED) ]==================================${NC}"
+          echo -e "Modo de Operação Ativo: ${YELLOW}VivoFlow${NC}"
+          echo -e "Branch Atual: ${YELLOW}$(Build.SourceBranchName)${NC}"
+          echo -e "Regras de Validação em Vigor: ${YELLOW}master, main, release/*, ${{ join(', ', parameters.vivoFlow) }}${NC}"
+          echo ""
+          echo -e "${YELLOW}MOTIVO: O scan de segurança foi intencionalmente ignorado pois o branch '$(Build.SourceBranchName)' não corresponde a nenhuma das regras de validação ativas.${NC}"
+          echo ""
+          echo -e "${BLUE}Dica: Se este branch deveria ser validado, acione a Equipe de AppSec appsec_vivo.br@telefonica.com${NC}"
+          echo -e "${YELLOW}====================================================================================================${NC}"             

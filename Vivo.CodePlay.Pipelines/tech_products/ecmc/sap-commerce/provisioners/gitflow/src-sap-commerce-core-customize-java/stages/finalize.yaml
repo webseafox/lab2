@@ -1,0 +1,61 @@
+﻿stages:
+- stage: finalize
+  dependsOn:
+  - bump_version
+  displayName: "Build/Deploy in Cloud"
+  pool: $(PRIVATE_AGENT_DEFAULT)
+  jobs:
+    - job: create_tag
+      displayName: "Create version tag"
+      variables:
+      - name: NEW_VERSION
+        value: $[ stageDependencies.bump_version.bump_version.outputs['BumpVersion.NEW_VERSION'] ]
+      - name: NEW_GIT_SHA
+        value: $[ stageDependencies.bump_version.bump_version.outputs['BumpVersion.NEW_GIT_SHA'] ]
+      steps:
+      - checkout: self
+        fetchDepth: 100
+        fetchTags: false
+        persistCredentials: true
+
+      - bash: |
+          echo "NEW_VERSION >> $(NEW_VERSION)"
+          echo -n $(NEW_VERSION) > VERSION
+
+          git config user.email "azure-pipelines@telefonicati.onmicrosoft.com"
+          git config user.name "Azure Pipelines"
+
+          echo "##[command]Atualizando o repositório para criação da tag"
+          git fetch
+          git reset --hard $NEW_GIT_SHA
+
+          echo "##[command]Criando tag da versão $(NEW_VERSION) com o SHA $(NEW_GIT_SHA)"
+          git tag $(NEW_VERSION) $(NEW_GIT_SHA)
+          git push origin refs/tags/$(NEW_VERSION) --force
+        displayName: "Create version tag"
+
+    - job: job_commit_hash_to_core
+      workspace:
+          clean: all
+      condition: succeeded()
+      dependsOn:
+      - create_tag
+      variables:
+        - name: NEW_VERSION
+          value: $[ stageDependencies.bump_version.bump_version.outputs['BumpVersion.NEW_VERSION'] ]
+        - name: NEW_GIT_SHA
+          value: $[ stageDependencies.bump_version.bump_version.outputs['BumpVersion.NEW_GIT_SHA'] ]
+        - name: SAP_COMMERCE_OPTIONS_VERSION
+          value: $[ stageDependencies.bump_version.bump_version.outputs['BumpVersion.SAP_COMMERCE_OPTIONS_VERSION'] ]
+      displayName: "Update submodule/Commit hash and tag"
+      steps:
+        - checkout: CloudSapCommerce
+          persistCredentials: true
+        - ${{ if and(or(startsWith(variables['Build.SourceBranch'], 'refs/heads/stage/'), in(variables['Build.SourceBranch'], 'refs/heads/s1', 'refs/heads/s2', 'refs/heads/s3', 'refs/heads/s4', 'refs/heads/s5', 'refs/heads/s6')), in(variables['Build.Reason'], 'IndividualCI', 'BatchedCI')) }}:
+          - template: /tech_products/ecmc/sap-commerce/tasks/versioning/update_repo_core_version.yaml
+            parameters:
+              newVersion: $(NEW_VERSION)
+              newGitSha: $(NEW_GIT_SHA)
+              workingDirectory: $(Build.SourcesDirectory)/$(Build.Repository.Name)
+              workingDirectoryCore: $(Build.SourcesDirectory)
+              repoIsCore: true

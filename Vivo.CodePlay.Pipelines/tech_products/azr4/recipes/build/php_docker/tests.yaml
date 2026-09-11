@@ -1,0 +1,64 @@
+jobs:
+- job: tests
+  pool: GeneralPurposeLinuxAgentsCI
+  workspace:
+    clean: all
+  condition: and(succeeded(), eq(variables['TESTS_ENABLED'], 'true'))
+  steps:
+  - task: Docker@2
+    inputs:
+      containerRegistry: registry-telefonicabigdata
+      displayName: 'Login to Docker Registry'
+      command: 'login'
+  - checkout: self
+    persistCredentials: true
+  - script: |
+      execute_command() {
+        command=$1
+        echo "##[command] $command"
+        docker run --rm -v $PWD:/app \
+          -e command="$command" \
+          -e COMPOSER_ALLOW_SUPERUSER=1 \
+          registry.telefonicabigdata.com/devops4p/php-composer:1.0.0 \
+          bash -c "cd /app && $command"
+        echo "##[debug] $command finished"
+      }
+
+      echo "##[debug] Initing Code Style Stage"
+      git config --global --add safe.directory ${CI_PROJECT_DIR}
+      git fetch --all
+      git pull
+      git checkout ${BRANCH_NAME}
+      if [ $(git rev-list --count HEAD) -gt 1 ]; then
+        export CHANGED_FILES=$(git diff --name-only --diff-filter=ACMR HEAD..HEAD~1)
+      else
+        export CHANGED_FILES=$(git diff --name-only --diff-filter=ACMR HEAD)
+      fi
+      echo "##[debug] Changed files: ${CHANGED_FILES}"
+      execute_command "cd tools/php-code-style && composer install"
+      echo '##[debug] Run PHP CS Fixer'
+      execute_command "tools/php-code-style/vendor/bin/php-cs-fixer --config=tools/php-code-style/.php-cs-fixer.php --path-mode=intersection --verbose fix ${CHANGED_FILES}"
+      echo '##[debug] Run PHPCBF'
+      execute_command "tools/php-code-style/vendor/bin/phpcbf --standard=tools/php-code-style/.phpcs.xml ${CHANGED_FILES} || true"
+      
+      echo '##[debug] Commit Files'
+      if [ -z "$(git status --porcelain)" ]; then
+        echo "##[debug] No changes to commit"
+        exit 0
+      fi
+      git commit -m "[CI SKIP] style: fix code style" --author="$BUILD_REQUESTEDFOR <$BUILD_REQUESTEDFOREMAIL>"
+      git push origin ${BRANCH_NAME}
+      if [ $? -ne 0 ]; then 
+        echo "##vso[task.logissue type=error;] Git push failed. Permission denied"
+        echo "##vso[task.complete result=Failed;]"
+        exit 1
+      fi  
+
+      echo '##[debug] Run PHPCS, annotating the errors'
+      execute_command "tools/php-code-style/vendor/bin/phpcs --standard=tools/php-code-style/.phpcs.xml -q --report=full ${CHANGED_FILES} || true"
+      echo '##[debug] TODO post to gitlabMR'
+    name: php_code_style
+    displayName: 'PHP Code Style'
+    env:
+      BRANCH_NAME: $(Build.SourceBranchName)
+      CI_PROJECT_DIR: $(Build.SourcesDirectory)

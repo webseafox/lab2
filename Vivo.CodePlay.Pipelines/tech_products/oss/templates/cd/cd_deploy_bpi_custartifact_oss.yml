@@ -1,0 +1,551 @@
+parameters:
+- name: custArtifactsType
+  type: string
+  values:
+  - neo4jPlugins
+  - webWebapps
+  - neo4jScripts
+  - chetakScripts
+- name: environment
+- name: infrastructureType
+
+stages:
+- stage: cd_deploy
+  displayName: CD - Deploy ${{parameters['environment']}}
+  dependsOn:
+  - environment_init
+  - ci_build
+  - ci_publish
+  pool: $(AGENT_POOL_CD)
+
+  ## -> Loads variables from other stages.
+  variables:
+  - name: NEW_VERSION
+    value: $[ stageDependencies.ci_build.build.outputs['new_version.NEW_VERSION'] ]
+  - name: ARTIFACT_FILE
+    value: $[ stageDependencies.ci_build.build.outputs['artifact_name.ARTIFACT_FILE'] ]
+  - name: ARTIFACT_NAME
+    value: $[ stageDependencies.ci_build.build.outputs['artifact_name.ARTIFACT_NAME'] ]
+  - name: ARTIFACT_ID
+    value: $[ stageDependencies.ci_build.build.outputs['source_data.ARTIFACT_ID'] ]
+
+  jobs:
+  - deployment: deploy
+    displayName: Deploy
+    workspace:
+      clean: all
+    environment: deploy-${{parameters['environment']}}
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+            ## -> Skip Download
+            - download: none
+
+            ## -> Download the build artifact
+            - task: DownloadBuildArtifacts@1
+              displayName: 'Download Build Artifacts'
+              inputs:
+                  artifactName: $(ARTIFACT_NAME)
+                  cleanDestinationFolder: false
+                  extractTars: true
+                  parallelizationLimit: 8
+                  downloadPath: $(System.ArtifactsDirectory)
+
+            ## -> Log in to kubernetes
+            - task: Kubernetes@1
+              displayName: Kubernetes Cluster Login
+              inputs:
+                connectionType: 'Kubernetes Service Connection'
+                kubernetesServiceEndpoint: 'kube-${{ parameters.infrastructureType }}-${{ parameters.environment }}'
+                command: 'login'
+
+            ## -> Set namespace to custpackage
+            - task: Bash@3
+              name: set_custpackage_namespace
+              displayName: 'Set CustPackage Namespace'
+              inputs:
+                targetType: 'inline'
+                script: |
+                  # Verify if NAMESPACE variable is empty, if yes set namespace by Select
+                  if [ -z "$NAMESPACE" ]; then
+
+                    # set default var CUSTARTIFACTS_SELECTOR  value
+                    if [ -z "$CUSTARTIFACTS_SELECTOR" ]; then
+                      CUSTARTIFACTS_SELECTOR="bp-app=custartifacts"
+                    fi
+
+                    echo "##[debug] It appears that the 'NAMESPACE' variable hasn't been set."
+                    echo "##[debug] Attempting to fetch the namespace from the 'Selector'. This will be done via the 'CUSTARTIFACTS_SELECTOR' variable."
+                    echo "##[debug] If 'CUSTARTIFACTS_SELECTOR' variable isn't set either, we'll resort to using the default value 'bp-app=custartifacts' for 'Selector'."
+
+                    namespaceSet=$(kubectl get pods --all-namespaces --selector $CUSTARTIFACTS_SELECTOR --insecure-skip-tls-verify | awk 'NR>1{print $1; exit}')
+                  else
+                    echo "##[debug] The NAMESPACE variable is defined as $NAMESPACE. Retrieving the $NAMESPACE namespace from the cluster."
+                    namespaceSet=$(kubectl get namespaces --insecure-skip-tls-verify --no-headers -o custom-columns=":metadata.name" | grep -m1 "^$NAMESPACE")
+                  fi
+
+                  # if namespace was not set yet, set it with var NAMESPACE_{ENVIRONMENT}, ex NAMESPACE_ESTEIRA1
+                  if  [ -z $namespaceSet ]; then
+                    selected_var="$NAMESPACE_$ENVIRONMENT"
+                    namespaceSet=${!selected_var}
+                    namespaceSet=$(eval echo \$NAMESPACE_$ENVIRONMENT)
+                  fi
+
+                  # log variable value
+                  if [ -z $namespaceSet ]; then
+                    echo "##vso[task.logissue type=error] it was not possible to Retrieve the namespace of Custpackage Pod" ; exit 1;
+                  fi
+
+                  echo "##[command]CustPackage namespace: $namespaceSet"
+
+                  # set namespace variable to others tasks
+                  echo "##vso[task.setvariable variable=namespace_custartifacts;isOutput=true]$namespaceSet"
+
+            ## -> Backup custpackage
+            - task: Bash@3
+              name: backup_custartifacts
+              displayName: 'Backup Custpackage'
+              condition: and(succeeded(),ne(variables.SKIP_BACKUP,'true'))
+              inputs:
+                targetType: 'inline'
+                script: |
+
+                  # shopt to enable the alias to set namespace and kubeconfig
+                  shopt -s expand_aliases
+                  alias kubectl='kubectl --namespace=$(set_custpackage_namespace.namespace_custartifacts) --insecure-skip-tls-verify'
+
+                  cluster_name=$(kubectl config current-context)
+
+                  # get pod status, to check if it is up and running ok
+                  status=$(kubectl get pods custartifacts-0 -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')
+
+                  # if it is running ok log message pod is ready, if not, log error
+                  if [ "$status" != "True" ]; then
+                    echo "##[error] The pod custartifacts-0 is in Not ready status."
+                    exit 1
+                  else
+                    echo "##[debug] The pod custartifacts-0 is ready, creating a backup copy..."
+                  fi
+
+                  echo "##[group]List Custpackage /bp2/tmp/ directory in the pod:"
+                  kubectl exec -i custartifacts-0 -- ls -la /bp2/tmp/
+                  echo "##[endgroup]"
+
+                  echo "##[command]Delete Custpackage /bp2/tmp/ directory in the pod:"
+                  kubectl exec -i custartifacts-0 -- rm -rf /bp2/tmp/custpackage-bkp.tar
+
+                  echo "##[group]Backup Custpackage to /bp2/tmp/custpackage-bkp.tar"
+                  kubectl exec -i custartifacts-0 -- tar -cvf /bp2/tmp/custpackage-bkp.tar -C /bp2/data/cust_process/cust/asset/custpackage/ .
+                  echo "##[endgroup]"
+
+                  echo "##[group]List Custpackage /bp2/tmp/ directory after the backup in the pod"
+                  kubectl exec -i custartifacts-0 -- ls -la /bp2/tmp/
+                  echo "##[endgroup]"
+
+                  echo "##[debug] Verify if the backup of Custartifacts was successfully created..."
+
+                  status=$(kubectl exec -i custartifacts-0 -- bash -c 'if [ $(find /bp2/tmp -mmin -10 -name custpackage-bkp.tar | wc -l) -gt 0 ]; then echo ""; else echo "is not up to date"; fi')
+
+                  if [[ "$status" == *"is not up to date"* ]]; then
+                    echo "##vso[error]The /bp2/tmp/custpackage-bkp.tar is not up to date. Please verify if the task Backup Custartifacts ran successfully."
+                    exit 1
+                  else
+                    echo "##[debug] The /bp2/tmp/custpackage-bkp.tar was successfully created."
+                  fi
+
+                  echo "##[command]Coping /bp2/tmp/custpackage-bkp.tar to $(System.ArtifactsDirectory)/custpackage-bkp.tar ..."
+                  kubectl cp custartifacts-0:/bp2/tmp/custpackage-bkp.tar $(System.ArtifactsDirectory)/custpackage-bkp.tar
+
+                  file_length=$(stat -c%s $(System.ArtifactsDirectory)/custpackage-bkp.tar)
+
+                  # when -lt 1048576 the custpackage is empty, the size of its backup becomes less than 1Mb.
+                  if [ $file_length -lt 1048576 ]; then
+                    echo "##vso[task.logissue type=warning]The backup size is less than 1MB. Please ensure that the Custpackage backup is correct before Rollback it"
+                  else
+                    echo "##[debug] custpackage-bkp.tar Copy was successfully copied"
+                    echo "##vso[task.setvariable variable=BACKUP_CUSTARTIFACTS_SUCCEEDED;isOutput=true]true"
+                  fi
+
+            ## -> Publish custpackage backup
+            - task: PublishBuildArtifacts@1
+              displayName: 'Publish Custpackage Backup to Pipeline'
+              condition: and(succeeded(),ne(variables.SKIP_BACKUP,'true'))
+              inputs:
+                PathtoPublish: '$(System.ArtifactsDirectory)/custpackage-bkp.tar'
+                ArtifactName: 'custpackage_backup'
+
+            ## -> Deploy custartifact
+            - task: Bash@3
+              name: deploy_custartifact
+              displayName: 'Deploy Custartifact'
+              inputs:
+                targetType: 'inline'
+                script: |
+
+                  # shopt to enable the use of alias to set namespace and kubeconfig default
+                  shopt -s expand_aliases
+                  alias kubectl='kubectl --namespace=$(set_custpackage_namespace.namespace_custartifacts) --insecure-skip-tls-verify'
+
+                  cluster_name=$(kubectl config current-context)
+
+                  # export var to report deploy task
+                  echo "##vso[task.setvariable variable=CLUSTER_NAME;]$cluster_name"
+
+                  echo "##[debug] Initiating the deployment of Custartifact within the pod(s) located in the $(set_custpackage_namespace.namespace_custartifacts) namespace of $cluster_name cluster"
+                  echo "##[command]Getting custartifacts pods..."
+                  custartifacts_pods=$(kubectl get pods --all-namespaces | grep -E "\scustartifacts-" | awk '{print $2}' | tr '\n' ' ')
+
+                  # check if custartifacts_pods is empty
+                  if [[ -z "$custartifacts_pods" ]]; then
+                    echo "##vso[task.logissue type=error]it was not possible to get custartifacts pods"
+                    exit 1;
+                  fi
+
+                  echo -e "\e[33mArtifact Type       : ${{parameters.custArtifactsType}}"
+                  echo -e "\e[33mKubernetes Cluster  : $cluster_name"
+                  echo -e "\e[33mNamespace           : $(set_custpackage_namespace.namespace_custartifacts)"
+                  echo -e "\e[33mPods                : $custartifacts_pods"
+
+                  # export custartifacts_pods var to report deploy task
+                  echo "##vso[task.setvariable variable=CUSTARTIFACTS_PODS;]$custartifacts_pods"
+
+                  # define the directory for each cust artifact type
+                  if [[ "${{parameters.custArtifactsType}}" == "neo4jPlugins" ]]; then
+                    dirCustpackage="/bp2/tmp/deploy/custpackage/neo4j/plugins/"
+                  elif [[ "${{parameters.custArtifactsType}}" == "webWebapps" ]]; then
+                    dirCustpackage="/bp2/tmp/deploy/custpackage/web/webapps/"
+                  elif [[ "${{parameters.custArtifactsType}}" == "neo4jScripts" ]]; then
+                    dirCustpackage="/bp2/tmp/deploy/custpackage/neo4j/scripts/"
+                  elif [[ "${{parameters.custArtifactsType}}" == "chetakScripts" ]]; then
+                    dirCustpackage="/bp2/tmp/deploy/custpackage/chetak/scripts/"
+                  fi
+
+                  # set var to log witch pod was successful deployed
+                  pods_success=""
+
+                  # Start deploy process
+                  for pod_name in $custartifacts_pods; do
+                    # control file verification to prevent concurrent deployments
+                    retries=0
+
+                    while kubectl exec -i $pod_name -- sh -c 'ls -lrtR /bp2/tmp/azuredevopsdeploy.log' &>/dev/null && [ $retries -lt 3 ]
+                    do
+                      echo "##[debug] There is another custartifacts deployment process currently in progress. Waiting 40 seconds to try again..."
+                      sleep 40
+                      ((retries++))
+                    done
+
+                    if [ $retries -eq 3 ]; then
+                      echo "##vso[task.logissue type=error] Please verify if there is another custartifacts deployment process currently in progress. If not, check whether the control file /bp2/tmp/azuredevopsdeploy.log exists in the pod $pod_name."
+                      exit 1
+                    fi
+                    # end control file
+
+                    # Logic to check if the control file error is not due to the pod being inaccessible.
+                    status=$(kubectl get pods $pod_name -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')
+                    if [ "$status" != "True" ]; then
+                      echo "##vso[task.logissue type=error] Pod is $pod_name Not ready."
+                      exit 1
+                    fi
+
+                    # create control file
+                    nohup kubectl exec -i $pod_name -- sh -c 'echo "arquivo de controle deploy" > /bp2/tmp/azuredevopsdeploy.log && sleep 90 && rm -f /bp2/tmp/azuredevopsdeploy.log' > /dev/null 2>&1 &
+                    # end of control logic
+
+                    ##########
+
+                    # Start the Sync
+                    echo "##[debug] Sync S3 Custpackage"
+                    
+                    # Coping custpackage-bkp.tar to pod $pod_name /bp2/tmp directory
+                    echo "##[command]Coping custpackage-bkp.tar to pod $pod_name /bp2/tmp directory"
+                    custpackageFile="$(System.ArtifactsDirectory)/custpackage-bkp.tar"
+                    kubectl cp $custpackageFile $pod_name:/bp2/tmp/custpackage-bkp.tar
+
+                    # Extracting custpackage-bkp.tar to /bp2/tmp/deploy/custpackage/
+                    echo "##[group]Extracting custpackage-bkp.tar to /bp2/tmp/deploy/custpackage/"
+                    echo "##[command]Resetting /bp2/tmp/deploy/custpackage/ directory"
+                    kubectl exec $pod_name -c app -- bash -c "rm -rf /bp2/tmp/deploy/custpackage/"
+                    kubectl exec $pod_name -c app -- bash -c "mkdir -p /bp2/tmp/deploy/custpackage/"
+                    echo "##[command]Extracting custpackage-bkp.tar"
+                    kubectl exec $pod_name -c app -- bash -c "ls -l /bp2/tmp/custpackage-bkp.tar"
+                    kubectl exec $pod_name -c app -- bash -c "tar -xf /bp2/tmp/custpackage-bkp.tar -C /bp2/tmp/deploy/custpackage/"
+                    echo "##[endgroup]"
+
+                    # Coping the artifact to /bp2/tmp/deploy/custpackage/
+                    if [[ "${{parameters.custArtifactsType}}" == "neo4jScripts" || "${{parameters.custArtifactsType}}" == "chetakScripts" ]]; then
+
+                      # export var to report deploy task
+                      echo "##vso[task.setvariable variable=ARTIFACT_NAME;]$(ARTIFACT_NAME)"
+                      echo "##vso[task.setvariable variable=PREVIOUS_ARTIFACT;]undefined"
+
+                      echo "##[section]========================== Deploy ${{parameters.custArtifactsType}} to $pod_name ======================="
+
+                      # Copy to a temp folder and then copy to the pod, thus deleting garbage
+                      dirScripts=$(Build.ArtifactStagingDirectory)/extracted_tars/$(ARTIFACT_NAME)
+
+                      if [ -z "$(ls -A $dirScripts)" ]; then
+                        echo "##vso[task.logissue type=error]It was not possible to find the scripts to deploy."
+                        exit 1
+                      else
+                        echo "##[debug] Coping the scripts into $pod_name..."
+                        echo "##[group]The scripts that will be deploy"
+                        tree $dirScripts
+                        echo "##[endgroup]"
+                      fi
+
+                      echo "##[group]The scripts in the pod $pod_name before deploy:"
+                      kubectl exec -i $pod_name -- sh -c "ls -lrtR $dirCustpackage"
+                      echo "##[endgroup]"
+
+                      echo "##[command]Delete old scripts directory of the pod $pod_name"
+                      kubectl exec -i $pod_name -- sh -c "rm -fr $dirCustpackage"
+
+                      echo "##[command]Create new scripts directory of the pod $pod_name"
+                      kubectl exec -i $pod_name -- sh -c "mkdir -p  $dirCustpackage"
+
+                      echo "##[command]Coping the scripts to $dirCustpackage in the pod $pod_name"
+                      cd $dirScripts
+                      kubectl cp ./ $pod_name:$dirCustpackage/
+
+                    else
+                      artifactId=$(ARTIFACT_ID)
+                      [ -z "$artifactId" ] && { echo "##vso[task.logissue type=error]The ARTIFACT_ID is null, therefore, it was not possible to find Artifact file"; exit 1; }
+
+                      workDir="$(DEFAULT_WORKDIR_ARTIFACTS)/$(ARTIFACT_NAME)/"
+                      sourceDir=$(dirname $(find $workDir -type f -name $ARTIFACT_FILE))
+
+                      echo -e "\e[33mArtifact File       : $(ARTIFACT_FILE)"
+                      echo -e "\e[33mArtifact Directory  : $sourceDir"
+
+                      echo "##[section]=================== Deploy $(ARTIFACT_ID) to $pod_name ==============="
+                      
+                      #Rename the artifact to match the application name
+                      echo "##[group]Renaming the artifact to match the application name ${artifactId}"
+                      
+                      echo "##[group]List Artifact before rename:"
+                      ls -l $sourceDir/$ARTIFACT_FILE || { echo "##vso[task.logissue type=error]It was not possible to find Artifact file"; exit 1; }
+                      echo "##[endgroup]"
+
+                      mv "$sourceDir/$ARTIFACT_FILE" "$sourceDir/$artifactId.${ARTIFACT_FILE##*.}";
+                      ARTIFACT_FILE="$artifactId.${ARTIFACT_FILE##*.}"
+                      echo "##[debug] Renamed. The new file name is ${ARTIFACT_FILE}"
+
+                      echo "##[group]List build artifact to deploy:"
+                      ls -l $sourceDir/$ARTIFACT_FILE || { echo "##vso[task.logissue type=error]It was not possible to find the build artifact to deploy" ; exit 1; }
+                      echo "##[endgroup]"
+
+                      echo "##[endgroup]"
+
+                      #Copy the artifact to its directory in the pod
+                      echo "##[group]Copying the artifact $artifactId to pod $pod_name"
+
+                      echo "##[group]List the $artifactId directory in the pod $pod_name before copy:"
+                      kubectl exec -i $pod_name -- sh -c "ls -l $dirCustpackage" || { echo "##vso[task.logissue type=warning]The directory $dirCustpackage does not exist, This likely indicates that the entire ‘custpackage’ has not been deployed. Therefore, directory will be created."; kubectl exec -i $pod_name -- sh -c "mkdir -p  $dirCustpackage"; }
+                      echo "##[endgroup]"
+
+                      echo "##[command]Remove old file of $artifactId in the pod $pod_name:"
+                      commandDeleteFile="find $dirCustpackage -type f -name '${artifactId}*' -exec bash -c 'echo \"\$0\"; rm -f \$0' {} \;"
+                      resultDeletefile=$(kubectl exec -i $pod_name -- sh -c "$commandDeleteFile")
+                      
+                      if [ -z "$resultDeletefile" ]; then
+                        echo "##vso[task.logissue type=warning] The file of ${artifactId} was not found in the pod ${pod_name}. Please verify if it exists and delete it manually if necessary. The deployment will continue regardless."
+                      else
+                        echo "##[debug] File deleted: $resultDeletefile"
+                        echo "##vso[task.setvariable variable=PREVIOUS_ARTIFACT;]$(basename "$resultDeletefile")"
+                      fi
+
+                      echo "##[group]List the $artifactId directory in the pod $pod_name after remove:"
+                      kubectl exec -i $pod_name -- sh -c "ls -l $dirCustpackage"
+                      echo "##[endgroup]"
+
+                      echo "##[command]Coping the artifact $ARTIFACT_NAME to its directory in the pod $pod_name"
+                      kubectl cp $sourceDir/$ARTIFACT_FILE $pod_name:$dirCustpackage/$ARTIFACT_FILE
+
+                      echo "##[group]List the $artifactId directory in the pod $pod_name after copy:"
+                      kubectl exec -i $pod_name -- sh -c "ls -l $dirCustpackage"
+                      echo "##[endgroup]"
+
+                      echo "##[endgroup]"
+
+                    fi
+
+                    echo "##[group]List custpackage running in $pod_name after deploy"
+                    kubectl exec -i $pod_name -- sh -c 'ls -lrtR /bp2/data/cust_process/cust/asset/custpackage/'
+                    echo "##[endgroup]"
+
+                    echo "##[command]Chmod the .sh files"
+                    kubectl exec -i $pod_name -- bash -c "find /bp2/data/cust_process/cust/asset/ -name '*.sh' | xargs chmod +x"
+
+                    ##########
+
+                    # S3CMD
+                    echo "##[command]Running S3CMD"
+                    kubectl exec $pod_name -c app -- bash -c "s3cmd -r sync --no-preserve /bp2/tmp/deploy/custpackage/ s3://bpinv-artifacts/custpackage/"
+
+                    # Cleaning
+                    echo "##[command]Cleaning"
+                    kubectl exec $pod_name -c app -- bash -c "rm -r /bp2/tmp/deploy/"
+                    kubectl exec $pod_name -c app -- bash -c "rm /bp2/tmp/custpackage-bkp.tar"
+
+                    ##########
+                  done
+                
+                  echo "##[debug] Waiting a minute before restarting all pods."
+                  sleep 60
+                  
+                  # Restarting Custartifacts Pods
+                  echo "##[section]==================== Deleting Custartifacts Pods ======================="
+                  echo "##[debug] Deleting pods for deploy... Pods list $custartifacts_pods "
+                  kubectl delete pods $custartifacts_pods
+                  echo "##[debug] Delete done. Waiting 30s for pods to get ready..."
+
+                  sleep 30
+                  
+                  for pod_name in $custartifacts_pods; do
+                    echo "##[section]==================== Verifying Status of Pod $pod_name ======================="
+
+                    # timeout in seconds
+                    TIMEOUT=300
+
+                    # Set timeout for pod readiness
+                    end=$((SECONDS+TIMEOUT))
+
+                    # Loop until status true or timeout
+                    until [ "$status" == "True" ] || [ $SECONDS -ge $end ]; do
+                      # get the status Readiness from pod
+                      status=$(kubectl get pods $pod_name -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')
+
+                      if [ "$status" != "True" ]; then
+                        echo "##[debug] Pod $pod_name is currently NOT in the ready state. A recheck will be performed after a pause of 30 seconds."
+                        sleep 30
+                      fi
+                    done
+
+                    # check status after the loop
+                    if [ "$status" == "True" ]; then
+                      echo "##[debug] Deployment to $pod_name done, $pod_name is ready."
+
+                      #save var with success
+                      pods_success="$pods_success $pod_name"
+
+                      echo "##[group]Custpackage Startup logs"
+                      kubectl exec -i $pod_name -- bash -c "tail -n 100 /bp2/log/Upgrade.log /bp2/log/process_log/custartifacts/cust_process_log.log"
+                      echo "##[endgroup]"
+                    else
+                      echo "##[group]Custpackage Startup logs"
+                      kubectl exec -i $pod_name -- bash -c "tail -n 200 /bp2/log/Upgrade.log /bp2/log/process_log/custartifacts/cust_process_log.log"
+                      echo "##[endgroup]"
+
+                      # If the timeout is reached and the pod is still not ready, exit with failure
+                      echo "##vso[task.logissue type=error]Pod $pod_name is currently is NOT ready after $TIMEOUT seconds."
+                      exit 1
+                    fi
+
+                    ##########
+
+                    echo "##[group]List custpackage running after deploy in the pod $pod_name"
+                    kubectl exec -i $pod_name -- sh -c 'ls -lrtR /bp2/data/cust_process/cust/asset/custpackage/'
+                    echo "##[endgroup]"
+                  done
+
+                  # Export var to report deploy task
+                  echo "##vso[task.setvariable variable=PODS_SUCCESS;]$pods_success"
+
+                  echo -e "\e[33m============================== Deployment Result ============================="
+                  echo -e "\e[33mCustpackage Pods : $(echo $custartifacts_pods | tr ' ' ',')"
+                  echo -e "\e[33mSuccessful Pods  : $(echo $pods_success | tr ' ' ',')"
+                  echo -e "\e[33m=============================================================================="
+
+            ## -> Publish Report
+            - task: Bash@3
+              displayName: 'Publish Deployment Report'
+              condition: succeededOrFailed()
+              inputs:
+                targetType: 'inline'
+                script: |
+                  deploy_report() {
+                    echo "\> **Artifact Deployed**" > publishInfo.md
+                    echo "*$(ARTIFACT_NAME).${ARTIFACT_FILE##*.}*" >> publishInfo.md
+                    echo "" >> publishInfo.md
+
+                    echo "\> **Previous Artifact**" >> publishInfo.md
+                    echo "*$(PREVIOUS_ARTIFACT)*" >> publishInfo.md
+                    echo "" >> publishInfo.md
+
+                    echo "\> **kubernetes Cluster**" >> publishInfo.md
+                    echo "*$(CLUSTER_NAME)*" >> publishInfo.md
+                    echo "" >> publishInfo.md
+
+                    echo "\> **Custpackage Namespace**" >> publishInfo.md
+                    echo "*$(set_custpackage_namespace.namespace_custartifacts)*" >> publishInfo.md
+                    echo "" >> publishInfo.md
+
+                    echo "\> **Custpackage Pods**" >> publishInfo.md
+                    echo "*$(echo $CUSTARTIFACTS_PODS | tr ' ' ',')*" >> publishInfo.md
+                    echo "" >> publishInfo.md
+
+                    echo "\> **Successful Deployment Pods**" >> publishInfo.md
+                    echo "*$(echo $PODS_SUCCESS | tr ' ' ',')*" >> publishInfo.md
+                  }
+
+                  deploy_report
+                  echo "##vso[task.addattachment type=Distributedtask.Core.Summary;name=Deployment Summary;]$(Build.SourcesDirectory)/publishInfo.md"
+
+            ## -> Logout of kubernetes
+            - task: Kubernetes@1
+              displayName: Kubernetes Cluster Logout
+              condition: always()
+              continueOnError: true
+              timeoutInMinutes: 1              
+              inputs:
+                command: 'logout'
+        on:
+          success:
+            steps:
+            ## -> If deploy succeeded log success mensagem and set pipeline tag
+            - task: Bash@3
+              displayName: Deploy Success
+              name: t_success_message
+              inputs:
+                targetType: inline
+                script: |
+                  echo "##[section] ================================================================================================================================="
+                  echo "##[section]                                                      DEPLOY WAS SUCCESSFUL! "
+                  echo "##[section] ================================================================================================================================="
+                  echo "##[section] Parabéns sua aplicação foi implantada com sucesso no ambiente de runtime."
+                  echo "##[section] Acesse a url da sua aplicação e valide  se sua nova versão foi entregue com sucesso."
+                  echo "##[section] "
+                  echo "##[section] $(ALERT_MESSAGE_ARROW) Sua aplicação foi implantada com sucesso no ambiente."
+                  echo "##[section] $(ALERT_MESSAGE_ARROW) Verifique com o responsável técnico como acessar acessar a sua aplicação."
+                  echo "##[section] $(ALERT_MESSAGE_ARROW) Caso não esteja conseguindo acessar a sua aplicação entre em contato com suporte."
+                  echo "##[section] "
+                  echo "##[section] Caso tenha dúvidas sobre essa fase do pipeline acesse a nossa documentação: $(CORPORATE_WIKI_DOC_URL)"
+                  echo "##[section]================================================================================================================================="
+
+                  ## -> Set Pipeline Tag
+                  echo "##vso[build.addbuildtag]deploy-$(environment)=succeeded"
+          failure:
+            steps:
+            ## -> If deploy fail log Failure mensagem and set pipeline tag
+            - task: Bash@3
+              displayName: Deploy Failure
+              name: t_failure_message
+              inputs:
+                targetType: inline
+                script: |
+                  echo "##[error] ================================================================================================================================="
+                  echo "##[error]                                                    DEPLOY WAS NOT SUCCESSFUL! "
+                  echo "##[error] ================================================================================================================================="
+                  echo "##[error] Se está vendo essa mensagem é porque aconteceu algo erro durante a impplantação da sua apliação."
+                  echo "##[error] "
+                  echo "##[error] Segue abaixo umas dicas para o Troubleshooting:"
+                  echo "##[error] $(ALERT_MESSAGE_ARROW) Consulte o log do estágio de deploy da aplicação."
+                  echo "##[error] $(ALERT_MESSAGE_ARROW) Verifique com o responsável técnico como proceder em caso de falha de ambiente."
+                  echo "##[error] "
+                  echo "##[error] Caso tenha dúvidas sobre essa fase do pipeline acesse a nossa documentação: $(CORPORATE_WIKI_DOC_URL)"
+                  echo "##[error] ================================================================================================================================="
+
+                  ## -> Set Pipeline Tag
+                  echo "##vso[build.addbuildtag]deploy-$(environment)=failed"

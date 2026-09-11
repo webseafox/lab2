@@ -1,0 +1,76 @@
+parameters:
+- name: contents
+  default: |
+    **/*
+    !.git/**/*
+    !?/**/*
+    !**/*.log
+- name: artifactPublishName
+  type: string
+  default: app
+- name: pathtoPublish
+  type: string
+  default: $(Build.ArtifactStagingDirectory)
+
+steps:
+- bash: |
+    echo "##[debug] Publishing to Repository: $(NEXUS_REPO_LIB_MVN)."
+    echo "##[debug] Default URL: $(NEXUS_REPOSITORY_URL)."
+    echo "##[debug] NEXUS_DEFAULT_USR: ${NEXUS_DEFAULT_USR}"
+    echo "##[debug] NEXUS_DEFAULT_PSW: ${NEXUS_DEFAULT_PSW}"
+
+    run_npm_publish() {
+
+      if [ -f .npmrc ]; then
+        echo "##[debug] Configuring credentials..."
+        auth_opt="email=vivo.devops.br@telefonica.com\nalways-auth=true"
+        auth=$(echo -n "${NEXUS_DEFAULT_USR}:${NEXUS_DEFAULT_PSW}" | openssl base64)
+
+        repos=$(grep -o "registry=.*" .npmrc | cut -d':' -f2 | awk -v auth="$auth" '{print $0 ":_auth="auth""}')
+        echo -e "\n$repos\n$auth_opt" >> .npmrc
+        echo "##[debug] Credentials configured!"
+
+        echo "##[debug] Publishing to Nexus:"
+        output=$(npm publish --verbose --access=restricted 2>&1)
+        publish_status=$?
+
+        ## -> Log the result of the publish
+        echo "##[group] Npm publish output"
+        echo "$output"
+        echo "##[endgroup]"
+
+        ## -> Check if artifact and version is already published by error *"does not allow updating"*
+        if echo "$output" | grep -q "does not allow updating"; then
+          echo '##[error] ARTIFACT VERSION ALREADY EXISTS ON NEXUS...'
+          echo '##vso[task.logissue type=error] The version of the artifact you are trying to publish has already been published and cannot be updated.'
+          echo '##[error] If you want to publish a new version of the artifact, please update the package version and try again.'
+          exit 1
+        elif [ $publish_status -ne 0 ]; then
+          echo '##[error] Error while executing npm publish command to push artifact to nexus.'
+          exit 1
+        fi
+
+      else
+        echo '##vso[task.logissue type=error] Error while executing npm publish. The file .npmrc was not found.'
+        exit 1
+      fi
+    }
+
+    run_npm_publish
+  displayName: Publish binary files to Nexus
+  condition: succeeded()
+  workingDirectory: $(Build.SourcesDirectory)
+  env:
+    NEXUS_DEFAULT_USR: $(NEXUS-DEFAULT-USR)
+    NEXUS_DEFAULT_PSW: $(NEXUS-DEFAULT-PSW)
+
+- template: copy_to_staging.yml
+  parameters:
+    contents: ${{ parameters.contents }}
+
+- task: PublishBuildArtifacts@1
+  displayName: 'Publish binary files to Artifacts'
+  inputs:
+    ArtifactName: ${{ parameters.artifactPublishName }}
+    StoreAsTar: true
+    PathtoPublish: ${{ parameters.pathtoPublish }}

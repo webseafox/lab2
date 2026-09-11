@@ -1,0 +1,92 @@
+parameters:
+  - name: EXTENSION_NAME
+  - name: EXTENSION_ID
+  - name: SKIP_TESTS
+  - name: TAG
+  - name: environment
+  - name: PAT_INSTALL_PREPROD
+  - name: PAT_INSTALL_PROD
+
+stages:
+  - stage: publish
+    displayName: 'Publish'
+    dependsOn:
+      - package
+      - validateTag
+    condition: succeeded()
+    jobs:
+      - job: publish
+        displayName: publishVersion
+        steps:
+          - checkout: self
+            clean: false
+
+          - download: current
+            artifact: vsix
+            patterns: "**/*.vsix"
+
+    #            - task: NodeTool@0
+    #              inputs:
+    #                versionSpec: '20.x'
+    #              displayName: 'Install Node.js'
+
+          - task: TfxInstaller@5
+            displayName: 'Use Node CLI for Azure DevOps'
+            inputs:
+              version: '0.x'
+              checkLatest: true
+
+          - bash: |
+                VERSION="${{ parameters.TAG }}"
+
+                if [ "${{ parameters.environment }}" = "preprod" ];then
+                  EXTENSION_NAME_SUFIX="- Preprod"
+                  EXTENSION_ID_SUFIX="-preprod"
+                elif [ "${{ parameters.environment }}" = "prod" ];then
+                  EXTENSION_NAME_SUFIX=""
+                  EXTENSION_ID_SUFIX=""
+                fi
+
+                echo "##vso[task.setvariable variable=TAG;isOutput=true]$TAG"
+                echo "##vso[task.setvariable variable=EXTENSION_NAME_SUFIX;isOutput=true]$EXTENSION_NAME_SUFIX"
+                echo "##vso[task.setvariable variable=EXTENSION_ID_SUFIX;isOutput=true]$EXTENSION_ID_SUFIX"
+                
+            name: packageInfo
+            displayName: 'Setting Sufix for Environments'
+
+          - task: PublishAzureDevOpsExtension@5
+            name: 'publishPreprod'
+            continueOnError: true
+            displayName: 'Publish the preprod extension'
+            inputs:
+              connectTo: "VsTeam"
+              connectedServiceName: "Visual Studio Marketplace (DevOps)" 
+              publisherId: 'telefonica-vivo-devops-brasil'
+              extensionName: '${{ parameters.EXTENSION_NAME }} Tasks $(packageInfo.EXTENSION_NAME_SUFIX)'
+              extensionId: '${{ parameters.EXTENSION_ID }}$(packageInfo.EXTENSION_ID_SUFIX)'
+              extensionVersion: '${{ parameters.TAG }}'
+              fileType: "vsix"
+              vsixFile: '$(Pipeline.Workspace)/vsix/telefonica-vivo-devops-brasil.${{ parameters.EXTENSION_ID }}$(packageInfo.EXTENSION_ID_SUFIX).vsix'
+              extensionVisibility: "private"
+              noWaitValidation: false
+              updateTasksVersion: true
+              shareWith: "telefonica-vivo-brasil$(packageInfo.EXTENSION_ID_SUFIX)"
+
+          - task: IsAzureDevOpsExtensionValid@5
+            displayName: 'Validate the private extension on the marketplace'
+            inputs:
+              connectTo: "VsTeam"
+              connectedServiceName: "Visual Studio Marketplace (DevOps)" 
+              method: 'vsix'
+              #vsixFile: '$(publishPreprod.Extension.OutputPath)'
+              vsixFile: '$(Pipeline.Workspace)/vsix/telefonica-vivo-devops-brasil.${{ parameters.EXTENSION_ID }}$(packageInfo.EXTENSION_ID_SUFIX).vsix'
+
+          - bash: |
+                if [ "${{ parameters.environment }}" = "preprod" ];then
+                  PAT_INSTALL="${{ parameters.PAT_INSTALL_PREPROD }}"
+                elif [ "${{ parameters.environment }}" = "prod" ];then
+                  PAT_INSTALL="${{ parameters.PAT_INSTALL_PROD }}"
+                fi
+                tfx extension install --service-url  https://dev.azure.com/telefonica-vivo-brasil$(packageInfo.EXTENSION_ID_SUFIX) -t $PAT_INSTALL --vsix "$(Pipeline.Workspace)/vsix/telefonica-vivo-devops-brasil.${{ parameters.EXTENSION_ID }}$(packageInfo.EXTENSION_ID_SUFIX).vsix" --share-with "telefonica-vivo-brasil$(packageInfo.EXTENSION_ID_SUFIX)" --nowait-validation  
+            name: installExtension
+            displayName: 'Installing Extension in Azure Marketplace'

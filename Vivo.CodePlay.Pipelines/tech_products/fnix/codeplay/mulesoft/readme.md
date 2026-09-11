@@ -1,0 +1,198 @@
+# Implantacao em Kubernetes VCR com kube-config file 
+
+## Capacidades
+* Lite
+  * **Constroi**, **Testa** e **Empacota** projeto `Java` x `Maven`
+  * Adaptavel a modelos de projetos **Maven Solo** e **Multimodulos** (*desde que o **pom.xml** parent fique na raiz*)
+  * **Bump automatico** de numero de versao e tag
+  * **Constroi** e **Empura** uma imagem docker (usando o `runtime.Dockerfile`)
+  * Publica o projeto no **Kubernetes** usando o **VCR**
+  * Upload de logs para **Auditoria**
+* Gold
+  * **Sonar Scan** para projetos **Maven Solo** e **Multimodulos**
+  * **Fortify Scan**
+  * **SCA**
+
+## Como usar
+`.azuredevops/azure-pipeline-ci.yml`
+```yaml
+trigger:
+  branches:
+    include:
+      - 'master'
+      - 'main'
+      - 'codeplay'
+  paths:
+    exclude:
+      - .azuredevops/*cd.*
+      - .azuredevops/*pr.*
+resources:
+  repositories:
+  - repository: CodePlay
+    name: DevOps/Vivo.CodePlay.Pipelines
+    type: git
+    ref: refs/heads/master
+    endpoint: CodePlay
+
+extends:  
+  template: /tech_products/fnix/codeplay/mulesoft/lite-ci.yaml@CodePlay
+  # template: /tech_products/fnix/codeplay/mulesoft/gold-ci.yaml@CodePlay
+  # template: /tech_products/fnix/codeplay/mulesoft/platinum-ci.yaml@CodePlay
+  # template: /tech_products/fnix/codeplay/mulesoft/diamond-ci.yaml@CodePlay
+  parameters:
+    variable_groups:
+    - ms-teste-pipeline-e2e-remover-v1
+    - azdo-team-project-variables
+
+
+```
+
+`.azuredevops/azure-pipeline-cd.yml`
+```yaml
+parameters:
+- name: environment
+  displayName: 'Escolha o ambiente para publicar'
+  type: string
+  default: preprod
+  values:
+  - dev
+  - esteira1
+  - esteira2
+  - esteira3
+  - preprod
+  - production
+  - prodlike
+
+- name: vivonow_chg
+  displayName: 'Numero CHG do VivoNow, somente para "production"'
+  default: CHG0000001
+
+trigger: none
+
+resources:
+  repositories:
+  - repository: CodePlay
+    name: DevOps/Vivo.CodePlay.Pipelines
+    type: git
+    ref: refs/heads/master
+    endpoint: CodePlay
+  # Repositorio onde estarao os arquivos: 
+  # .azuredevops/config/dev/values.yml
+  # .azuredevops/config/dev/environments_variables.yml
+  # .azuredevops/config/dev/secrets.yaml
+  - repository: CodePlay
+    name: <<meu projeto>>/<<meu repositorio>>
+    type: git
+    ref: refs/heads/master
+    endpoint: DeployConfig
+
+extends:  
+  template: /tech_products/fnix/codeplay/mulesoft/lite-cd.yaml@CodePlay
+  # template: /tech_products/fnix/codeplay/mulesoft/gold-cd.yaml@CodePlay
+  # template: /tech_products/fnix/codeplay/mulesoft/platinum-cd.yaml@CodePlay
+  # template: /tech_products/fnix/codeplay/mulesoft/diamond-cd.yaml@CodePlay
+  parameters:
+    variable_groups:
+    - ms-teste-pipeline-e2e-remover-v1
+    - azdo-team-project-variables
+    # valores aceitaveis sao [dev | test | production | esteira1 | esteira2 | preprod | prodlike]
+    environment: ${{ parameters.environment }}
+    vivonow_chg: ${{ parameters.vivonow_chg }}
+```
+
+`.azuredevops/azure-pipeline-pr.yml`
+```yaml
+trigger:
+  branches:
+    include:
+      - 'master'
+      - 'main'
+      - 'develop'
+      - 'release'
+      - 'codeplay'
+  paths:
+    exclude:
+      - .azuredevops/*cd.*
+
+resources:
+  repositories:
+  - repository: CodePlay
+    name: DevOps/Vivo.CodePlay.Pipelines
+    type: git
+    ref: refs/heads/master
+    endpoint: CodePlay
+
+extends:  
+  template: /tech_products/fnix/codeplay/mulesoft/lite-pr.yaml@CodePlay
+  # template: /tech_products/fnix/codeplay/mulesoft/gold-pr.yaml@CodePlay
+  # template: /tech_products/fnix/codeplay/mulesoft/platinum-pr.yaml@CodePlay
+  # template: /tech_products/fnix/codeplay/mulesoft/diamond-pr.yaml@CodePlay
+  parameters:
+   # valores aceitaveis sao [dev | test | production | esteira1 | esteira2 | preprod | prodlike]
+    variable_groups:
+    - ms-teste-pipeline-e2e-remover-v1
+    - azdo-team-project-variables
+```
+
+## Dependencias e configuracoes
+
+### Ambientes dentro do seu projeto (`AzureDevOps > Pipelines > Environments`)
+
+* `deploy-dev`
+* `deploy-esteira[1...N]`
+* `deploy-preprod`
+* `deploy-production`
+* `deploy-prodlike`
+
+### Arquivos dentro do Repositorio (`git`)
+
+> Antes de executar verifique se o seu repositorio tem esses arquivos com essas configuracoes minimas.
+
+```
+📂.azuredevops
+ ┣ 📂config
+ ┃ ┣ 📂[dev | esteira[1...N] | preprod | prodlike | producao]
+ ┃ ┃ ┣ 📜environments_variables.yml
+ ┃ ┃ ┣ 📜secrets.yaml
+ ┃ ┃ ┗ 📜values.yml
+ ┣ 📂variables
+ ┃ ┗ 📜private.yml
+ ┣ 📜pull_request_template.md
+ ┣ 📜runtime.Dockerfile
+ ┣ 📜sonar-project.properties
+ ┣ 📜[any-prefix]settings.xml (opcional)
+ ┗ 📜sonar.env
+📜catalog-info.yaml
+📜pom.xml
+```
+
+`./catalog-info.yaml`
+```yaml  
+  metadata:
+    name: ms-...-v[1...N]
+    annotations:
+      techarch.governance-app.acronym: 'dip'
+      techarch.governance-app.module: 'common-domain'
+      sonarqube.org/project-key: ''
+      arqtech.telefonica.com.br/language-version: '[7, 8, 11, 17, 19, 21]'
+      vivo.io/kubernetes-k8s-namespace-dev: 'dip-dev'
+      vivo.io/kubernetes-k8s-namespace-esteira[1...N]: 'dip-esteira[1...N]'
+      vivo.io/kubernetes-k8s-namespace-preprod: 'dip-preprod'
+      vivo.io/kubernetes-k8s-namespace-production: 'dip-production'
+      vivo.io/kubernetes-k8s-namespace-prodlike: 'dip-prodlike'
+```
+
+`./pom.xml`
+```xml  
+<?xml version="1.0" encoding="UTF-8"?>
+<project ...>
+  <groupId>br.com.tlf.dip</groupId> 
+  <artifactId>ms-...-v[1...N]</artifactId>
+  <version>1.0.0</version>
+  ...
+</project>
+
+```
+
+### 
+`meu-settings.xml`

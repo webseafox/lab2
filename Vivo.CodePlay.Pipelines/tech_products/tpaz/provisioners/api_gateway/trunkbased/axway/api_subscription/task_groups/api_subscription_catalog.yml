@@ -1,0 +1,142 @@
+parameters:
+- name: applicationName
+- name: apiName
+
+steps:
+- task: PythonScript@0
+  displayName: 'API Subscription'
+  name: api_subscription_catalog
+  inputs:
+    scriptSource: inline
+    script: |
+      import json
+      import os
+      
+      catalog_file_name = os.getenv('CATALOG_FILE_NAME')
+      api_name = os.getenv('API_NAME')
+      application_name = os.getenv('APPLICATION_NAME')
+
+      print("##[debug] API_NAME................: {}".format(api_name))
+      print("##[debug] APPLICATION_NAME........: {}".format(application_name))
+      
+      with open(catalog_file_name, 'r', encoding='utf8') as catalog_file:
+        catalog = json.loads(catalog_file.read())
+      
+      def application_exists_in_catalog(catalog, application_name):
+        for organization in catalog["topology"]["workflow"]["organizations"]:
+          for application in organization["applications"]:
+            if application['name'] == application_name:
+              print("##[section] Application '{}' found in catalog for organization '{}'".format(application_name, organization['name']))
+              return True
+        return False
+
+      def get_application_organization_name(catalog, application_name):
+        for organization in catalog["topology"]["workflow"]["organizations"]:
+          for application in organization["applications"]:
+            if application['name'] == application_name:
+              return organization['name']
+
+      def get_api_organization_name(catalog, api_name):
+        for organization in catalog["topology"]["workflow"]["organizations"]:
+          for api in organization["apis"]:
+            if api['name'] == api_name:
+              return organization['name']
+
+      def get_api_shared_organizations(catalog, api_name, organization_name):
+        for organization in catalog["topology"]["workflow"]["organizations"]:
+          if organization['name'] == organization_name:
+            print("##[debug] Organization name found........: {}".format(organization_name))
+            for api in organization["apis"]:
+              if api['name'] == api_name:
+                print("##[debug] API name found.................: {}".format(api_name))
+                shared_organizations = []
+                for shared_org in api['sharedOrganizations']:
+                  print("##[debug] Shared org found...............: {}".format(shared_org))
+                  shared_org_name = shared_org['name']
+                  shared_organizations += [shared_org_name]
+                print("##[debug] All shared_organizations.......: {}".format(shared_organizations))
+                return shared_organizations
+
+      def add_sharedorg_in_catalog(catalog, api_name, api_organization_name, application_organization_name):
+        for org in catalog['topology']['workflow']['organizations']:
+          if org['name'] == api_organization_name:
+            for api in org['apis']:
+              if api['name'] == api_name:
+                for shared_org in api['sharedOrganizations']:
+                  if shared_org['name'] == application_organization_name:
+                    print("##[section] Organization '{}' already exists in Shared Organizations Catalog for API '{}'".format(application_organization_name, api_name))
+                    return catalog
+                api['sharedOrganizations'].append({
+                  "name": application_organization_name
+                })
+                print(json.dumps(api, indent=2))
+                with open(catalog_file_name, 'w') as catalog_file:
+                  catalog_file.write(json.dumps(catalog, indent=2, ensure_ascii=False))
+                print("##vso[task.logissue type=warning;] Catalog updated. Organization '{}' added in shared organization list for API '{}'".format(application_organization_name, api_name))
+                print("##vso[task.setvariable variable=updateCatalog]Yes")
+                return catalog
+
+      def add_api_in_catalog(catalog, api_name, application_name):
+        for org in catalog['topology']['workflow']['organizations']:
+          for app in org['applications']:
+            if app['name'] == application_name:
+              if api_name not in app['apis']:
+                app['apis'].append(api_name)
+                with open(catalog_file_name, 'w') as catalog_file:
+                  catalog_file.write(json.dumps(catalog, indent=2, ensure_ascii=False))
+                print("##vso[task.logissue type=warning;] Catalog updated. API '{}' added for application '{}'".format(api_name, application_name))
+                print("##vso[task.setvariable variable=updateCatalog]Yes")
+                return catalog
+              else:
+                print("##[section] API '{}' already exists in Catalog".format(api_name))
+      
+      print("##[group] Check application existence in catalog")
+      appInCatalog = application_exists_in_catalog(catalog, application_name)
+      if appInCatalog != True:
+        print("##vso[task.logissue type=error;] Application '{}' was not found in the Catalog for any Organization. Please create it before perform API Subscription.".format(application_name))
+        print("##vso[task.complete result=Failed;]")
+        exit()
+      print("##[endgroup]")
+
+      print("##[group] Get Application organization name from Catalog")
+      application_organization_name = get_application_organization_name(catalog, application_name)
+      print("##vso[task.setvariable variable=APPLICATION_ORGANIZATION_NAME]{}".format(application_organization_name))
+      print("##[debug] APPLICATION_ORGANIZATION_NAME.......: {}".format(application_organization_name))
+      print("##[endgroup]")
+
+      print("##[group] Get API organization name from Catalog")
+      api_organization_name = get_api_organization_name(catalog, api_name)
+      if api_organization_name is None:
+        print("##vso[task.logissue type=error;] Organization was not found in catalog for API '{}'. Make sure the API name is correct as in the catalog.".format(api_name))
+        print("##vso[task.complete result=Failed;]")
+        exit()
+      print("##[debug] api_organization_name...............: {}".format(api_organization_name))
+      print("##[endgroup]")
+
+      if api_organization_name != application_organization_name:
+        print("##[group] Add Application organization name in API shared organizations list in Catalog")
+        add_sharedorg_in_catalog(catalog, api_name, api_organization_name, application_organization_name)
+        print("##[endgroup]")
+      
+      print("##[group] Add API in Catalog application api list")
+      add_api_in_catalog(catalog, api_name, application_name)
+      print("##[endgroup]")
+
+      print("##[group] Get API Shared Organizations")
+      print("##[debug] catalog.................: {}".format(catalog))
+      print("##[debug] api_name................: {}".format(api_name))
+      print("##[debug] api_organization_name...: {}".format(api_organization_name))
+
+      shared_organizations = get_api_shared_organizations(catalog, api_name, api_organization_name)
+      print("##[debug] SHARED_ORGANIZATIONS.......: {}".format(','.join(shared_organizations)))
+      print("##vso[task.setvariable variable=SHARED_ORGANIZATIONS;isOutput=true]{}".format(','.join(shared_organizations)))
+      print("##[endgroup]")
+    workingDirectory: $(Build.SourcesDirectory)
+  env:
+    CATALOG_FILE_NAME: $(CATALOG_FILE_NAME)
+    API_NAME: ${{ parameters.apiName }}
+    APPLICATION_NAME: ${{ parameters.applicationName }}
+
+- template: /tasks/axway/catalog/push_changes.yml
+  parameters:
+    commitMessage: "feat: API '${{ parameters.apiName }}' subscription for application '${{ parameters.applicationName }}' [skip ci]"

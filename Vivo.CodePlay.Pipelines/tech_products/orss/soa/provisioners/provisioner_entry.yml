@@ -1,0 +1,579 @@
+parameters:
+- name: qa_environment
+  type: string
+
+stages:
+- stage: pipeline_init
+  displayName: "Pipeline initialization"
+  pool: $(PRIVATE_AGENT_DEFAULT_CI)
+  jobs:
+    - job: Prepare_Pipeline
+      steps:
+        - bash: echo "##[debug] PREPARING PIPELINE"
+- ${{ if eq(variables['Build.Reason'], 'PullRequest') }}:
+  - stage: BuildAndPackage
+    displayName: "Build and Package"
+    pool: $(PRIVATE_AGENT_DEFAULT_CI)
+    jobs:
+    - job: Build
+      steps:
+      - checkout: self  # self represents the repo where the initial Pipelines YAML file was found
+        submodules: true
+        persistCredentials: true
+        clean: false
+        fetchDepth: 0
+      
+      - task: AzureKeyVault@2  
+        displayName: 'Getting AKV credentials'
+        timeoutInMinutes: 1
+        retryCountOnTaskFailure: 5  
+        inputs:    
+          azureSubscription: DevOpsSharedResources    
+          KeyVaultName: kv-azdevops-shared
+          SecretsFilter: 'NEXUS-DEPS-USR, NEXUS-DEPS-PSW'
+        
+      - task: Docker@2
+        inputs:
+          containerRegistry: 'ACR-DEVOPS'
+          command: 'login'
+
+      - task: DownloadSecureFile@1
+        name: DownloadSettings
+        displayName: 'Download SOA settings XML'
+        inputs:
+          secureFile: $(COMPONENT_SETTINGS)
+      
+      - task: Bash@3
+        displayName: 'Identify commits and type of execution'
+        inputs:
+          targetType: 'inline'
+          script: |
+            echo 'Fetch and Log'
+            git fetch
+            if [[ `echo $(Build.SourceBranch) | grep refs/tags` ]]
+            then
+              HASH_LIST=`git log --merges -n 1 --pretty=format:'%h' $(Build.SourceBranch)`
+              EXECUTION_TYPE=DEPLOY
+            else
+              SOURCE_BRANCH_NAME=`echo $(System.PullRequest.SourceBranch) | sed 's|refs/heads/||g'`
+              HASH_LIST=`git log --oneline --no-merges --pretty=format:'%h' origin/$(System.PullRequest.TargetBranchName)..origin/$SOURCE_BRANCH_NAME | sed '1!G;h;$!d' | paste -sd','`
+              EXECUTION_TYPE=BUILD
+            fi
+            echo "##vso[task.setvariable variable=EXECUTION_TYPE]$EXECUTION_TYPE"
+            echo "##vso[task.setvariable variable=HASH_LIST]$HASH_LIST"
+      
+      - task: Bash@3
+        displayName: 'Validating changed files and project'
+        inputs:
+          targetType: 'inline'
+          script: |
+            declare -a PROJECTS
+            declare -a FILES
+            IFS=','
+            for hash in $HASH_LIST
+            do
+              if [[ $EXECUTION_TYPE == BUILD ]]
+              then
+                echo "Tipo build..."
+                COMMIT=$(git show $hash --name-status --no-merges --pretty=format: | sed 's/\\t/,/g')
+                echo "$COMMIT" >> changes.txt
+              else
+                echo "Tipo deploy..."
+                COMMIT=$(git show --name-status -m $hash --pretty=format: | sed 's/\\t/,/g')
+                echo "Commit: $COMMIT"
+              fi
+              PATHS=${COMMIT:1}
+              IFS='/'
+              read -r -a PATH_LIST <<< "$PATHS"
+              FILES+="${COMMIT:2}|"
+              echo "##vso[task.setvariable variable=FILES]$FILES"
+              if [[ "${PROJECTS[@]}" != "${PATH_LIST[1]}" && "${PATH_LIST[0]:1}" != "Mocks" && "${PATH_LIST[0]:1}" != ".adf" && "${PATH_LIST[0]:1}" != ".azuredevops" && "${PATH_LIST[0]:1}" != ".settings" ]]
+              then
+                PARTITION=${PATH_LIST[0]:1}
+                echo "##vso[task.setvariable variable=PARTITION]$PARTITION"
+                PROJECT=${PATH_LIST[1]}
+                echo "##vso[task.setvariable variable=PROJECT]$PROJECT"
+                PROJECTS+=(${PATH_LIST[1]})
+              fi
+              if [[ ${#PROJECTS[@]} > 1 ]]
+              then
+                echo "##vso[task.logissue type=error]Não podem haver projetos/compostos diferentes alterados em uma mesma Pull Request."
+                echo "##vso[task.complete result=Failed;]"
+                exit 1
+              fi
+              ACTION=${COMMIT:0:1}
+              case $ACTION in
+              R)
+                echo -n "Artefato removido: $COMMIT"
+                ;;
+              D)
+                echo -n "Artefato deletado: $COMMIT"
+                ;;
+              M | A)
+                echo -n "Artefato modificado ou adicionado: $COMMIT"
+                ;;
+              esac
+            done
+
+      - task: Bash@3
+        displayName: 'Identify type of project'
+        inputs:
+          targetType: 'inline'
+          script: |
+            if [[ `echo $PARTITION | grep resources` && `echo $PROJECT | grep oramds` ]]
+            then
+              PROJECT_TYPE=METADATA_STORE
+              echo "##vso[task.setvariable variable=PROJECT_TYPE]$PROJECT_TYPE"
+            else
+              PROJECT_TYPE=COMPOSITE
+              echo "##vso[task.setvariable variable=PROJECT_TYPE]$PROJECT_TYPE"
+            fi
+
+      - task: Bash@3
+        displayName: 'Getting composite version'
+        condition: and(succeeded(), in(variables['PROJECT_TYPE'], 'COMPOSITE'))
+        inputs:
+          targetType: 'inline'
+          script: |
+            cd $PARTITION/$PROJECT
+            COMPOSITE_VERSION=`find . -name composite.xml -exec grep -Po '(?<=revision=\")([0-9.]+)' {} \;`
+            echo "##vso[task.setvariable variable=COMPOSITE_VERSION]$COMPOSITE_VERSION"
+
+      - task: Bash@3
+        displayName: 'Building MDS'
+        condition: and(succeeded(), in(variables['PROJECT_TYPE'], 'METADATA_STORE'))
+        inputs:
+          targetType: 'inline'
+          script: |
+            mkdir $(Build.SourcesDirectory)/oramds_build_tmp
+            IFS='|'
+            for file in $FILES
+            do
+              cp -Rva --parents $file $(Build.SourcesDirectory)/oramds_build_tmp
+            done
+            cd $(Build.SourcesDirectory)/oramds_build_tmp/$PARTITION/$PROJECT/apps
+            zip -r oramds-$(System.PullRequest.PullRequestId).jar *
+            mv oramds-$(System.PullRequest.PullRequestId).jar $(Build.SourcesDirectory)
+
+            cd $(Build.SourcesDirectory)/oramds_build_tmp/$PARTITION/$PROJECT
+            zip -r oramds-$(System.PullRequest.PullRequestId).zip ./apps
+            mv oramds-$(System.PullRequest.PullRequestId).zip $(Build.SourcesDirectory)
+
+            mv $(Build.SourcesDirectory)/changes.txt $(Build.SourcesDirectory)/oramds-$(System.PullRequest.PullRequestId).txt
+
+            rm -rf $(Build.SourcesDirectory)/oramds_build_tmp
+        
+      - task: NexusUploadMvnFromVivo@5
+        displayName: 'Publishing oramds.zip'
+        condition: and(succeeded(), in(variables['PROJECT_TYPE'], 'METADATA_STORE'))
+        inputs:
+          nexusEndpoint: 'NEXUS-DEVOPS'
+          nexusRepoMaven: '$(NEXUS_PUBLISH_REPOSITORY)'
+          groupId: '$(NEXUS_PUBLISH_REPOSITORY_GROUP_ID)'
+          artifactId: 'oramds'
+          artifactVersion: '$(System.PullRequest.PullRequestId)'
+          artifactFile1: 'oramds-$(System.PullRequest.PullRequestId).zip'
+          artifactExtension1: 'zip'
+
+      - task: NexusUploadMvnFromVivo@5
+        displayName: 'Publishing oramds.jar'
+        condition: and(succeeded(), in(variables['PROJECT_TYPE'], 'METADATA_STORE'))
+        inputs:
+          nexusEndpoint: 'NEXUS-DEVOPS'
+          nexusRepoMaven: '$(NEXUS_PUBLISH_REPOSITORY)'
+          groupId: '$(NEXUS_PUBLISH_REPOSITORY_GROUP_ID)'
+          artifactId: 'oramds'
+          artifactVersion: '$(System.PullRequest.PullRequestId)'
+          artifactFile1: 'oramds-$(System.PullRequest.PullRequestId).jar'
+          artifactExtension1: 'jar'
+
+      - task: NexusUploadMvnFromVivo@5
+        displayName: 'Publishing oramds.txt'
+        condition: and(succeeded(), in(variables['PROJECT_TYPE'], 'METADATA_STORE'))
+        inputs:
+          nexusEndpoint: 'NEXUS-DEVOPS'
+          nexusRepoMaven: '$(NEXUS_PUBLISH_REPOSITORY)'
+          groupId: '$(NEXUS_PUBLISH_REPOSITORY_GROUP_ID)'
+          artifactId: 'oramds'
+          artifactVersion: '$(System.PullRequest.PullRequestId)'
+          artifactFile1: 'oramds-$(System.PullRequest.PullRequestId).txt'
+          artifactExtension1: 'txt'
+
+      - task: Bash@3
+        displayName: 'Build SOA Composite'
+        condition: and(succeeded(), in(variables['PROJECT_TYPE'], 'COMPOSITE'))
+        inputs:
+          targetType: 'inline'
+          script: |
+            docker run --rm --entrypoint bash \
+              -v $(Build.SourcesDirectory):/builds \
+              -v $(Agent.TempDirectory):/settings \
+              -w /builds \
+              -e COMPONENT_SETTINGS=$(COMPONENT_SETTINGS) \
+              -e NEXUS_DEPS_USR=$NEXUS_DEPS_USR \
+              -e NEXUS_DEPS_PSW=$NEXUS_DEPS_PSW \
+              -e PARTITION=$(PARTITION) \
+              -e PROJECT=$(PROJECT) \
+              -e COMPOSITE_VERSION=$(COMPOSITE_VERSION) \
+              $(DOCKER_IMAGE) \
+              -c "cd /;
+                chmod +x /build.sh;
+                ./build.sh"
+
+            if grep -q 'ERROR' $(Build.SourcesDirectory)/build.log
+            then
+              echo "##vso[task.complete result=Failed;]"
+            else
+              mv $(Build.SourcesDirectory)/soaconfig.jar soaconfig-$(System.PullRequest.PullRequestId).jar
+              mv $(Build.SourcesDirectory)/changes.txt soaconfig-$(System.PullRequest.PullRequestId).txt
+            fi
+        env:
+          NEXUS_DEPS_USR: $(NEXUS-DEPS-USR)
+          NEXUS_DEPS_PSW: $(NEXUS-DEPS-PSW)
+
+      - task: NexusUploadMvnFromVivo@5
+        displayName: 'Publishing soaconfig.jar'
+        condition: and(succeeded(), in(variables['PROJECT_TYPE'], 'COMPOSITE'))
+        inputs:
+          nexusEndpoint: 'NEXUS-DEVOPS'
+          nexusRepoMaven: '$(NEXUS_PUBLISH_REPOSITORY)'
+          groupId: '$(NEXUS_PUBLISH_REPOSITORY_GROUP_ID)'
+          artifactId: 'soaconfig'
+          artifactVersion: '$(System.PullRequest.PullRequestId)'
+          artifactFile1: 'soaconfig-$(System.PullRequest.PullRequestId).jar'
+          artifactExtension1: 'jar'
+
+      - task: NexusUploadMvnFromVivo@5
+        displayName: 'Publishing soaconfig.txt'
+        condition: and(succeeded(), in(variables['PROJECT_TYPE'], 'COMPOSITE'))
+        inputs:
+          nexusEndpoint: 'NEXUS-DEVOPS'
+          nexusRepoMaven: '$(NEXUS_PUBLISH_REPOSITORY)'
+          groupId: '$(NEXUS_PUBLISH_REPOSITORY_GROUP_ID)'
+          artifactId: 'soaconfig'
+          artifactVersion: '$(System.PullRequest.PullRequestId)'
+          artifactFile1: 'soaconfig-$(System.PullRequest.PullRequestId).txt'
+          artifactExtension1: 'txt'
+
+      - task: Bash@3
+        displayName: 'Tagging SOA Composite'
+        condition: and(succeeded(), in(variables['PROJECT_TYPE'], 'COMPOSITE'))
+        inputs:
+          targetType: 'inline'
+          script: |
+            git tag -a SOA-$(System.PullRequest.PullRequestId) -m "$(Build.SourceVersionMessage)"
+            git push --tags
+
+      - task: Bash@3
+        displayName: 'Tagging SOA MDS'
+        condition: and(succeeded(), in(variables['PROJECT_TYPE'], 'METADATA_STORE'))
+        inputs:
+          targetType: 'inline'
+          script: |
+            git tag -a MDS-$(System.PullRequest.PullRequestId) -m "$(Build.SourceVersionMessage)"
+            git push --tags
+        
+- ${{ elseif startsWith(variables['Build.SourceBranch'], 'refs/tags/') }}:
+  - stage: Deploy_${{ upper(parameters.qa_environment) }}
+    pool: $(PRIVATE_AGENT_DEFAULT_CD)
+    jobs:
+    - job: Deploy
+      steps:  
+      - checkout: self  # self represents the repo where the initial Pipelines YAML file was found
+        submodules: true
+        persistCredentials: true
+        clean: false
+        fetchDepth: 0
+
+      - task: Docker@2
+        inputs:
+          containerRegistry: 'ACR-DEVOPS'
+          command: 'login'
+      
+      - task: Bash@3
+        displayName: 'Identify commits and type of execution'
+        inputs:
+          targetType: 'inline'
+          script: |
+            echo 'Fetch and Log'
+            git fetch
+            if [[ `echo $(Build.SourceBranch) | grep refs/tags` ]]
+            then
+              HASH_LIST=`git log --merges -n 1 --pretty=format:'%h' $(Build.SourceBranch)`
+              EXECUTION_TYPE=DEPLOY
+            else
+              SOURCE_BRANCH_NAME=`echo $(System.PullRequest.SourceBranch) | sed 's|refs/heads/||g'`
+              HASH_LIST=`git log --oneline --no-merges --pretty=format:'%h' origin/$(System.PullRequest.TargetBranchName)..origin/$SOURCE_BRANCH_NAME | sed '1!G;h;$!d' | paste -sd','`
+              EXECUTION_TYPE=BUILD
+            fi
+            echo "##vso[task.setvariable variable=EXECUTION_TYPE]$EXECUTION_TYPE"
+            echo "##vso[task.setvariable variable=HASH_LIST]$HASH_LIST"
+      
+      - task: Bash@3
+        displayName: 'Validating changed files and project'
+        inputs:
+          targetType: 'inline'
+          script: |
+            declare -a PROJECTS
+            declare -a FILES
+            IFS=','
+            for hash in $HASH_LIST
+            do
+              if [[ $EXECUTION_TYPE == BUILD ]]
+              then
+                echo "Tipo build..."
+                COMMIT=$(git show $hash --name-status --no-merges --pretty=format: | sed 's/\\t/,/g')
+                echo "$COMMIT" >> changes.txt
+              else
+                echo "Tipo deploy..."
+                COMMIT=$(git show --name-status -m $hash --pretty=format: | sed 's/\\t/,/g')
+                echo "Commit: $COMMIT"
+              fi
+              PATHS=${COMMIT:1}
+              IFS='/'
+              read -r -a PATH_LIST <<< "$PATHS"
+              FILES+="${COMMIT:2}|"
+              echo "##vso[task.setvariable variable=FILES]$FILES"
+              if [[ "${PROJECTS[@]}" != "${PATH_LIST[1]}" && "${PATH_LIST[0]:1}" != "Mocks" && "${PATH_LIST[0]:1}" != ".adf" && "${PATH_LIST[0]:1}" != ".azuredevops" && "${PATH_LIST[0]:1}" != ".settings" ]]
+              then
+                PARTITION=${PATH_LIST[0]:1}
+                echo "##vso[task.setvariable variable=PARTITION]$PARTITION"
+                PROJECT=${PATH_LIST[1]}
+                echo "##vso[task.setvariable variable=PROJECT]$PROJECT"
+                PROJECTS+=(${PATH_LIST[1]})
+              fi
+              if [[ ${#PROJECTS[@]} > 1 ]]
+              then
+                echo "##vso[task.logissue type=error]Não podem haver projetos/compostos diferentes alterados em uma mesma Pull Request."
+                echo "##vso[task.complete result=Failed;]"
+                exit 1
+              fi
+              ACTION=${COMMIT:0:1}
+              case $ACTION in
+              R)
+                echo -n "Artefato removido: $COMMIT"
+                ;;
+              D)
+                echo -n "Artefato deletado: $COMMIT"
+                ;;
+              M | A)
+                echo -n "Artefato modificado ou adicionado: $COMMIT"
+                ;;
+              esac
+            done
+
+      - task: Bash@3
+        displayName: 'Identify type of project'
+        inputs:
+          targetType: 'inline'
+          script: |
+            if [[ `echo $PARTITION | grep resources` && `echo $PROJECT | grep oramds` ]]
+            then
+              PROJECT_TYPE=METADATA_STORE
+              echo "##vso[task.setvariable variable=PROJECT_TYPE]$PROJECT_TYPE"
+            else
+              PROJECT_TYPE=COMPOSITE
+              echo "##vso[task.setvariable variable=PROJECT_TYPE]$PROJECT_TYPE"
+            fi
+
+      - task: Bash@3
+        displayName: 'Identifying package number'
+        inputs:
+          targetType: 'inline'
+          script: |
+            TAG=$(Build.SourceBranch)
+            echo "##vso[task.setvariable variable=PACKAGE_NUMBER]$(echo ${TAG:14})"
+
+      - task: Bash@3
+        displayName: 'Getting composite version'
+        condition: and(succeeded(), in(variables['PROJECT_TYPE'], 'COMPOSITE'))
+        inputs:
+          targetType: 'inline'
+          script: |
+            cd $PARTITION/$PROJECT
+            COMPOSITE_VERSION=`find . -name composite.xml -exec grep -Po '(?<=revision=\")([0-9.]+)' {} \;`
+            echo "##vso[task.setvariable variable=COMPOSITE_VERSION]$COMPOSITE_VERSION"
+      
+      - task: DownloadArtifactsNexusMavenRepositoryV3@3
+        displayName: "Download MDS Package"
+        condition: contains(variables['Build.SourceBranch'], 'MDS')
+        inputs:
+          NexusConnection: 'NEXUS-DEVOPS'
+          RepositoryId: $(NEXUS_PUBLISH_REPOSITORY)
+          GroupId: $(NEXUS_PUBLISH_REPOSITORY_GROUP_ID)
+          ArtifactId: oramds
+          BaseVersion: $(PACKAGE_NUMBER)
+          Packaging: jar
+          DownloadPath: $(Build.SourcesDirectory)
+      
+      - task: DownloadArtifactsNexusMavenRepositoryV3@3
+        displayName: "Download SOA Package"
+        condition: and(succeeded(), contains(variables['Build.SourceBranch'], 'SOA'))
+        inputs:
+          NexusConnection: 'NEXUS-DEVOPS'
+          RepositoryId: $(NEXUS_PUBLISH_REPOSITORY)
+          GroupId: $(NEXUS_PUBLISH_REPOSITORY_GROUP_ID)
+          ArtifactId: soaconfig
+          BaseVersion: $(PACKAGE_NUMBER)
+          Packaging: jar
+          DownloadPath: $(Build.SourcesDirectory)
+
+      - task: Bash@3
+        displayName: 'Define SOA Package Name'
+        condition: and(succeeded(), in(variables['EXECUTION_TYPE'], 'DEPLOY'))
+        inputs:
+          targetType: 'inline'
+          script: |
+            if [[ `echo $PARTITION | grep resources` && `echo $PROJECT | grep oramds` ]]
+            then
+              SOA_PACKAGE_NAME=soaconfig.jar
+              echo "##vso[task.setvariable variable=SOA_PACKAGE_NAME]$SOA_PACKAGE_NAME"
+              mv $(Build.SourcesDirectory)/oramds-$(PACKAGE_NUMBER).jar $(Build.SourcesDirectory)/soaconfig.jar
+            else
+              SOA_PACKAGE_NAME=sca_"$PROJECT"_rev"$COMPOSITE_VERSION".jar
+              echo "##vso[task.setvariable variable=SOA_PACKAGE_NAME]$SOA_PACKAGE_NAME"
+              mv $(Build.SourcesDirectory)/soaconfig-$(PACKAGE_NUMBER).jar $(Build.SourcesDirectory)/$SOA_PACKAGE_NAME
+            fi
+
+      - task: Bash@3
+        displayName: "Deploy MDS Package"
+        condition: and(succeeded(), contains(variables['Build.SourceBranch'], 'MDS'))
+        inputs:
+          targetType: 'inline'
+          script: |
+            SERVER_HOST="$(QA_${{ upper(parameters.qa_environment) }}_DEPLOY_HOST)"
+            echo "##vso[task.setvariable variable=SERVER_HOST]$SERVER_HOST"
+            SERVER_IP="$(QA_${{ upper(parameters.qa_environment) }}_DEPLOY_HOST_IP)"
+            echo "##vso[task.setvariable variable=SERVER_IP]$SERVER_IP"
+            SERVER_LISTENER_NAME="$(QA_${{ upper(parameters.qa_environment) }}_DEPLOY_HOST_LISTENER_NAME)"
+            echo "##vso[task.setvariable variable=SERVER_LISTENER_NAME]$SERVER_LISTENER_NAME"
+            SERVER_PORT="$(QA_${{ upper(parameters.qa_environment) }}_DEPLOY_PORT)"
+            echo "##vso[task.setvariable variable=SERVER_PORT]$SERVER_PORT"
+            IFS=';'
+            read -ra HOSTS <<< "$SERVER_HOST"
+            read -ra IPS <<< "$SERVER_IP"
+            read -ra LISTENERS <<< "$SERVER_LISTENER_NAME"
+            read -ra PORTS <<< "$SERVER_PORT"
+            for (( i = 0; i < ${#HOSTS[@]}; i++ ))
+            do
+              echo "${HOSTS[i]}":"${PORTS[i]}"
+              SERVER="${HOSTS[i]}":"${PORTS[i]}"
+              echo "${LISTENERS[i]}":"${IPS[i]}"
+              SERVER_HOST="${LISTENERS[i]}":"${IPS[i]}"
+              docker run --rm --entrypoint bash \
+                -v $(Build.SourcesDirectory):/builds \
+                -w /builds \
+                --hostname azdevops-daet \
+                --dns=$(PRIMARY_DNS) \
+                --dns=$(SECONDARY_DNS) \
+                --dns-search=redecorp.br \
+                --add-host $SERVER_HOST \
+                -e PIPELINE_DEPLOYER_USER=$(PIPELINE_DEPLOYER_USER) \
+                -e PIPELINE_DEPLOYER_PASS=$(PIPELINE_DEPLOYER_PASS) \
+                -e ENVIRONMENT=$SERVER \
+                -e SOA_PACKAGE_NAME=$(SOA_PACKAGE_NAME) \
+                -e PARTITION=$(PARTITION) \
+                -e PROJECT=$(PROJECT) \
+                $(DOCKER_IMAGE) \
+                -c "cd /;
+                  chmod +x /deploy-mds.sh;
+                  ./deploy-mds.sh"
+              if ! grep -q 'code=200' $(Build.SourcesDirectory)/deploy.log
+              then
+                echo "##vso[task.complete result=Failed;]"
+                break
+              fi
+            done
+
+      - task: Bash@3
+        displayName: 'Verify ConfigPlan'
+        condition: and(succeeded(), contains(variables['Build.SourceBranch'], 'SOA'))
+        inputs:
+          targetType: 'inline'
+          script: |
+            if [ "${{ upper(parameters.qa_environment) }}" = "ESTEIRA1" ]; then
+              CFGPLAN=cfgplan.esteira-1.xml
+              echo "##vso[task.setvariable variable=CFGPLAN]$CFGPLAN"
+            elif [ "${{ upper(parameters.qa_environment) }}" = "ESTEIRA2" ]; then
+              CFGPLAN=cfgplan.esteira-2.xml
+              echo "##vso[task.setvariable variable=CFGPLAN]$CFGPLAN"
+            elif [ "${{ upper(parameters.qa_environment) }}" = "PREPROD" ]; then
+              CFGPLAN=cfgplan.pre-prod.xml
+              echo "##vso[task.setvariable variable=CFGPLAN]$CFGPLAN"
+            fi
+
+            if test -f $(Build.SourcesDirectory)/$PARTITION/$PROJECT/$CFGPLAN; then
+              echo "Deploy será realizado com ConfigPlan na ${{ upper(parameters.qa_environment) }}"
+            else
+              echo "Deploy será realizado sem ConfigPlan na ${{ upper(parameters.qa_environment) }}"
+            fi
+
+      - task: Bash@3
+        displayName: "Deploy SOA Package"
+        condition: and(succeeded(), contains(variables['Build.SourceBranch'], 'SOA'))
+        inputs:
+          targetType: 'inline'
+          script: |
+            SERVER_HOST="$(QA_${{ upper(parameters.qa_environment) }}_DEPLOY_HOST)"
+            echo "##vso[task.setvariable variable=SERVER_HOST]$SERVER_HOST"
+            SERVER_IP="$(QA_${{ upper(parameters.qa_environment) }}_DEPLOY_HOST_IP)"
+            echo "##vso[task.setvariable variable=SERVER_IP]$SERVER_IP"
+            SERVER_LISTENER_NAME="$(QA_${{ upper(parameters.qa_environment) }}_DEPLOY_HOST_LISTENER_NAME)"
+            echo "##vso[task.setvariable variable=SERVER_LISTENER_NAME]$SERVER_LISTENER_NAME"
+            SERVER_PORT="$(QA_${{ upper(parameters.qa_environment) }}_DEPLOY_PORT)"
+            echo "##vso[task.setvariable variable=SERVER_PORT]$SERVER_PORT"
+            IFS=';'
+            read -ra HOSTS <<< "$SERVER_HOST"
+            read -ra IPS <<< "$SERVER_IP"
+            read -ra LISTENERS <<< "$SERVER_LISTENER_NAME"
+            read -ra PORTS <<< "$SERVER_PORT"
+            for (( i = 0; i < ${#HOSTS[@]}; i++ ))
+            do
+              echo "${HOSTS[i]}":"${PORTS[i]}"
+              SERVER="${HOSTS[i]}":"${PORTS[i]}"
+              echo "${LISTENERS[i]}":"${IPS[i]}"
+              SERVER_HOST="${LISTENERS[i]}":"${IPS[i]}"
+              docker run --rm --entrypoint bash \
+                -v $(Build.SourcesDirectory):/builds \
+                -w /builds \
+                --hostname azdevops-daet \
+                --dns=$(PRIMARY_DNS) \
+                --dns=$(SECONDARY_DNS) \
+                --dns-search=redecorp.br \
+                --add-host $SERVER_HOST \
+                -e PIPELINE_DEPLOYER_USER=$(PIPELINE_DEPLOYER_USER) \
+                -e PIPELINE_DEPLOYER_PASS=$(PIPELINE_DEPLOYER_PASS) \
+                -e ENVIRONMENT=$SERVER \
+                -e SOA_PACKAGE_NAME=$(SOA_PACKAGE_NAME) \
+                -e PARTITION=$(PARTITION) \
+                -e PROJECT=$(PROJECT) \
+                -e CFGPLAN=$(CFGPLAN) \
+                $(DOCKER_IMAGE) \
+                -c "cd /;
+                  chmod +x /deploy-composite.sh;
+                  ./deploy-composite.sh"
+              if [[ $(grep -ic "already exists" $(Build.SourcesDirectory)/partition.log) -eq 0 && $(grep -ic "Partition was successfully created" $(Build.SourcesDirectory)/partition.log) -eq 0 ]]
+              then
+                echo "##vso[task.logissue type=error]Ocorreu um problema durante a criação da partição."
+                echo "##vso[task.complete result=Failed;]"
+                break
+              elif ! grep -q 'code=200' $(Build.SourcesDirectory)/deploy.log
+              then
+                echo "##vso[task.logissue type=error]Ocorreu um problema durante o deploy do composto."
+                echo "##vso[task.complete result=Failed;]"
+                break
+              fi
+            done
+
+- ${{ else }}:
+  - stage: Error
+    jobs:
+    - job: Error
+      steps:  
+      - task: Bash@3
+        inputs:
+          targetType: 'inline'
+          script: |
+            script: |
+              print("##vso[task.logissue type=error;]Do Not Run Pipelines Without a Pull Request")
+              print("##vso[task.complete result=Failed;]Text")

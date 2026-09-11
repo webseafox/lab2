@@ -1,0 +1,596 @@
+## -> Parameters:
+parameters:
+- name: qa_environment
+  type: string
+- name: skip_deploy
+  type: boolean
+  default: false
+- name: VERSION
+  type: string
+  default: ''
+- name: fortifyExclusionRepository
+  type: string
+  default: 'FortifyExclusion'
+
+## -> Resources:
+resources:
+  repositories:
+  - repository: FortifyExclusion
+    name: DevOps/Vivo.Fortify.Exclusions
+    type: git
+    ref: refs/heads/master
+    endpoint: CorePipelines
+  - repository: CorePipelines
+    name: DevOps/Vivo.Core.Pipelines
+    type: git
+    ref: refs/tags/latest
+    endpoint: CorePipelines
+
+## -> Initialize global variables   
+variables:
+
+- template: /global/variables/pipeline.yml@CorePipelines
+
+- name: DEFAULT_WORKDIR_ARTIFACTS
+  value: "$(System.ArtifactsDirectory)/extracted_tars/app"
+- name: MAVEN_CACHE_FOLDER
+  value: $HOME/.m2/repository
+- name: MAVEN_OPTS
+  value: '-Dmaven.repo.local=$(MAVEN_CACHE_FOLDER)' 
+
+## -> Override global variables, with variables set in Library/Variable Groups (Pipelines)
+## -> Use this to change the variables on runtime
+- group: "${{ variables['Build.DefinitionName'] }}"
+
+stages:
+## -> Initialize pipeline
+- stage: pipeline_init
+  displayName: "Pipeline initialization"
+  pool: $(PRIVATE_AGENT_DEFAULT)
+  jobs:
+  - job: prepare_pipeline
+    displayName: "Prepare"
+    steps:
+
+    - script: |
+        echo "##[debug] BREAK_WHEN_NOT_FOUND.....: ${BREAK_WHEN_NOT_FOUND}"
+        if [ ! -f "catalog-info.yaml" ]; then
+          if [ "$BREAK_WHEN_NOT_FOUND" = 'True' ]; then
+            echo "##vso[task.logissue type=error] Unable to find catalog-info.yaml file (path=$(pwd))."
+            exit 1
+          fi
+        fi
+      displayName: "Check for catalog-info.yml"
+      env:
+        BREAK_WHEN_NOT_FOUND: true
+
+    - task: CopyFiles@2
+      displayName: "Copy catalog-info.yaml to Staging Directory"
+      inputs:
+        TargetFolder: "$(Build.ArtifactStagingDirectory)"
+        OverWrite: true
+        CleanTargetFolder: true
+        Contents: |
+          catalog-info.yaml
+
+    - task: PublishPipelineArtifact@1
+      displayName: "Publish catalog-info.yaml"
+      inputs:
+        artifactName: "catalog-info"
+        targetPath: "$(Build.ArtifactStagingDirectory)"
+
+## -> Build for CI - Weblogic
+- stage: build
+  displayName: Build
+  jobs:
+  - job: package
+    displayName: Build, Test and Pack
+    pool: GeneralPurposeLinuxAgentsCI
+
+    steps:
+    - checkout: self
+      fetchDepth: 1
+      persistCredentials: true
+
+    - task: NodeTool@0
+      inputs:
+        versionSource: 'spec'
+        versionSpec: '10.x'
+      env:
+        HTTPS_PROXY: http://10.240.58.39:3128 # SQUID PROXY
+        HTTP_PROXY: http://10.240.58.39:3128 # SQUID PROXY
+        NO_PROXY: localhost,0.0.0.0,127.0.0.1,10.244.0.0/16,192.168.0.0/16,10.129.178.173,nexus.telefonica.com.br,acrsharedservices01.azurecr.io,appcs-azdevops-shared.azconfig.io,scm.azurewebsites.net
+
+    - task: AzureKeyVault@2
+      displayName: 'Getting AKV Credentials'
+      timeoutInMinutes: 1
+      retryCountOnTaskFailure: 5
+      inputs:
+        azureSubscription: 'DevOpsSharedResources'
+        KeyVaultName: 'kv-azdevops-shared'
+        SecretsFilter: 'NEXUS-DEPS-USR, NEXUS-DEPS-PSW, NEXUS-DEFAULT-USR, NEXUS-DEFAULT-PSW'
+
+    - script: echo "##vso[task.setvariable variable=NEXUS_USR]$(NEXUS-DEFAULT-USR)"
+      displayName: Set NEXUS_USR Var
+
+    - task: Bash@3
+      name: get_latest_version
+      inputs:
+        targetType: 'inline'
+        script: |
+          if [ "${{ parameters.VERSION }}" == "latest" ] || [ -z "${{ parameters.VERSION }}" ]; then
+            echo "Fetching latest version..."
+            SELECTED_VERSION=$(curl -s -u $(NEXUS-DEFAULT-USR):$(NEXUS-DEFAULT-PSW) \
+            'https://nexus.telefonica.com.br/service/rest/v1/search?repository=sgoe-frontend-npm&name=novo-sgoe-portal' | \
+            jq -r '.items | map(.version) | sort_by(split(".") | map(tonumber)) | last')
+            echo "Latest version: $SELECTED_VERSION"
+          else
+            SELECTED_VERSION=${{ parameters.VERSION }}
+            echo "Specific version provided: $SELECTED_VERSION"
+          fi
+            echo "##vso[task.setvariable variable=SELECTED_VERSION]$SELECTED_VERSION"
+      displayName: Get latest version Nexus
+
+    - task: Bash@3
+      name: update_package_json
+      inputs:
+        targetType: 'inline'
+        script: |
+          CURRENT_VERSION=$(echo $(SELECTED_VERSION))
+          echo "Updating package.json to version $CURRENT_VERSION"
+          jq --arg current_version "$CURRENT_VERSION" '.version = $current_version' package.json > temp.json && mv temp.json package.json
+          echo "##vso[task.setvariable variable=CURRENT_VERSION]$CURRENT_VERSION"
+          echo "##vso[task.setvariable variable=NEW_VERSION]$NEW_VERSION"
+      displayName: Update package.json version
+
+    - script: npm version patch --no-git-tag-version
+      displayName: Bump version
+
+    - script: npm i -ddd;npm i -g @angular/cli@8.3.29
+      displayName: Install dependencies
+
+    - script: npm install --package-lock-only
+      displayName: Generating package-lock.json
+
+    - script: |
+        echo "Environment set to: ${{ parameters.qa_environment }}"
+        if [ "${{ parameters.qa_environment }}" == "dev" ]; then
+          echo "Building for DEV"
+          ng build --configuration=pp --base-href /novo-sgoe-portal_dev/
+        elif [ "${{ parameters.qa_environment }}" == "hml" ]; then
+          echo "Building for HML"
+          ng build --configuration=pp --base-href /novo-sgoe-portal/
+        elif [ "${{ parameters.qa_environment }}" == "qa" ]; then
+          echo "Building for QA"
+          ng build --configuration=pp --base-href /novo-sgoe-portal/
+        elif [ "${{ parameters.qa_environment }}" == "preprod" ]; then
+          echo "Building for PreProd"
+          ng build --configuration=pp --base-href /novo-sgoe-portal/
+        elif [ "${{ parameters.qa_environment }}" == "prod" ]; then
+          echo "Building for PROD"
+          ng build --configuration=newprod --base-href /novo-sgoe-portal/
+        else
+          echo "Unknown environment, building for default (PP)"
+          ng build --configuration=pp --base-href /novo-sgoe-portal/
+        fi
+      displayName: 'Build Angular Project by Environment'
+
+    - task: Bash@3
+      displayName: 'List Files and Create WEB-INF'
+      continueOnError: true
+      inputs:
+        workingDirectory: '$(Build.SourcesDirectory)'
+        targetType: inline
+        script: |
+          mkdir -p dist/WEB-INF
+          cp web.xml dist/WEB-INF
+          mv dist novo-sgoe-portal
+          ls -lah novo-sgoe-portal
+
+    - task: JsonParseFromVivo@4
+      displayName: Get package.json info
+      name: package_info
+      inputs:
+        type: 'file'
+        origin: $(Build.SourcesDirectory)/package.json
+        jpaths: |
+          var PACKAGE_JSON_VERSION =  .version
+
+    - task: CopyFiles@2
+      name: t_copy_file
+      displayName: 'Staging Artifacts'
+      condition: succeeded()
+      continueOnError: false
+      inputs:
+        SourceFolder: '$(build.sourcesdirectory)'
+        TargetFolder: '$(Build.ArtifactStagingDirectory)'
+        Contents: |
+          novo-sgoe-portal/**/*
+          package.json
+          package-lock.json
+        CleanTargetFolder: true
+        OverWrite: true
+        flattenFolders: false
+
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Artifacts'
+      condition: succeeded()
+      continueOnError: false
+      inputs:
+        ArtifactName: bin
+
+## -> Gates for CI - Weblogic
+- stage: gates
+  displayName: "Quality Gates"
+  dependsOn: 
+  - build
+  pool: $(PRIVATE_AGENT_DEFAULT)
+  jobs:
+
+  - job: governance
+    displayName: Governance Policies Check
+    steps:
+
+    - script: |
+        if [ ! -f "catalog-info.yaml" ]; then
+          echo "##vso[task.logissue type=error] Unable to find catalog-info.yaml file (path=$(pwd))."
+        fi
+
+        COMPONENT_NAME="$(yq -r 'select(documentIndex == 0) | .metadata.name | select (.!=null)' catalog-info.yaml)"
+        echo "##vso[task.setvariable variable=COMPONENT_NAME]${COMPONENT_NAME}"
+        echo "##vso[task.setvariable variable=CATALOG_INFO_FILE_CONTENT]$(cat catalog-info.yaml)"
+      name: export_catalog_info
+      displayName: Reading Catalog Info File
+
+    - bash: |
+        version=$(grep version pom.xml | grep -v '<?xml' | grep '<version>'|head -n 1|awk '{print $1}'| cut -d'>' -f 2 | cut -d'<' -f 1)
+        echo "##vso[task.setvariable variable=APP_VERSION]$version"
+        echo "##[debug] Exporting variable 'APP_VERSION': $version"
+      name: export_current_version
+      displayName: Extract App Version 
+
+    - task: VivoGovernance@1
+      inputs:
+        breakglass: $(GOVAPP_BREAK_GLASS)
+        cluster: "$(GOVAPP_CLUSTER)"
+        component: "$(COMPONENT_NAME)"
+        deployment: "$(COMPONENT_NAME)"
+        environment: "${{ parameters.qa_environment }}" 
+        namespace: "$(GOVAPP_NAMESPACE)"
+        operation: "validate"
+        serverEndpoint: $(GOVAPP_SERVICE_CONNECTION_NAME)
+        version: "$(APP_VERSION)"
+        catalogInfo: $(CATALOG_INFO_FILE_CONTENT)
+      continueOnError: true
+      condition: eq(lower(variables.GOVAPP_INTEGRATION_ENABLED), 'true')
+
+  - job: sonarqube
+    displayName: Code Analysis
+    variables:
+    - name: APP_VERSION
+      value: $[ stageDependencies.build_test.bump_version.outputs['component_bump_version.APP_NEW_VERSION'] ]    
+    steps:
+    - script: |
+        if [ ! -f "catalog-info.yaml" ]; then
+          echo "##vso[task.logissue type=error] Unable to find catalog-info.yaml file (path=$(pwd))."
+          exit 1
+        fi
+
+        SONAR_PROJECT_KEY="$(yq -r 'select(documentIndex == 0) | .metadata.annotations."sonarqube.org/project-key" | select (.!=null)' catalog-info.yaml)"
+
+        echo "##[debug] SONAR_PROJECT_KEY..........: ${SONAR_PROJECT_KEY}"
+        echo "##vso[task.setvariable variable=SONAR_PROJECT_KEY]${SONAR_PROJECT_KEY}"
+      displayName: "Extract catalog-info.yaml - Sonar Project Key"
+
+    - task: AzureKeyVault@2  
+      displayName: 'Getting AKV credentials'
+      timeoutInMinutes: 1
+      retryCountOnTaskFailure: 5  
+      inputs:    
+        azureSubscription: DevOpsSharedResources    
+        KeyVaultName: $(AKV_DEVOPS_NAME)
+        SecretsFilter: 'SONARQUBE-TOKEN'
+
+    - task: DownloadBuildArtifacts@1
+      displayName: 'Download Build Artifacts'
+      inputs:
+        artifactName: bin
+        parallelizationLimit: 20
+        extractTars: false
+
+    - bash: |
+        url="$(SONARQUBE_URL)"
+        token="${SONARQUBE_TOKEN}"
+        project_key="$(SONAR_PROJECT_KEY)"
+        project_name="$(System.TeamProject)-$(Build.Repository.Name)"
+        app_quality_gate="$(SONARQUBE_PROJECT_QUALITYGATE)"
+        default_quality_gate="$(SONARQUBE_DEFAULT_QUALITYGATE)"
+
+        # If no custom quality gate was provided, use default.
+        if [[ -z $app_quality_gate ]]; then
+            app_quality_gate="$default_quality_gate"
+        fi
+
+        # Checks if the project exists. If not, creates it.
+        project_exists=$(curl -s -X POST -u $token: "$url/api/projects/search?projects=$project_key" | jq '.paging.total' | sed 's/null/0/g')
+
+        if [ "$project_exists" -ne 1 ]; then
+            project_status=$(curl -s -X POST -o ./.tmp.sonar.out -w "%{http_code}" -u $token: "$url/api/projects/create?name=$project_name&project=$project_key&visibility=public")
+
+            if [ "$project_status" -eq 200 ]; then
+                echo "SonarQube project created for $project_name"
+            else
+                echo "Error creating SonarQube project for $project_name...($(cat ./.tmp.sonar.out | jq '.errors[0].msg'))"
+            fi
+        fi
+
+        # Checks if the project's Quality Gate exists. If not, use default.
+        app_quality_gate_status=$(curl -s -o /dev/null -w "%{http_code}" -u $token: "$url/api/qualitygates/show?name=$app_quality_gate")
+
+        if [ "$app_quality_gate_status" -eq 200 ]; then
+            echo "Quality Gate found ($app_quality_gate)"
+        else
+            echo "Quality Gate not found ($app_quality_gate). Using default..."
+            
+            app_quality_gate="$default_quality_gate"
+        fi
+
+        # Links the project to its Quality Gate
+        echo "Ensuring project is linked to Quality Gate..."
+
+        status=$(curl -s -X POST -o /dev/null -w "%{http_code}" -u $token: "$url/api/qualitygates/select?gateName=$app_quality_gate&projectKey=$project_key")
+
+        if [ "$status" -ne 204 ]; then
+            echo "Error while linking application to Quality Gate!"
+        fi
+
+        rm -rf ./.tmp.sonar.out
+      displayName: 'Setup Project & Quality Gate'
+      env:
+        SONARQUBE_TOKEN: $(SONARQUBE-TOKEN)
+
+    - bash: |
+          ls -lah
+          ls -alh  $(System.ArtifactsDirectory)/bin/
+          cd $(System.ArtifactsDirectory)
+          mkdir -p $(System.ArtifactsDirectory)/extracted_tars/app
+          cp -r bin/* $(System.ArtifactsDirectory)/extracted_tars/app
+          ls -alh  $(System.ArtifactsDirectory)/
+      displayName: 'Fetch "sonar.java.binaries"'
+
+    - task: SonarSource.sonarqube.15B84CA1-B62F-4A2A-A403-89B77A063157.SonarQubePrepare@5
+      displayName: 'Prepare analysis on SonarQube'
+      inputs:
+        SonarQube: '$(SONARQUBE_SERVICE_CONNECTION_NAME)'
+        scannerMode: CLI
+        configFile: '$(SONARQUBE_CONFIG_FILE)'
+        extraProperties: |
+          sonar.scm.disabled=True
+          sonar.java.binaries=$(BINARIES_DIRECTORIES)
+          sonar.projectBaseDir=$(DEFAULT_WORKDIR_ARTIFACTS)
+          sonar.inclusions=**/src/app/**,**/*.ts,**/*.tsx,**/*.js,**/*.jsx,**/*.java,**/*.html,**/*.css,**/*.scss,**/*.json,**/*.xml,**/*.properties
+          sonar.exclusions=**/node_modules/**,**/dist/**,**/build/**,**/coverage/**,**/test/**,**/tests/**,**/tmp/**,**/temp,**/public/**,**/metrics/*.py,/migrations/*.ts,/*.config.ts,/src/configs/**/*,**/*.module.ts,/src/main.ts
+          sonar.projectKey=$(SONAR_PROJECT_KEY)
+          sonar.projectName=$(System.TeamProject)-$(Build.Repository.Name)
+          sonar.projectVersion=$(APP_VERSION)
+          sonar.analysis.repositoryName=$(Build.Repository.Name)
+          sonar.analysis.buildId=$(Build.BuildId)
+          sonar.analysis.repositoryId=$(Build.Repository.ID)
+          sonar.analysis.projectName=$(System.TeamProject)
+          sonar.analysis.projectId=$(System.TeamProjectId)
+          sonar.links.homepage=$(System.TeamFoundationCollectionUri)$(System.TeamProject)
+          sonar.links.ci=$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)&_a=summary
+          sonar.links.issue=$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_workitems
+          sonar.links.scm=$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_git/$(Build.Repository.Name)
+          sonar.scanner.metadataFilePath=$(Agent.TempDirectory)/sonar/$(Build.BuildId)/report-task.txt
+          sonar.qualitygate.wait=true
+          sonar.qualitygate.timeout=300
+          sonar.scanner.connectTimeout=10
+          sonar.scanner.socketTimeout=120
+          sonar.scanner.responseTimeout=120
+          sonar.coverage.jacoco.xmlReportPaths=$(Build.SourcesDirectory)/target/site/jacoco/jacoco.xml
+          sonar.language=ts
+          sonar.sources=.
+          sonar.javascript.lcov.reportPaths=**/coverage/lcov.info
+          sonar.coverage.exclusions=tests/**
+          sonar.typescript.tsconfigPath=./tsconfig.json
+          sonar.test.inclusions=**/*.spec.ts
+      env:
+        NODE_EXTRA_CA_CERTS: $(CACORP_LOCATION)
+
+    - script: |
+        echo "##[debug] SONAR_PROJECT_KEY...........: ${SONAR_PROJECT_KEY}"
+      displayName: Show sonar project key
+      env:
+        SONAR_PROJECT_KEY: $(SONAR_PROJECT_KEY)
+
+    - task: SonarSource.sonarqube.6D01813A-9589-4B15-8491-8164AEB38055.SonarQubeAnalyze@5
+      displayName: 'Run Code Analysis'
+      continueOnError: true
+      env:
+        ASDF_JAVA_VERSION: "openjdk-11.0.2"
+
+    - script: |
+        echo "##[debug] REPORT_TASK_NAME....: $(pwd)/${REPORT_TASK_NAME}"
+        cat ${REPORT_TASK_NAME}
+
+        SONAR_TASK_ID="$(cat ${REPORT_TASK_NAME} | grep -o 'ceTaskId=[^,]*' | awk -F= '{print $2}')"
+        echo "##[debug] SONAR_TASK_ID.......: ${SONAR_TASK_ID}"
+
+        echo "##vso[task.setvariable variable=SONAR_TASK_ID;isOutput=true]${SONAR_TASK_ID}"
+      displayName: Get Sonar TaskId
+      name: sonar_task_id
+      workingDirectory: $(Agent.TempDirectory)/sonar/$(Build.BuildId)
+      env:
+        REPORT_TASK_NAME: "report-task.txt"
+
+    - task: SonarSource.sonarqube.291ed61f-1ee4-45d3-b1b0-bf822d9095ef.SonarQubePublish@5
+      displayName: 'Publish Quality Gate Result'
+      continueOnError: true
+      env:
+        NODE_EXTRA_CA_CERTS: $(CACORP_LOCATION)
+
+    - script: |
+        echo "##[debug] SONAR_TASK_ID...............: ${SONAR_TASK_ID}"
+
+        SONAR_TASK_URL="${SONARQUBE_URL}/api/ce/task?id=${SONAR_TASK_ID}"
+        echo "##[debug] SONAR_TASK_URL..............: ${SONAR_TASK_URL}"
+        ANALYSIS_ID="$(curl -s -u "${SONARQUBE_TOKEN}:" "${SONAR_TASK_URL}" | jq -r '.task.analysisId')"
+        echo "##[debug] ANALYSIS_ID.................: ${ANALYSIS_ID}"
+
+        SONAR_PROJECT_STATUS_URL="${SONARQUBE_URL}/api/qualitygates/project_status?analysisId=${ANALYSIS_ID}"
+        echo "##[debug] SONAR_PROJECT_STATUS_URL....: ${SONAR_PROJECT_STATUS_URL}"
+        ANALYSIS_STATUS="$(curl -s -u "${SONARQUBE_TOKEN}:" "${SONAR_PROJECT_STATUS_URL}" | jq -r '.projectStatus.status')"
+        echo "##[debug] ANALYSIS_STATUS.............: ${ANALYSIS_STATUS}"
+
+        if [[ "${ANALYSIS_STATUS}" == "ERROR" ]]; then
+          echo "##vso[task.logissue type=error;] Sonar Quality Gate status is ERROR - View details on step Run Code Analysis."
+          echo "##vso[task.complete result=Failed;]"
+        fi
+      displayName: 'Break build on quality gate failure'
+      continueOnError: true
+      env:
+        SONARQUBE_TOKEN: $(SONARQUBE-TOKEN)
+        SONARQUBE_URL: $(SONARQUBE_URL)
+        SONAR_TASK_ID: $(sonar_task_id.SONAR_TASK_ID)
+
+## -> Security for CI - Weblogic
+- stage: security
+  displayName: "Security"
+  dependsOn: 
+    - pipeline_init
+    - build
+  pool:
+    name: $(PRIVATE_AGENT_DEFAULT)
+  jobs:
+  - job: app_config_keys
+    displayName: "Get AppSec Config Keys"
+    steps:
+    - template: /task_groups/security/get_appconfig_keys.yml@CorePipelines
+
+  - job: fortify_scan
+    dependsOn: app_config_keys
+    variables:
+      USE_FORTIFY: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_FORTIFY'] ]
+      USE_CONVISO: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_CONVISO'] ]
+      SKIP_SECURITY_GATE: $[ dependencies.app_config_keys.outputs['evaluate_flags.SKIP_SECURITY_GATE'] ]
+    condition: and(
+                    succeeded(),
+                    and(
+                      eq(variables.USE_FORTIFY, 'true'),
+                      eq(variables.flowIsToReview, true),
+                      not(startsWith(variables['Build.SourceBranch'], 'refs/tags/'))
+                    )
+                  )
+    displayName: "Fortify Scan"
+    steps:
+    - template: /task_groups/security/run_fortify_scan.yml@CorePipelines
+      parameters:
+        isGitFlow: true
+        gateCondition: and(
+                        succeeded(),
+                        ne(variables.skip_fortify_gate, true),
+                        ne(variables.USE_CONVISO, 'true')
+                      )
+        fortifyExclusionRepository: ${{ parameters.fortifyExclusionRepository }}
+        skipSecurityGate: $(SKIP_SECURITY_GATE)
+    - template: /tasks/telemetry/telemetry.yml@CorePipelines
+
+  - job: sca_scan
+    dependsOn: app_config_keys
+    displayName: "SCA Scan"
+    variables: 
+      USE_DEPENDENCY_TRACK: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_DEPENDENCY_TRACK'] ]
+      USE_DT_DOCKER: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_DT_DOCKER'] ]
+      USE_CONVISO: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_CONVISO'] ]
+      SKIP_SECURITY_GATE_SCA: $[ dependencies.app_config_keys.outputs['evaluate_flags.SKIP_SECURITY_GATE_SCA'] ]
+    condition: and(
+                  succeeded(),
+                  eq(variables.USE_DEPENDENCY_TRACK, true),
+                  eq(variables.USE_DT_DOCKER, false)
+                )
+    steps:
+      #- template: /security/define_appsec_app_version.yml
+      - template: /security/run_sca_scan.yml
+        parameters:
+          buildArtifactName: bin
+          #appVersion: "$(FORTIFY_APP_VERSION)"
+          #vivoFlow: "develop,preprod,esteira1,esteira2"
+
+## -> Package for CI - Weblogic
+- stage: state_push_nexus
+  displayName: Push to Nexus
+  dependsOn: ['gates', 'security']
+  condition: and(succeeded('gates'), succeeded('security'))
+  jobs:
+  - job: job_push_nexus
+    displayName: Push to Nexus
+    pool: GeneralPurposeLinuxAgentsCI
+
+    steps:
+    - checkout: self
+
+    - task: DownloadBuildArtifacts@1
+      displayName: Download artifacts
+      inputs:
+        buildType: 'current'
+        downloadType: 'specific'
+        downloadPath: '$(System.ArtifactsDirectory)'
+        cleanDestinationFolder: true
+
+    - task: NodeTool@0
+      inputs:
+        versionSource: 'spec'
+        versionSpec: '10.x'
+      env:
+        HTTPS_PROXY: http://10.240.58.39:3128 # SQUID PROXY
+        HTTP_PROXY: http://10.240.58.39:3128 # SQUID PROXY
+        NO_PROXY: localhost,0.0.0.0,127.0.0.1,10.244.0.0/16,192.168.0.0/16,10.129.178.173,nexus.telefonica.com.br,acrsharedservices01.azurecr.io,appcs-azdevops-shared.azconfig.io,scm.azurewebsites.net
+    
+    - task: AzureKeyVault@2
+      displayName: 'Getting AKV Credentials'
+      timeoutInMinutes: 1
+      retryCountOnTaskFailure: 5
+      inputs:
+        azureSubscription: 'DevOpsSharedResources'
+        KeyVaultName: 'kv-azdevops-shared'
+        SecretsFilter: 'NEXUS-DEPS-USR, NEXUS-DEPS-PSW, NEXUS-DEFAULT-USR, NEXUS-DEFAULT-PSW'
+
+    - script: echo "##vso[task.setvariable variable=NEXUS_USR]$(NEXUS-DEFAULT-USR)"
+      displayName: Set NEXUS_USR Var
+
+    - task: Bash@3
+      displayName: Preparando o pacote e .npmrc
+      inputs:
+        targetType: 'inline'
+        script: |
+            cd  $(System.ArtifactsDirectory)/bin
+            touch .npmrc
+            cat >> .npmrc <<EOF
+            _auth=$(echo -n $(NEXUS-DEFAULT-USR):$(NEXUS-DEFAULT-PSW) | base64)
+            always-auth=true
+            EOF
+            ls -lah
+            npm pack
+      
+    - script: npm publish --access=public -ddd --registry https://nexus.telefonica.com.br/repository/
+      workingDirectory: $(System.ArtifactsDirectory)/bin
+      displayName: Publish
+      
+    - task: Bash@3
+      name: list_artifacts_in_nexus
+      inputs:
+        targetType: 'inline'
+        script: |
+            echo "Fetching all available versions of 'novo-sgoe-portal' from Nexus..."  
+            # Fazer o request para buscar todos os artefatos
+            ALL_ARTIFACTS=$(curl -s -u $(NEXUS-DEFAULT-USR):$(NEXUS-DEFAULT-PSW) \
+            'https://nexus.telefonica.com.br/service/rest/v1/search?repository=sgoe-frontend-npm')
+            # Exibir todos os artefatos encontrados
+            echo "Available artifacts: "
+            echo "$ALL_ARTIFACTS"
+      
+            if [ -z "$ALL_ARTIFACTS" ]; then
+              echo "No artifacts found in the repository."
+            fi
+      displayName: List all artifacts in Nexus

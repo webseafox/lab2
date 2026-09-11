@@ -1,0 +1,539 @@
+# ==================================================================
+# Pipeline: Deploy Azure Data Factory - Deployment Automatizado de ADF
+# -----------------------------------------------------
+# Pipeline de deployment para projetos Azure Data Factory utilizando Git tags.
+# Consome código versionado via tags Git e aplica configurações no ADF
+# do ambiente especificado com validação pré e pós-deploy.
+# ==================================================================
+
+# Dependencies:
+# - Service Connections Azure configuradas por ambiente
+# - Azure Data Factory instances criadas nos ambientes de destino
+# - Tags Git geradas pelo pipeline de CI
+# - PowerShell instalado nos agentes do Azure DevOps
+# - Módulo PowerShell 'azure.datafactory.tools' disponível nos agentes
+
+parameters:
+  # ==================================================================
+  # Configurações de Infraestrutura e Ambiente
+  # ==================================================================
+  - name: agentPool
+    type: string
+    default: GeneralPurposeLinuxAgentsCD
+    displayName: 'Agent Pool para execução'
+
+  - name: environment
+    type: string
+    default: dev
+    displayName: 'Ambiente de destino para deployment'
+    values:
+      - dev
+      - preprod  
+      - prod
+
+  - name: variableGroupName
+    type: string
+    default: ''
+    displayName: 'Grupo de variáveis para uso nos arquivos de configuração'
+
+  - name: environmentPrefix
+    type: string
+    default: 'deploy-'
+    displayName: 'Prefixo do environment resource no Azure DevOps'
+
+  # ==================================================================
+  # Configurações de Versionamento
+  # ==================================================================
+  - name: version
+    type: string
+    displayName: 'Versão/Tag para deployment'
+    default: getLatestVersion() # Padrão para obter a última versão gerada
+
+  - name: adfSourcePath
+    type: string
+    default: ''
+    displayName: 'Caminho da pasta do ADF no repositório'
+
+  - name: workingDirectory
+    type: string
+    default: $(Build.SourcesDirectory)
+    displayName: 'Diretório do projeto'
+
+  # ==================================================================
+  # Configurações de Recursos Azure por Ambiente
+  # ==================================================================
+  - name: azureSubscription
+    displayName: 'Service Connection Azure por ambiente'
+    type: object
+    default:
+      dev: 'adf-$(SIGLA)-dev'
+      preprod: 'adf-$(SIGLA)-preprod'
+      prod: 'adf-$(SIGLA)-prod'
+
+  - name: adfResourceGroup
+    displayName: 'Resource Group do ADF por ambiente'
+    type: object
+    default:
+      dev: 'rg-adf-$(SIGLA)-brsouth-dev'
+      preprod: 'rg-adf-$(SIGLA)-brsouth-preprod'
+      prod: 'rg-adf-$(SIGLA)-brsouth-prod'
+
+  - name: adfName
+    displayName: 'Nome do Azure Data Factory por ambiente'
+    type: object
+    default:
+      dev: 'adf-$(SIGLA)-brsouth-dev'
+      preprod: 'adf-$(SIGLA)-brsouth-preprod'
+      prod: 'adf-$(SIGLA)-brsouth-prod'
+
+  - name: adfLocation
+    displayName: 'Localização do Azure Data Factory por ambiente'
+    type: object
+    default:
+      dev: 'brazilsouth'
+      preprod: 'brazilsouth'
+      prod: 'brazilsouth'
+
+  # ==================================================================
+  # Configurações de Controle de Deploy
+  # ==================================================================
+  - name: dryRun
+    type: boolean
+    default: false
+    displayName: 'Executar em modo Dry Run (simulação)'
+  
+  - name: enablePreDeployValidation
+    type: boolean
+    default: true
+    displayName: 'Executar validação pré-deploy'
+
+  # ==================================================================
+  # Configurações de Gerenciamento de Triggers
+  # ==================================================================
+  - name: startStopTriggersForDeploy
+    type: boolean
+    default: true
+    displayName: 'Parar triggers antes/depois do deploy'
+
+  - name: doNotStopStartExcludedTriggers
+    type: boolean
+    default: false
+    displayName: 'Não parar/iniciar triggers marcados como excluídos'
+
+  - name: triggerStopMethod
+    type: string
+    default: 'AllEnabled'
+    displayName: 'Quais triggers devem ser parados para o deploy'
+    values:
+      - 'AllEnabled'
+      - 'DeployableOnly'
+
+  - name: triggerStartMethod 
+    type: string
+    default: 'BasedOnSourceCode'
+    displayName: 'Quais triggers devem ser iniciados após o deploy'
+    values:
+      - 'BasedOnSourceCode'
+      - 'KeepPreviousState'
+
+  # ==================================================================
+  # Configurações de Filtros e Arquivos de Deployment
+  # ==================================================================
+  - name: deploymentFilterFile
+    type: string
+    default: 'rules.txt'
+    displayName: 'Arquivo com filtros para deployment'
+
+  - name: deleteObjectsNotInSource
+    type: boolean
+    default: false
+    displayName: 'Deletar recursos não presentes no código-fonte'
+
+  - name: doNotDeleteExcludedObjects
+    type: boolean
+    default: true
+    displayName: 'Não deletar objetos marcados como excluídos'
+    
+  - name: failsWhenConfigItemNotFound
+    type: boolean
+    default: true
+    displayName: 'Falhar quando arquivo de configuração de parâmetros não existir'
+
+  - name: failsWhenPathNotFound
+    type: boolean
+    default: true
+    displayName: 'Falhar script quando caminhos não forem encontrados'
+
+# ==================================================================
+# Variáveis Internas do Pipeline
+# ==================================================================
+variables:
+  - ${{ if ne(parameters.variableGroupName, '') }}:
+    - group: ${{ parameters.variableGroupName }}
+  - name: SIGLA
+    value: $[ lower(split(variables['System.TeamProject'],' ')[0]) ]
+  - name: ENVIRONMENT_RESOURCE
+    value: '${{ parameters.environmentPrefix }}${{ parameters.environment }}'
+  - name: ADF_FULL_PATH
+    value: '${{ parameters.workingDirectory }}/${{ parameters.adfSourcePath }}'
+  - name: ADF_DEPLOYMENT_FILTER_FILE
+    value: '${{ parameters.workingDirectory }}/deployment/${{ parameters.deploymentFilterFile }}'
+  - name: ADF_PARAMETER_CONFIG_FILE
+    value: '${{ parameters.workingDirectory }}/deployment/config-${{ parameters.environment }}.csv'
+
+# ==================================================================
+# Estágios do Pipeline
+# ==================================================================
+stages:
+  # Stage 1: Preparation - Preparação e validação pré-deploy
+  - stage: Preparation
+    displayName: 'Preparação e Validação (${{ parameters.environment }})'
+    pool: ${{ parameters.agentPool }}
+    jobs:
+    - job: PreparationAndValidation
+      displayName: 'Setup e Validação Pré-Deploy'
+      steps:
+        # ==================================================================
+        # Configuração inicial do ambiente
+        # ==================================================================
+        - checkout: self
+          clean: true
+          fetchDepth: 0
+
+        # ==================================================================
+        # Observabilidade e validação
+        # ==================================================================
+        - task: VivoUtilsFromVivo@1
+          displayName: 'Show Pipeline Parameters'
+          condition: eq(variables['System.Debug'], 'true')
+          inputs:
+            command: 'show-pipeline-parameters'
+            parameters: '${{ convertToJson(parameters) }}'
+
+        # Previne que utilize valores de prod em ambientes de non-prod
+        - task: VivoUtilsFromVivo@1
+          displayName: 'Validate Environment Parameters'
+          inputs:
+            command: 'validate-environment-parameters'
+            parameters: '${{ convertToJson(parameters) }}'
+            environment: '${{ parameters.environment }}'
+
+        # ==================================================================
+        # Configuração de tags do build
+        # ==================================================================
+        - script: |
+            echo "##vso[build.addbuildtag]adf"
+            echo "##vso[build.addbuildtag]azure-data-factory"
+            echo "##vso[build.addbuildtag]deploy-adf"
+            echo "##vso[build.addbuildtag]${{ parameters.environment }}"
+          displayName: 'Set Pipeline Execution Tags'
+
+        # ==================================================================
+        # Determinação da versão para deploy
+        # ==================================================================
+        - task: VersionManagerVivo@8
+          inputs:
+            command: 'setDeployVersion'
+            version: ${{ parameters.version }}
+          displayName: 'Set Deployment Version'
+          name: VersionManagerVivo
+
+        - script: |         
+            echo "##vso[build.updatebuildnumber]deploy-${DEPLOY_VERSION}-${{ parameters.environment }}"
+          displayName: 'Set Pipeline Execution Number'
+          env:
+            DEPLOY_VERSION: $(VersionManagerVivo.DEPLOY_VERSION)
+
+        # ==================================================================
+        # Checkout da versão específica para deploy
+        # ==================================================================
+        - script: |
+            echo "##[section]Fazendo checkout da versão: $(VersionManagerVivo.DEPLOY_VERSION)"
+            
+            # Remover branch de deploy se existir
+            git branch -D deploy-$(VersionManagerVivo.DEPLOY_VERSION) 2>/dev/null || true
+            
+            # Fazer checkout da tag e criar nova branch
+            git checkout tags/$(VersionManagerVivo.DEPLOY_VERSION) -b deploy-$(VersionManagerVivo.DEPLOY_VERSION)
+
+            echo "##[section]Verificando arquivos do ADF..."
+            ls -la "$(ADF_FULL_PATH)" || echo "Diretório ADF não encontrado"
+          displayName: 'Checkout Deploy Version'
+
+        # ==================================================================
+        # Validação pré-deploy do código ADF
+        # ==================================================================
+        - powershell: |
+            Test-AdfCode -RootFolder "$(ADF_FULL_PATH)"
+          displayName: 'Validate ADF Code'
+          condition: eq('${{ parameters.enablePreDeployValidation }}', true)
+
+  # Stage 2: Deployment - Execução do deployment no ADF
+  - stage: Deployment
+    displayName: 'ADF Deployment (${{ parameters.environment }})'
+    dependsOn: Preparation
+    condition: succeeded()
+    jobs:
+      - deployment: ADFDeployment
+        ${{ if eq(parameters.dryRun, false) }}:
+          displayName: 'Deploy ADF to ${{ parameters.environment }}'
+        ${{ else }}:
+          displayName: 'Deploy ADF to ${{ parameters.environment }} (Dry Run)'
+        pool: ${{ parameters.agentPool }}
+        environment: 
+          name: $(ENVIRONMENT_RESOURCE)
+        variables:
+          DEPLOY_VERSION: $[ stageDependencies.Preparation.PreparationAndValidation.outputs['VersionManagerVivo.DEPLOY_VERSION'] ]
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+              # ==================================================================
+              # Configuração inicial - Checkout para deployment
+              # ==================================================================
+              - checkout: self
+                displayName: 'Checkout Project Repository'
+                fetchDepth: 0
+                clean: true
+                
+              # ==================================================================
+              # Checkout da versão específica para deploy
+              # ==================================================================
+              - script: |
+                  echo "##[section]Fazendo checkout da versão: $(DEPLOY_VERSION)"
+                  
+                  # Remover branch de deploy se existir
+                  git branch -D deploy-$(DEPLOY_VERSION)-${{ parameters.environment }} 2>/dev/null || true
+                  
+                  # Fazer checkout da tag e criar nova branch
+                  git checkout tags/$(DEPLOY_VERSION) -b deploy-$(DEPLOY_VERSION)-${{ parameters.environment }}
+                displayName: 'Checkout Deploy Version'
+
+              # ==================================================================
+              # Informações detalhadas do deployment
+              # ==================================================================
+              - script: |
+                  echo "##[section]Informações do deployment:"
+                  echo "🎯 Ambiente: ${{ parameters.environment }}"
+                  echo "📦 Versão: $(DEPLOY_VERSION)"
+                  echo "🏭 ADF: ${{ parameters.adfName[parameters.environment] }}"
+                  echo "📁 Resource Group: ${{ parameters.adfResourceGroup[parameters.environment] }}"
+                  echo "📍 Localização: ${{ parameters.adfLocation[parameters.environment] }}"
+                  echo "🔗 Service Connection: ${{ parameters.azureSubscription[parameters.environment] }}"
+                  echo ""
+                  echo "##[section]Configurações de Deploy:"
+                  echo "🧪 Dry Run (Simulação): ${{ parameters.dryRun }}"
+                  echo "✅ Validação Pré-Deploy: ${{ parameters.enablePreDeployValidation }}"
+                  echo "⚡ Parar/Iniciar Triggers: ${{ parameters.startStopTriggersForDeploy }}"
+                  echo "🚫 Não Parar Triggers Excluídos: ${{ parameters.doNotStopStartExcludedTriggers }}"
+                  echo "🛑 Método de Parada de Triggers: ${{ parameters.triggerStopMethod }}"
+                  echo "▶️ Método de Início de Triggers: ${{ parameters.triggerStartMethod }}"
+                  echo "🗑️ Deletar Recursos Não Presentes no Código-Fonte: ${{ parameters.deleteObjectsNotInSource }}"
+                  echo "🛡️ Não Deletar Objetos Excluídos: ${{ parameters.doNotDeleteExcludedObjects }}"
+                  echo "❌ Falhar se Config Não Encontrada: ${{ parameters.failsWhenConfigItemNotFound }}"
+                  echo "📂 Falhar se Caminho Não Encontrado: ${{ parameters.failsWhenPathNotFound }}"
+                  
+                  # Verificar se arquivo de filtro existe
+                  if [ -f "$(ADF_DEPLOYMENT_FILTER_FILE)" ]; then
+                    echo "🔍 Arquivo de Filtro: '$(ADF_DEPLOYMENT_FILTER_FILE)' ✅ PRESENTE"
+                  else
+                    echo "🔍 Arquivo de Filtro: '$(ADF_DEPLOYMENT_FILTER_FILE)' ❌ AUSENTE"
+                  fi
+                  
+                  # Verificar se arquivo de configuração de parâmetros existe
+                  if [ -f "$(ADF_PARAMETER_CONFIG_FILE)" ]; then
+                    echo "⚙️ Arquivo de Config de Parâmetros: '$(ADF_PARAMETER_CONFIG_FILE)' ✅ PRESENTE"
+                  else
+                    echo "⚙️ Arquivo de Config de Parâmetros: '$(ADF_PARAMETER_CONFIG_FILE)' ❌ AUSENTE"
+                  fi
+                displayName: 'Deployment Information'
+
+              # ==================================================================
+              # Execução do deployment do ADF
+              # ==================================================================
+              - task: AzurePowerShell@5
+                displayName: 'Deploy ADF Resources'
+                inputs:
+                  azureSubscription: '${{ parameters.azureSubscription[parameters.environment] }}'
+                  ScriptType: InlineScript
+                  Inline: |
+                    # ================================
+                    # Configurações iniciais
+                    # ================================
+                    $rootFolder = '$(ADF_FULL_PATH)'
+                    $resourceGroup = '${{ parameters.adfResourceGroup[parameters.environment] }}'
+                    $dataFactoryName = '${{ parameters.adfName[parameters.environment] }}'
+                    $location = '${{ parameters.adfLocation[parameters.environment] }}'
+                    $stage = '${{ parameters.environment }}'
+                    $dryRun = [System.Convert]::ToBoolean('${{ parameters.dryRun }}')
+                    $filterFile = '$(ADF_DEPLOYMENT_FILTER_FILE)'
+                    $parameterConfigFile = '$(ADF_PARAMETER_CONFIG_FILE)'
+
+                    # ================================
+                    # 🔧 NORMALIZAÇÃO DE TRIGGERS (UTC)
+                    # ================================
+
+                    # Suporte a convenções: trigger / triggers
+                    $triggerPathCandidates = @('trigger', 'triggers') |
+                      ForEach-Object { Join-Path $rootFolder $_ } |
+                      Where-Object { Test-Path $_ }
+
+                    $triggerPath = $triggerPathCandidates | Select-Object -First 1
+
+                    if ($null -ne $triggerPath) {
+                      Write-Host "##[section]🕒 Normalizando ScheduleTriggers para UTC..."
+
+                      Get-ChildItem $triggerPath -Filter *.json | ForEach-Object {
+                        $file = $_.FullName
+
+                        try {
+                          $json = Get-Content $file -Raw | ConvertFrom-Json
+                        } catch {
+                          Write-Host "⚠️ Erro ao parsear JSON: $file — $($_.Exception.Message)"
+                          return
+                        }
+
+                        if ($json.properties?.type -ne 'ScheduleTrigger') {
+                          return
+                        }
+
+                        $recurrence = $json.properties.typeProperties?.recurrence
+                        if ($null -eq $recurrence -or [string]::IsNullOrWhiteSpace($recurrence.startTime)) {
+                          return
+                        }
+
+                        try {
+                          # Preserva offset original e evita dependência do timezone do agente
+                          $dto = [System.DateTimeOffset]::Parse($recurrence.startTime)
+                          $startUtcString = $dto.ToUniversalTime().UtcDateTime.ToString("yyyy-MM-ddTHH:mm:ssZ")
+                        } catch {
+                          Write-Host "⚠️ startTime inválido em $file — $($_.Exception.Message)"
+                          return
+                        }
+
+                        $recurrence.startTime = $startUtcString
+                        $recurrence.timeZone = 'UTC'
+
+                        # Garantir encoding UTF-8
+                        $json | ConvertTo-Json -Depth 20 | Set-Content -Path $file -Encoding UTF8
+                        Write-Host "✔ Trigger normalizado: $($_.Name)"
+                      }
+                    } else {
+                      Write-Host "##[section]ℹ Nenhuma pasta de triggers encontrada, pulando normalização"
+                    }
+
+
+                    # ================================
+                    # Opções de deploy
+                    # ================================
+                    if (Test-Path $filterFile) {
+                      $opt = New-AdfPublishOption -FilterFilePath $filterFile
+                      Write-Host "##[section]🔍 Utilizando arquivo de filtro: $filterFile"
+                    } else {
+                      $opt = New-AdfPublishOption
+                      Write-Host "##[section]🔍 Deployment sem filtros"
+                    }
+
+                    $opt.DeleteNotInSource = [System.Convert]::ToBoolean('${{ parameters.deleteObjectsNotInSource }}')
+                    $opt.StopStartTriggers = [System.Convert]::ToBoolean('${{ parameters.startStopTriggersForDeploy }}')
+                    $opt.DoNotStopStartExcludedTriggers = [System.Convert]::ToBoolean('${{ parameters.doNotStopStartExcludedTriggers }}')
+                    $opt.TriggerStopMethod = '${{ parameters.triggerStopMethod }}'
+                    $opt.TriggerStartMethod = '${{ parameters.triggerStartMethod }}'
+                    $opt.DoNotDeleteExcludedObjects = [System.Convert]::ToBoolean('${{ parameters.doNotDeleteExcludedObjects }}')
+                    $opt.FailsWhenConfigItemNotFound = [System.Convert]::ToBoolean('${{ parameters.failsWhenConfigItemNotFound }}')
+                    $opt.FailsWhenPathNotFound = [System.Convert]::ToBoolean('${{ parameters.failsWhenPathNotFound }}')
+                    $opt.CreateNewInstance = $false
+
+                    # ================================
+                    # Execução do deploy
+                    # ================================
+                    $publishParams = @{
+                      RootFolder        = $rootFolder
+                      ResourceGroupName = $resourceGroup
+                      DataFactoryName   = $dataFactoryName
+                      Location          = $location
+                      Option            = $opt
+                      DryRun            = $dryRun
+                    }
+
+                    if (Test-Path $parameterConfigFile) {
+                      Write-Host "##[section]📄 Usando config de parâmetros: $parameterConfigFile"
+                      $publishParams.Stage = $stage
+                    }
+
+                    Write-Host "##[section]🚀 Iniciando deployment do ADF..."
+                    Publish-AdfV2FromJson @publishParams
+                    Write-Host "##[section]✅ Deployment concluído com sucesso!"
+                  azurePowerShellVersion: LatestVersion
+                  pwsh: true
+
+
+              # ==================================================================
+              # Relatório pós-deployment
+              # ==================================================================
+              - task: AzureCLI@2
+                displayName: 'Post Deployment Report'
+                inputs:
+                  azureSubscription: '${{ parameters.azureSubscription[parameters.environment] }}'
+                  scriptType: 'bash'
+                  addSpnToEnvironment: false
+                  visibleAzLogin: false
+                  scriptLocation: 'inlineScript'
+                  inlineScript: |
+                    echo "##[section]📊 Relatório do ambiente pós-Deployment - ${{ parameters.environment }}"
+                    
+                    ADF_NAME="${{ parameters.adfName[parameters.environment] }}"
+                    RG_NAME="${{ parameters.adfResourceGroup[parameters.environment] }}"
+                    
+                    echo "##[section]📈 Recursos Deployados:"
+                    
+                    # Pipelines
+                    PIPELINES_COUNT=$(az datafactory pipeline list --factory-name "$ADF_NAME" --resource-group "$RG_NAME" --query "length([])" -o tsv 2>/dev/null || echo "0")
+                    echo "🔄 Pipelines: $PIPELINES_COUNT"
+                    
+                    # Datasets
+                    DATASETS_COUNT=$(az datafactory dataset list --factory-name "$ADF_NAME" --resource-group "$RG_NAME" --query "length([])" -o tsv 2>/dev/null || echo "0")
+                    echo "📊 Datasets: $DATASETS_COUNT"
+                    
+                    # Triggers
+                    TRIGGERS_COUNT=$(az datafactory trigger list --factory-name "$ADF_NAME" --resource-group "$RG_NAME" --query "length([])" -o tsv 2>/dev/null || echo "0")
+                    echo "⚡ Triggers: $TRIGGERS_COUNT"
+                    
+                    # Linked Services
+                    LINKEDSERVICES_COUNT=$(az datafactory linked-service list --factory-name "$ADF_NAME" --resource-group "$RG_NAME" --query "length([])" -o tsv 2>/dev/null || echo "0")
+                    echo "🔗 Linked Services: $LINKEDSERVICES_COUNT"
+                    
+                    echo "##[section]✅ Deployment da versão $(DEPLOY_VERSION) concluído com sucesso!"
+                    
+                    # Capturar URL de acesso ao ADF no Portal Azure se não fornecida
+                    echo "##[debug]Construindo URL de acesso automaticamente..."
+                    
+                    # Capturar Subscription ID da connection atual
+                    SUBSCRIPTION_ID=$(az account show --query "id" -o tsv)
+                    
+                    # Construir Resource ID manualmente
+                    ADF_RESOURCE_ID="/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RG_NAME}/providers/Microsoft.DataFactory/factories/${ADF_NAME}"
+                    
+                    # Construir URL do Portal Azure
+                    ADF_ACCESS_URL="https://portal.azure.com/#@/resource${ADF_RESOURCE_ID}/overview"
+                    echo "##[debug]URL do Portal Azure construída: $ADF_ACCESS_URL"
+
+                    echo "##vso[task.setvariable variable=ADF_ACCESS_URL]${ADF_ACCESS_URL}"
+
+              # ==================================================================
+              # Registro de deploy no Event Hub
+              # ==================================================================
+              - task: VivoEventHubTools@3
+                displayName: 'Registro de deploy no Event Hub'
+                condition: always()
+                continueOnError: true
+                inputs:
+                  command: 'deploy'
+                  eventHubConnection: 'EVHCodeProd'
+                  componentVersion: '$(DEPLOY_VERSION)'
+                  deployArtifactName: '${{ parameters.adfName[parameters.environment] }}'
+                  deployArtifactType: 'azure-data-factory'
+                  deployEnvironmentType: 'azure'
+                  deployEnvironmentName: '${{ parameters.environment }}'
+                  deployEnvironmentAccessUrl: '$(ADF_ACCESS_URL)'
+                  pipelineType: 'framework/deploy-adf'

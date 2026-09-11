@@ -1,0 +1,115 @@
+parameters:
+  environment: ''
+
+jobs:
+- deployment: deployment
+  pool: GeneralPurposeLinuxAgentsCD
+  continueOnError: false
+  environment: 
+    name: deploy-${{ parameters.environment }}
+  strategy:
+    runOnce:   
+      deploy:
+        steps:
+        - checkout: self
+          persistCredentials: true
+        - template: /tech_products/hdop/templates/steps/get_latest_version.yaml
+        - task: Bash@3
+          name: deploy
+          displayName: 'Deploy'
+          continueOnError: false
+          env:
+            NEW_VERSION: $(get_version.VERSION)
+            CLIENT_ID: $(AZURE_CLIENT_ID)
+            CLIENT_SECRET: $(AZURE_CLIENT_SECRET)
+            TENANT_ID: $(AZURE_TENANT_ID)
+            MULTI_CONTAINERAPP: $(MULTI_CONTAINERAPP)
+            SUBSCRIPTION: $(AZURE_SUBSCRIPTION)
+            BRANCH_NAME: $(Build.SourceBranchName)
+          inputs:
+            targetType: inline
+            script: |
+
+              update_image() {
+                local manifest
+                local type
+                local image
+                local image_name
+                local last_version
+                local new_image
+                local manifest_path="$1"
+                # Ler o arquivo YAML
+                echo "##[debug] Reading manifest file: $manifest_path"
+                manifest=$(yq e '.' "$manifest_path")
+          
+                # Extrair a info do containerAPP
+                type=$(echo "$manifest" | yq e '.type' -)
+                if [ "$type" == "Microsoft.App/jobs" ]; then
+                  export CONTAINER_APP_TYPE="job"
+                fi
+          
+                image=$(echo "$manifest" | yq e '.properties.template.containers[0].image' -)
+                image_name=$(echo "$image" | cut -d':' -f1)
+                last_version=$(echo "$image" | cut -d':' -f2)
+          
+                # Definir a última versão como variável de ambiente
+                export LAST_VERSION="$last_version"
+                echo "##[debug] Old version: $LAST_VERSION, New Version: $NEW_VERSION"
+          
+                # Atualizar a imagem do contêiner com a nova versão
+                new_image="${image_name}:${NEW_VERSION}"
+                manifest=$(echo "$manifest" | yq e ".properties.template.containers[0].image = \"$new_image\"" -)
+          
+                # Escrever o arquivo YAML atualizado
+                echo "$manifest" | yq e -P - > "$manifest_path"
+                cat "$manifest_path"
+              }
+
+              echo "##[debug] Starting deployment environment ${ENVIRONMENT}, version ${NEW_VERSION}, multi-containerapp $MULTI_CONTAINERAPP"
+              AZURE_FOLDER="azure/${ENVIRONMENT}"
+              CONTAINER_APP_TYPE=""
+
+              echo "##[debug] Starting deploy - ${ENVIRONMENT} ${CONTAINER_APP_TYPE}"
+      
+              az login --service-principal --username ${CLIENT_ID} \
+                --password ${CLIENT_SECRET} --tenant ${TENANT_ID} &> /dev/null
+              az account set --subscription "${SUBSCRIPTION}" &> /dev/null
+
+              if [ "$MULTI_CONTAINERAPP" == "true" ]; then
+                  CONTAINERAPP_LIST=($(ls "$AZURE_FOLDER" | sed -e 's/\.[^.]*$//'))
+              else
+                CONTAINERAPP_LIST="${CONTAINER_APP_NAME}"
+              fi
+              for CONTAINERAPP in "${CONTAINERAPP_LIST[@]}"; do
+                if [ "$MULTI_CONTAINERAPP" == "true" ]; then
+                  CONTAINERAPP_PATH="${AZURE_FOLDER}/${CONTAINERAPP}.yaml"
+                  update_image "${CONTAINERAPP_PATH}"
+                else
+                  CONTAINERAPP_PATH="${AZURE_FOLDER}.yaml"
+                  update_image "${CONTAINERAPP_PATH}"
+                fi
+                CONAPP_ID=$(yq e '.id' ${CONTAINERAPP_PATH})
+                echo "##[debug] Updating ${CONAPP_ID}"
+                echo "##[debug] Using yaml manifest - ${CONTAINERAPP_PATH}"
+                az containerapp ${CONTAINER_APP_TYPE} update --ids ${CONAPP_ID} \
+                  --yaml ${CONTAINERAPP_PATH}
+              done
+
+              ## Atualizar o arquivo de versão
+              git branch -a
+              git fetch --all
+              git checkout ${BRANCH_NAME}
+              git add azure/
+              if [ -z "$(git status --porcelain)" ]; then
+              echo "##[debug] No changes to commit, project is up to date"
+              exit 0
+              fi
+              git commit -m "[CI SKIP] Update Version '${LAST_VERSION} -> ${NEW_VERSION}'" --author="$BUILD_REQUESTEDFOR <$BUILD_REQUESTEDFOREMAIL>"      
+              git status
+              echo "##[command] git push origin ${BRANCH_NAME}"
+              git push origin ${BRANCH_NAME}
+              if [ $? -ne 0 ]; then 
+                echo "##vso[task.logissue type=error;] Git push failed. Permission denied"
+                echo "##vso[task.complete result=Failed;]"
+                exit 1
+              fi  

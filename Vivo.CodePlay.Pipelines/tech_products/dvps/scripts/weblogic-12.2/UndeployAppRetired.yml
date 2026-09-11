@@ -1,0 +1,103 @@
+#########################################
+##  Script: UndeployAppRetired.yml     ##
+##  Weblogic 12.2                      ##
+#########################################
+
+parameters:
+  WEBLOGIC_USER: ''
+  WEBLOGIC_PASS: ''
+  WEBLOGIC_ADMIN_SERVER_URL: ''
+  ARTIFACT_ID: ''
+
+steps:
+    - task: Bash@3
+      displayName: Start UndeployAppRetired
+      name: Start_UndeployAppRetired
+      condition: succeeded()
+      inputs:
+           targetType: inline
+           workingDirectory: $(Pipeline.Workspace)
+           script: |
+            
+            #set -x
+
+            CYAN='\033[96m'
+            RED='\033[91m'
+            RESET='\033[0m'
+
+            echo -e "${CYAN}=========================================${RESET}"
+            echo -e "${CYAN}     Starting UndeployAppRetired.sh      ${RESET}"
+            echo -e "${CYAN}=========================================${RESET}"
+
+            wlsAdmin=${{ parameters.WEBLOGIC_USER }}
+            wlsPassword=${{ parameters.WEBLOGIC_PASS }}
+            wlsUrl=${{ parameters.WEBLOGIC_ADMIN_SERVER_URL }}
+            appName=${{ parameters.ARTIFACT_ID }}
+
+            if [ -z "$wlsAdmin" ] || [ -z "$wlsPassword" ] || [ -z "$wlsUrl" ] || [ -z "$appName" ]; then
+                echo -e "${RED} Um dos parametros wlsAdmin, wlsPassword, wlsUrl ou appName não estão definidos!${RESET}"
+                exit 1  # Sair com erro
+            fi
+
+            # Função para chamar a API REST
+            function call_rest_api() {
+                local url=$1
+                local method=$2
+                local data=$3
+
+                if [[ -n "$data" ]]; then
+                    curl -s -u "$wlsAdmin:$wlsPassword" -X "$method" -H "X-Requested-By: curl" -H "Accept: application/json" -H "Content-Type: application/json" -d "$data" "$url"
+                else
+                    curl -s -u "$wlsAdmin:$wlsPassword" -X "$method" -H "X-Requested-By: curl" -H "Accept: application/json" "$url"
+                fi
+
+                if [[ $? -ne 0 ]]; then
+                    echo -e "${RED}Erro ao executar curl - Retorno código: $? ${RESET} \n Log de saida: $response " 
+                fi
+            }
+
+            # 1. Buscar todas as aplicações e seus status
+            echo "Searching for application $appName with RETIRED status..."
+
+            response=$(call_rest_api "$wlsUrl/management/weblogic/latest/edit/appDeployments" "GET")
+
+            # 2. Verificar se a aplicação foi encontrada e se o nome corresponde
+            appFound=$(echo "$response" | jq -r --arg appName "$appName" '.items[] | select(.applicationName == $appName) | .applicationName')
+            appPackage=$(echo "$response" | jq -r --arg appName "$appName" '.items[] | select(.applicationName == $appName) | .name')
+
+            if [[ "$appFound" == "$appName" ]]; then
+                echo -e "Application ${CYAN} $appPackage ${RESET}found. Checking deployment status..."
+
+                # Se quiser buscar mais detalhes, como os targets ou outra propriedade
+                appTargets=$(echo "$response" | jq -r --arg appName "$appName" '.items[] | select(.applicationName == $appName) | .targets[].identity[1]')
+
+                #Busca o URL da aplicação.
+                appSelfLink=$(echo "$response" | jq -r --arg appName "$appName" '.items[] | select(.applicationName == $appName) | .links[] | select(.rel == "self") | .href')
+                
+                echo "Application $appName is deployed to the following targets: $appTargets"
+
+                # A partir daqui, você pode adicionar uma lógica para verificar o estado desejado,
+                # ou realizar o undeploy conforme sua necessidade.
+
+                # 3. Realizar undeploy da aplicação
+                #OBS: O appSelfLink já possui a URL completa.
+                undeploy_response=$(call_rest_api "$appSelfLink" "DELETE")
+
+
+                if [[ $(echo "$undeploy_response" | jq -r '.state') == "STATE_COMPLETED" ]]; then
+                    echo -e "${CYAN}Undeploy of application $appName completed!${RESET}"
+                else
+                    echo -e "${RED}Error during undeploy of application $appName! ${RESET}"
+                    echo -e "Response: $undeploy_response"
+                    #teste
+                    #exit 1
+                fi
+            else
+                echo "No application named $appName found in the response!"
+                #exit 1
+            fi
+
+            # Encerrar script
+            exit 0
+
+          

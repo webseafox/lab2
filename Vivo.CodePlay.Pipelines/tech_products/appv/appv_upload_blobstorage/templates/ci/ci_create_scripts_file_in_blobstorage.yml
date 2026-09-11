@@ -1,0 +1,257 @@
+parameters:
+  - name: qa_environment
+    type: string
+    default: 'hml'
+    values:
+      - 'hml'
+      - 'prod'
+  - name: createScripts
+    type: boolean
+  - name: scriptName
+    type: string
+    default: ''  
+  - name: enabled
+    type: boolean
+    default: false  
+  - name: AZURE_STORAGE_ACCOUNT_NAME
+    type: string
+  - name: AZURE_STORAGE_ACCOUNT_KEY
+    type: string
+
+stages:
+- stage: create_scripts_blobstorage
+  displayName: "Create Scripts in Blob Storage"
+  pool:
+    name: GeneralPurposeLinuxAgentsCI
+  dependsOn:
+  - environment_init
+
+  jobs:
+  - job: Publish
+    displayName: "Create and Publish Scripts"
+    condition: succeeded()
+    steps:
+
+    - task: 6d15af64-176c-496d-b583-fd2ae21d4df4@1
+      displayName: Checkout Code
+      name: checkout_code 
+      inputs:
+        repository: self
+        persistCredentials: "true"
+        clean: true
+
+    - task: Bash@3
+      displayName: Checkout Last Commit
+      name: checkout_last_commit
+      condition: succeeded()
+      continueOnError: false
+      inputs:
+        targetType: 'inline'
+        script: |
+          echo "##[debug] Checkout last commit from '$(Build.SourceBranchName)'"
+
+          git config pull.rebase true
+          git fetch -f --depth 1 origin $(Build.SourceBranchName):$(Build.SourceBranchName)
+          git checkout -f $(Build.SourceBranchName)
+          lastCommitHash=$(git rev-parse --short=6 HEAD)
+
+          echo "##[debug] Last commit short hash: '$lastCommitHash'"
+          echo "##vso[task.setvariable variable=SHORT_HASH]$lastCommitHash"
+
+    - task: Bash@3
+      displayName: Verify Files in repository and Blob Storage
+      name: verify_files
+      condition: succeeded()
+      continueOnError: false
+      inputs:
+        targetType: inline
+        script: |
+          echo '##[debug] Looking for project folder...'
+
+          valuesFile=$(find "$(Build.SourcesDirectory)/$(PROJECT_FOLDER)/public" -type f)
+          if [ -z $valuesFile ] ; then
+            echo "##[error] $(PROJECT_FOLDER) project folder not found. Aborting..."
+            exit 1;
+          fi
+
+          echo "##[debug] $valuesFile found successfully";
+          
+          # Verificar se existem arquivos que contêm o nome base
+          matchingFilesInRepository=$(echo "$valuesFile" | grep "${{ parameters.scriptName }}" || true)
+          if [ -z $matchingFilesInRepository ] ; then
+            echo "##[error] $(PROJECT_FOLDER) project folder do not contain ${{ parameters.scriptName }}. Aborting..."
+            exit 1;
+          fi
+
+          echo "##[info] Getting current files from blob storage container $(BLOB_CONTAINER_NAME)"
+
+          if ! blobFiles=$(az storage blob list \
+            --account-name "${{ parameters.AZURE_STORAGE_ACCOUNT_NAME }}" \
+            --account-key "${{ parameters.AZURE_STORAGE_ACCOUNT_KEY }}" \
+            --container-name $(BLOB_CONTAINER_NAME) \
+            --prefix $(BLOB_CONTAINER_FOLDER) \
+            --query "[].name" \
+            --output tsv); then
+
+            echo "##[error] Failed to retrieve list from blobStorage"
+            exit 1
+          fi
+          
+          scriptName="${{ parameters.scriptName }}"
+
+          echo "##[debug] Files found in blob storage:"
+          if [ -n "$scriptName" ]; then
+          echo "##[section] Checking if script '$scriptName' already exists..."
+          
+          filename="${scriptName%.*}"     # Remove extensão: meuscript.js -> meuscript
+          extension="${scriptName##*.}"   # Pega extensão: meuscript.js -> js
+          
+          echo "##[debug] Filename: $filename"
+          echo "##[debug] Extension: $extension"
+          
+          # Verificar se existem arquivos que contêm o nome base
+          matchingFiles=$(echo "$blobFiles" | grep "$filename" || true)
+          
+          if [ -n "$matchingFiles" ]; then
+            # Contar quantos arquivos contêm o nome
+            fileCount=$(echo "$matchingFiles" | wc -l)
+            
+            echo "##[warning] Found $fileCount file(s) containing '$filename':"
+            echo "$matchingFiles" | while IFS= read -r file; do
+              echo "  - $file"
+            done
+            
+            nextVersion=$((fileCount + 1))
+            
+            newScriptName="${filename}-v${nextVersion}.${extension}"
+            
+            echo "##[section] New script name with version: $newScriptName"
+            echo "##vso[task.setvariable variable=VERSIONED_SCRIPT_NAME]$newScriptName"
+            
+          else
+            echo "##[info] No files containing '$filename' found. Using original name: $scriptName"
+            echo "##vso[task.setvariable variable=VERSIONED_SCRIPT_NAME]$scriptName"
+          fi
+          fi
+    
+    - task: Bash@3
+      displayName: Upload Scripts to BlobStorage
+      name: script_upload_to_blob
+      condition: succeeded()
+      continueOnError: false
+      inputs:
+        targetType: inline
+        script: |
+          echo "Uploading file to container $(BLOB_CONTAINER_NAME)"
+          echo "##[debug] File to upload: $(Build.SourcesDirectory)/$(PROJECT_FOLDER)/public/${{ parameters.scriptName }}"
+          echo "##[debug] Destination blob name: $(BLOB_CONTAINER_FOLDER)/$(VERSIONED_SCRIPT_NAME)"
+
+          set -e
+          if ! az storage blob upload \
+            --account-name "${{ parameters.AZURE_STORAGE_ACCOUNT_NAME }}" \
+            --account-key "${{ parameters.AZURE_STORAGE_ACCOUNT_KEY }}" \
+            --container-name $(BLOB_CONTAINER_NAME) \
+            --file "$(Build.SourcesDirectory)/$(PROJECT_FOLDER)/public/${{ parameters.scriptName }}" \
+            --name "$(BLOB_CONTAINER_FOLDER)/$(VERSIONED_SCRIPT_NAME)"; then 
+          
+            echo "##[error] Failed to upload script to blob storage!"
+            exit 1
+          fi
+          
+          echo "##[info] Script uploaded successfully as $(VERSIONED_SCRIPT_NAME)"
+
+    - task: Bash@3
+      displayName: Searching JSON File in BlobStorage
+      name: search_json_file
+      condition: succeeded()
+      continueOnError: false
+      inputs:
+        targetType: inline
+        script: |
+          echo "##[info] Getting current files from blob storage container $(BLOB_CONTAINER_NAME)"
+
+          if ! az storage blob download \
+            --account-name "${{ parameters.AZURE_STORAGE_ACCOUNT_NAME }}" \
+            --account-key "${{ parameters.AZURE_STORAGE_ACCOUNT_KEY }}" \
+            --container-name $(BLOB_CONTAINER_NAME) \
+            --name $(BLOB_CONTAINER_FOLDER)/$(BLOB_CONTAINER_SUBFOLDER)/$(JSON_FILE_NAME) \
+            --file $(JSON_FILE_NAME); then
+
+            echo "##[error] Failed to download $(JSON_FILE_NAME) from blob storage!" >&2
+            exit 1
+          fi
+
+          echo "##[info] Updating $(JSON_FILE_NAME) with new script entry"
+
+          content=$(cat $(JSON_FILE_NAME))
+          
+          count=$(printf "%s\n" "$content" | jq 'length')
+          
+          newId=$((count + 1))
+          
+          # Desabilitar scripts existentes que contenham o nome base
+          scriptBaseName="${{ parameters.scriptName }}"
+          scriptBaseName="${scriptBaseName%.*}"  # Remove extensão
+
+          enabledParam="${{ parameters.enabled }}"
+          enabledParam=$(echo "$enabledParam" | tr '[:upper:]' '[:lower:]')
+
+          updatedContent=$(printf "%s\n" "$content" | jq --arg basename "$scriptBaseName" --argjson shouldDisable "$enabledParam" '
+            map(
+              if (.name | contains($basename)) and $shouldDisable then
+                .enabled = false
+              else
+                .
+              end
+            )
+          ')
+          
+          enabledValue="${{ parameters.enabled }}"
+          enabledValue=$(echo "$enabledValue" | tr '[:upper:]' '[:lower:]')
+
+          echo "##[debug] Item content: { name: $(VERSIONED_SCRIPT_NAME), id: $newId, enabled: $enabledValue }"
+
+          newItem=$(jq -n --arg name "$(VERSIONED_SCRIPT_NAME)" --argjson id "$newId" --argjson enabled "$enabledValue" '{
+            name: $name,
+            id: $id,
+            enabled: $enabled
+          }')
+
+          newContent=$(printf "%s\n" "$updatedContent" | jq ". += [$newItem]")
+
+          echo "$newContent" > $(JSON_FILE_NAME)   
+          echo "##[section] New script file created"
+
+    - task: Bash@3
+      displayName: Update BlobStorage JSON
+      name: upload_files
+      condition: succeeded()
+      continueOnError: false
+      inputs:
+        targetType: inline
+        script: |
+          echo "##[info] Uploading updated $(JSON_FILE_NAME) back to blob storage"
+
+          if [ ! -f $(JSON_FILE_NAME) ]; then
+            echo "##[error] $(JSON_FILE_NAME) not found!"
+            exit 1
+          fi
+
+          if ! az storage blob upload \
+            --account-name "${{ parameters.AZURE_STORAGE_ACCOUNT_NAME }}" \
+            --account-key "${{ parameters.AZURE_STORAGE_ACCOUNT_KEY }}" \
+            --container-name $(BLOB_CONTAINER_NAME) \
+            --file $(JSON_FILE_NAME) \
+            --name $(BLOB_CONTAINER_FOLDER)/$(BLOB_CONTAINER_SUBFOLDER)/$(JSON_FILE_NAME) \
+            --overwrite true; then
+
+            echo "##[error] Failed to upload updated $(JSON_FILE_NAME) to blob storage!"
+            exit 1
+          fi
+
+          echo "##[info] $(JSON_FILE_NAME) updated successfully."  
+          
+          rm -f $(JSON_FILE_NAME)
+          echo "##[debug] Local file $(JSON_FILE_NAME) deleted."
+       
+                

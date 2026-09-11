@@ -1,0 +1,71 @@
+parameters:
+- name: environment
+- name: workDir
+- name: k8sNamespace
+- name: dockerRegistry
+- name: dockerServer
+- name: dockerUsername
+- name: dockerPassword
+- name: dockerEmail
+- name: k8sKubeconfig
+- name: argocd_enabled
+  type: boolean
+  default: 'false'
+
+steps:
+- bash: |
+    source ~/.bashrc
+
+    echo "##[debug]Check if namespace [${{parameters.k8sNamespace}}] exists "
+
+    ENABLE_CREATE_NAMESPACE="$(ENABLE_CREATE_NAMESPACE_IF_NOT_EXISTS)"
+    
+    NAMESPACES=$(kubectl get ns -o json --kubeconfig="${{parameters.k8sKubeconfig}}" --insecure-skip-tls-verify)
+    
+    echo "##[group]Namespaces in cluster"
+    echo "##[debug]${NAMESPACES}"
+    echo "##[endgroup]"
+
+    NS=$(echo $NAMESPACES | jq -c '.items[].metadata | select(.name=="${{parameters.k8sNamespace}}")' | jq -r '.name')
+
+    if [ "$NS" = "${{parameters.k8sNamespace}}" ]; then
+      echo "##[debug]Namespace [${{parameters.k8sNamespace}}] OK"
+    else 
+      if [ "$ENABLE_CREATE_NAMESPACE" = "true" ]; then
+        kubectl create ns ${{parameters.k8sNamespace}} --kubeconfig=${{parameters.k8sKubeconfig}} --insecure-skip-tls-verify
+      else
+        echo "##[debug]Namespace [${{parameters.k8sNamespace}}] not found"
+        exit 1;
+      fi
+    fi
+    
+    kubectl get secrets ${{parameters.dockerRegistry}} \
+      -n ${{parameters.k8sNamespace}} \
+      --kubeconfig="${{parameters.k8sKubeconfig}}" \
+      --insecure-skip-tls-verify
+    
+    if [ $? -gt 0 ]; then
+      echo "##[debug]Setup docker registry"
+      
+      kubectl create secret docker-registry ${{parameters.dockerRegistry}} \
+        --docker-server=${{parameters.dockerServer}} \
+        --docker-username=${{parameters.dockerUsername}} \
+        --docker-password=${{parameters.dockerPassword}} \
+        --docker-email='${{parameters.dockerEmail}}' \
+        -n ${{parameters.k8sNamespace}} \
+        --kubeconfig="${{parameters.k8sKubeconfig}}" \
+        --insecure-skip-tls-verify
+        
+      if [ $? -gt 0 ]; then
+        echo "##[error]Error create docker registry ${{parameters.dockerRegistry}}"
+        exit 1;
+      else
+        echo "##[debug]Docker registry ${{parameters.dockerRegistry}} configured success!"
+      fi
+    else
+      echo "##[debug]Registry ${{parameters.dockerRegistry}} exists!!!"
+      exit 0;
+    fi
+  displayName: "Create docker registry secret [${{parameters.dockerRegistry}}] "
+  condition: ne('${{ parameters.argocd_enabled }}', 'true')
+  workingDirectory: "${{parameters.workDir}}"

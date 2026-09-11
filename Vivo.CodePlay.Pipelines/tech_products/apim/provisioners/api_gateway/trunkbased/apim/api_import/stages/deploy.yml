@@ -1,0 +1,148 @@
+parameters:
+- name: environment
+  type: string
+- name: description
+  type: string
+  default: ""
+- name: deployComponentVersion
+  type: string
+  default: ""
+- name: privateAgentPool
+  type: string
+  default: $(PRIVATE_AGENT_SHARED)
+- name: dependsOn
+  type: object
+  default: []
+
+stages:
+
+- stage: deploy_${{ parameters.environment }}
+  pool: ${{ parameters.privateAgentPool }}
+  displayName: "Deploy ${{ parameters.environment }}"
+  variables:
+    - template: /.azuredevops/env/apiconfig.yml@MasterEnv
+    - template: /.azuredevops/env/${{ parameters.environment }}/apiconfig.yml@MasterEnv
+    - name: deployComponentVersion
+      ${{ if ne(parameters.deployComponentVersion, '') }}:
+        value: ${{ parameters.deployComponentVersion }}
+      ${{ else }}:
+        value: $[ stageDependencies.stage_build.job_bump_revision.outputs['component_bump_version.NEW_API_REVISION'] ]
+    - name: apiRevisionFormatted
+      ${{ if ne(parameters.deployComponentVersion, '') }}:
+        value: ${{ replace(parameters.deployComponentVersion, '.', '-') }}
+      ${{ else }}:
+        value: $[ replace(stageDependencies.stage_build.job_bump_revision.outputs['component_bump_version.NEW_API_REVISION'], '.', '-') ]
+  dependsOn: ${{ parameters.dependsOn }}
+  jobs:
+  - job: job_validate_revision_${{ parameters.environment }}
+    displayName: "Validate API Revision - ${{ parameters.environment }}"
+    steps:
+    - template: /tech_products/apim/tasks/validate_api_revision.yml
+      parameters:
+        subscriptionId: $(subscriptionId)
+        resourceGroup: $(resourceGroup)
+        apimName: $(apimName)
+        environment: ${{ parameters.environment }}
+        apiName: $(apiName)
+        apiRevision: $(apiRevisionFormatted)
+  - deployment: import_${{ parameters.environment }}
+    dependsOn:
+      - job_validate_revision_${{ parameters.environment }}
+    variables:
+      - name: EXISTS_API_REVISION
+        value: $[ dependencies.job_validate_revision_${{ parameters.environment }}.outputs['validate_revision.EXISTS_API_REVISION'] ]
+      - name: ISCURRENT_API_REVISION
+        value: $[ dependencies.job_validate_revision_${{ parameters.environment }}.outputs['validate_revision.ISCURRENT_API_REVISION'] ]
+    workspace:
+      clean: all
+    displayName: "Import API Revision - ${{ parameters.environment }}"
+    environment: "deploy-${{ parameters.environment }}"
+    strategy:
+      runOnce:      
+        deploy:
+          steps:
+          - checkout: self
+          - template: /tech_products/apim/tasks/upsert_version_set.yml
+            parameters:
+              subscriptionId: $(subscriptionId)
+              resourceGroup: $(resourceGroup)
+              apimName: $(apimName)
+              apiDisplayName: $(apiDisplayName)
+              apiVersionSet: $(apiVersionSet)
+              environment: ${{ parameters.environment }}
+          - template: /tech_products/apim/tasks/import_api.yml
+            parameters:
+              subscriptionId: $(subscriptionId)
+              resourceGroup: $(resourceGroup)
+              apimName: $(apimName)
+              apiDisplayName: $(apiDisplayName)
+              apiVersionSet: $(apiVersionSet)
+              environment: ${{ parameters.environment }}
+              apiName: $(apiName)
+              apiRevision: $(apiRevisionFormatted)
+              apiVersion: $(apiVersion)
+              apiPath: $(apiUrlSuffix)
+              backendUrl: $(backendUrl)
+              specPath: $(specPath)
+              condition: and(succeeded(), eq(variables['EXISTS_API_REVISION'], 'false'))
+          - task: qetza.replacetokens.replacetokens-task.replacetokens@5
+            displayName: 'Replace Policies Environment Variables'
+            inputs:
+              targetFiles: |
+                **/policy.xml
+              verbosity: detailed
+              tokenPattern: default
+              tokenPrefix: '#{'
+              tokenSuffix: '}#'
+              keepToken: false
+              actionOnMissing: warn
+          - template: /tech_products/apim/tasks/upsert_api_policy.yml
+            parameters:
+              subscriptionId: $(subscriptionId)
+              resourceGroup: $(resourceGroup)
+              apimName: $(apimName)
+              environment: ${{ parameters.environment }}
+              apiName: $(apiName)
+              apiRevision: $(apiRevisionFormatted)
+              policyFile: $(policyFile)
+          - template: /tech_products/apim/tasks/upsert_api_operation_policy.yml
+            parameters:
+              subscriptionId: $(subscriptionId)
+              resourceGroup: $(resourceGroup)
+              apimName: $(apimName)
+              environment: ${{ parameters.environment }}
+              apiName: $(apiName)
+              apiRevision: $(apiRevisionFormatted)
+          - template: /tech_products/apim/tasks/update_api_revision.yml
+            parameters:
+              subscriptionId: $(subscriptionId)
+              resourceGroup: $(resourceGroup)
+              apimName: $(apimName)
+              environment: ${{ parameters.environment }}
+              apiName: $(apiName)
+              apiRevision: $(apiRevisionFormatted)
+              apiPath: $(apiUrlSuffix)
+              backendUrl: $(backendUrl)
+              apiRevDescription: ${{ parameters.description }}
+              isCurrentRevision: $(ISCURRENT_API_REVISION)
+          - template: /tech_products/apim/tasks/create_release.yml
+            parameters:
+              subscriptionId: $(subscriptionId)
+              resourceGroup: $(resourceGroup)
+              apimName: $(apimName)
+              environment: ${{ parameters.environment }}
+              apiName: $(apiName)
+              apiRevision: $(apiRevisionFormatted)
+        on:
+          success:
+            steps:
+            - template: /tasks/versioning/update_repo_version.yml@CorePipelines
+              parameters:
+                componentNewVersion: $(deployComponentVersion)
+                condition: and(succeeded(), eq(variables['flowIsMain'], 'true'))
+                createGitTag: true
+                bashScript: 
+                  content: |
+                    echo -n "${COMPONENT_NEW_VERSION}" > REVISION
+                  envs:
+                    COMPONENT_NEW_VERSION: $(deployComponentVersion)

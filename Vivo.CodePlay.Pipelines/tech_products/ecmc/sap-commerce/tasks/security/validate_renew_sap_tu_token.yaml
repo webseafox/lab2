@@ -1,0 +1,63 @@
+steps:
+- checkout: EcmcPythonScripts
+  clean: true
+  fetchDepth: 1
+  fetchTags: false
+  sparseCheckoutDirectories: python/sap-renew-secrets
+  persistCredentials: true
+
+- task: PipAuthenticate@1
+  displayName: 'Pip Authenticate'
+  inputs:
+    artifactFeeds: $(AZURE_ARTIFACTS_FEED)
+  env:
+    http_proxy: $(PROXY_AGENT_HTTP)
+    https_proxy: $(PROXY_AGENT_HTTPS)
+    no_proxy: $(PROXY_AGENT_NO_PROXY)
+
+- bash: |
+    cd $(Build.SourcesDirectory)/python/sap-renew-secrets
+    CONFIG_FILE_PATH=".tool-versions"
+    PYTHON_VERSION=$(awk '/^python[[:space:]]/{print $2; exit}' "${CONFIG_FILE_PATH}")
+    PYTHON_DIR=$(asdf where python $PYTHON_VERSION)
+    echo "##vso[task.prependpath]$PYTHON_DIR/bin"
+  displayName: 'Set python version from .tool-versions'
+
+- bash: |
+    PYTHON_VERSION=$(python --version)
+    echo "[section]Using python version: ${PYTHON_VERSION}"
+    python -m pip install -r requirements.txt
+  displayName: 'Pip install dependencies'
+  workingDirectory: $(Build.SourcesDirectory)/python/sap-renew-secrets
+
+- bash: |
+    cd $(Build.SourcesDirectory)/python/sap-renew-secrets
+    echo "[section]Utilizando repositório: ......... src-devops-scripts"
+    echo "[section]Script: ......................... python/sap-renew-secrets/renew_secrets.py"
+    python renew_secrets.py
+    if [ $? -ne 0 ]; then
+      echo "[error]Failed to validate/renew SAP TU token"
+      echo "[error]Sending notification to chat ${RENEW_SECRETS_SAP_CHAT_ID}"
+      REPO_NAME="$(Build.Repository.Name)"
+      URL_BUILD="https://dev.azure.com/telefonica-vivo-brasil/${TEAM_PROJECT}/_build/results?buildId=$(Build.BuildId)"
+      MESSAGE_DATA="<h2 style='font-size:18px;text-align:center;'>⚠️ <strong style='color:#ff1700;'>Falha ao validar/renovar o token SAP TU</strong></h2><br> \
+          <p style='font-size:14px;'><strong>Verifique o log da pipeline para ver os detalhes.<br> \
+          Repositório: ${REPO_NAME}</strong><br> \
+          <a href='${URL_BUILD}'>Clique aqui para ver o build com falha</a></p>"
+
+      BODY_DATA=$(jq -n --arg content "${MESSAGE_DATA}" \
+            --arg chatId "${RENEW_SECRETS_SAP_CHAT_ID}" \
+            --arg source "RENEW_SECRETS_SAP" \
+            '{content: $content, chatId: $chatId, source: $source}' \
+            )
+      curl -X POST --location "${CHATOPS_NOTIFICATION_URL}" \
+          --header 'Content-Type: application/json' \
+          --data-raw "${BODY_DATA}"
+      exit 1
+    fi
+  displayName: 'Validate/Renew SAP TU token'
+  env:
+    VAULT_USER: $(VAULT_USER)
+    VAULT_PASSWORD: $(VAULT_PASSWORD)
+    SYSTEM_ACCESS_TOKEN: $(System.AccessToken)
+    RENEW_SECRETS_SAP_CHAT_ID: $(RENEW_SECRETS_SAP_CHAT_ID)

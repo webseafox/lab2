@@ -1,0 +1,274 @@
+## -> Parameters:
+parameters:
+- name: environment
+  type: string
+  default: 'dev'
+
+## -> Resources:
+resources:
+  repositories:
+  
+  ## -> Fortify
+  - repository: FortifyExclusion
+    name: DevOps/Vivo.Fortify.Exclusions
+    type: git
+    ref: refs/heads/master
+    endpoint: CorePipelines
+  ## -> OSSD Repository
+  - repository: OSSDevOpsHelm
+    name: 'OSSD - OSS DEVOPS/helm-oss-default'
+    type: git
+    ref: refs/heads/master
+    endpoint: CodePlay
+  - repository: OSSDevOpsSettings
+    name: 'OSSD - OSS DEVOPS/settings-oss-default'
+    type: git
+    ref: refs/heads/master
+    endpoint: CodePlay
+  - repository: OSSDevOpsExclusions
+    name: 'OSSD - OSS DEVOPS/exclusions-oss-default'
+    type: git
+    ref: refs/heads/master
+    endpoint: CodePlay
+  - repository: OSSDevOpsHosts
+    name: 'OSSD - OSS DEVOPS/hosts-oss-default'
+    type: git
+    ref: refs/heads/master
+    endpoint: CodePlay    
+
+## -> Initialize global variables   
+variables:
+
+- template: /tech_products/oss/initialize/variables_global.yml
+- template: /tech_products/oss/initialize/variables_nodejs.yml
+- template: /tech_products/oss/initialize/variables_gates.yml
+- template: /tech_products/oss/initialize/variables_docker.yml
+  
+## -> Override global variables, with variables set in Library/Variable Groups (Pipelines)
+## -> Use this to change the variables on runtime
+- group: "${{ variables['Build.Repository.Name'] }}"
+
+- name: CORPORATE_WIKI_DOC_URL
+  value: "TBD"
+
+## -> Whether branch is dev, esteira1, esteira2, preprod, prodlike or producao, set environment to branch name, 
+## -> Otherwise use parameter environment
+- ${{ if in(variables['Build.SourceBranchName'],'dev','esteira1','esteira2','preprod','prodlike','producao' )}}:
+    - name: environment
+      value: ${{variables['Build.SourceBranchName']}}
+- ${{ else }}:
+    - name: environment
+      value: ${{ parameters.environment }}
+
+stages:
+
+- stage: CI_Pipeline
+  displayName: 'CI Pipeline'
+  jobs:
+    - job: Build_And_Validate
+      displayName: 'Validate & Build'
+      pool:
+        name: $(AGENT_POOL_CI)
+      steps:
+        - checkout: self
+          displayName: Checkout Source Code
+          clean: true
+          fetchDepth: 0
+          path: source_code
+
+        - checkout: OSSDevOpsExclusions
+          displayName: Checkout OSS Exclusions
+          path: oss_exclusions
+          fetchDepth: 1
+
+        ## -> Load Flags Exclusions
+        - task: Bash@3
+          displayName: 'Load Execution Flags'
+          name: evaluate_flags
+          inputs:
+            targetType: inline
+            script: |
+              repoName="$(Build.Repository.Name)"
+              projectName="$(System.TeamProject)"
+              
+              ## -> Configuration Files
+              configFileRepo="$(Pipeline.Workspace)/oss_exclusions/pr_validation.yml"
+              configFileProject="$(Pipeline.Workspace)/oss_exclusions/pr_validation_project.yml"
+              
+              echo "##[debug] Checking flags for Repo: $repoName | Project: $projectName"
+
+              ## -> default values
+              isDisableAll="false"
+              isSkipValidation="false"
+              isSkipBuild="false"
+
+              ## -> Validation pr_validation_project.yml
+              if [ -f "$configFileProject" ]; then
+                  
+                  if grep -q "^ALL .*disable_all=true" "$configFileProject"; then
+                      echo "##[warning] ALL Flag Detected: PR validation is disabled for all projects."
+                      isDisableAll="true"
+                  fi
+
+                  if grep -q "^${projectName}$" "$configFileProject" || grep -q "^${projectName}[[:space:]]" "$configFileProject"; then
+                      echo "##[warning] Project exclusion flag detected: '$projectName' is listed in exclusion file."
+                      isDisableAll="true"
+                  fi
+               else
+                  echo "##[error] Project config file not found at $configFileProject"
+                  exit 1
+                fi
+
+              ## -> Validation pr_validation.yml
+              if [[ "$isDisableAll" == "false" ]]; then
+                  if [ -f "$configFileRepo" ]; then
+                      
+                      repoConfig=$(grep "^${repoName}[[:space:]]" "$configFileRepo" || true)
+                      
+                      if [[ -n "$repoConfig" ]]; then
+                          echo "##[debug] Repo Configuration found: $repoConfig"
+                          
+                          [[ "$repoConfig" =~ "disable_all=true" ]] && isDisableAll="true"
+                          [[ "$repoConfig" =~ "skip_validation=true" ]] && isSkipValidation="true"
+                          [[ "$repoConfig" =~ "skip_build=true" ]] && isSkipBuild="true"
+                      fi
+                  else
+                      echo "##[error] Repo Config file not found at $configFileRepo"
+                      exit 1
+                  fi
+              fi
+
+              if [[ "$isDisableAll" == "true" ]]; then
+                  isSkipValidation="true"
+                  isSkipBuild="true"
+                  echo "##[warning] PIPELINE DISABLED VIA FLAG (Project or Repo exclusion)"
+              fi
+
+              echo "##vso[task.setvariable variable=isSkipValidation]$isSkipValidation"
+              echo "##vso[task.setvariable variable=isSkipBuild]$isSkipBuild"
+
+              echo "Final Flags: Valid=$isSkipValidation | Build=$isSkipBuild"
+
+        ## -> Validate Commit
+        - task: Bash@3
+          displayName: 'Validate Commit Message'
+          name: validate_commit
+          condition: and(succeeded(), ne(variables['isSkipValidation'], 'true'))
+          inputs:
+            targetType: inline
+            workingDirectory: $(Pipeline.Workspace)/source_code
+            script: |
+              if [ "$(Build.Reason)" == "PullRequest" ]; then
+                  TARGET="$(System.PullRequest.TargetBranch)"
+              else
+                  TARGET="$(Build.SourceBranchName)"
+              fi
+              TARGET="${TARGET#refs/heads/}"
+              
+              echo "##[debug] Target Branch: '$TARGET'"
+              if [[ ! "$TARGET" =~ ^(master|main|producao|prodlike|preprod|esteira[12]|dev)$ ]]; then
+                 echo "Skipping: Branch '$TARGET' is not in the official list."
+                 exit 0
+              fi
+              ## -> Validate Message
+              commitID=$(System.PullRequest.SourceCommitId)
+              MSG=$(git log -1 --pretty=%B "$commitID")
+
+              echo "##[group] Commit Message:"
+              echo "$MSG"
+              echo "##[endgroup]"
+                            
+              if [[ ! "$MSG" =~ ^(feat|fix|chore|docs|test|refactor|ci|build|perf|revert)(\(.+\))?: ]] || [[ ! "$MSG" =~ [A-Z0-9]+(-[0-9]+|[0-9]+) ]]; then
+                  echo ""
+                  echo "##[error] ❌ Invalid Commit Message Format!"
+                  echo "##[error] Requirement: <type>: <description> <ID>"
+                  echo "##[error] Example: feat: add login screen PTI-123"
+                  echo "##[error] Example: fix: resolve timeout issue INC00001"
+                  echo "##[error] For more info: https://www.conventionalcommits.org/en/v1.0.0/"
+                  exit 1
+              fi
+              echo "✅ Commit Validated"
+
+        ## -> Download NEXUS Credentials
+        - task: AzureKeyVault@2
+          displayName: 'Getting AKV Credentials'
+          timeoutInMinutes: 1
+          retryCountOnTaskFailure: 5
+          inputs:
+            azureSubscription: DevOpsSharedResources
+            KeyVaultName: $(AKV_DEVOPS_NAME)
+            SecretsFilter: 'NEXUS-DEPS-USR, NEXUS-DEPS-PSW'
+
+        ## -> Bump version in code and build code.
+        - task: Bash@3
+          displayName: Build Version
+          name: build_version
+          condition: and(succeeded(), ne(variables['isSkipBuild'], 'true'))
+          continueOnError: false
+          env:
+            NEXUS_DEPS_USR_VAL: $(NEXUS-DEPS-USR)
+            NEXUS_DEPS_PSW_VAL: $(NEXUS-DEPS-PSW)
+            SYSTEM_ACCESSTOKEN: $(System.AccessToken)                
+          inputs:
+            targetType: inline
+            workingDirectory: $(Pipeline.Workspace)/source_code
+            script: |
+              echo "##[debug] Environment: ${{ parameters.environment }}"
+              
+              VERSION_TAG="0.0.0-pr-$(Build.BuildId)"
+              
+              BUILDER_IMAGE_NAME="builder/$(Build.BuildId)"
+
+              ## -> Grant execute permissions to all .sh files in the root directory
+              for FILE in *.sh; do
+                 if [ -f "$FILE" ]; then
+                   chmod +x "$FILE"
+                 fi
+              done
+
+              docker build --no-cache \
+                --build-arg USER_ID=$(DOCKER_CMD_USERNAME) \
+                --build-arg GROUP_ID=$(DOCKER_CMD_GROUP) \
+                --build-arg NODE_ENV=${{parameters.environment}} \
+                -t $BUILDER_IMAGE_NAME \
+                -f .azuredevops/builder.Dockerfile .
+
+              run_docker() {
+                docker run --rm \
+                  --user="$(DOCKER_CMD_USERNAME):$(DOCKER_CMD_GROUP)" \
+                  --network host \
+                  --log-driver none \
+                  -e NPM_CONFIG_USERCONFIG="/tmp/.npmrc" \
+                  -e HTTPS_PROXY=$(PROXY_AGENT_HTTPS) \
+                  -e HTTP_PROXY=$(PROXY_AGENT_HTTP) \
+                  -e NO_PROXY=$(PROXY_AGENT_NO_PROXY) \
+                  -e TZ="America/Sao_Paulo" \
+                  -e SYSTEM_ACCESSTOKEN="$(System.AccessToken)" \
+                  -e NEXUS_DEPS_USR="$NEXUS_DEPS_USR_VAL" \
+                  -e NEXUS_DEPS_PSW="$NEXUS_DEPS_PSW_VAL" \
+                  -e NODE_ENV="${{parameters.environment}}" \
+                  -v $(pwd):/app \
+                  -v $(DEFAULT_NPMRC_TEMP_FILE_PATH):/tmp/.npmrc \
+                  -w $(DOCKER_WORKDIR) \
+                  "$BUILDER_IMAGE_NAME" sh -c "$1"
+              }
+
+              if [[ "${BUMP_VERSION_ENABLED}" == 'true' ]]; then
+                echo "##[debug] Bump version to NEW_VERSION: $VERSION_TAG"
+                if command -v jq &> /dev/null; then
+                    jq --arg v "$VERSION_TAG" '.version=$v' package.json > /tmp/package.json && mv /tmp/package.json package.json
+                fi
+              fi
+
+              echo "##[debug] Build with version: $VERSION_TAG"
+              echo "##[debug] NODEJS_CMD_BUILD: $(NODEJS_CMD_BUILD)"
+              echo "##[debug] NODEJS_CMD_BUILD_TEST: $(NODEJS_CMD_BUILD_TEST)"
+              echo "##[debug] NODEJS_CMD_OPTIONAL: $(NODEJS_CMD_OPTIONAL)"
+
+              CMD_BUILD="$(NODEJS_CMD_BUILD)"
+              if [ ! -f "package-lock.json" ] && [[ "$CMD_BUILD" == *"npm ci"* ]]; then
+                 echo "##[warning] 'package-lock.json' missing. Switching 'npm ci' to 'npm install'."
+                 CMD_BUILD="${CMD_BUILD//npm ci/npm install}"
+              fi
+
+              run_docker "$CMD_BUILD $( [[ -n "$(NODEJS_CMD_BUILD_TEST)" ]] && echo "&& $(NODEJS_CMD_BUILD_TEST)" ) $( [[ -n "$(NODEJS_CMD_OPTIONAL)" ]] && echo "&& $(NODEJS_CMD_OPTIONAL)" )"

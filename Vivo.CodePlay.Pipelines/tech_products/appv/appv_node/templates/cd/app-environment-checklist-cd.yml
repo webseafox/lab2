@@ -1,0 +1,355 @@
+stages:
+  - stage: cd_environment_checklist
+    displayName: "CD - Environment Checklist"
+    pool:
+      name: GeneralPurposeLinuxAgentsCD
+    dependsOn:
+      - environment_init
+    condition: succeeded()
+
+    ## -> Loads variables from other stages.
+    variables:
+      - name: setVersion
+        value: $(echo "${{ parameters.setVersion }}" | xargs)
+      - name: setEnvironment
+        value: $(echo "${{ parameters.setEnvironment }}" | xargs)
+
+    jobs:
+      - job: environment_checklist
+        displayName: "Environment Checklist"
+        condition: succeeded()
+        steps:
+          ## -> Download Artifacts
+          - download: none
+
+          ## -> Clean the pipeline workspace and checkout the code.
+          ## -> 6d15af64-176c-496d-b583-fd2ae21d4df4 is the decorator for checkout.
+          - task: 6d15af64-176c-496d-b583-fd2ae21d4df4@1
+            displayName: Checkout Code
+            name: checkout_code
+            inputs:
+              repository: self
+              persistCredentials: "true"
+              clean: true
+
+          ## -> Download kube config
+          - task: DownloadSecureFile@1
+            displayName: "Download Kube Config for $namespace"
+            condition: succeeded()
+            continueOnError: true
+            name: kubeconf
+            inputs:
+              secureFile: kubeconf-${{ parameters.setEnvironment }}.yml
+
+          - task: Bash@3
+            displayName: "Remap Environment Variable"
+            condition: succeeded()
+            inputs:
+              targetType: "inline"
+              script: |
+                echo "##[debug] Original environment: ${{ parameters.setEnvironment }}"
+
+                REMAPPED_ENV="${{ parameters.setEnvironment }}"
+
+                if [[ "$REMAPPED_ENV" == *"esteira01"* ]]; then
+                  REMAPPED_ENV="${REMAPPED_ENV/esteira01/esteira1}"
+                  echo "##[debug] Remapping namespace: $REMAPPED_ENV"
+                else
+                  echo "##[debug] No remapping needed for: $REMAPPED_ENV"
+                fi
+
+                echo "##[debug] Final remapped environment: $REMAPPED_ENV"
+                echo "##vso[task.setvariable variable=REMAPPED_ENVIRONMENT;isOutput=true]$REMAPPED_ENV"
+            name: "remap_env"
+
+          - task: Bash@3
+            displayName: "Compare cluster and pipeline versions"
+            name: compare_versions
+            condition: succeeded()
+            inputs:
+              targetType: inline
+              script: |
+                PIPELINE_VERSION=$(setVersion)
+                PIPELINE_ENVIRONMENT=$(remap_env.REMAPPED_ENVIRONMENT)
+
+                echo "##vso[task.setvariable variable=PIPELINE_ENVIRONMENT]$PIPELINE_ENVIRONMENT"
+
+                echo "Versão desejada (PIPELINE_VERSION): $PIPELINE_VERSION"
+
+                PROD_VERSION=$(kubectl --kubeconfig "$(kubeconf.secureFilePath)" get deployment "$(APPLICATION_NAME)-stable" -n "$PIPELINE_ENVIRONMENT" -o jsonpath="{.metadata.labels.app-version}")
+                if [ -z "$PROD_VERSION" ]; then
+                  echo "Não foi possível obter a versão do cluster (label app-version ausente ou comando falhou)."
+                  echo "Ação definida como RELEASE"
+                  echo "##vso[task.setvariable variable=IS_ROLLBACK;isOutput=true]false"
+                  exit 0
+                fi
+                echo "Versão no cluster (PROD_VERSION): $PROD_VERSION"
+                echo "##vso[task.setvariable variable=PROD_VERSION;isOutput=true]$PROD_VERSION"
+
+                # Checa se versões são iguais
+                if [ "$PROD_VERSION" = "$PIPELINE_VERSION" ]; then
+                  echo -e "\e[34mREDEPLOY: versão atual ($PROD_VERSION) == versão desejada ($PIPELINE_VERSION).\e[0m"
+                  echo "##vso[task.setvariable variable=IS_ROLLBACK;isOutput=true]false"
+                  exit 0
+                fi
+
+                # Comando sort -V para comparar SemVer
+                if [ "$(printf "%s\n%s\n" "$PROD_VERSION" "$PIPELINE_VERSION" | sort -V | head -n1)" = "$PROD_VERSION" ]; then
+                  echo -e "\e[32mRELEASE: versão atual ($PROD_VERSION) < versão desejada ($PIPELINE_VERSION).\e[0m"
+                  echo "##vso[task.setvariable variable=IS_ROLLBACK;isOutput=true]false"
+                else
+                  echo -e "\e[31mROLLBACK: versão atual ($PROD_VERSION) > versão desejada ($PIPELINE_VERSION).\e[0m"
+                  echo "##vso[task.setvariable variable=IS_ROLLBACK;isOutput=true]true"
+                fi
+
+          - task: Bash@3
+            displayName: "Get cluster and repository environment variables"
+            name: "get_environment_variables"
+            condition: succeeded()
+            inputs:
+              targetType: inline
+              script: |
+                # Nomes dos arquivos .env
+                CLUSTER_ENVS_FILENAME=cluster.env
+                REPOSITORY_ENVS_FILENAME=repository.env
+                echo "##vso[task.setvariable variable=CLUSTER_ENVS_FILENAME;isOutput=true]$CLUSTER_ENVS_FILENAME"
+                echo "##vso[task.setvariable variable=REPOSITORY_ENVS_FILENAME;isOutput=true]$REPOSITORY_ENVS_FILENAME"
+
+                echo -e "\033[1mVariáveis do CLUSTER\033[0m"
+
+                # Obtendo variáveis do cluster
+                echo "Obtendo variáveis do cluster para \"$APPLICATION_NAME\" em \"$PIPELINE_ENVIRONMENT\""
+                clusterEnvs=$(kubectl --kubeconfig "$(kubeconf.secureFilePath)" get deployment "$(APPLICATION_NAME)-stable" -n "$(PIPELINE_ENVIRONMENT)" -o jsonpath="{.spec.template.spec.containers[0].env}" || true)
+                if [ -z "${clusterEnvs:-}" ]; then
+                  echo "Não foi possível obter envs do cluster."
+                  clusterEnvs=''
+                fi
+
+                # Geração de arquivo .env do CLUSTER
+                if [ -n "${clusterEnvs:-}" ]; then
+                  echo "$clusterEnvs" | jq -r '
+                    map(
+                      if has("value") then
+                        "\(.name)=\(.value)"
+                      elif has("valueFrom") and .valueFrom.secretKeyRef then
+                        "\(.name)=secret(\(.valueFrom.secretKeyRef.key)=\(.valueFrom.secretKeyRef.name))"
+                      else
+                        "\(.name)=<no-direct-value>"
+                      end
+                    ) | .[]
+                  ' > $CLUSTER_ENVS_FILENAME || echo "Falha ao gerar $CLUSTER_ENVS_FILENAME"
+                else
+                  echo "Sem variáveis para gerar arquivo .env (cluster vazio)."
+                fi
+
+                if [ -f $CLUSTER_ENVS_FILENAME ]; then
+                  # Ordena arquivo por ordem alfabética
+                  sort -o $CLUSTER_ENVS_FILENAME $CLUSTER_ENVS_FILENAME
+                  # Remove aspas simples e duplas dos valores
+                  sed -i -E "s/^([A-Za-z_][A-Za-z0-9_]*)=['\"]([^'\"]*)['\"]$/\1=\2/" $CLUSTER_ENVS_FILENAME
+                  # Exibe output
+                  echo "##[group]$CLUSTER_ENVS_FILENAME"
+                  cat $CLUSTER_ENVS_FILENAME
+                  echo "##[endgroup]"
+                else
+                  touch $CLUSTER_ENVS_FILENAME
+                fi
+
+                echo -e "\033[1mVariáveis do REPOSITÓRIO (Branch: MASTER)\033[0m"
+
+                CONFIG_FILE=".azuredevops/config/$PIPELINE_ENVIRONMENT/values.yml"
+                echo "Usando: $CONFIG_FILE"
+
+                # Geração do arquivo .env do REPOSITÓRIO
+                if [ -f "$CONFIG_FILE" ]; then
+                  awk '
+                  /^env:/ { in_env = 1; next }
+                  /^[a-zA-Z]/ && in_env { in_env = 0 }
+                  in_env && /- name:/ {
+                      # Extrair nome da variável
+                      gsub(/.*name: */, "")
+                      gsub(/[ \t\r\n]*$/, "")
+                      var_name = $0
+                      getline
+                      
+                      # Verificar se é value ou valueFrom
+                      if (/value:/) {
+                          # Variável com valor direto
+                          gsub(/.*value: */, "")
+                          gsub(/^"/, "")
+                          gsub(/"$/, "")
+                          gsub(/[ \t\r\n]*$/, "")
+                          print var_name "=" $0
+                      } else if (/valueFrom:/) {
+                          # Variável com secret
+                          # Pular linha secretKeyRef
+                          getline
+                          # Capturar name
+                          getline
+                          gsub(/.*name: */, "")
+                          gsub(/[ \t\r\n]*$/, "")
+                          secret_name = $0
+                          # Capturar key
+                          getline
+                          gsub(/.*key: */, "")
+                          gsub(/[ \t\r\n]*$/, "")
+                          secret_key = $0
+                          print var_name "=secret(" secret_key "=" secret_name ")"
+                      }
+                  }
+                  ' $CONFIG_FILE > $REPOSITORY_ENVS_FILENAME || echo "Falha ao gerar $REPOSITORY_ENVS_FILENAME"
+                else
+                  echo "Sem variáveis para gerar arquivo .env (repositório vazio)."
+                fi
+
+                if [ -f $REPOSITORY_ENVS_FILENAME ]; then
+                  # Ordena o arquivo por ordem alfabética
+                  sort -o $REPOSITORY_ENVS_FILENAME $REPOSITORY_ENVS_FILENAME
+                  # Remove aspas simples e duplas dos valores
+                  sed -i -E "s/^([A-Za-z_][A-Za-z0-9_]*)=['\"]([^'\"]*)['\"]$/\1=\2/" $REPOSITORY_ENVS_FILENAME
+                  # Exibe output
+                  echo "##[group]$REPOSITORY_ENVS_FILENAME"
+                  cat $REPOSITORY_ENVS_FILENAME
+                  echo "##[endgroup]"
+                else
+                  touch $REPOSITORY_ENVS_FILENAME
+                fi
+
+          - task: Bash@3
+            displayName: "Discriminate cluster and repository environment variables"
+            name: "discriminate_environment_variables"
+            condition: succeeded()
+            inputs:
+              targetType: inline
+              script: |
+                clusterEnv=$(get_environment_variables.CLUSTER_ENVS_FILENAME)
+                repositoryEnv=$(get_environment_variables.REPOSITORY_ENVS_FILENAME)
+                inEnv=in.env
+                outEnv=out.env
+
+                echo -e "\033[1mDiferenças entre variáveis no cluster e repositório\033[0m"
+
+                # Diferenças unificadas
+                diffU=$(diff $clusterEnv $repositoryEnv -u || true)
+
+                echo "##[group]Diferenças unificadas - Cluster e Repositório"
+                echo "$diffU"
+                echo "##[endgroup]"
+
+                # Variáveis adicionadas (linhas com '+' exceto cabeçalho '+++')
+                printf '%s\n' "$diffU" | awk '/^\+[^+]/ && /[A-Za-z0-9_]+=/{sub(/^\+/,"");print}' > $inEnv
+                # Variáveis removidas (linhas com '-' exceto cabeçalho '---')
+                printf '%s\n' "$diffU" | awk '/^-[^-]/ && /[A-Za-z0-9_]+=/{sub(/^-/, "");print}' > $outEnv
+
+                echo "##[group]Variáveis adicionadas (Repositório)"
+                cat $inEnv
+                echo "##[endgroup]"
+                echo "##[group]Variáveis removidas (Cluster)"
+                cat $outEnv
+                echo "##[endgroup]"
+
+                echo "##vso[task.setvariable variable=IN_ENVS_FILENAME;isOutput=true]$inEnv"
+                echo "##vso[task.setvariable variable=OUT_ENVS_FILENAME;isOutput=true]$outEnv"
+
+          - task: Bash@3
+            displayName: "Generate HTML Report"
+            name: "generate_html_report"
+            condition: succeeded()
+            inputs:
+              targetType: inline
+              script: |
+                clusterEnv=$(get_environment_variables.CLUSTER_ENVS_FILENAME)
+                repositoryEnv=$(get_environment_variables.REPOSITORY_ENVS_FILENAME)
+                inEnv=$(discriminate_environment_variables.IN_ENVS_FILENAME)
+                outEnv=$(discriminate_environment_variables.OUT_ENVS_FILENAME)
+                
+                echo "##[debug]Rollback: $(compare_versions.IS_ROLLBACK)"
+  
+                # Função para escapar HTML
+                html_escape() {
+                  sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
+                }
+
+                APP_NAME="${APPLICATION_NAME:-desconhecido}"
+                ENVIRONMENT="${PIPELINE_ENVIRONMENT:-desconhecido}"
+                CLUSTER_VERSION_RAW=$(compare_versions.PROD_VERSION)
+                if [ -z "${CLUSTER_VERSION_RAW// }" ]; then
+                  CLUSTER_VERSION_OUT="Não encontrado"
+                else
+                  CLUSTER_VERSION_OUT="$CLUSTER_VERSION_RAW"
+                fi
+                PIPELINE_VERSION_RAW=$(setVersion)
+                if [ -z "${PIPELINE_VERSION_RAW// }" ]; then
+                  PIPELINE_VERSION_OUT="Não encontrado"
+                else
+                  PIPELINE_VERSION_OUT="$PIPELINE_VERSION_RAW"
+                fi
+                IS_ROLLBACK_OUT_RAW=$(compare_versions.IS_ROLLBACK)
+                case "$IS_ROLLBACK_OUT_RAW" in
+                  true) IS_ROLLBACK_OUT="SIM" ;;
+                  false) IS_ROLLBACK_OUT="NÃO" ;;
+                  *) IS_ROLLBACK_OUT="Indefinido" ;;
+                esac
+                
+                {
+                  echo "<!doctype html>"
+                  echo "<html lang=\"pt-br\">"
+                  echo "<head>"
+                  echo "<meta charset=\"utf-8\">"
+                  echo "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+                  echo "<meta name=\"color-scheme\" content=\"light dark\">"
+                  echo "<title>$APP_NAME - $ENVIRONMENT</title>"
+                  echo "<link rel=\"stylesheet\" href=\"https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.fluid.classless.blue.min.css\">"
+                  echo "<style>pre.diffY{white-space:pre;font-family:monospace;tab-size:1}</style>"
+                  echo "</head>"
+                  echo "<body>"
+                  echo "<main>"
+                  echo "<h3>Checklist de Ambiente</h3>"
+                  echo "<h4>Aplicação</h4>"
+                  echo "<p>Nome: $APP_NAME</p>"
+                  echo "<p>Ambiente (Namespace): $ENVIRONMENT</p>"
+                  echo "<h4>Versões</h4>"
+                  echo "<p>Versão do release atual (Cluster): $CLUSTER_VERSION_OUT</p>"
+                  echo "<p>Versão do nova release (Pipeline): $PIPELINE_VERSION_OUT</p>"
+                  echo "<p>É um Rollback? <strong>$IS_ROLLBACK_OUT</strong></p>"
+                  echo "<hgroup>"
+                  echo "<h4>Variáveis no cluster ($ENVIRONMENT)</h4>"
+                  echo "<p>Variáveis de ambiente do release atual em $ENVIRONMENT</p>"
+                  echo "</hgroup>"
+                  echo "<pre><code>$(html_escape < $clusterEnv)</code></pre>"
+                  echo "<hgroup>"
+                  echo "<h4>Variáveis no repositório ($ENVIRONMENT)</h4>"
+                  echo "<p>Variáveis de ambiente da nova release em $ENVIRONMENT</p>"
+                  echo "</hgroup>"
+                  echo "<pre><code>$(html_escape < $repositoryEnv)</code></pre>"
+                  echo "<hgroup>"
+                  echo "<h4>Variáveis incluídas</h4>"
+                  echo "<p>Variáveis da nova release que não estão presentes no release atual</p>"
+                  echo "</hgroup>"
+                  echo "<pre><code>$(html_escape < $inEnv)</code></pre>"
+                  echo "<hgroup>"
+                  echo "<h4>Variáveis removidas</h4>"
+                  echo "<p>Variáveis do release atual que não estão presentes na nova release</p>"
+                  echo "</hgroup>"
+                  echo "<pre><code>$(html_escape < $outEnv)</code></pre>"
+                  echo "<h6>OBS: Pode ser que algumas variáveis injetadas automaticamente pelo ambiente apareçam como removidas, como \"APPLICATION_PREFIX\", \"PORT\" ou \"DD_*\". Nesses casos, não é necessário adicionar as variáveis no repositório, pois elas continuarão sendo injetadas automaticamente. Apenas valide se as variáveis fazem sentido no contexto da sua aplicação.</h6>"
+                  echo "</main>"
+                  echo "</body>"
+                  echo "</html>"
+                } > report.html
+
+                if [ -f report.html ]; then
+                  echo "##[group]report.html"
+                  cat report.html
+                  echo "##[endgroup]"
+                else
+                  echo "Falha ao gerar relatório"
+                fi
+
+          - task: PublishHtmlReport@1
+            displayName: "Publish HTML Report"
+            name: "publish_report"
+            condition: succeeded()
+            inputs:
+              reportDir: "report.html"
+              tabName: '..Checklist de Variáveis'

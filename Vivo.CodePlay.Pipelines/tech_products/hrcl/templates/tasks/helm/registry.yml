@@ -1,0 +1,107 @@
+parameters:
+- name: environment
+- name: workDir
+- name: k8sNamespace
+- name: dockerRegistry
+- name: dockerServer
+- name: dockerUsername
+- name: dockerPassword
+- name: dockerEmail
+- name: k8sKubeconfig
+- name: argocd_enabled
+  type: boolean
+  default: 'false'
+- name: createNamespaceIfNotExists
+  default: $(ENABLE_CREATE_NAMESPACE_IF_NOT_EXISTS)
+- name: createRegistryCredentials
+  default: $(CREATE_REGISTRY_CREDENTIALS)
+
+steps:
+- bash: |
+    source ~/.bashrc
+
+    echo "##[debug] Check if namespace [${{parameters.k8sNamespace}}] exists "
+
+    ENABLE_CREATE_NAMESPACE=${{parameters.createNamespaceIfNotExists}}
+    
+    echo "##[debug] ENABLE_CREATE_NAMESPACE...........: ${ENABLE_CREATE_NAMESPACE}"
+    
+    NAMESPACES=$(kubectl get ns -o json --kubeconfig="${{parameters.k8sKubeconfig}}" --insecure-skip-tls-verify)
+    
+    echo "##[group]Namespaces in cluster"
+    echo "##[debug] ${NAMESPACES}"
+    echo "##[endgroup]"
+
+    NS=$(echo $NAMESPACES | jq -c '.items[].metadata | select(.name=="${{parameters.k8sNamespace}}")' | jq -r '.name')
+
+    if [ "$NS" = "${{parameters.k8sNamespace}}" ]; then
+      echo "##[debug] Namespace [${{parameters.k8sNamespace}}] OK"
+    else 
+      if [ "$ENABLE_CREATE_NAMESPACE" = true ]; then
+        kubectl create ns ${{parameters.k8sNamespace}} --kubeconfig=${{parameters.k8sKubeconfig}} --insecure-skip-tls-verify
+      else
+        echo "##[debug] Namespace [${{parameters.k8sNamespace}}] not found"
+        exit 1;
+      fi
+    fi
+  displayName: "Create namespace if not exists"
+  condition: ne('${{ parameters.argocd_enabled }}', 'true')
+  workingDirectory: "${{parameters.workDir}}"
+
+- bash: |
+    source ~/.bashrc
+
+    CREATE_REGISTRY_CREDENTIALS=${{parameters.createRegistryCredentials}}
+
+    echo "##[debug] Check if namespace [${{parameters.k8sNamespace}}] has credentials for '${{parameters.dockerRegistry}}' registry."
+
+    echo "##[debug] CREATE_REGISTRY_CREDENTIALS...........: ${CREATE_REGISTRY_CREDENTIALS}"
+    
+    kubectl get secrets ${{parameters.dockerRegistry}} \
+      -n ${{parameters.k8sNamespace}} \
+      --kubeconfig="${{parameters.k8sKubeconfig}}" \
+      --insecure-skip-tls-verify
+    
+    if [ $? -gt 0 ]; then
+      SECRET_FOUND=false
+    else
+      SECRET_FOUND=true
+    fi
+    
+    if [ "$SECRET_FOUND" = true ]; then
+      echo "##[debug] Registry '${{parameters.dockerRegistry}}' exists."
+      exit 0;
+    fi
+
+    if [ "$CREATE_REGISTRY_CREDENTIALS" = false ]; then
+      echo "##[debug] Secret for registry '${{parameters.dockerRegistry}}' does not exist in namespace [${{parameters.k8sNamespace}}] and will not be created."
+      exit 0;
+    fi
+
+    echo "##[debug] Secret for registry '${{parameters.dockerRegistry}}' does not exist in namespace [${{parameters.k8sNamespace}}] and will be created."
+    
+    echo "##[debug] Setup docker registry."
+
+    echo "##[debug] dockerServer.............: ${{parameters.dockerServer}}"
+    echo "##[debug] dockerUsername...........: ${{parameters.dockerUsername}}"
+    echo "##[debug] dockerPassword...........: ${{parameters.dockerPassword}}"
+    echo "##[debug] dockerEmail..............: ${{parameters.dockerEmail}}"
+    
+    kubectl create secret docker-registry ${{parameters.dockerRegistry}} \
+      --docker-server=${{parameters.dockerServer}} \
+      --docker-username=${{parameters.dockerUsername}} \
+      --docker-password=${{parameters.dockerPassword}} \
+      --docker-email='${{parameters.dockerEmail}}' \
+      -n ${{parameters.k8sNamespace}} \
+      --kubeconfig="${{parameters.k8sKubeconfig}}" \
+      --insecure-skip-tls-verify
+      
+    if [ $? -gt 0 ]; then
+      echo "##[error] Error create docker registry '${{parameters.dockerRegistry}}'"
+      exit 1;
+    else
+      echo "##[debug] Docker registry '${{parameters.dockerRegistry}}' configured success."
+    fi
+  displayName: "Create docker registry secret"
+  condition: ne('${{ parameters.argocd_enabled }}', 'true')
+  workingDirectory: "${{parameters.workDir}}"

@@ -1,0 +1,221 @@
+parameters:
+  - name: nextVersion
+    type: string
+  - name: cacheAppDependencies
+    type: boolean
+    default: true
+    
+steps:
+- task: AzureKeyVault@2  
+  displayName: 'Get Secrets'
+  timeoutInMinutes: 1
+  retryCountOnTaskFailure: 5
+  inputs:    
+    azureSubscription: DevOpsSharedResources    
+    KeyVaultName: $(AKV_DEVOPS_NAME)
+    SecretsFilter: 'NEXUS-DEFAULT-USR, NEXUS-DEFAULT-PSW'
+
+- bash: |
+    echo "##[debug]DEFAULT_NPMRC_TEMP_FILE_PATH.....: ${DEFAULT_NPMRC_TEMP_FILE_PATH}"
+
+    if [ -f .npmrc ]; then
+      cp .npmrc ${DEFAULT_NPMRC_TEMP_FILE_PATH}
+    else
+      echo "##vso[task.logissue type=error]O arquivo .npmrc não foi encontrado!"
+      echo "##[error]O arquivo .npmrc não foi encontrado!"
+      exit 1;
+    fi
+
+    echo ##vso[task.setvariable variable=NPM_CONFIG_USERCONFIG]${DEFAULT_NPMRC_TEMP_FILE_PATH}
+  displayName: "Prepare NPMRC"
+  env:
+    DEFAULT_NPMRC_TEMP_FILE_PATH: $(Agent.TempDirectory)/.npmrc
+
+- task: npmAuthenticate@0
+  inputs:
+    workingFile: $(Agent.TempDirectory)/.npmrc
+  displayName: 'NPM Authenticate'
+  env:
+    HTTPS_PROXY: $(PROXY_AGENT_HTTPS)
+    HTTP_PROXY: $(PROXY_AGENT_HTTP)
+    NO_PROXY: $(PROXY_AGENT_NO_PROXY)
+
+- bash: |
+    if [ -f .npmrc ]; then
+      auth_opt="email=vivo.devops.br@telefonica.com\nalways-auth=true"
+      auth=$(echo -n ${NEXUS_DEFAULT_USR}:${NEXUS_DEFAULT_PSW} | openssl base64)
+      repos=$(grep -o "registry=.*" .npmrc | cut -d':' -f2 | awk -v auth="$auth" '{print $0 ":_auth="auth""}')
+      { printf '\n'; echo -e "$repos\n$auth_opt"; } | tee -a >(cat >> .npmrc) > /dev/null
+      echo "##[debug]Credenciais configuradas em $(Agent.TempDirectory)/.npmrc!"
+      echo "##vso[task.setvariable variable=DEFAULT_NPMRC_TEMP_FILE_PATH;isOutput=true]$(Agent.TempDirectory)/.npmrc"
+    else
+      echo "##vso[task.logissue type=error]O arquivo .npmrc não foi encontrado!"
+      echo "##[error]O arquivo .npmrc não foi encontrado!"
+      exit 1;
+    fi
+  displayName: "Nexus Credentials"
+  name: configure_nexus_credentials
+  condition: succeeded()
+  workingDirectory: $(Agent.TempDirectory)
+  env:    
+    NEXUS_DEFAULT_USR: $(NEXUS-DEFAULT-USR)
+    NEXUS_DEFAULT_PSW: $(NEXUS-DEFAULT-PSW)
+    
+- task: Bash@3
+  displayName: "Detect Node Version"
+  condition: succeeded()
+  inputs:
+    targetType: inline
+    script: |
+      echo ""
+      NODE_VERSION=$(jq -r '.engines.node' package.json | grep -o '[0-9]\+\.[0-9]\+' | head -1)
+      echo "##vso[task.setvariable variable=NODE_VERSION]$NODE_VERSION"
+      echo "Node version from package.json: $NODE_VERSION"
+
+- task: UseNode@1
+  inputs:
+    version: '$(NODE_VERSION)'
+  displayName: 'Set Node Version'
+
+- task: Bash@3
+  displayName: "Pre Update Package Version"
+  condition: succeeded()
+  inputs:
+    targetType: inline
+    script: |
+      echo "##[section]Updating package.json version to: ${{ parameters.nextVersion }}"
+      
+      # Backup original package.json
+      cp package.json package.json.backup
+      
+      # Update version using jq
+      if command -v jq >/dev/null 2>&1; then
+        jq --arg version "${{ parameters.nextVersion }}" '.version = $version' package.json > package.json.tmp && mv package.json.tmp package.json
+        echo "##[debug]Version updated using jq"
+      else
+        # Fallback to npm version command
+        npm version ${{ parameters.nextVersion }} --no-git-tag-version
+        echo "##[debug]Version updated using npm version"
+      fi
+      
+      # Verify the update
+      NEW_VERSION=$(jq -r '.version' package.json)
+      echo "##[section]Package.json version successfully updated to: $NEW_VERSION"
+      
+      # Validate that the version was correctly set
+      if [ "$NEW_VERSION" != "${{ parameters.nextVersion }}" ]; then
+        echo "##vso[task.logissue type=error]Failed to update package.json version. Expected: ${{ parameters.nextVersion }}, Got: $NEW_VERSION"
+        exit 1
+      fi
+      
+      # Remove backup file after successful update
+      rm -f package.json.backup
+      echo "##[debug]Backup file package.json.backup removed after successful update"
+    workingDirectory: $(Build.SourcesDirectory)
+
+- task: Npm@1
+  displayName: "Install Dependencies"
+  condition: succeeded()
+  continueOnError: true    
+  inputs:
+    command: 'install'
+    workingDir: $(Build.SourcesDirectory)
+
+- task: Npm@1
+  displayName: "Run Tests"
+  name: running_tests
+  condition: succeeded()
+  continueOnError: false
+  inputs:
+    command: custom
+    customCommand: run test:all:coverage
+    workingDir: $(Build.SourcesDirectory)
+
+- task: Npm@1
+  displayName: "Build Project"
+  name: running_build
+  condition: succeeded()
+  continueOnError: false
+  inputs:
+    command: custom
+    customCommand: run build
+    workingDir: $(Build.SourcesDirectory)
+
+- task: Docker@2
+  displayName: "Docker Login"
+  condition: succeeded()
+  inputs:
+    containerRegistry: $(REGISTRY_SERVICE_CONNECTION)
+    command: login
+
+- task: Docker@2
+  displayName: "ACR Login"
+  condition: succeeded()
+  inputs:
+    containerRegistry: "ACR-DEVOPS"
+    command: login
+
+# ==================================================================
+# [Compliance] Verifica se o repositório está em conformidade com as políticas de configuração
+# ==================================================================
+- task: VivoDevOpsConfigCompliance@1
+  displayName: 'Check DevOps Config Compliance'
+  inputs:
+    workDir: $(Build.SourcesDirectory)
+    policySets: |
+      image-definition-files
+
+- task: Docker@2
+  displayName: "Build Image"
+  condition: succeeded()
+  inputs:
+    containerRegistry: "ACR-DEVOPS"
+    command: build
+    repository: $(GOV_APP_ACRONYM)/$(Build.Repository.Name)
+    Dockerfile: $(Build.SourcesDirectory)/.azuredevops/runtime.Dockerfile
+    buildContext: '$(Build.SourcesDirectory)'
+    tags: |
+      ${{ parameters.nextVersion }}
+
+- task: Docker@2
+  displayName: "Push Image"
+  inputs:
+    containerRegistry: $(REGISTRY_SERVICE_CONNECTION)
+    repository: $(GOV_APP_ACRONYM)/$(Build.Repository.Name)
+    command: push
+    tags: |
+      ${{ parameters.nextVersion }}
+  condition: succeeded()
+
+- task: Bash@3
+  displayName: "Clean Images"
+  condition: always()
+  continueOnError: true
+  inputs:
+    targetType: inline
+    script: |
+      echo "##[command] docker rmi ${REGISTRY}/${IMAGE_REPOSITORY}:${IMAGE_VERSION}"
+      docker rmi ${REGISTRY}/${IMAGE_REPOSITORY}:${IMAGE_VERSION}
+  env:
+    REGISTRY: $(REGISTRY_NAME)
+    IMAGE_REPOSITORY: $(GOV_APP_ACRONYM)/$(Build.Repository.Name)
+    IMAGE_VERSION: ${{ parameters.nextVersion }}
+
+#MANDATÓRIO PARA PROCESSO DE SCA
+- template: /tech_products/hrcl/templates/tasks/artifacts/publish_app.yml
+  parameters:
+    artifactPublishName: 'app'
+
+- task: PublishPipelineArtifact@1
+  displayName: "Publish Tests"
+  inputs:
+    targetPath: '$(System.DefaultWorkingDirectory)/junit-report.xml'
+    artifactName: junit-report
+    publishLocation: 'pipeline'
+
+- task: PublishPipelineArtifact@1
+  displayName: "Publish Coverage"
+  inputs:
+    targetPath: '$(System.DefaultWorkingDirectory)/lcov.info'
+    artifactName: coverage-report
+    publishLocation: 'pipeline'

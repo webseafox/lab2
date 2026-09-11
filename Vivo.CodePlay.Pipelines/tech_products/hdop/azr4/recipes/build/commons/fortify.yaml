@@ -1,0 +1,128 @@
+jobs:
+- job: fortify
+  pool: GeneralPurposeLinuxAgentsCI
+  continueOnError: false
+  condition: true
+  steps:
+    - template: /tech_products/hdop/templates/steps/download_nexus_artifact.yaml
+      parameters:
+        file: 'securitygatecli-linux-amd64'
+        folder: 'devops'
+        outputFilePath: 'securitygatecli'
+        version: $(SECURITY_GATE_CLI_VERSION)
+        chmod: 755
+    - script: |
+        #!/bin/bash
+        echo '##[debug] Checking if fortify analysis is enabled'
+        ./securitygatecli --version
+        echo "##[command] ./securitygatecli ff --project '${AZDO_PROJECT}' --project-id ${PROJECT_ID} --id ${COMPONENT_ID} --name '${COMPONENT_NAME}' --stage ${FEATURE_STAGE} ${SECURITY_GATE_CLI_ARGS}"
+        shouldExecute=$(./securitygatecli ff --project "${AZDO_PROJECT}" --project-id ${PROJECT_ID} --id ${COMPONENT_ID} --name "${COMPONENT_NAME}" --stage ${FEATURE_STAGE} ${SECURITY_GATE_CLI_ARGS})
+        shouldExecute=$(echo $shouldExecute | xargs) # Trim whitespace
+        echo "##[debug] shouldExecute: $shouldExecute"
+        if [[ "$shouldExecute" == "false" ]]; then
+          echo "##[debug] Fortify analysis is not enabled"
+          echo "##vso[task.setvariable variable=FORTIFY_ENABLED;isOutput=true]false"
+        else
+          echo "##[debug] Fortify analysis is enabled"
+          echo "##vso[task.setvariable variable=FORTIFY_ENABLED;isOutput=true]true"
+        fi
+      displayName: 'Check if Fortify Analysis is Enabled'
+      name: check_ff
+      env:
+        AZURE_APP_CONFIG_CONNECTION_STRING: $(AZURE_APP_CONFIG_CONNECTION_STRING)
+        AZDO_PROJECT: $(System.TeamProject)
+        COMPONENT_NAME: $(Build.Repository.Name)
+        PROJECT_ID: $(System.TeamProjectId)
+        COMPONENT_ID: $(Build.Repository.ID)
+        FEATURE_STAGE: 'fortify'
+        SECURITY_GATE_CLI_ARGS: "--debug"
+    - script: |
+        pipelineTechArg=""
+
+        if [ -n "${PIPELINE_TECH}" ]; then
+            pipelineTechArg="--pipeline-tech ${PIPELINE_TECH}"
+        fi
+        echo '##[debug] Fortify Analysis'
+        echo "##[command]
+          ./securitygatecli scan \
+            --project \"${AZDO_PROJECT}\" \
+            --project-id ${PROJECT_ID} \
+            --id ${COMPONENT_ID} \
+            --name \"${COMPONENT_NAME}\" \
+            --scan-central-path ${SCAN_CENTRAL_PATH} \
+            --fortify-log-dir $(Agent.TempDirectory) \
+            ${pipelineTechArg} ${SECURITY_GATE_CLI_ARGS}
+        "
+        ./securitygatecli scan \
+          --project "${AZDO_PROJECT}" \
+          --project-id ${PROJECT_ID} \
+          --id ${COMPONENT_ID} \
+          --name "${COMPONENT_NAME}" \
+          --scan-central-path ${SCAN_CENTRAL_PATH} \
+          --fortify-log-dir $(Agent.TempDirectory) \
+          ${pipelineTechArg} ${SECURITY_GATE_CLI_ARGS}
+        cat $(Agent.TempDirectory)/fortify.log
+      displayName: 'Run Fortify Analysis'
+      condition: and(succeeded(), eq(variables['check_ff.FORTIFY_ENABLED'], 'true'))
+      env:
+        AZURE_APP_CONFIG_CONNECTION_STRING: $(AZURE_APP_CONFIG_CONNECTION_STRING)
+        FORTIFY_API_KEY: $(FORTIFY_API_KEY)
+        API_KEY: $(CONVISO_API_KEY)
+        AZDO_PROJECT: $(System.TeamProject)
+        COMPONENT_NAME: $(Build.Repository.Name)
+        PROJECT_ID: $(System.TeamProjectId)
+        COMPONENT_ID: $(Build.Repository.ID)
+        SECURITY_GATE_CLI_ARGS: ''
+        PIPELINE_TECH: $(PIPELINE_TECH)
+        SCAN_CENTRAL_PATH: /devops/fortify/scancentral/22.1.0/bin/scancentral
+        ASDF_JAVA_VERSION: "openjdk-11.0.2"
+    - template: /tech_products/hdop/templates/steps/download_nexus_artifact.yaml
+      parameters:
+        file: 'securitygatecli-linux-amd64'
+        folder: 'devops'
+        outputFilePath: 'securitygatecli'
+        version: $(SECURITY_GATE_CLI_VERSION)
+        chmod: 755
+    - script: |
+        SIGLA=$(echo ${AZDO_PROJECT} | cut -d' ' -f1)
+        if [[ "${SIGLA}" == "VVMY" ]]; then
+          echo "##[debug] SIGLA: ${SIGLA} -> Setting COMPANY_ID to 639."
+          export COMPANY_ID=639
+        elif [[ "${SIGLA}" == "VLSS" ]]; then
+          echo "##[debug] SIGLA: ${SIGLA} -> Setting COMPANY_ID to 862."
+          export COMPANY_ID=862
+        fi
+        echo "##[debug] Syncing Fortify with Covisio platform. Company ID: ${COMPANY_ID}"
+        echo "##[command]
+          ./securitygatecli sync \
+            --iterations ${CONVISO_SYNC_ITERATION} \
+            --project \"${AZDO_PROJECT}\" \
+            --project-id ${PROJECT_ID} \
+            --id ${COMPONENT_ID} \
+            --name \"${COMPONENT_NAME}\" \
+            --company-id ${COMPANY_ID} \
+            --fortify \
+            ${SECURITY_GATE_CLI_ARGS}
+        "
+        ./securitygatecli sync \
+          --iterations ${CONVISO_SYNC_ITERATION} \
+          --project "${AZDO_PROJECT}" \
+          --project-id ${PROJECT_ID} \
+          --id ${COMPONENT_ID} \
+          --name "${COMPONENT_NAME}" \
+          --company-id ${COMPANY_ID} \
+          --fortify \
+          ${SECURITY_GATE_CLI_ARGS}
+      displayName: 'Sync Fortify and Conviso Platform'
+      condition: and(succeeded(), eq(variables['check_ff.FORTIFY_ENABLED'], 'true'))
+      env:
+        AZURE_APP_CONFIG_CONNECTION_STRING: $(AZURE_APP_CONFIG_CONNECTION_STRING)
+        FORTIFY_API_KEY: $(FORTIFY_API_KEY)
+        API_KEY: $(CONVISO_API_KEY)
+        AZDO_PROJECT: $(System.TeamProject)
+        COMPONENT_NAME: $(Build.Repository.Name)
+        PROJECT_ID: $(System.TeamProjectId)
+        COMPONENT_ID: $(Build.Repository.ID)
+        COMPANY_ID: '439'
+        SECURITY_GATE_CLI_ARGS: '--debug'
+        CONVISO_SYNC_ITERATION: '10'

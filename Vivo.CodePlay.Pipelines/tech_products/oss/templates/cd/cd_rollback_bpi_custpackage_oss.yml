@@ -1,0 +1,304 @@
+parameters:
+- name: custArtifactsType
+  type: string
+  values:
+  - neo4jPlugins
+  - webWebapps
+  - neo4jScripts
+  - chetakScripts
+- name: environment
+- name: infrastructureType
+
+stages:
+- stage: cd_rollback
+  displayName: CD - Rollback ${{parameters['environment']}}
+  dependsOn:
+  - ${{ if or(eq(parameters.custArtifactsType, 'neo4jScripts'), eq(parameters.custArtifactsType, 'chetakScripts'))}}:
+    - cd_deploy
+  - ${{ else }}:
+    - environment_init
+    - ci_build
+    - cd_deploy
+  condition: in(dependencies.cd_deploy.result, 'Succeeded', 'SucceededWithIssues', 'Failed')
+  pool: $(AGENT_POOL_CD)
+  ## -> Loads variables from other stages.
+  variables:
+  - name: NEW_VERSION
+    value: $[ stageDependencies.ci_build.build.outputs['new_version.NEW_VERSION'] ]
+  - name: ARTIFACT_FILE
+    value: $[ stageDependencies.ci_build.build.outputs['artifact_name.ARTIFACT_FILE'] ]
+  - name: ARTIFACT_NAME
+    value: $[ stageDependencies.ci_build.build.outputs['artifact_name.ARTIFACT_NAME'] ]
+  - name: NAMESPACE_CUSTARTIFACTS
+    value: $[ stageDependencies.cd_deploy.deploy.outputs['deploy.set_custpackage_namespace.namespace_custartifacts'] ]
+
+  jobs:
+  - deployment: rollback
+    displayName: Rollback ${{parameters['environment']}}
+    condition: eq(stageDependencies.cd_deploy.deploy.outputs['deploy.backup_custartifacts.BACKUP_CUSTARTIFACTS_SUCCEEDED'],'true')
+    workspace:
+      clean: all
+    environment: rollback-${{parameters['environment']}}
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          ## -> Skip Download
+          - download: none
+
+          ## -> Download custpackage backup
+          - task: DownloadBuildArtifacts@1
+            displayName: 'Download CustPackage'
+            inputs:
+              artifactName: custpackage_backup
+              cleanDestinationFolder: true
+              extractTars: false
+              parallelizationLimit: 8
+              downloadPath: $(System.ArtifactsDirectory)
+
+          ## -> Log in to kubernetes
+          - task: Kubernetes@1
+            displayName: Kubernetes Cluster Login
+            inputs:
+              connectionType: 'Kubernetes Service Connection'
+              kubernetesServiceEndpoint: 'kube-${{ parameters.infrastructureType }}-${{ parameters.environment }}'
+              command: 'login'
+
+          ## -> Rollback to custpackage backup
+          - task: Bash@3
+            name: rollback_custpackage
+            displayName: 'Rollback Custpackage'
+            inputs:
+              targetType: 'inline'
+              script: |
+
+                # Starting Rollback Custpackage
+                echo "##[section]==================== Starting Rollback Custpackage ======================="
+                echo "##[debug] Namespace: $(NAMESPACE_CUSTARTIFACTS)"
+
+                # shopt to enable the use of alias to set namespace and kubeconfig default
+                shopt -s expand_aliases
+                alias kubectl='kubectl --namespace=$(NAMESPACE_CUSTARTIFACTS) --kubeconfig=$(secureFile.secureFilePath) --insecure-skip-tls-verify'
+
+                cluster_name=$(kubectl config current-context)
+
+                #set variable with path to custpackage-bkp.tar
+                custpackageFile="$(System.ArtifactsDirectory)/custpackage_backup/custpackage-bkp.tar"
+
+                # export var to report deploy task
+                echo "##vso[task.setvariable variable=CLUSTER_NAME;]$cluster_name"
+
+                echo "##[debug] Starting the deployment of $ARTIFACT_FILE within the pod(s) located in the $(NAMESPACE_CUSTARTIFACTS) namespace of $cluster_name cluster"
+                echo "##[command]Getting custartifacts pods..."
+                custartifacts_pods=$(kubectl get pods --all-namespaces | grep -E "\scustartifacts-" | awk '{print $2}' | tr '\n' ' ')
+
+                # check if custartifacts_pods is empty
+                if [[ -z "$custartifacts_pods" ]]; then
+                  echo "##vso[task.logissue type=error]it was not possible to get custartifacts pods"
+                  exit 1;
+                fi
+
+                echo -e "\e[33mKubernetes Cluster  : $cluster_name"
+                echo -e "\e[33mNamespace           : $(NAMESPACE_CUSTARTIFACTS)"
+                echo -e "\e[33mPods                : $custartifacts_pods"
+
+                # export custartifacts_pods var to report deploy task
+                echo "##vso[task.setvariable variable=CUSTARTIFACTS_PODS;]$custartifacts_pods"
+
+                # check if custpackge.tar exist
+                if [ ! -f $custpackageFile ]; then
+                  echo "##vso[task.logissue type=error]The file custartifacts.tar could not be found. Please verify if the download was successful."
+                  exit 1
+                fi
+
+                echo "##[group]List custpackage-bkp.tar in $custpackageFile:"
+                ls -l $custpackageFile
+                echo "##[endgroup]"
+
+                echo "##[debug] The pods of custartifacts: $custartifacts_pods"
+
+                # Start Rollback
+                for pod_name in $custartifacts_pods; do
+                  echo "##[section]==================== Rollback Custpackage in $pod_name ======================="
+
+                  # Control file verification to prevent concurrent deployments.
+                  retries=0
+
+                  while kubectl exec -i $pod_name -- sh -c 'ls -lrtR /bp2/tmp/azuredevopsdeploy.log' &>/dev/null && [ $retries -lt 3 ]
+                  do
+                    echo "##[debug] There is another custartifacts deployment process currently in progress. Waiting 40 seconds to try again..."
+                    sleep 40
+                    ((retries++))
+                  done
+
+                  if [ $retries -eq 3 ]; then
+                    echo "##vso[task.logissue type=error] Please verify if there is another custartifacts deployment process currently in progress. If not, check whether the control file /bp2/tmp/azuredevopsdeploy.log exists in the pod $pod_name"
+                    exit 1
+                  fi
+                  # end control file
+
+                  # Logic to check if the control file error is not due to the pod being inaccessible.
+                  status=$(kubectl get pods $pod_name -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')
+                  if [ "$status" != "True" ]; then
+                    echo "##vso[task.logissue type=error] Pod is $pod_name Not ready."
+                    exit 1
+                  fi
+
+                  # create control file
+                  nohup kubectl exec -i $pod_name -- sh -c 'echo "arquivo de controle deploy" > /bp2/tmp/azuredevopsdeploy.log && sleep 90 && rm -f /bp2/tmp/azuredevopsdeploy.log' > /dev/null 2>&1 &
+                  # end of control logic
+
+                  echo "##[command]Deleting the old custpackage-bkp.tar file in pod /bp2/tmp/ directory in the pod $pod_name"
+                  kubectl exec -i $pod_name -- sh -c 'rm -rf /bp2/tmp/custpackage-bkp.tar'
+
+                  echo "##[group]List custpackage running before rollback in $pod_name"
+                  kubectl exec -i $pod_name -- sh -c 'ls -lrtR /bp2/data/cust_process/cust/asset/custpackage/'
+                  echo "##[endgroup]"
+
+                  echo "##[group]List the SyncS3 directory before copy in the pod $pod_name"
+                  kubectl exec -i $pod_name -- sh -c "ls -l /bp2/tmp/deploy/custpackage_backup/" || { echo "##vso[task.logissue type=warning]The directory /bp2/tmp/deploy/custpackage_backup/ does not exist, This likely indicates that the entire ‘custpackage’ has not been deployed. Therefore, directory will be created."; }
+                  echo "##[endgroup]"
+
+                  echo "##[command]Deleting the custpackage directory in the pod $pod_name"
+                  kubectl exec -i $pod_name -- sh -c 'rm -rf /bp2/data/cust_process/cust/asset/custpackage/'
+
+                  echo "##[command]Deleting the SyncS3 directory in the pod $pod_name"
+                  kubectl exec -i $pod_name -- sh -c 'rm -rf /bp2/tmp/deploy/custpackage_backup/'
+
+                  echo "##[command]Creating the custpackage directory in the pod $pod_name"
+                  kubectl exec -i $pod_name -- sh -c 'mkdir -p /bp2/data/cust_process/cust/asset/custpackage/'
+
+                  echo "##[command]Creating the SyncS3 directory in the pod $pod_name"
+                  kubectl exec -i $pod_name -- sh -c 'mkdir -p /bp2/tmp/deploy/custpackage_backup/'
+
+                  echo "##[command]Coping custpackage-bkp.tar to pod /bp2/tmp directory in the pod $pod_name"
+                  kubectl cp $custpackageFile $pod_name:/bp2/tmp/custpackage-bkp.tar
+
+                  echo "##[group]List custpackage-bkp.tar /bp2/tmp directory in the pod $pod_name"
+                  kubectl exec -i $pod_name -- sh -c 'ls -lrtR /bp2/tmp/custpackage-bkp.tar'
+                  echo "##[endgroup]"
+
+                  echo -e "##[group]\e[34mExtract custpackage-bkp.tar to /bp2/data/cust_process/cust/asset/custpackage/ in the pod $pod_name"
+                  kubectl exec -i $pod_name -- sh -c 'tar -xvf /bp2/tmp/custpackage-bkp.tar -C /bp2/data/cust_process/cust/asset/custpackage/'
+                  echo "##[endgroup]"
+
+                  echo -e "##[group]\e[34mExtract custpackage-bkp.tar to /bp2/tmp/deploy/custpackage_backup/ in the pod $pod_name"
+                  kubectl exec -i $pod_name -- sh -c 'tar -xvf /bp2/tmp/custpackage-bkp.tar -C /bp2/tmp/deploy/custpackage_backup/'
+                  echo "##[endgroup]"
+
+                  echo "##[command]Chmod the .sh files"
+                  kubectl exec -i $pod_name -- bash -c "find /bp2/data/cust_process/cust/asset/custpackage/ -name '*.sh' | xargs -r chmod +x"
+
+                  ##########
+
+                  # S3CMD
+                  echo "##[command]Running S3CMD in the pod $pod_name"
+                  kubectl exec $pod_name -c app -- bash -c "s3cmd -r sync --no-preserve /bp2/tmp/deploy/custpackage_backup/ s3://bpinv-artifacts/custpackage/"
+
+                  ##########
+
+                  echo "##[group]List custpackage running after deploy in the pod $pod_name"
+                  kubectl exec -i $pod_name -- sh -c 'ls -lrtR /bp2/data/cust_process/cust/asset/custpackage/'
+                  echo "##[endgroup]"
+                done
+                
+                echo "##[debug] Waiting a minute before restarting all pods."
+                sleep 60
+                
+                # Restarting Custartifacts Pods
+                echo "##[section]==================== Deleting Custartifacts Pods ======================="
+                echo "##[debug] Deleting pods for deploy... Pods list $custartifacts_pods "
+                kubectl delete pods $custartifacts_pods
+                echo "##[debug] Delete done. Waiting 30s for pods to get ready..."
+                sleep 30
+
+                for pod_name in $custartifacts_pods; do
+                  echo "##[section]==================== Verifying Status of Pod $pod_name ======================="
+
+                  echo "##[command]Verifying the pod $pod_name status..."
+                  # timeout in seconds
+                  TIMEOUT=300
+
+                  # Set timeout for pod readiness
+                  end=$((SECONDS+TIMEOUT))
+
+                  # Loop until status true or timeout
+                  until [ "$status" == "True" ] || [ $SECONDS -ge $end ]; do
+                    # get the status Readiness from pod
+                    status=$(kubectl get pods $pod_name -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')
+
+                    if [ "$status" != "True" ]; then
+                      echo "##[debug] Pod $pod_name is currently NOT in the ready state. A recheck will be performed after a pause of 30 seconds."
+                      sleep 30
+                    fi
+                  done
+
+                  # check status after the loop
+                  if [ "$status" == "True" ]; then
+                    echo "##[debug] Deployment to $pod_name done, $pod_name is ready."
+
+                    #save var with success
+                    pods_success="$pods_success $pod_name"
+
+                    echo "##[group]Custpackage Startup logs"
+                    kubectl exec -i $pod_name -- bash -c "tail -n 100 /bp2/log/Upgrade.log /bp2/log/process_log/custartifacts/cust_process_log.log"
+                    echo "##[endgroup]"
+                  else
+                    echo "##[group]Custpackage Startup logs"
+                    kubectl exec -i $pod_name -- bash -c "tail -n 200 /bp2/log/Upgrade.log /bp2/log/process_log/custartifacts/cust_process_log.log"
+                    echo "##[endgroup]"
+
+                    # If the timeout is reached and the pod is still not ready, exit with failure
+                    echo "##vso[task.logissue type=error]Pod $pod_name is currently is NOT ready after $TIMEOUT seconds."
+                    exit 1
+                  fi
+                done
+
+                # Export var to report deploy task
+                echo "##vso[task.setvariable variable=PODS_SUCCESS;]$pods_success"
+
+                echo -e "\e[33m============================== Rollback Result ============================="
+                echo -e "\e[33mCustpackage Pods : $(echo $custartifacts_pods | tr ' ' ',')"
+                echo -e "\e[33mSuccessful Pods  : $(echo $pods_success | tr ' ' ',')"
+                echo -e "\e[33m=============================================================================="
+
+          ## -> Logout of kubernetes
+          - task: Kubernetes@1
+            displayName: Kubernetes Cluster Logout
+            condition: always()
+            continueOnError: true
+            timeoutInMinutes: 1            
+            inputs:
+              command: 'logout'
+        on:
+          success:
+            steps:
+            ## -> if rollback succeeded log successful message and set pipeline tag
+            - task: Bash@3
+              displayName: Rollback Success
+              name: t_success_message
+              inputs:
+                targetType: inline
+                script: |
+                  echo "##[section] ================================================================================================================================="
+                  echo "##[section]                                                      ROLLBACK WAS SUCCESSFUL! "
+                  echo "##[section] ================================================================================================================================="
+
+                  ## -> Set Pipeline Tag
+                  echo "##vso[build.addbuildtag]rollback-$(environment)=succeeded"
+
+          ## -> if rollback was failed log failure message and set pipeline tag
+          failure:
+            steps:
+            - task: Bash@3
+              displayName: Rollback Failure
+              name: t_failure_message
+              inputs:
+                targetType: inline
+                script: |
+                  echo "##[error] ================================================================================================================================="
+                  echo "##[error]                                                    ROLLBACK WAS NOT SUCCESSFUL! "
+                  echo "##[error] ================================================================================================================================="
+
+                  ## -> Set Pipeline Tag
+                  echo "##vso[build.addbuildtag]rollback-$(environment)=failed"

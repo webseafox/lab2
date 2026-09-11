@@ -1,0 +1,75 @@
+parameters:
+  - name: environment
+    type: string
+  - name: createGitTag
+    type: boolean
+    default: true
+
+stages:
+- stage: Publish
+  displayName: Publish
+  variables:
+    - name: APP_VERSION
+      value: $[ stageDependencies.build_test.bump_version.outputs['component_bump_version.LIB_NEW_VERSION'] ]
+  dependsOn:
+    - security
+    - gate
+    - build_test
+  pool: $(PRIVATE_AGENT_DEFAULT)
+  jobs:
+    - job: pre_publish
+      displayName: "Pre-publish"
+      condition: succeeded()
+      steps:
+        - template: /tech_products/srus/tasks/maven/lib_publish_custom_settings_export.yml
+          parameters:
+            mavenSettingsContentOutputVarName: "MAVEN_LIB_CUSTOM_SETTINGS_CONTENT"
+            mavenIsSettingsCustomOutputVarName: "MAVEN_LIB_IS_SETTINGS_CUSTOM"
+
+    - deployment: publish
+      displayName: Publish Library
+      dependsOn: pre_publish
+      condition: succeeded()
+      variables:
+        - name: MAVEN_LIB_CUSTOM_SETTINGS_CONTENT
+          value: $[ dependencies.pre_publish.outputs['custom_settings_export.MAVEN_LIB_CUSTOM_SETTINGS_CONTENT'] ]
+        - name: MAVEN_LIB_IS_SETTINGS_CUSTOM
+          value: $[ dependencies.pre_publish.outputs['custom_settings_export.MAVEN_LIB_IS_SETTINGS_CUSTOM'] ]
+      workspace:
+        clean: all
+      environment: ${{ parameters.environment }}
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+              - download: none
+
+              - template: /tech_products/srus/tasks/maven/lib_publish_custom_settings_import.yml
+                parameters:
+                  mavenCustomSettingsContent: $(MAVEN_LIB_CUSTOM_SETTINGS_CONTENT)
+                  condition: eq(variables['MAVEN_LIB_IS_SETTINGS_CUSTOM'], 'true')
+
+              - template: /tech_products/srus/task_groups/publish/maven_lib_publish.yml
+          on:
+            success:
+              steps:
+                - template: /tech_products/srus/provisioners/app/trunkbased/java/lib_default/steps/publish/success.yml
+                  parameters:
+                    createGitTag: ${{ parameters.createGitTag }}
+                - template: /tech_products/srus/tasks/telemetry/telemetry.yml
+                
+            failure:
+              steps:
+                - template: /tech_products/srus/provisioners/app/trunkbased/java/lib_default/steps/publish/failure.yml
+                - template: /tech_products/srus/tasks/telemetry/telemetry.yml
+
+    - job: push_repo_version_bump
+      displayName: "Push/tag version bump"
+      dependsOn: publish
+      condition: eq(variables.BUMP_VERSION_ENABLED, true)
+      steps:
+        - template: /tech_products/srus/tasks/maven/update_repo_version.yml
+          parameters:
+            newVersion: "$(APP_VERSION)"
+            condition: eq(variables.BUMP_VERSION_ENABLED, true)
+            createGitTag: ${{ parameters.createGitTag }}

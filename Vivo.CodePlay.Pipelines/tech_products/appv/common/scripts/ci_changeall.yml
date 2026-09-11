@@ -1,0 +1,402 @@
+## ========================================================================
+## Pipeline para Alteração em Massa de Variáveis em Grupos de Recursos
+## ========================================================================
+## Esta pipeline permite alterar valores de variáveis em grupos de recursos
+## de todas as libraries de um projeto específico.
+##
+## Parâmetros:
+##   - projectName: Nome EXATO do projeto no Azure DevOps
+##   - variableChange: String no formato "CHAVE:VALOR" onde:
+##       * CHAVE = Nome da variável no grupo de recursos
+##       * VALOR = Novo valor a ser atribuído
+##   - specificRepository: Nome exato do grupo de variáveis (opcional)
+##
+## Pré-requisitos:
+##   1. Criar grupo de variáveis: 'edit-library' (ou ajustar o nome abaixo em variables: group)
+##   2. Adicionar variável AZURE_DEVOPS_PAT (secreta) com um PAT válido
+##   3. PAT deve ter permissões: Variable Groups (Read & manage)
+##   4. Nome do projeto deve ser EXATO (case-sensitive)
+##
+## Exemplo de uso:
+##   projectName: "FRBR - FRAMEWORK BRASIL"  # Nome exato do projeto
+##   variableChange: "NODEJS_VERSION:18.x"
+##   specificRepository: ""  # vazio = todos os grupos src.src
+## ========================================================================
+
+parameters:
+  - name: projectName
+    displayName: 'Nome do Projeto'
+    type: string
+    default: ''
+    values:
+      - FRBR - FRAMEWORK BRASIL
+      - APPV - APP VIVO
+      - APPV - Microservicosmeuvivo
+      - APPV - Microservicos4p
+  
+  - name: variableChange
+    displayName: 'Variável a Alterar (formato: CHAVE:VALOR)'
+    type: string
+    default: ''
+  
+  - name: specificRepository
+    displayName: 'Repositório Específico (deixe vazio para todos)'
+    type: string
+    default: ''
+  - name: dryRun
+    displayName: 'Dry Run (não aplicar alterações)'
+    type: boolean
+    default: true
+  - name: executionMode
+    displayName: 'Modo de Execução'
+    type: string
+    default: 'MASSIVO'
+    values:
+      - MASSIVO
+      - UNICO
+  - name: groupCategory
+    displayName: 'Escopo de Grupos (bff/front/ms/todos/unico)'
+    type: string
+    default: 'todos'
+    values:
+      - bff
+      - front
+      - ms
+      - todos
+      - unico
+
+trigger: none
+pr: none
+
+pool:
+  name: GeneralPurposeLinuxAgentsCD
+
+variables:
+  - name: AZURE_DEVOPS_ORG
+    value: 'https://dev.azure.com/telefonica-vivo-brasil/'
+  - group: 'edit-library'
+
+jobs:
+- job: editar_variaveis
+  displayName: 'Editar variável em grupo(s) de recurso'
+  steps:
+    # 1. Validação de parâmetros e definição de modo
+    - task: Bash@3
+      name: validar
+      displayName: 'Validar parâmetros / Definir modo'
+      inputs:
+        targetType: inline
+        script: |
+          set -e
+          echo "============================================================"
+          echo "VALIDAÇÃO DE PARÂMETROS"
+          echo "============================================================"
+
+          PROJETO='${{ parameters.projectName }}'
+          VAR_CHANGE='${{ parameters.variableChange }}'
+          GRUPO_RECURSO='${{ parameters.specificRepository }}'
+          DRY_RUN='${{ parameters.dryRun }}'
+          GROUP_CATEGORY='${{ parameters.groupCategory }}'
+
+          if [ -z "$VAR_CHANGE" ]; then
+            echo "##[error] Parâmetro variableChange obrigatório (formato CHAVE:VALOR)."; exit 1
+          fi
+          # Suporte a múltiplos pares separados por vírgula ou ponto-e-virgula
+          # Exemplos:
+          #   NODE_VERSION:20.x,JAVA_VERSION:17;FEATURE_FLAG:true
+          #   NODE_VERSION:20.x;JAVA_VERSION:17,FEATURE_FLAG:true
+          PAIRS_RAW="$VAR_CHANGE"
+          # Normalizar delimitadores: vírgula ou ponto-e-virgula -> quebra de linha
+          PAIRS_NORMALIZADO=$(echo "$PAIRS_RAW" | sed -E 's/[;,]/\n/g')
+          if [[ "$PAIRS_NORMALIZADO" != *":"* ]]; then
+            echo "##[error] Formato inválido. Cada entrada deve conter CHAVE:VALOR."; exit 1
+          fi
+          > pairs.txt
+          TOTAL_PAIRS=0
+          while IFS= read -r LINHA; do
+            [ -z "$LINHA" ] && continue
+            LINHA_TRIM=$(echo "$LINHA" | sed 's/^ *//;s/ *$//')
+            if [[ "$LINHA_TRIM" != *":"* ]]; then
+              echo "##[error] Entrada sem ':' => $LINHA_TRIM"; exit 1
+            fi
+            CHAVE=$(echo "$LINHA_TRIM" | cut -d':' -f1)
+            VALOR=$(echo "$LINHA_TRIM" | cut -d':' -f2-)
+            CHAVE=$(echo "$CHAVE" | sed 's/^ *//;s/ *$//')
+            VALOR=$(echo "$VALOR" | sed 's/^ *//;s/ *$//')
+            if [ -z "$CHAVE" ] || [ -z "$VALOR" ]; then
+              echo "##[error] Chave ou valor vazios em linha: $LINHA_TRIM"; exit 1
+            fi
+            echo "$CHAVE:::${VALOR}" >> pairs.txt
+            TOTAL_PAIRS=$((TOTAL_PAIRS+1))
+          done <<< "$PAIRS_NORMALIZADO"
+          if [ $TOTAL_PAIRS -eq 0 ]; then
+            echo "##[error] Nenhum par chave:valor válido identificado."; exit 1
+          fi
+          echo "Total de pares identificados: $TOTAL_PAIRS"
+
+          MODO='${{ parameters.executionMode }}'
+          # Se o novo parâmetro groupCategory = unico, forçamos modo UNICO
+          if [ "$GROUP_CATEGORY" = "unico" ]; then
+            MODO="UNICO"
+          fi
+          if [ "$MODO" = "UNICO" ]; then
+            if [ -z "$GRUPO_RECURSO" ]; then
+              echo "##[error] Modo UNICO selecionado mas 'specificRepository' não foi informado."; exit 1
+            fi
+            if [[ "$GRUPO_RECURSO" != src* ]]; then
+              echo "##[error] Grupo informado deve iniciar com 'src'. Valor atual: $GRUPO_RECURSO"; exit 1
+            fi
+          else
+            # MASSIVO
+            if [ -z "$PROJETO" ]; then
+              echo "##[error] Para execução MASSIVA é necessário escolher um projeto."; exit 1
+            fi
+            # Normalizar e validar nome do projeto (tolerante a caixa e espaços extras)
+            PROJETO_TRIM=$(echo "$PROJETO" | sed 's/^ *//;s/ *$//')
+            PROJETO_UP=$(echo "$PROJETO_TRIM" | tr '[:lower:]' '[:upper:]')
+            case "$PROJETO_UP" in
+              "APPV - APP VIVO")                PROJETO="APPV - APP VIVO" ;;
+              "FRBR - FRAMEWORK BRASIL")        PROJETO="FRBR - FRAMEWORK BRASIL" ;;
+              "APPV - MICROSERVICOSMEUVIVO")    PROJETO="APPV - Microservicosmeuvivo" ;;
+              "APPV - MICROSERVICOS4P")         PROJETO="APPV - Microservicos4p" ;;
+              *) echo "##[error] Projeto inválido: $PROJETO_TRIM"; echo "Aceitos: APPV - APP VIVO | FRBR - FRAMEWORK BRASIL | APPV - Microservicosmeuvivo | APPV - Microservicos4p"; exit 1 ;;
+            esac
+              if [ -n "$GRUPO_RECURSO" ]; then
+                echo "##[warning] Campo 'specificRepository' será ignorado em modo MASSIVO (valor informado: $GRUPO_RECURSO)."
+              fi
+              GRUPO_RECURSO=""  # garantir vazio para etapas posteriores
+          fi
+
+          # Normalizar DRY_RUN para 'true' ou 'false'
+          RAW_DRY="$DRY_RUN"
+          DRY_RUN=$(echo "$DRY_RUN" | tr '[:upper:]' '[:lower:]')
+          case "$DRY_RUN" in
+            true|1|yes|y) DRY_RUN="true" ;;
+            false|0|no|n|"") DRY_RUN="false" ;;
+            *) echo "##[warning] Valor inesperado para dryRun ('$RAW_DRY'). Assumindo 'false'."; DRY_RUN="false" ;;
+          esac
+
+          echo "Modo de execução: $MODO (categoria: $GROUP_CATEGORY)"
+          echo "Projeto: $PROJETO"
+          echo "Grupo (se modo UNICO): $GRUPO_RECURSO"
+          echo "Pares de variáveis (primeiro exibido):"
+          head -1 pairs.txt | awk -F':::' '{print $1 " -> " $2}'
+          echo "Total pares: $TOTAL_PAIRS"
+          echo "Dry-run: $DRY_RUN"
+
+          echo "##vso[task.setvariable variable=MODO]$MODO"
+          echo "##vso[task.setvariable variable=PROJETO]$PROJETO"
+          echo "##vso[task.setvariable variable=GRUPO_RECURSO]$GRUPO_RECURSO"
+          echo "##vso[task.setvariable variable=PAIRS_PATH]$(System.DefaultWorkingDirectory)/pairs.txt"
+          echo "##vso[task.setvariable variable=TOTAL_PAIRS]$TOTAL_PAIRS"
+          echo "##vso[task.setvariable variable=DRY_RUN]$DRY_RUN"
+          echo "##vso[task.setvariable variable=GROUP_CATEGORY]$GROUP_CATEGORY"
+
+    # 2. Instalar CLI / autenticar
+    - task: Bash@3
+      name: auth
+      displayName: 'Instalar Azure DevOps CLI e autenticar'
+      env:
+        AZURE_DEVOPS_PAT: $(AZURE_DEVOPS_PAT)
+      inputs:
+        targetType: inline
+        script: |
+          set -e
+          if ! command -v az >/dev/null 2>&1; then
+            echo "Instalando Azure CLI..."
+            curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+          fi
+          if ! az extension show --name azure-devops >/dev/null 2>&1; then
+            az extension add --name azure-devops
+          fi
+          if [ -z "$AZURE_DEVOPS_PAT" ]; then
+            echo "##[error] Variável AZURE_DEVOPS_PAT não encontrada no grupo 'edit-library'."; exit 1
+          fi
+          echo $AZURE_DEVOPS_PAT | az devops login --organization $(AZURE_DEVOPS_ORG) 2>&1 | grep -v WARNING || true
+          echo "Autenticado na organização: $(AZURE_DEVOPS_ORG)"
+
+    # 3. Listar grupos alvo (massivo) ou validar único
+    - task: Bash@3
+      name: preparar
+      displayName: 'Preparar lista de grupos alvo'
+      inputs:
+        targetType: inline
+        script: |
+          set -e
+          MODO="$(MODO)"
+          PROJETO="$(PROJETO)"
+          GRUPO_RECURSO="$(GRUPO_RECURSO)"
+          GROUP_CATEGORY="$(GROUP_CATEGORY)"
+          echo "Modo: $MODO"
+          if [ "$MODO" = "UNICO" ]; then
+            echo "$GRUPO_RECURSO" > grupos.txt
+            echo "Grupo único: $GRUPO_RECURSO"
+            echo "##vso[task.setvariable variable=GROUPS_ENCONTRADOS]1"
+          else
+            echo "Listando grupos do projeto: $PROJETO"
+            GRUPOS_JSON=$(az pipelines variable-group list --org $(AZURE_DEVOPS_ORG) --project "$PROJETO" -o json)
+            QTDE_TOTAL=$(echo "$GRUPOS_JSON" | jq 'length')
+            echo "Total retornado (todos): $QTDE_TOTAL"
+            # Aplicar filtro conforme categoria
+            case "$GROUP_CATEGORY" in
+              bff)
+                FILTRADOS=$(echo "$GRUPOS_JSON" | jq -r '.[] | select(.name | startswith("src") and contains("bff")) | .name')
+                ;;
+              front)
+                FILTRADOS=$(echo "$GRUPOS_JSON" | jq -r '.[] | select(.name | startswith("src") and contains("front")) | .name')
+                ;;
+              ms)
+                FILTRADOS=$(echo "$GRUPOS_JSON" | jq -r '.[] | select(.name | startswith("src") and contains("-ms")) | .name')
+                ;;
+              todos)
+                # todos os grupos (mantendo padrão anterior de prefixo src? requisito diz todos -> remover startswith se quiser tudo)
+                FILTRADOS=$(echo "$GRUPOS_JSON" | jq -r '.[] | .name')
+                ;;
+              *)
+                # fallback para prefixo src
+                FILTRADOS=$(echo "$GRUPOS_JSON" | jq -r '.[] | select(.name | startswith("src")) | .name')
+                ;;
+            esac
+            if [ -z "$FILTRADOS" ]; then
+              echo "##[error] Nenhum grupo iniciando com 'src' encontrado no projeto $PROJETO"; echo "" > grupos.txt; echo "##vso[task.setvariable variable=GROUPS_ENCONTRADOS]0"; exit 1
+            else
+              echo "$FILTRADOS" > grupos.txt
+              QTDE_FILTRADOS=$(echo "$FILTRADOS" | wc -l | tr -d ' ')
+              echo "Grupos filtrados (prefixo 'src'): $QTDE_FILTRADOS"
+              echo "$FILTRADOS"
+              echo "##vso[task.setvariable variable=GROUPS_ENCONTRADOS]$QTDE_FILTRADOS"
+            fi
+          fi
+          echo "##vso[task.setvariable variable=GRUPOS_PATH]$(System.DefaultWorkingDirectory)/grupos.txt"
+
+    # 4. (Modo único) Capturar valor atual da variável antes de atualizar
+    - task: Bash@3
+      name: valor_atual
+      displayName: 'Capturar valor atual (modo único)'
+      condition: eq(variables.MODO, 'UNICO')
+      inputs:
+        targetType: inline
+        script: |
+          set -e
+          PROJETO="$(PROJETO)"
+          GRUPO="$(GRUPO_RECURSO)"
+          PAIRS_FILE="$(PAIRS_PATH)"
+          if [ -z "$GRUPO" ]; then echo "##[error] Grupo não informado para modo UNICO."; exit 1; fi
+          if [ ! -f "$PAIRS_FILE" ]; then echo "##[error] Arquivo de pares não encontrado: $PAIRS_FILE"; exit 1; fi
+          ID=$(az pipelines variable-group list --org $(AZURE_DEVOPS_ORG) --project "$PROJETO" --query "[?name=='$GRUPO'].id" -o tsv)
+          if [ -z "$ID" ]; then echo "##[error] Grupo $GRUPO não encontrado."; exit 1; fi
+          echo "Capturando valores atuais das variáveis no grupo: $GRUPO"
+          CURRENT_VALUES=""
+          while IFS= read -r PAR; do
+            [ -z "$PAR" ] && continue
+            CHAVE=$(echo "$PAR" | cut -d':' -f1)
+            CHAVE=$(echo "$PAR" | cut -d':' -f1 | sed 's/:::.*//')
+            CHAVE=$(echo "$PAR" | cut -d':' -f1)  # garantia
+            VALOR_DESEJADO=$(echo "$PAR" | awk -F':::' '{print $2}')
+            [ -z "$CHAVE" ] && continue
+            EXISTE=$(az pipelines variable-group variable list --group-id $ID --org $(AZURE_DEVOPS_ORG) --project "$PROJETO" --query "$CHAVE.value" -o tsv 2>/dev/null || true)
+            if [ -z "$EXISTE" ]; then
+              echo " - $CHAVE: (não existe)"
+              CURRENT_VALUES+="$CHAVE=(não existe)\n"
+            else
+              echo " - $CHAVE: $EXISTE"
+              CURRENT_VALUES+="$CHAVE=$EXISTE\n"
+            fi
+          done < "$PAIRS_FILE"
+          CURRENT_VALUES_EXPORT=$(echo -e "$CURRENT_VALUES" | tr '\n' ';')
+          echo "##vso[task.setvariable variable=VALOR_ATUAL]$CURRENT_VALUES_EXPORT"
+
+    # 5. Atualizar variável( s )
+    - task: Bash@3
+      name: atualizar
+      displayName: 'Aplicar atualização de variável'
+      env:
+        AZURE_DEVOPS_PAT: $(AZURE_DEVOPS_PAT)
+      inputs:
+        targetType: inline
+        script: |
+          set -e
+          PROJETO="$(PROJETO)"; MODO="$(MODO)"; GRUPOS_FILE="$(GRUPOS_PATH)"; DRY_RUN="$(DRY_RUN)"; PAIRS_FILE="$(PAIRS_PATH)"; TOTAL_PAIRS="$(TOTAL_PAIRS)"
+          if [ ! -f "$GRUPOS_FILE" ]; then echo "##[error] Arquivo de grupos não encontrado: $GRUPOS_FILE"; exit 1; fi
+          if [ ! -f "$PAIRS_FILE" ]; then echo "##[error] Arquivo de pares não encontrado: $PAIRS_FILE"; exit 1; fi
+          TOTAL_SUCESSO=0; TOTAL_FALHA=0; TOTAL_PROCESSADOS=0
+          echo "Dry-run: $DRY_RUN"
+          APLICOU="true"
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "[DRY-RUN] Nenhuma alteração será aplicada. Apenas simulação."
+            APLICOU="false"
+          fi
+          while IFS= read -r GRUPO; do
+            [ -z "$GRUPO" ] && continue
+            TOTAL_PROCESSADOS=$((TOTAL_PROCESSADOS+1))
+            echo "---- Grupo: $GRUPO ----"
+            ID=$(az pipelines variable-group list --org $(AZURE_DEVOPS_ORG) --project "$PROJETO" --query "[?name=='$GRUPO'].id" -o tsv)
+            if [ -z "$ID" ]; then echo "Grupo não encontrado (skipping)."; TOTAL_FALHA=$((TOTAL_FALHA+1)); continue; fi
+            while IFS= read -r PAR; do
+              [ -z "$PAR" ] && continue
+              CHAVE=$(echo "$PAR" | cut -d':' -f1 | sed 's/:::.*//')
+              VALOR=$(echo "$PAR" | sed 's/^[^:]*::://')
+              # Ajustar extração correta
+              CHAVE=$(echo "$PAR" | cut -d':' -f1)
+              VALOR=$(echo "$PAR" | awk -F':::' '{print $2}')
+              [ -z "$CHAVE" ] && continue
+              echo "   > Processando variável: $CHAVE"
+              EXISTE=$(az pipelines variable-group variable list --group-id $ID --org $(AZURE_DEVOPS_ORG) --project "$PROJETO" --query "$CHAVE.value" -o tsv 2>/dev/null || true)
+              if [ -z "$EXISTE" ]; then
+                echo "      - Criar $CHAVE"
+                if [ "$DRY_RUN" = "true" ]; then
+                  echo "[DRY-RUN] az pipelines variable-group variable create --group-id $ID --name '$CHAVE' --value '***' --org $(AZURE_DEVOPS_ORG) --project '$PROJETO'"
+                  echo "[DRY-RUN] Simulado: criação da variável $CHAVE no grupo $GRUPO"
+                else
+                  az pipelines variable-group variable create --group-id $ID --name "$CHAVE" --value "$VALOR" --org $(AZURE_DEVOPS_ORG) --project "$PROJETO" 2>/dev/null || { echo "Falha ao criar $CHAVE"; TOTAL_FALHA=$((TOTAL_FALHA+1)); continue; }
+                  echo "      - Criada"
+                fi
+                TOTAL_SUCESSO=$((TOTAL_SUCESSO+1))
+              else
+                echo "      - Atualizar $CHAVE (valor anterior: $EXISTE)"
+                if [ "$DRY_RUN" = "true" ]; then
+                  echo "[DRY-RUN] az pipelines variable-group variable update --group-id $ID --name '$CHAVE' --value '***' --org $(AZURE_DEVOPS_ORG) --project '$PROJETO'"
+                  echo "[DRY-RUN] Simulado: atualização da variável $CHAVE no grupo $GRUPO"
+                else
+                  az pipelines variable-group variable update --group-id $ID --name "$CHAVE" --value "$VALOR" --org $(AZURE_DEVOPS_ORG) --project "$PROJETO" 2>/dev/null || { echo "Falha ao atualizar $CHAVE"; TOTAL_FALHA=$((TOTAL_FALHA+1)); continue; }
+                  echo "      - Atualizada"
+                fi
+                TOTAL_SUCESSO=$((TOTAL_SUCESSO+1))
+              fi
+            done < "$PAIRS_FILE"
+          done < "$GRUPOS_FILE"
+          echo "Processados: $TOTAL_PROCESSADOS | Sucesso: $TOTAL_SUCESSO | Falha: $TOTAL_FALHA"
+          echo "##vso[task.setvariable variable=TOTAL_PROCESSADOS]$TOTAL_PROCESSADOS"
+          echo "##vso[task.setvariable variable=TOTAL_SUCESSO]$TOTAL_SUCESSO"
+          echo "##vso[task.setvariable variable=TOTAL_FALHA]$TOTAL_FALHA"
+          echo "##vso[task.setvariable variable=APLICOU]$APLICOU"
+
+    # 6. Resumo final
+    - task: Bash@3
+      name: resumo
+      displayName: 'Resumo final'
+      inputs:
+        targetType: inline
+        script: |
+          echo "============================================================"
+          echo "RESUMO"
+          echo "============================================================"
+          echo "Modo: $(MODO)"
+          echo "Projeto: $(PROJETO)"
+            echo "Grupo único: $(GRUPO_RECURSO)"
+          echo "Total pares: $(TOTAL_PAIRS)"
+          echo "Arquivo de pares: $(PAIRS_PATH)"
+          echo "Dry-run: $(DRY_RUN)"
+          if [ "$(MODO)" = "UNICO" ]; then
+            echo "Valor anterior (se existia): $(VALOR_ATUAL)"
+          fi
+          echo "Total grupos processados: $(TOTAL_PROCESSADOS)"
+          echo "Sucessos (simulados ou reais): $(TOTAL_SUCESSO)"
+          echo "Falhas: $(TOTAL_FALHA)"
+          if [ "$(APLICOU)" = "false" ]; then
+            echo "Nenhuma alteração aplicada (modo dry-run)."
+          else
+            echo "Alterações aplicadas nos grupos com sucesso (onde não houve falha)."
+          fi
+          echo "============================================================"
+

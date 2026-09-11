@@ -1,0 +1,354 @@
+# ==================================================================
+# Pipeline: IVR Flow - CI/CD + Build & Deploy All (template unificado)
+# ------------------------------------------------------------------
+# Template único (uso via `extends`) que reúne os antigos ci.yml + cd.yml +
+# builddeployall.yml (removidos, substituídos por este arquivo):
+#   - Disparo Manual (Build.Reason == 'Manual'): roda o fluxo
+#     "Build & Deploy All" (builda e deploya TODOS os fluxos do repo,
+#     com aprovação manual prévia).
+#   - Qualquer outro disparo (push, etc.): roda o fluxo normal de
+#     CI (validação + build dos fluxos alterados) + CD (deploy hml).
+#
+# Uso no repositório consumidor (via extends):
+#   resources:
+#     repositories:
+#       - repository: CodePlay
+#         name: DevOps/Vivo.CodePlay.Pipelines
+#         type: git
+#         ref: refs/heads/<branch>
+#   extends:
+#     template: tech_products/was/ivrflow/ci-cd-hml.yml@CodePlay
+# ==================================================================
+
+stages:
+  # Build & Deploy All - executado apenas quando a pipeline é disparada manualmente
+  - ${{ if eq(variables['Build.Reason'], 'Manual') }}:
+    - stage: Build_Deploy_All
+      displayName: '🏗️ Build & Deploy All ${{ split(variables[''Build.SourceBranchName''],''_'')[0] }}'
+      condition: eq(variables['Build.Reason'], 'Manual')
+      pool: GeneralPurposeLinuxAgentsCI
+      jobs:
+      - job: waitForValidation
+        displayName: '⏳ Wait for external validation'
+        pool: server
+        timeoutInMinutes: 4320 # job times out in 3 days
+        steps:
+        - task: ManualValidation@0
+          inputs:
+            notifyUsers: '$(Build.RequestedForEmail)'
+            instructions: 'Deseja realizar o build e deploy de TODOS os fluxos presentes neste repositorio?'
+          timeoutInMinutes: 30
+      - job: Build
+        displayName: '🏗️ Build'
+        steps: 
+        - checkout: self
+          displayName: '🔄 Checkout code'
+          fetchDepth: 0
+        - task: DownloadSecureFile@1
+          name: md5
+          displayName: '🔐 Download secure file (md5)'
+          inputs:
+            secureFile: 'md5-controller.properties'
+        
+        - task: UniversalPackages@0
+          displayName: '⬇️ Download flow-generator'
+          inputs:
+            command: 'download'
+            downloadDirectory: '$(System.DefaultWorkingDirectory)/flow-generator'
+            feedsToUse: 'internal'
+            vstsFeed: '3d53bc62-8749-4931-ae46-a443b73bc87a'
+            vstsFeedPackage: 'd2384e59-012e-43e6-bd50-7b1834c79c76'
+            vstsPackageVersion: '0.0.*'
+        - script: |
+              ls $(System.DefaultWorkingDirectory)/flow-generator
+              mkdir -p $FILES_DIR/JSON
+              java -jar $(System.DefaultWorkingDirectory)/flow-generator/flow-generator.jar $PWD $FILES_DIR/JSON $(md5.secureFilePath) $(Build.BuildId) $SCP_DEST/$ESTEIRA
+          displayName: '🏗️ Build all flows (JSON)'
+
+        - publish: $(FILES_DIR)/JSON
+          artifact: json
+          displayName: '📤 Publish JSON artifact'
+        dependsOn: waitForValidation
+
+    - stage: security_scan
+      pool: GeneralPurposeLinuxAgentsCI
+      displayName: Security Scan
+      dependsOn: Build_Deploy_All
+      condition: succeeded('Build_Deploy_All')
+      jobs:
+      - job: AppSecConfigKeys
+        displayName: 'Get AppSec Config Keys'
+        steps:
+        - template: /security/get_appconfig_keys_framework.yml
+          parameters:
+            azureSubscription: DevOpsSharedResources
+            appConfigurationEndpoint: https://appcs-azdevops-shared.azconfig.io
+
+      - job: run_fortify
+        displayName: Run Fortify
+        dependsOn: AppSecConfigKeys
+        variables:
+          USE_FORTIFY: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.USE_FORTIFY'] ]
+          USE_CONVISO: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.USE_CONVISO'] ]
+          SKIP_SECURITY_GATE: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.SKIP_SECURITY_GATE'] ]
+          FORTIFY_APP_VERSION: $[ dependencies.AppSecConfigKeys.outputs['scan_version_name.FORTIFY_APP_VERSION'] ]
+        condition: and(succeeded(), eq(variables.USE_FORTIFY, 'true'))
+        steps:
+        - template: /security/define_appsec_app_version.yml
+
+        - template: /security/run_fortify_scan.yml
+          parameters:
+            vivoFlow: "DEV,EsteiraPreProd,EsteiraQA1,EsteiraQA2,EsteiraQA3,EsteiraQA4"
+            fortifyExclusionRepository: 'FortifyExclusion'
+            enableFortifyExclusions: false
+            appLanguage: 'java'
+            appVersion: '$(FORTIFY_APP_VERSION)'
+
+      - job: RunSCA
+        displayName: '🔍 Run SCA Scan'
+        dependsOn: AppSecConfigKeys
+        steps:
+        - template: /security/run_sca_scan.yml
+          parameters:
+            buildArtifactName: 'json'
+            appVersion: 'DevSecOps'
+            vivoFlow: 'EsteiraPreProd,EsteiraQA1,EsteiraQA2,EsteiraQA3,EsteiraQA4'
+            repositoryName: '$(Build.Repository.Name)'
+
+    - stage: Deploy
+      displayName: '🚚 Deploy to $(environment)'
+      pool: GeneralPurposeLinuxAgentsCD
+      dependsOn: security_scan
+      condition: succeeded('security_scan')
+      jobs:
+      - deployment: Deploy
+        displayName: '🚚 Deploy to $(environment)'
+        environment: 'deploy-dev'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+              - download: current
+                artifact: json
+                displayName: '⬇️ Download artifact'
+              - task: CopyFilesOverSSH@0
+                displayName: '📤 Transfer flows via SSH'
+                inputs:
+                  sshEndpoint: '$(SERVICE_CONNECTION)'
+                  sourceFolder: '$(Pipeline.Workspace)/json'
+                  contents: '**'
+                  targetFolder: '/opt/web/applications/ccenter/ura_movel/fluxos/$(SCP_DEST)'
+                  cleanTargetFolder: true
+                  readyTimeout: '20000'
+              
+              # Registro de deploy no Event Hub
+              - task: VivoEventHubTools@3
+                displayName: 'Registro de deploy no Event Hub'
+                condition: always() # A task passa o status do deploy
+                continueOnError: true
+                inputs:
+                  command: 'deploy'
+                  eventHubConnection: 'EVHCodeProd'
+                  componentVersion: '$(Build.BuildId)'
+                  deployArtifactName: 'json'
+                  deployArtifactType: 'artifact'
+                  deployEnvironmentType: 'ssh'
+                  deployEnvironmentName: 'dev'
+                  deployEnvironmentAccessUrl: '$(APPLICATION_URL)'
+                  annotations: 'deployment-path=/opt/web/applications/ccenter/ura_movel/fluxos/$(SCP_DEST),package-type=json'
+                  pipelineType: 'framework/deploy-ssh'
+
+  # CI/CD - executado em todos os outros casos (não manual)
+  - ${{ if ne(variables['Build.Reason'], 'Manual') }}:
+    - stage: Validate
+      pool: GeneralPurposeLinuxAgentsCI
+      displayName: '✅ Validate'
+      jobs:
+      - job: Validate
+        displayName: '✅ Validate'
+        steps:
+          - checkout: self
+            displayName: '🔄 Checkout code'
+            fetchDepth: 0
+          - task: UniversalPackages@0
+            displayName: '⬇️ Download flow-validator'
+            inputs:
+              command: 'download'
+              downloadDirectory: '$(System.DefaultWorkingDirectory)/flow-validator'
+              feedsToUse: 'internal'
+              vstsFeed: '3d53bc62-8749-4931-ae46-a443b73bc87a'
+              vstsFeedPackage: 'f03a6e06-bb85-4de7-8ef5-e642fd56dee6'
+              vstsPackageVersion: '0.0.*'
+
+          - script: |
+                set +x
+                echo "PipelineId: $(Build.BuildId)"
+                echo "URA/Branch: $SCP_DEST/$ESTEIRA"
+                echo "Processando arquivos alterados pelo commit"
+                mkdir -p $FILES_DIR/JSON
+                mkdir -p $FILES_DIR/TRANSACTION
+                mkdir -p $FILES_DIR/XSD
+
+                echo $(git diff-tree --no-commit-id --name-only -r HEAD)
+                for file in $(git diff-tree --no-commit-id --name-only -r HEAD); do
+                  echo "$file ---> $FILES_DIR"
+                  cp "$file" "$FILES_DIR/"
+                done
+
+                echo "Processando lista de audios"
+                # RISCO ACEITO: StrictHostKeyChecking=no necessário pois agents são efêmeros (sem known_hosts persistente)
+                sshpass -p "$SSH_QA_PASS" ssh -o StrictHostKeyChecking=no "$SSH_QA_USER@$IP" \
+                  "find $AUD_DIR -type f -name '*.wav'" > $FILES_DIR/audios_list.txt
+
+                echo "Processando script point"
+                sshpass -p "$SSH_QA_PASS" scp -o StrictHostKeyChecking=no \
+                  "$SSH_QA_USER@$IP:$SCRIPT_POINT_FILE_DIR" $FILES_DIR/LogURAConfig_ScriptsPoint.json
+
+                echo "Processando transaction file"
+                sshpass -p "$SSH_QA_PASS" scp -o StrictHostKeyChecking=no \
+                  "$SSH_QA_USER@$IP:$TRANSACTION_FILE_DIR" $FILES_DIR/TRANSACTION/transaction-config.xml
+
+                echo "Processando transaction xsd"
+                sshpass -p "$SSH_QA_PASS" scp -o StrictHostKeyChecking=no \
+                  "$SSH_QA_USER@$IP:$TRANSACTION_XSD" $FILES_DIR/XSD/transactionXSD.xsd
+
+                java -jar $(System.DefaultWorkingDirectory)/flow-validator/flow-validator.jar \
+                  $FILES_DIR $(Build.BuildId) $SCP_DEST/$ESTEIRA \
+                  $FILES_DIR $FILES_DIR/LogURAConfig_ScriptsPoint.json \
+                  $FILES_DIR/TRANSACTION $FILES_DIR/XSD
+            displayName: '✅ Validação de fluxos'
+            env:
+              SSH_QA_USER: $(SSH_QA_USER)
+              SSH_QA_PASS: $(SSH_QA_PASS)
+
+    - stage: Build
+      pool: GeneralPurposeLinuxAgentsCI
+      condition: succeeded('Validate')
+      displayName: '🏗️ Build ${{ split(variables[''Build.SourceBranchName''],''_'')[0] }}'
+      jobs:
+      - job: Build
+        displayName: '🏗️ Build'
+        steps:
+        - checkout: self
+          displayName: '🔄 Checkout code'
+          fetchDepth: 0
+        - task: UniversalPackages@0
+          displayName: '⬇️ Download flow-generator'
+          inputs:
+            command: 'download'
+            downloadDirectory: '$(System.DefaultWorkingDirectory)/flow-generator'
+            feedsToUse: 'internal'
+            vstsFeed: '3d53bc62-8749-4931-ae46-a443b73bc87a'
+            vstsFeedPackage: 'd2384e59-012e-43e6-bd50-7b1834c79c76'
+            vstsPackageVersion: '0.0.*'
+
+        - script: |
+              ls $(System.DefaultWorkingDirectory)/flow-generator
+              echo "Processando arquivos alterados pelo commit"
+              mkdir -p $FILES_DIR/JSON
+              for file in $(git diff-tree --no-commit-id --name-only -r HEAD); do
+                echo $file "--->" $FILES_DIR
+                cp $file $FILES_DIR
+              done
+              java -jar $(System.DefaultWorkingDirectory)/flow-generator/flow-generator.jar $FILES_DIR $FILES_DIR/JSON "" $(Build.BuildId) $SCP_DEST/$ESTEIRA
+          displayName: '🏗️ Build flows (JSON)'
+
+        - publish: $(FILES_DIR)/JSON
+          artifact: json
+          displayName: '📤 Publish JSON artifact'
+      dependsOn:
+        - Validate
+
+    - stage: security_scan
+      pool: GeneralPurposeLinuxAgentsCI
+      displayName: Security Scan
+      dependsOn:
+      - Build
+      condition: succeeded('Build')
+      jobs:
+      - job: AppSecConfigKeys
+        displayName: 'Get AppSec Config Keys'
+        steps:
+        - template: /security/get_appconfig_keys_framework.yml
+          parameters:
+            azureSubscription: DevOpsSharedResources
+            appConfigurationEndpoint: https://appcs-azdevops-shared.azconfig.io
+
+      - job: run_fortify
+        displayName: Run Fortify
+        dependsOn: AppSecConfigKeys
+        variables:
+          USE_FORTIFY: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.USE_FORTIFY'] ]
+          USE_CONVISO: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.USE_CONVISO'] ]
+          SKIP_SECURITY_GATE: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.SKIP_SECURITY_GATE'] ]
+          FORTIFY_APP_VERSION: $[ dependencies.AppSecConfigKeys.outputs['scan_version_name.FORTIFY_APP_VERSION'] ]
+        condition: and(succeeded(), eq(variables.USE_FORTIFY, 'true'))
+        steps:
+        - template: /security/define_appsec_app_version.yml
+
+        - template: /security/run_fortify_scan.yml
+          parameters:
+            vivoFlow: "DEV,EsteiraPreProd,EsteiraQA1,EsteiraQA2,EsteiraQA3,EsteiraQA4"
+            fortifyExclusionRepository: 'FortifyExclusion'
+            enableFortifyExclusions: false
+            appLanguage: 'java'
+            appVersion: '$(FORTIFY_APP_VERSION)'
+
+      - job: RunSCA
+        displayName: '🔍 Run SCA Scan'
+        dependsOn: AppSecConfigKeys
+        steps:
+        - template: /security/run_sca_scan.yml
+          parameters:
+            buildArtifactName: 'json'
+            appVersion: 'DevSecOps'
+            vivoFlow: 'EsteiraPreProd,EsteiraQA1,EsteiraQA2,EsteiraQA3,EsteiraQA4'
+            repositoryName: '$(Build.Repository.Name)'
+
+    - stage: Deploy
+      displayName: '🚀 Deploy ${{ split(variables[''Build.SourceBranchName''],''_'')[0] }}'
+      dependsOn: security_scan
+      condition: succeeded('security_scan')
+      jobs:
+
+      - deployment: Deploy
+        displayName: "🚚 Deploy to $(environment)"
+        environment: 'deploy-dev'
+        pool: GeneralPurposeLinuxAgentsCD
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+              - script: |
+                  if [ -d $(Pipeline.Workspace)/json ]; then
+                    echo "O diretório existe."
+                    rm -r $(Pipeline.Workspace)/json
+                  else
+                    echo "O diretório não existe."
+                  fi
+                displayName: '🗑️ Clear directory'
+              - download: current
+                artifact: json
+                displayName: '⬇️ Download artifact'
+              - task: CopyFilesOverSSH@0
+                displayName: '📤 Transfer JSON files to $(environment) via SSH'
+                inputs:
+                  sshEndpoint: '$(SERVICE_CONNECTION)'
+                  sourceFolder: '$(Pipeline.Workspace)/json'
+                  contents: '**'
+                  targetFolder: '/opt/web/applications/ccenter/ura_movel/fluxos/$(SCP_DEST)'
+                  readyTimeout: '20000' # string. Required. SSH handshake timeout. Default: 20000.
+              
+              - task: VivoEventHubTools@3
+                displayName: 'Registrar deploy no Event Hub'
+                condition: always()
+                continueOnError: true
+                inputs:
+                  command: 'deploy'
+                  eventHubConnection: 'EVHCodeProd'
+                  deployArtifactName: 'ura $(SCP_DEST)'
+                  deployArtifactType: 'file'
+                  deployEnvironmentType: 'ssh'
+                  deployEnvironmentName: 'qa'
+                  annotations: 'deployment-path=/opt/web/applications/ccenter/ura_movel/fluxos/$(SCP_DEST),full-deploy=true'
+                  pipelineType: 'tech_products/was/ivrflow'

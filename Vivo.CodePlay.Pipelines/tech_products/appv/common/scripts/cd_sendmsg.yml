@@ -1,0 +1,134 @@
+
+# azure-pipelines.yml
+# --------------------------------------------------------------------------
+# Pipeline: Send Message to Teams via Incoming Webhook
+# Description: Sends pipeline status notifications to Microsoft Teams
+# Author: DevOps Team
+# Created: 2026-01-08
+# --------------------------------------------------------------------------
+
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+      - release/*
+
+variables:
+  teamsWebhookUrl: 'https://telefonicacorp.webhook.office.com/webhookb2/d6e93e61-a639-4cae-b43c-71e80cca1f3a@9744600e-3e04-492e-baa1-25ec245c6f10/IncomingWebhook/8baf927fb231495e8697ffb6cf15998b/4ab0dbff-76b5-417b-b024-ce39298d9110/V2MVmsaWbCZOlwXuQyFXNtgfYBnVghTmKgQ20lZoDqn0U1'
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+stages:
+- stage: BuildAndTest
+  displayName: 'Build & Test'
+  jobs:
+  - job: Build
+    displayName: 'Executar build e testes'
+    steps:
+    - checkout: self
+
+    - script: |
+        echo "Simulando build..."
+        # Exemplo real: npm ci && npm run build
+      displayName: 'Build'
+
+    - script: |
+        echo "Simulando testes..."
+        # Exemplo real: npm test -- --ci
+      displayName: 'Testes'
+
+    - bash: |
+        set -euo pipefail
+
+        # Variáveis do Azure DevOps
+        BUILD_NAME='$(Build.DefinitionName)'
+        BUILD_ID='$(Build.BuildId)'
+        BUILD_NUMBER='$(Build.BuildNumber)'
+        PROJECT='$(System.TeamProject)'
+        REPO='$(Build.Repository.Name)'
+        BRANCH='$(Build.SourceBranch)'
+        COMMIT='$(Build.SourceVersion)'
+        REQUESTEDFOR='$(Build.RequestedFor)'
+        STATUS='$(Agent.JobStatus)'   # Succeeded / Failed / Canceled
+        STARTTIME='$(Build.StartTime)'
+        QUEUE_TIME='$(Build.QueuedTime)'
+        RUN_URL='$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)'
+        PIPELINE_URL='$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_build?definitionId=$(System.DefinitionId)'
+
+        # Normalizar STATUS
+        if [ -z "${STATUS}" ]; then
+          STATUS="Unknown"
+        fi
+
+        # Cor do card baseada no status
+        case "${STATUS}" in
+          Succeeded)
+            COLOR="2EB886"; EMOJI="✅" ;;
+          Failed)
+            COLOR="D00000"; EMOJI="❌" ;;
+          Canceled|Cancelled)
+            COLOR="808080"; EMOJI="🛑" ;;
+          *)
+            COLOR="FFA500"; EMOJI="⚠️" ;;
+        esac
+
+        # Formatar branch (remover refs/heads/)
+        CLEAN_BRANCH="${BRANCH#refs/heads/}"
+
+        # Construir JSON (MessageCard) com here-doc robusto
+        PAYLOAD="$(cat <<EOF
+        {
+          "@type": "MessageCard",
+          "@context": "https://schema.org/extensions",
+          "summary": "Status da Pipeline",
+          "themeColor": "${COLOR}",
+          "title": "${EMOJI} Pipeline \\"${BUILD_NAME}\\" finalizada: ${STATUS}",
+          "sections": [
+            {
+              "activityTitle": "📦 Projeto: **${PROJECT}**",
+              "activitySubtitle": "Repositório: **${REPO}**",
+              "facts": [
+                { "name": "Pipeline:", "value": "${BUILD_NAME}" },
+                { "name": "Build Number:", "value": "${BUILD_NUMBER}" },
+                { "name": "Build ID:", "value": "${BUILD_ID}" },
+                { "name": "Branch:", "value": "${CLEAN_BRANCH}" },
+                { "name": "Commit:", "value": "${COMMIT}" },
+                { "name": "Solicitado por:", "value": "${REQUESTEDFOR}" },
+                { "name": "Status:", "value": "${STATUS}" }
+              ],
+              "markdown": true
+            }
+          ],
+          "potentialAction": [
+            {
+              "@type": "OpenUri",
+              "name": "🔎 Ver resultados do build",
+              "targets": [
+                { "os": "default", "uri": "${RUN_URL}" }
+              ]
+            },
+            {
+              "@type": "OpenUri",
+              "name": "⚙️ Abrir pipeline",
+              "targets": [
+                { "os": "default", "uri": "${PIPELINE_URL}" }
+              ]
+            }
+          ]
+        }
+        EOF
+        )"
+
+        # Diagnóstico breve
+        echo "STATUS=${STATUS}"
+        echo "Payload (head):"
+        echo "${PAYLOAD}" | head -n 10
+
+        # Enviar para Teams
+        curl -sS -H 'Content-Type: application/json' \
+             -d "${PAYLOAD}" \
+             '$(teamsWebhookUrl)'
+      displayName: 'Notificar Teams (Incoming Webhook)'
+      condition: succeededOrFailed()

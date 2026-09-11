@@ -1,0 +1,810 @@
+# ==================================================================
+# Pipeline: Build VSIX Extension (VSCode) - CI para Extensões Visual Studio Code
+# ==================================================================
+#
+# Este pipeline realiza o build, empacotamento e publicação do artefato .vsix
+# de extensões para o Visual Studio Code Marketplace.
+# O artefato gerado é publicado como Universal Package no Azure Artifacts,
+# podendo ser consumido pelo pipeline de CD (deploy-vsix-vscode-extension).
+#
+# ==================================================================
+# CARACTERÍSTICAS PRINCIPAIS:
+# ==================================================================
+# • Build automatizado com Node.js e npm
+# • Empacotamento em formato .vsix via vsce
+# • Publicação como Universal Package no Azure Artifacts
+# • Quality Gate via SonarQube
+# • Testes unitários e cobertura de código
+# • Validação de conteúdo de documentação (detecção de placeholders)
+# • Suporte a Trunk-based, GitLabFlow e demais estratégias
+#
+# ==================================================================
+# PRÉ-REQUISITOS:
+# ==================================================================
+# • Arquivo .nvmrc no repositório
+# • Arquivo package.json com campos name, displayName e publisher
+# • Feed configurado no Azure Artifacts para publicação do Universal Package
+#
+# ==================================================================
+# EXEMPLO DE USO - TRUNK BASED DEVELOPMENT:
+# ==================================================================
+# name: '[$(Date:yyyyMMdd)$(Rev:.r)]'
+#
+# trigger:
+#   branches:
+#     include:
+#       - master
+#
+# resources:
+#   repositories:
+#     - repository: CodePlay
+#       name: DevOps/Vivo.CodePlay.Pipelines
+#       type: git
+#       ref: refs/heads/master
+#
+# extends:
+#   template: /framework/pipelines/ci/build-vsix-vscode-extension/pipeline.yaml@CodePlay
+#   parameters:
+#     enableTest: true
+#     enableCoverage: true
+#
+# ==================================================================
+# EXEMPLO DE USO - GITLABFLOW:
+# ==================================================================
+# name: '[$(Date:yyyyMMdd)$(Rev:.r)]'
+#
+# trigger:
+#   branches:
+#     include:
+#       - master
+#       - develop
+#
+# resources:
+#   repositories:
+#     - repository: CodePlay
+#       name: DevOps/Vivo.CodePlay.Pipelines
+#       type: git
+#       ref: refs/heads/master
+#
+# extends:
+#   template: /framework/pipelines/ci/build-vsix-vscode-extension/pipeline.yaml@CodePlay
+#   parameters:
+#     branchingStrategy: gitlabflow
+#
+# ==================================================================
+
+parameters:
+  # ==================================================================
+  # Infraestrutura e Ambiente
+  # ==================================================================
+  - name: agentPool
+    type: string
+    default: GeneralPurposeLinuxAgentsCI
+    displayName: 'Agent Pool para execução'
+
+  # ==================================================================
+  # Parâmetros para habilitar capacidades do Pipeline
+  # ==================================================================
+  # Habilita execução do linter para análise de qualidade de código
+  - name: enableLint
+    type: boolean
+    default: true
+    displayName: 'Executar Linter'
+
+  # Habilita execução do build e transpilação do código
+  - name: enableBuild
+    type: boolean
+    default: true
+    displayName: 'Executar Build'
+
+  # Habilita execução dos testes unitários
+  - name: enableTest
+    type: boolean
+    default: true
+    displayName: 'Executar Testes'
+
+  # Habilita execução da análise de cobertura de código
+  - name: enableCoverage
+    type: boolean
+    default: true
+    displayName: 'Executar Cobertura'
+
+  # Quando true, executa apenas lint/build/test sem publicar nem versionar.
+  # Ideal para validação em Pull Requests.
+  - name: prValidationOnly
+    type: boolean
+    default: false
+    displayName: 'Executar apenas validação (sem publicar versão)'
+
+  # ==================================================================
+  # Publicação no Azure Artifacts (Universal Package)
+  # ==================================================================
+  # Nome do feed de Universal Packages onde o .vsix será publicado.
+  - name: feedName
+    type: string
+    default: '3d53bc62-8749-4931-ae46-a443b73bc87a'
+    displayName: 'Nome ou ID do feed no Azure Artifacts (Universal Packages)'
+
+  # Nome do pacote publicado no feed.
+  - name: packageName
+    type: string
+    default: '$(Build.Repository.Name)'
+    displayName: 'Nome do pacote no Azure Artifacts'
+
+  # Quando true, o feed tem escopo de projeto; quando false, escopo de organização.
+  # O feed padrão (3d53bc62-...) é de organização — manter false.
+  - name: projectScopedFeed
+    type: boolean
+    default: false
+    displayName: 'Feed com escopo de projeto (true) ou organização (false)'
+
+  # ==================================================================
+  # Configurações do SonarQube
+  # ==================================================================
+  - name: runQualityGate
+    type: boolean
+    default: true
+    displayName: 'Executar Quality Gate (SonarQube)'
+
+  - name: useSonarConfigFile
+    type: boolean
+    default: true
+    displayName: 'Usar arquivo de configuração do SonarQube?'
+
+  - name: sonarConfigFilePath
+    type: string
+    default: '.azuredevops/sonar-project.properties'
+    displayName: 'Caminho do arquivo de configuração do SonarQube'
+
+  - name: sonarPollingTimeoutSec
+    type: string
+    default: '300'
+    displayName: 'Timeout do Polling SonarQube (s)'
+
+  - name: sonarJavaVersion
+    type: string
+    default: 'openjdk-17.0.2'
+    displayName: 'Versão do Java para análise SonarQube'
+    values:
+      - 'openjdk-21.0.2'
+      - 'openjdk-17.0.2'
+      - 'openjdk-11.0.2'
+
+  # ==================================================================
+  # Service Connection do SonarQube
+  # Hoje ainda permite referenciar manualmente o Sonar VIP ou comum.
+  # Será depreciado em breve (história futura) para aderir à governança da ADR 0006.
+  # ==================================================================
+  - name: sonarServiceConnection
+    type: string
+    default: 'VIVO_SONARQUBE'
+    displayName: '(DEPRECATED) Service Connection do SonarQube'
+
+  - name: sonarQualityGate
+    type: string
+    default: 'AzureDevOps-Default'
+    displayName: 'Quality Gate do SonarQube'
+
+  - name: sonarScannerMode
+    type: string
+    default: 'cli'
+    displayName: 'Modo do scanner SonarQube'
+    values:
+      - 'cli'
+      - 'dotnet'
+
+  - name: sonarProjectKey
+    type: string
+    default: '$(System.TeamProject)-$(Build.Repository.Name)'
+    displayName: 'Chave do projeto no SonarQube'
+
+  - name: sonarProjectName
+    type: string
+    default: '$(System.TeamProject)-$(Build.Repository.Name)'
+    displayName: 'Nome do projeto no SonarQube'
+
+  - name: useAppConfig
+    type: boolean
+    default: true
+    displayName: 'Usar Azure App Configuration para SonarQube'
+
+  # ==================================================================
+  # Configurações de Segurança
+  # ==================================================================
+  - name: enableFortifyExclusions
+    displayName: 'Faz checkout do repositório Fortify Exclusions'
+    type: boolean
+    default: false
+
+  - name: useNetworkProxy
+    type: boolean
+    default: false
+    displayName: 'Configurar proxy de rede para acesso externo (se necessário)'
+
+  - name: buildArtifactName
+    type: string
+    default: $(Build.Repository.Name)
+    displayName: 'Nome do artefato de build para SCA Scan'
+
+  # ==================================================================
+  # Configurações de Versionamento
+  # ==================================================================
+  - name: branchingStrategy
+    type: string
+    default: 'trunkbased'
+    displayName: 'Estratégia de versionamento'
+    values:
+      - 'trunkbased'
+      - 'vivoflow'
+      - 'releaseflow'
+      - 'gitlabflow'
+      - 'gitlabflow-semantic'
+      - 'custom'
+      - 'monorepo'
+
+  - name: versionFiles
+    type: string
+    default: ''
+    displayName: >
+      Arquivos de versionamento personalizados
+      separados por quebra de linha '\n' ou ponto e vírgula ';'
+      Ex: 'package.json;task'
+
+variables:
+  - name: SIGLA
+    value: $[ lower(split(variables['System.TeamProject'],' ')[0]) ]
+
+  # Variáveis utilizadas por templates de Segurança (Fortify/SCA)
+  - name: AKV_DEVOPS_NAME
+    value: 'kv-azdevops-shared'
+
+  - name: CACORP_LOCATION
+    value: $(Agent.HomeDirectory)/../../certs/CACORP.pem
+
+  - name: APP_LANGUAGE
+    value: 'nodejs'
+
+  - name: FORTIFY_APP_DEFAULT_VERSION
+    value: DevSecOps
+
+# ==================================================================
+# ESTRUTURA DO PIPELINE
+# ==================================================================
+# STAGE 1 - Build:
+#   - Validação de documentação
+#   - Cálculo de versão (nextVersion)
+#   - Setup Node.js + autenticação NPM
+#   - Extração de metadados da extensão
+#   - Lint, Build, Testes, Cobertura
+#   - Empacotamento .vsix (tfx ou vsce) — skip se prValidationOnly
+#   - Publicação dos artifacts (vsix + build-output para SonarQube)
+#
+# STAGE 2 - QualityGate (skip se runQualityGate=false):
+#   - SonarQube Analysis
+#
+# STAGE 3 - SecurityAnalysis (paralelo ao QualityGate):
+#   - AppSecConfigKeys: obtém flags de segurança do App Configuration
+#   - FortifyScan (SAST): análise estática — condicional via flag USE_FORTIFY
+#   - SCAScan: análise de composição — condicional via flag USE_DEPENDENCY_TRACK
+#
+# STAGE 4 - Publish (skip se prValidationOnly=true):
+#   - Publicação do .vsix como Universal Package no Azure Artifacts
+#
+# STAGE 5 - VersionCommit (skip se prValidationOnly=true):
+#   - Commit e tag da versão no repositório
+# ==================================================================
+stages:
+  # ==================================================================
+  # STAGE 1: Build
+  # ==================================================================
+  - stage: Build
+    displayName: 'Build & Test'
+    jobs:
+      - job: build
+        displayName: 'Install, Lint, Build & Test'
+        pool: ${{ parameters.agentPool }}
+        steps:
+          # Categorização do build
+          - script: |
+              echo "##vso[build.addbuildtag]nodejs"
+              echo "##vso[build.addbuildtag]vscode"
+              echo "##vso[build.addbuildtag]extension"
+              echo "##vso[build.addbuildtag]ci-framework"
+              echo "##vso[build.addbuildtag]build-vsix-extension"
+              echo "##vso[build.addbuildtag]vsix"
+            displayName: 'Set Build Tags'
+
+          - checkout: self
+            fetchDepth: 1
+            persistCredentials: true
+
+          # AVISO TEMPORÁRIO: Este bloco será removido após a remoção definitiva do parâmetro 'sonarServiceConnection'.
+          # Exibe warning para quem ainda sobrescreve manualmente o parâmetro.
+          - ${{ if ne(parameters.sonarServiceConnection, 'VIVO_SONARQUBE') }}:
+            - script: |
+                echo "##vso[task.logissue type=warning]O parâmetro 'sonarServiceConnection' está depreciado e será removido após 30/06/2026. Consulte ADR 0006 e ADR 0008 para detalhes. A escolha da instância Sonar será automática via custom task e vip.json. Atualize seu pipeline!"
+                echo "##vso[task.logissue type=warning]ADR 0006: https://dev.azure.com/telefonica-vivo-brasil/DevOps/_git/Vivo.CodePlay.Pipelines?path=/doc/adr/0006-uso-do-sonar.md"
+                echo "##vso[task.logissue type=warning]ADR 0008: https://dev.azure.com/telefonica-vivo-brasil/DevOps/_git/Vivo.CodePlay.Pipelines?path=/framework/docs/adr/0008-sonar-vip-governance.md"
+                echo "##vso[task.complete result=SucceededWithIssues;]"
+              displayName: '⚠️ AVISO: Depreciação do sonarServiceConnection'
+
+          # Validação de conteúdo obrigatório nos arquivos de documentação
+          - task: AzdoTaskRegexValidateContentFromVivo@1
+            displayName: 'Validate Documentation Files'
+            inputs:
+              globPattern: '{CONTRIBUTING.md,README.md}'
+              regexPattern: '<!-- MUDAR_AQUI:.*?-->'
+              failMode: 'failOnFound'
+              regexFlags: 's'
+              verbose: true
+              skipFileErrors: false
+              errorMessage: "É necessário alterar os arquivos CONTRIBUTING.md e README.md com o conteúdo específico de sua extensão antes de publicar."
+
+          # Cálculo da próxima versão semântica.
+          # passthroughVersion=true (prValidationOnly): retorna a versão atual do arquivo
+          # sem calcular next version — compatível com branches de PR.
+          # passthroughVersion=false (normal): calcula a próxima versão semântica real.
+          - task: VersionManagerVivo@8
+            displayName: 'Next Version'
+            inputs:
+              command: 'nextVersion'
+              branchingStrategy: ${{ parameters.branchingStrategy }}
+              fileStrategy: 'customTask'
+              ${{ if ne(parameters.versionFiles, '') }}:
+                versionFiles: '${{ parameters.versionFiles }}'
+              ${{ else }}:
+                versionFiles: 'package.json'
+              passthroughVersion: '${{ parameters.prValidationOnly }}'
+            name: VersionManagerVivo
+
+          # Setup do Node.js baseado no .nvmrc
+          - task: NodeTool@0
+            displayName: 'Setup Node.js Environment'
+            inputs:
+              versionSource: 'fromFile'
+              versionFilePath: '.nvmrc'
+
+          # Autenticação com registries npm
+          - task: npmAuthenticate@0
+            displayName: 'Authenticate NPM Registry'
+            inputs:
+              workingFile: ".npmrc"
+
+          ### MUDAR PARA VERSION MANAGER NO FUTURO ###
+          # Extração de metadados da extensão
+          - task: JsonParseFromVivo@4
+            displayName: 'Extract Extension Metadata (VSCode)'
+            inputs:
+              type: 'file'
+              origin: './package.json'
+              jpaths: |
+                var VSSEXTENSION_JSON_ID = .name
+                var VSSEXTENSION_JSON_NAME = .displayName
+                var VSSEXTENSION_JSON_PUBLISHER = .publisher
+
+          # Instalação de dependências
+          - task: Npm@1
+            displayName: 'Install Dependencies'
+            inputs:
+              command: 'install'
+
+          # Lint
+          - task: Npm@1
+            condition: and( succeeded(), ${{ parameters.enableLint }} )
+            displayName: 'Run Code Linter'
+            inputs:
+              command: 'custom'
+              customCommand: 'run lint'
+
+          # Build
+          - task: Npm@1
+            condition: and( succeeded(), ${{ parameters.enableBuild }} )
+            displayName: 'Build and Transpile Code'
+            inputs:
+              command: 'custom'
+              customCommand: 'run build'
+
+          # Testes unitários
+          - script: |
+              command="test"
+              if [[ ${ENABLE_COVERAGE} == "True" ]]; then
+                echo "[debug] ENABLE_COVERAGE is set to True"
+                command="coverage"
+              fi
+              echo "[debug] Running unit tests..."
+              set -o pipefail
+              echo "##[command] npm run ${command}"
+              npm run ${command} 2>&1 | sed 's/##//g'
+              TEST_EXIT=${PIPESTATUS[0]}
+              echo "[debug] Original exit code: $TEST_EXIT"
+              if [ "$TEST_EXIT" -eq 0 ]; then
+                echo "##vso[task.complete result=Succeeded;]DONE"
+                exit 0
+              else
+                echo "##vso[task.logissue type=error]Testes falharam (exit code $TEST_EXIT)."
+                exit $TEST_EXIT
+              fi
+            condition: and( succeeded(), or( ${{ parameters.enableTest }}, ${{ parameters.enableCoverage }} ) )
+            displayName: 'Run Unit Tests'
+            env:
+              ENABLE_COVERAGE: ${{ parameters.enableCoverage }}
+
+          # Cobertura de código
+          - task: PublishCodeCoverageResults@2
+            condition: and( always(), ${{ parameters.enableCoverage }} )
+            displayName: 'Publish Code Coverage'
+            inputs:
+              summaryFileLocation: '**/lcov.info'
+              failIfCoverageEmpty: false
+
+          # Resultados de testes
+          - task: PublishTestResults@2
+            condition: and( always(), ${{ parameters.enableTest }} )
+            displayName: 'Publish Test Results'
+            inputs:
+              testResultsFormat: 'JUnit'
+              testResultsFiles: '**/test-results.xml'
+              mergeTestResults: true
+              failTaskOnFailedTests: false
+              testRunTitle: 'Unit Tests'
+
+          # Empacotamento do .vsix (apenas quando não é prValidationOnly)
+          - ${{ if eq(parameters.prValidationOnly, false) }}:
+            - script: |
+                VERSION="$(VersionManagerVivo.VERSION)"
+                echo "##[section]Packaging VSCode Extension version: ${VERSION}"
+                # --no-git-tag-version: não cria tag git durante empacotamento.
+                # Sem --no-update-package-json: vsce atualiza package.json no disco com a
+                # versão correta, garantindo que nome do arquivo E manifesto interno do
+                # VSIX reflitam a versão calculada. O package.json é excluído do
+                # build-output (CopyFiles abaixo) para evitar drift no QualityGate.
+                npx --yes @vscode/vsce package --no-git-tag-version "${VERSION}"
+              displayName: 'Package VSCode Extension (vsce)'
+
+            # Localiza o arquivo .vsix gerado
+            - script: |-
+                VSIX_FILE=$(ls *.vsix | head -n 1)
+                echo "##[debug] VSIX_FILE: $VSIX_FILE"
+                if [ -z "$VSIX_FILE" ]; then
+                  echo "##vso[task.logissue type=error]Nenhum arquivo .vsix encontrado."
+                  exit 1
+                fi
+                echo "##vso[task.setvariable variable=VSIX_FILE;isOutput=true]${VSIX_FILE}"
+              displayName: 'Find VSIX File'
+              name: PackageStep
+
+            # Publica o .vsix como pipeline artifact para o stage Publish
+            - task: PublishPipelineArtifact@1
+              displayName: 'Publish VSIX Artifact'
+              inputs:
+                targetPath: $(PackageStep.VSIX_FILE)
+                artifactName: 'vsix'
+                publishLocation: 'pipeline'
+
+          # Publica build output (sem node_modules) para uso no stage QualityGate (lcov.info)
+          # package.json é excluído para evitar que a versão atualizada pelo vsce cause
+          # drift no nextVersion do QualityGate (que fará checkout limpo do repo).
+          - task: CopyFiles@2
+            displayName: 'Prepare Build Output (exclude node_modules)'
+            inputs:
+              sourceFolder: '$(Build.SourcesDirectory)'
+              contents: |
+                **/*
+                !node_modules/**
+                !.git/**
+                !package.json
+              targetFolder: '$(Build.ArtifactStagingDirectory)/build-output'
+              flattenFolders: false
+
+          # Artefato único reutilizado por QualityGate (lcov.info) e SCAScan
+          - task: PublishPipelineArtifact@1
+            displayName: 'Publish Build Artifact'
+            inputs:
+              targetPath: '$(Build.ArtifactStagingDirectory)/build-output'
+              artifactName: '${{ parameters.buildArtifactName }}'
+              publishLocation: 'pipeline'
+
+#############################################################################
+# CAPACIDADE: QUALITY GATE (SONARQUBE)
+#############################################################################
+# Descrição: Análise estática de código e quality gate
+# Documentação: https://dvps-dev.redecorp.azr/portal/codeplay/capacidades/catalog/quality-gate
+# Pré-requisitos:
+#   - Service Connection 'SonarQube' configurada
+#   - Projeto configurado no SonarQube
+# Configuração: Parâmetro 'runQualityGate' = true
+# Observações: Não executa em Pull Requests
+#############################################################################
+  # ==================================================================
+  # STAGE 2: QualityGate
+  # Executa análise SonarQube após o build.
+  # Não executa se runQualityGate=false.
+  # ==================================================================
+  - ${{ if eq(parameters.runQualityGate, true) }}:
+    - stage: QualityGate
+      displayName: 'Quality Gate (SonarQube)'
+      dependsOn: Build
+      condition: succeeded()
+      jobs:
+        - job: sonar
+          displayName: 'SonarQube Analysis'
+          pool: ${{ parameters.agentPool }}
+          steps:
+            - checkout: self
+              fetchDepth: 1
+
+            # Baixa o build output para restaurar relatórios de cobertura (lcov.info)
+            - task: DownloadPipelineArtifact@2
+              displayName: 'Download Build Output (coverage reports)'
+              inputs:
+                artifactName: '${{ parameters.buildArtifactName }}'
+                targetPath: '$(Build.SourcesDirectory)'
+
+            # Recalcula a versão para o SonarQube.
+            # passthroughVersion=true (prValidationOnly): retorna a versão atual do arquivo
+            # sem calcular next version — compatível com branches de PR.
+            # passthroughVersion=false (normal): calcula a próxima versão semântica real.
+            - task: VersionManagerVivo@8
+              displayName: 'Next Version'
+              inputs:
+                command: 'nextVersion'
+                branchingStrategy: ${{ parameters.branchingStrategy }}
+                fileStrategy: 'customTask'
+                ${{ if ne(parameters.versionFiles, '') }}:
+                  versionFiles: '${{ parameters.versionFiles }}'
+                ${{ else }}:
+                  versionFiles: 'package.json'
+                passthroughVersion: '${{ parameters.prValidationOnly }}'
+              name: VersionManagerVivo
+
+            # Resolve a versão final para o SonarQube.
+            # Fallback para 0.0.1 caso o repositório ainda não possua versão definida.
+            - script: |
+                VERSION="$(VersionManagerVivo.VERSION)"
+                if [ -z "$VERSION" ]; then
+                  echo "##[warning]Versão não encontrada. Usando 0.0.1 como fallback para o SonarQube."
+                  VERSION="0.0.1"
+                fi
+                echo "##vso[task.setvariable variable=SONAR_VERSION]$VERSION"
+              displayName: 'Resolve Sonar Version'
+
+            - task: SonarAnalysisFromVivo@4
+              displayName: 'SonarQube Full Analysis'
+              inputs:
+                command: 'analysis'
+                SonarQubeVip: 'VIVO_SONARQUBE_VIP'
+                SonarQube: 'VIVO_SONARQUBE'
+                scannerMode: ${{ parameters.sonarScannerMode }}
+                ${{ if eq(parameters.useSonarConfigFile, true) }}:
+                  configFile: ${{ parameters.sonarConfigFilePath }}
+                cliProjectKey: ${{ parameters.sonarProjectKey }}
+                cliProjectName: ${{ parameters.sonarProjectName }}
+                cliProjectVersion: $(SONAR_VERSION)
+                qualityGate: ${{ parameters.sonarQualityGate }}
+                acronym: $(SIGLA)
+                reportPath: '$(Agent.TempDirectory)/sonar/$(Build.BuildId)/report-task.txt'
+                pollingTimeoutSec: ${{ parameters.sonarPollingTimeoutSec }}
+                useOpaRepository: 'true'
+                codePlayServiceConnection: 'CodePlay'
+                opaProject: 'DVPS - DEVOPS'
+                opaRepository: 'Vivo.OpenPolicy.SonarQube'
+                opaBranch: 'master'
+                useAppConfig: ${{ parameters.useAppConfig }}
+                azureSubscription: 'DevOpsSharedResources'
+                appConfigurationEndpoint: 'https://appcs-azdevops-shared.azconfig.io'
+                sonarUrlPemCertificate: $(Agent.HomeDirectory)/../../certs/CACORP.pem
+                extraProperties: |
+                  sonar.scanner.metadataFilePath=$(Agent.TempDirectory)/sonar/$(Build.BuildId)/report-task.txt
+                  sonar.qualitygate.wait=false
+                  sonar.qualitygate.timeout=${{ parameters.sonarPollingTimeoutSec }}
+                  sonar.javascript.lcov.reportPaths=**/lcov.info
+              env:
+                ASDF_JAVA_VERSION: ${{ parameters.sonarJavaVersion }}
+
+#############################################################################
+# CAPACIDADE: SECURITY ANALYSIS (SAST + SCA)
+#############################################################################
+# Descrição: Análise de segurança estática (Fortify/SAST) e composição de
+# software (Dependency Track/SCA), paralela ao QualityGate.
+# Documentação: https://dvps.redecorp.azr/portal/codeplay/capacidades/catalog/sast
+# Observações: Execução condicional via flags obtidas do App Configuration.
+#############################################################################
+  - stage: SecurityAnalysis
+    displayName: 'Security Analysis'
+    dependsOn: Build
+    condition: succeeded()
+    jobs:
+
+      - job: AppSecConfigKeys
+        displayName: 'Get AppSec Config Keys'
+        pool: ${{ parameters.agentPool }}
+        steps:
+        - template: /security/get_appconfig_keys_framework.yml
+          parameters:
+            azureSubscription: DevOpsSharedResources
+            appConfigurationEndpoint: https://appcs-azdevops-shared.azconfig.io
+            useNetworkProxy: ${{ parameters.useNetworkProxy }}
+
+# ==================================================================
+# CAPACIDADE: FORTIFY SCAN (SAST)
+# ==================================================================
+# Descrição: Análise estática de código (SAST) usando Fortify ScanCentral e SSC,
+# com integração à Conviso e publicação de artefatos.
+# Documentação: https://dvps.redecorp.azr/portal/codeplay/capacidades/catalog/sast
+# Observações: Exporta variáveis e publica artefatos para uso no Security Gate.
+# ==================================================================
+      - job: FortifyScan
+        displayName: 'Fortify Scan (SAST)'
+        dependsOn:
+        - AppSecConfigKeys
+        variables:
+          USE_FORTIFY: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.USE_FORTIFY'] ]
+          USE_CONVISO: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.USE_CONVISO'] ]
+          SKIP_SECURITY_GATE: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.SKIP_SECURITY_GATE'] ]
+          FORTIFY_LOCAL_SCANCENTRAL_VERSION: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.FORTIFY_LOCAL_SCANCENTRAL_VERSION'] ]
+        condition: and(succeeded(), eq(variables.USE_FORTIFY, true))
+        pool: ${{ parameters.agentPool }}
+        steps:
+        - template: /security/define_appsec_app_version.yml
+
+        - template: /security/run_fortify_scan.yml
+          parameters:
+            fortifyExclusionRepository: 'FortifyExclusion'
+            enableFortifyExclusions: ${{ parameters.enableFortifyExclusions }}
+            appLanguage: 'nodejs'
+            appVersion: '$(FORTIFY_APP_VERSION)' # OBS: FORTIFY_APP_VERSION é definida no template /security/define_appsec_app_version.yml
+
+# ==================================================================
+# CAPACIDADE: SCA SCAN (SCA)
+# ==================================================================
+# Descrição: Análise de composição de software (SCA) usando Dependency Track,
+# com integração à Conviso e publicação de artefatos.
+# Documentação: https://dvps.redecorp.azr/portal/codeplay/capacidades/catalog
+# Observações: Exporta variáveis e publica artefatos para uso no Security Gate.
+# ==================================================================
+      - job: SCAScan
+        displayName: 'SCA Scan'
+        dependsOn:
+        - AppSecConfigKeys
+        variables:
+          USE_DEPENDENCY_TRACK: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.USE_DEPENDENCY_TRACK'] ]
+          USE_DT_DOCKER: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.USE_DT_DOCKER'] ]
+          USE_CONVISO: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.USE_CONVISO'] ]
+          SKIP_SECURITY_GATE_SCA: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.SKIP_SECURITY_GATE_SCA'] ]
+        condition: and(
+                      succeeded(),
+                      eq(variables.USE_DEPENDENCY_TRACK, true)
+                    )
+        pool: ${{ parameters.agentPool }}
+        steps:
+        - template: /security/define_appsec_app_version.yml
+
+        - template: /security/run_sca_scan.yml
+          parameters:
+            appVersion: '$(FORTIFY_APP_VERSION)' # OBS: FORTIFY_APP_VERSION é definida no template /security/define_appsec_app_version.yml
+            buildArtifactName: ${{ parameters.buildArtifactName }}
+
+  # ==================================================================
+  # STAGE 4 + 5: Publish & VersionCommit
+  # Não executa em prValidationOnly.
+  # Publish depende do QualityGate quando runQualityGate=true.
+  # ==================================================================
+  - ${{ if eq(parameters.prValidationOnly, false) }}:
+    # ==================================================================
+    # STAGE 3: Publish
+    # Publica o .vsix como Universal Package no Azure Artifacts.
+    # ==================================================================
+    - stage: Publish
+      displayName: 'Publish to Azure Artifacts'
+      dependsOn:
+        - Build
+        - SecurityAnalysis
+        - ${{ if eq(parameters.runQualityGate, true) }}:
+          - QualityGate
+      condition: succeeded()
+      jobs:
+        - job: publish
+          displayName: 'Publish Universal Package'
+          pool: ${{ parameters.agentPool }}
+          variables:
+            # Reutiliza a versão calculada no stage Build (determinístico até o commitVersion)
+            VERSION: $[ stageDependencies.Build.build.outputs['VersionManagerVivo.VERSION'] ]
+          steps:
+            - checkout: none
+
+            # Baixa o .vsix gerado no stage Pack
+            - task: DownloadPipelineArtifact@2
+              displayName: 'Download VSIX Artifact'
+              inputs:
+                artifactName: 'vsix'
+                targetPath: '$(Pipeline.Workspace)/vsix'
+
+            # Publica no feed de Universal Packages do Azure Artifacts
+            - task: UniversalPackages@0
+              displayName: 'Publish VSIX to Azure Artifacts'
+              inputs:
+                command: 'publish'
+                publishDirectory: '$(Pipeline.Workspace)/vsix'
+                feedsToUsePublish: 'internal'
+                ${{ if eq(parameters.projectScopedFeed, true) }}:
+                  vstsFeedPublish: '$(System.TeamProject)/${{ parameters.feedName }}'
+                ${{ else }}:
+                  vstsFeedPublish: '${{ parameters.feedName }}'
+                vstsFeedPackagePublish: '${{ parameters.packageName }}'
+                versionOption: 'custom'
+                versionPublish: '$(VERSION)'
+                packagePublishDescription: |
+                  VSIX Extension (vscode) - $(Build.Repository.Name) v$(VERSION)
+                  Repositório: $(Build.Repository.Uri)?path=/README.md
+
+    # ==================================================================
+    # STAGE 4: VersionCommit
+    # Commit e tag da versão no repositório.
+    # Executa apenas após a publicação bem-sucedida no Artifacts.
+    # ==================================================================
+    - stage: VersionCommit
+      displayName: 'Commit Version'
+      dependsOn:
+        - Publish
+      condition: succeeded()
+      jobs:
+        - job: commitVersion
+          displayName: 'Commit and Tag Version'
+          pool: ${{ parameters.agentPool }}
+          steps:
+            - checkout: self
+              clean: true
+              fetchDepth: 0
+              persistCredentials: true
+
+            # Recalcula a versão (determinístico)
+            - task: VersionManagerVivo@8
+              displayName: 'Next Version'
+              inputs:
+                command: 'nextVersion'
+                branchingStrategy: ${{ parameters.branchingStrategy }}
+                fileStrategy: 'customTask'
+                ${{ if ne(parameters.versionFiles, '') }}:
+                  versionFiles: '${{ parameters.versionFiles }}'
+                ${{ else }}:
+                  versionFiles: 'package.json'
+              name: VersionManagerVivo
+
+            # Commit e tag da versão no repositório
+            - task: VersionManagerVivo@8
+              displayName: 'Commit and Tag Version'
+              inputs:
+                command: 'commitVersion'
+                version: '$(VersionManagerVivo.VERSION)'
+                ${{ if ne(parameters.versionFiles, '') }}:
+                  versionFiles: '${{ parameters.versionFiles }}'
+                ${{ else }}:
+                  versionFiles: 'package.json'
+                createTag: true
+                pushChanges: true
+                fileStrategy: 'customTask'
+
+# ==================================================================
+# TROUBLESHOOTING
+# ==================================================================
+#
+# 1. Erro "No VSIX file found":
+#    - Verifique se o build executou com sucesso
+#    - package.json deve conter os campos name, displayName e publisher
+#
+# 2. Erro de autenticação com npm:
+#    - Verifique se o arquivo .npmrc está configurado corretamente
+#
+# 3. Falha na publicação no Azure Artifacts:
+#    - Verifique se o feed existe e o pipeline tem permissão de contribuidor
+#    - Confirme se projectScopedFeed está correto (projeto vs. organização)
+#    - O pacote não pode ter a mesma versão já publicada (imutável)
+#
+# CONFIGURAÇÕES NECESSÁRIAS:
+#
+# Agent Pool:
+# - GeneralPurposeLinuxAgentsCI
+#
+# Azure Artifacts:
+# - Feed com permissão de contribuidor para o service account do pipeline
+# ==================================================================

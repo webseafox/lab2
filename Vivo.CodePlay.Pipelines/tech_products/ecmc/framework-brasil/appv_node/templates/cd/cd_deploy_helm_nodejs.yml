@@ -1,0 +1,314 @@
+stages:
+- stage: cd_deploy
+  displayName: "CD - Deploy"
+  pool:
+    name: GeneralPurposeLinuxAgentsCD
+  dependsOn:
+  - environment_init
+  - ci_build
+  - ci_publish
+  - ci_package
+  - deploy_environment_init
+  condition: succeeded()
+
+  ## -> Loads variables from other stages.
+  variables:
+
+  - name: ARTIFACT_NAME
+    value: $[ stageDependencies.ci_build.build.outputs['artifact_name.ARTIFACT_NAME'] ]
+  - name: DOCKER_IMAGE_NAME
+    value: $[ stageDependencies.ci_package.package.outputs['docker_metadata.DOCKER_IMAGE_NAME'] ]
+  - name: DOCKER_IMAGE_TAG
+    value: $[ stageDependencies.ci_package.package.outputs['docker_metadata.DOCKER_IMAGE_TAG'] ]
+  - name: DOCKER_REGISTRY_USERNAME
+    value: $[ stageDependencies.deploy_environment_init.environment.outputs['credentials.DOCKER_REGISTRY_USERNAME'] ]
+  - name: DOCKER_REGISTRY_PASSWORD
+    value: $[ stageDependencies.deploy_environment_init.environment.outputs['credentials.DOCKER_REGISTRY_PASSWORD'] ]
+  - name: NEXUS_DEPS_USR
+    value: $[ stageDependencies.nodejs_environment_init.environment.outputs['credentials.NEXUS_DEPS_USR'] ]
+  - name: NEXUS_DEPS_PSW
+    value: $[ stageDependencies.nodejs_environment_init.environment.outputs['credentials.NEXUS_DEPS_PSW'] ]
+  - name: NEXUS_DEFAULT_USR
+    value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEFAULT_USR'] ]
+  - name: NEXUS_DEFAULT_PSW
+    value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEFAULT_PSW'] ]
+  - name: NEW_VERSION
+    value: $[ stageDependencies.ci_build.build.outputs['new_version.NEW_VERSION'] ]
+
+
+  - template: /tech_products/ecmc/framework-brasil/appv/initialize/variables_catalog_info.yml
+
+  jobs:
+
+  - deployment: deploy
+    displayName: 'Deploy'
+    condition: succeeded()
+    environment:
+      name: $(DEPLOY_ENVIRONMENT_LIB)
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+
+          ## -> Download Artifacts
+          - download: none
+
+          ## -> Clean the pipeline workspace and checkout the code.
+          ## -> 6d15af64-176c-496d-b583-fd2ae21d4df4 is the decorator for checkout.
+          - task: 6d15af64-176c-496d-b583-fd2ae21d4df4@1
+            displayName: Checkout Code
+            name: checkout_code
+            inputs:
+              repository: self
+              persistCredentials: "true"
+              clean: true
+
+          ## -> Download and uncompress the downloaded artifact.
+          - task: DownloadBuildArtifacts@1
+            displayName: 'Download Build Artifacts'
+            inputs:
+              artifactName: app
+              cleanDestinationFolder: false
+              extractTars: true
+              parallelizationLimit: 8
+              downloadPath: $(System.ArtifactsDirectory)
+
+          - script: |
+              cd $(DEFAULT_WORKDIR_ARTIFACTS)/$(ARTIFACT_NAME)
+              unzip -q '$(ARTIFACT_NAME).zip'
+              rm '$(ARTIFACT_NAME).zip'
+            displayName: 'Unzip with symlinks'
+
+          - task: DownloadBuildArtifacts@1
+            displayName: 'Download Build Docker'
+            inputs:
+              artifactName: docker
+              extractTars: false
+              parallelizationLimit: 20
+              downloadPath: $(System.ArtifactsDirectory)
+
+          ## -> Download kube config
+          - task: DownloadSecureFile@1
+            displayName: 'Download Kube Config for $namespace'
+            condition: and(succeeded(), notIn('${{ parameters.setEnvironment }}', 'prod-bff', 'prod-front'))
+            continueOnError: true
+            name: kubeconf
+            inputs:
+              secureFile: kubeconf-${{ parameters.setEnvironment }}.yml
+
+          - task: Bash@3
+            displayName: 'Set output variables'
+            inputs:
+              targetType: inline
+              script: |
+
+                setVariables(){
+                eval result=$2
+                echo "##vso[task.setvariable variable=$1;]$result"
+                }
+                setVariables "K8S_NAMESPACE" "$(echo $DOCKER_OUTPUT | jq -r '.K8S_NAMESPACE')"
+
+                HELM_RELEASE_NAME="$(echo $DOCKER_OUTPUT | jq -r '.DOCKER_APP')"
+                echo "##vso[task.setvariable variable=HELM_RELEASE_NAME;]$HELM_RELEASE_NAME"
+
+                HELM_IMAGE_REPOSITORY="$(echo $DOCKER_OUTPUT | jq -r '.DOCKER_IMAGE_NAME_FULL')"
+                echo "##vso[task.setvariable variable=HELM_IMAGE_REPOSITORY;]$HELM_IMAGE_REPOSITORY"
+
+                HELM_IMAGE_TAG="$(echo $DOCKER_OUTPUT | jq -r '.DOCKER_IMAGE_TAG')"
+                echo "##vso[task.setvariable variable=HELM_IMAGE_TAG;]$HELM_IMAGE_TAG"
+
+                echo "##[debug] NEW_VERSION: $(NEW_VERSION)"
+              workingDirectory: $(System.ArtifactsDirectory)
+
+
+          - task: Bash@3
+            displayName: 'Create helm chart package '
+            condition: succeeded()
+            inputs:
+              targetType: inline
+              script: |
+
+                echo "##[debug] Creating helm package..."
+                helmChart=$(helm package .)
+                echo "##[debug] $helmChart"
+
+                helmChartPackage=$(ls | grep -E "\.tgz$" | head -n 1)
+                echo "##[debug] Helm chart package: $helmChartPackage"
+                echo "##vso[task.setvariable variable=HELM_CHART_PACKAGE;]$helmChartPackage"
+
+
+          - task: Bash@3
+            displayName: 'Verify Namespace'
+            condition: succeeded()
+            inputs:
+              targetType: inline
+              script: |
+                echo "##[debug] setEnvironment: ${{ parameters.setEnvironment }}"
+                echo "##[debug]Check if namespace [${{ parameters.setEnvironment }}] exists"
+
+                NAMESPACES=$(kubectl get ns -o json --kubeconfig=$(kubeconf.secureFilePath) --insecure-skip-tls-verify)
+
+                echo "##[group] Namespaces in cluster"
+                echo "##[debug] ${{ parameters.setEnvironment }}"
+                echo "##[endgroup]"
+
+                NS=$(echo $NAMESPACES | jq -c '.items[].metadata | select(.name=="${{ parameters.setEnvironment }}")' | jq -r '.name')
+
+                if [ "$NS" = "${{ parameters.setEnvironment }}" ]; then
+                  echo "##[debug] Namespace [${{ parameters.setEnvironment }}] OK."
+                else
+                  echo "##[error] Namespace [$(NAMESPACES)] not found."
+                  exit 1;
+                fi
+
+          - task: Bash@3
+            displayName: 'Create docker registry secret '
+            condition: succeeded()
+            inputs:
+              targetType: inline
+              script: |
+
+                dockerSecretName=$(echo $(DOCKER_SERVICE_CONNECTION) | tr A-Z a-z)
+
+                echo "##[debug] Searching secrets..."
+                kubectl get secrets $dockerSecretName \
+                  -n ${{ parameters.setEnvironment }} \
+                  --kubeconfig=$(kubeconf.secureFilePath) \
+                  --insecure-skip-tls-verify
+
+                if [ $? -gt 0 ]; then
+                  echo "##[debug] Setup docker registry."
+
+                  kubectl create secret docker-registry $dockerSecretName \
+                    --docker-server=$(DOCKER_REGISTRY) \
+                    --docker-username=$(DOCKER_REGISTRY_USERNAME) \
+                    --docker-password=$(DOCKER_REGISTRY_PASSWORD) \
+                    --docker-email=$(DOCKER_REGISTRY_EMAIL) \
+                    -n ${{ parameters.setEnvironment }} \
+                    --kubeconfig=$(kubeconf.secureFilePath) \
+                    --insecure-skip-tls-verify
+
+                  if [ $? -gt 0 ]; then
+                    echo "##[error] Error create docker registry $dockerSecretName"
+                    exit 1;
+                  else
+                    echo "##[debug] Docker registry $dockerSecretName configured success!"
+                  fi
+                else
+                  echo "##[debug] Registry $dockerSecretName exists!"
+                fi
+
+                echo "##vso[task.setvariable variable=IMAGE_REPOSITORY_SECRET_NAME;]$dockerSecretName"
+
+
+          - task: Bash@3
+            displayName: "Deploy Application through helm"
+            condition: succeeded()
+            inputs:
+              targetType: inline
+              script: |
+                set -e
+
+                echo "##[section] HELM upgrade:"
+                echo "##[debug] KUBECONFIG: $(kubeconf.secureFilePath)"
+                echo "##[debug] NAMESPACE: ${{ parameters.setEnvironment }}"
+
+                echo "##[group] Properties for deployment"
+
+                echo "##[debug]IMAGE_VERSION: $(NEW_VERSION)"
+                echo "##[debug]APPLICATION_NAME: $(APPLICATION_NAME)"
+                echo "##[debug]WAIT_TIMEOUT: ${WAIT_TIMEOUT}"
+                echo "##[debug]CHART_NAME: $(CHART_NAME)"
+                echo "##[debug]CHART_REPOSITORY: $(CHART_REPOSITORY)"
+                echo "##[debug]CHART_VERSION: $(CHART_VERSION)"
+                echo "##[debug]IMAGE_NAME: $(IMAGE_NAME)"
+                echo "##[debug]IMAGE_REGISTRY: $(IMAGE_REGISTRY)"
+                echo "##[debug]PATH : $(DEFAULT_WORKDIR_ARTIFACTS)$(ARTIFACT_NAME)/"
+                echo "##[endgroup]"
+
+                echo "##[debug] Looking for values.(yml,yaml) file..."
+                valuesFile=$(find $(DEFAULT_WORKDIR_ARTIFACTS)$(ARTIFACT_NAME)/.azuredevops/config/${{ parameters.setEnvironment }} -name 'values*')
+
+                if [ -z $valuesFile ] ; then
+                  echo "##[error] values.(yml,yaml) not found. Aborting..."
+                  exit 1;
+                fi
+
+                echo "##[debug] valuesFile: $valuesFile"
+                echo "##[debug] $(cat $valuesFile)"
+
+                mkdir -p $(System.DefaultWorkingDirectory)/chart
+                echo "descompactando o template do helm ${HELM_CHART_PACKAGE}"
+                echo "downloading 'https://nexus.telefonica.com.br/repository/$(CHART_REPOSITORY)/$(CHART_NAME)-$(CHART_VERSION).tgz'"
+
+                curl -u '$(NEXUS_DEFAULT_USR)':'$(NEXUS_DEFAULT_PSW)' -O https://nexus.telefonica.com.br/repository/$(CHART_REPOSITORY)/$(CHART_NAME)-$(CHART_VERSION).tgz
+                file "$(CHART_NAME)-$(CHART_VERSION).tgz"
+                tar -zxvf "$(CHART_NAME)-$(CHART_VERSION).tgz" -C $(System.DefaultWorkingDirectory)/chart
+                rm "$(CHART_NAME)-$(CHART_VERSION).tgz"
+
+                #helm --kubeconfig $(kubeconf.secureFilePath) status $(IMAGE_NAME) --namespace ${{ parameters.setEnvironment }}
+
+                #helm repo update
+                #helm search repo framework-brasil-helm-bff
+
+                helm --kubeconfig $(kubeconf.secureFilePath) upgrade $(APPLICATION_NAME) --install $(System.DefaultWorkingDirectory)/chart/$(CHART_NAME) --atomic -f "$valuesFile" --namespace ${{ parameters.setEnvironment }} --wait --timeout $(WAIT_TIMEOUT) --set image.tag=$(NEW_VERSION) --set image.name=$(IMAGE_NAME) --set image.repository=$(IMAGE_REGISTRY)
+
+                echo "###[debug]helm upgrade $(APPLICATION_NAME) \
+                   $(System.DefaultWorkingDirectory)/chart/ \
+                   -f "$valuesFile" \
+                   --namespace ${{ parameters.setEnvironment }} \
+                   --install \
+                   --insecure-skip-tls-verify \
+                   --wait \
+                   --timeout $(WAIT_TIMEOUT) \
+                   --set "image.repository=$(IMAGE_REGISTRY)/$(IMAGE_NAME)" \
+                   --set "image.name=$(IMAGE_NAME)" \
+                   --set "image.tag=$(NEW_VERSION)" \
+                   --set "imagePullSecrets[0].name=$(IMAGE_REPOSITORY_SECRET_NAME)" \
+                   --output table \
+                   --history-max $(HELM_UPGRADE_HISTORY_MAX) \
+                   --atomic \
+                   --debug"
+
+
+        on:
+          success:
+            steps:
+            - task: Bash@3
+              displayName: Lib Publish Success
+              name: t_success_message
+              inputs:
+                targetType: inline
+                script: |
+                  echo "##[section] ================================================================================================================================="
+                  echo "##[section]                                                      DEPLOY WAS SUCCESSFUL! "
+                  echo "##[section] ================================================================================================================================="
+                  echo "##[section] Parabéns sua aplicação foi implantada com sucesso no ambiente de runtime."
+                  echo "##[section] Acesse a url da sua aplicação e valide  se sua nova versão foi entregue com sucesso."
+                  echo "##[section] "
+                  echo "##[section] $(ALERT_MESSAGE_ARROW) Sua aplicação foi implantada com sucesso no ambiente."
+                  echo "##[section] $(ALERT_MESSAGE_ARROW) Verifique com o responsável técnico como acessar acessar a sua aplicação."
+                  echo "##[section] $(ALERT_MESSAGE_ARROW) Caso não esteja conseguindo acessar a sua aplicação entre em contato com suporte."
+                  echo "##[section] "
+                  echo "##[section] Caso tenha dúvidas sobre essa fase do pipeline acesse a nossa documentação: $(CORPORATE_WIKI_DOC_URL)"
+                  echo "##[section]================================================================================================================================="
+
+          failure:
+            steps:
+            - task: Bash@3
+              displayName: Lib Publish Failure
+              name: t_failure_message
+              inputs:
+                targetType: inline
+                script: |
+                  echo "##[error] ================================================================================================================================="
+                  echo "##[error]                                                    DEPLOY WAS NOT SUCCESSFUL! "
+                  echo "##[error] ================================================================================================================================="
+                  echo "##[error] Se está vendo essa mensagem é porque aconteceu algo erro durante a impplantação da sua apliação."
+                  echo "##[error] "
+                  echo "##[error] Segue abaixo umas dicas para o Troubleshooting:"
+                  echo "##[error] $(ALERT_MESSAGE_ARROW) Consulte o log do estágio de deploy da aplicação."
+                  echo "##[error] $(ALERT_MESSAGE_ARROW) Verifique com o responsável técnico como proceder em caso de falha de ambiente."
+                  echo "##[error] "
+                  echo "##[error] Caso tenha dúvidas sobre essa fase do pipeline acesse a nossa documentação: $(CORPORATE_WIKI_DOC_URL)"
+                  echo "##[error] ================================================================================================================================="

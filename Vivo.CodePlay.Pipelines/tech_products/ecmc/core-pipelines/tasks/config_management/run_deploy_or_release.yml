@@ -1,0 +1,142 @@
+﻿steps:
+- bash: |
+    echo "##[debug] Executando script de configuração de gerenciamento"
+    PROJECT_DIR=$(Build.SourcesDirectory)/$(Build.Repository.Name)
+    cd ${PROJECT_DIR}
+
+    echo "##[debug] Configurando namespaces..."
+
+    IS_PRODUCTION=$(echo "${ENVIRONMENT}" | grep -qE "^(production|prod|producao|ms)$" && echo "true" || echo "false")
+    NAMESPACES=($ENVIRONMENT)
+    ARGOCD_BRANCH=$(ARGOCD_HML_MAIN_BRANCH)
+    ARGOCD_REPOSITORY="argocd"
+
+    ######## DEFININDO SE SERA DEPLOY DO UNICOM, LOJAONLINE OU AMBIENTES DE DEV1 ##########
+    if [[ "${ENVIRONMENT_FOR_UNICOMM}" == "true" ]]; then
+        NAMESPACES=("uncm-${ENVIRONMENT}")
+        ENVIRONMENT="uncm-${ENVIRONMENT}"
+    fi
+
+    #### DEFININDO ARGOCD, SE SERÁ PRODUÇÃO OU HOMOLOGAÇÃO ######
+    if [[ "${IS_PRODUCTION}" == "true" && ! ("${IS_CONFIG_MANAGEMENT_DEV}" == "true") ]]; then
+        echo "##[section]Setado argocd-production como repositório de destino"
+        ARGOCD_REPOSITORY="argocd-production"
+        ARGOCD_BRANCH=$(ARGOCD_PRODUCTION_MAIN_BRANCH)
+
+        # ENVIRONMENT_CONF fica setado no grupo de variaveis de ambiente, onde microservices tem o valor "ms" e frontend
+        NAMESPACES=($ENVIRONMENT_CONF)
+    else
+        echo "##[section]Setado argocd como repositório de destino"
+
+        MSG_ARGOCD="##[section]Executando argocd em homologação"
+
+    if [[ "${ARGOCD_ALLNAMESPACES_HML}" == "true" && "${IS_PRODUCTION}" != "true" ]]; then
+      if [[ "${ENVIRONMENT_FOR_UNICOMM}" == "true" ]]; then
+        # Evita duplicação de prefixo uncm-
+        if [[ "${ENVIRONMENT}" =~ ^uncm- ]]; then
+          NAMESPACES=("${ENVIRONMENT}")
+        else
+          NAMESPACES=("uncm-${ENVIRONMENT}")
+        fi
+      else
+        # Para config management, commitamos apenas no ambiente especificado
+        NAMESPACES=($ENVIRONMENT)
+      fi
+    elif [[ "${IS_CONFIG_MANAGEMENT_DEV}" == "true" ]]; then
+      MSG_ARGOCD="##[section]Executando argocd em ambiente de desenvolvimento"
+      NAMESPACES=($DEV_NAMESPACE)
+    fi
+
+        echo "${MSG_ARGOCD}"
+    fi
+
+    echo "##[section]IS_PRODUCTION ........................: ${IS_PRODUCTION}"
+    echo "##[section]APP_NAME .............................: ${APP_NAME}"
+    echo "##[section]ENVIRONMENT ..........................: ${ENVIRONMENT}"
+    echo "##[section]NAMESPACES ...........................: ${NAMESPACES}"
+    echo "##[section]ARGOCD_REPOSITORY ....................: ${ARGOCD_REPOSITORY}"
+    echo "##[section]ARGOCD_BRANCH ........................: ${ARGOCD_BRANCH}"
+
+    cd ../$ARGOCD_REPOSITORY/
+    git fetch
+    git checkout $ARGOCD_BRANCH
+    git pull origin $ARGOCD_BRANCH
+    git reset --hard origin/$ARGOCD_BRANCH
+
+    for ENV_CONFIG in "${NAMESPACES[@]}"; do
+        cd ${PROJECT_DIR}
+
+        mkdir ${ENV_CONFIG}
+
+        echo "##[section]Gerando ConfigMap para ${APP_NAME} no namespace ${ENV_CONFIG}"
+        if [[ "${IS_CONFIG_MANAGEMENT_DEV}" == "true" ]]; then
+            python $(Build.SourcesDirectory)/Vivo.Core.Pipelines.Scripts/app.py -cm -cmf env/env.yaml -cmn $APP_NAME -cms ${ENVIRONMENT} -cmda ${PROJECT_DIR}/${ENV_CONFIG}
+        else
+            python $(Build.SourcesDirectory)/Vivo.Core.Pipelines.Scripts/app.py -cm -cmf env/env.yaml -cmn $APP_NAME -cms ${ENV_CONFIG} -cmda ${PROJECT_DIR}/${ENV_CONFIG}
+        fi
+
+        if [[ $? != 0 ]]; then
+            echo "##[error]Falha ao tentar executar o script de geração do ConfigMap"
+            exit 1
+        fi
+        FILE_TO_ARG0=${PROJECT_DIR}/${ENV_CONFIG}/configmap${ENV_CONFIG}.yaml
+        FILE_TO_RENAME=${PROJECT_DIR}/${ENV_CONFIG}/$APP_NAME-ConfigMap.yaml
+
+        if [[ "${IS_CONFIG_MANAGEMENT_DEV}" == "true" ]]; then
+            FILE_TO_ARG0=${PROJECT_DIR}/${ENV_CONFIG}/configmap${ENVIRONMENT}.yaml
+        fi
+
+        echo "##[debug] Arquivo de ConfigMap gerado: ${FILE_TO_ARG0}"
+        echo "_________________________________________"
+        cat $FILE_TO_RENAME
+
+        echo "_________________________________________"
+        cat $FILE_TO_ARG0
+
+        mv ${FILE_TO_ARG0} ${FILE_TO_RENAME}
+
+
+        echo "_________________________________________"
+        ls -la ${PROJECT_DIR}/${ENV_CONFIG}
+
+        cd ../$ARGOCD_REPOSITORY/
+
+        git config --replace-all user.name "Azure DevOps"
+        git config --replace-all user.email "azuredevops@telefonicati.onmicrosoft.com"
+
+        if [[ $? != 0 ]]; then
+            echo "##[error]Falha ao realizar o checkout na branch $ARGOCD_BRANCH"
+            exit 1
+        fi
+
+        git pull origin $ARGOCD_BRANCH
+
+        if [[ $? != 0 ]]; then
+            echo "##[error]Falha ao tentar executar git reset --hard origin/$ARGOCD_BRANCH"
+            exit 1
+        fi
+
+        cp -f ${FILE_TO_RENAME} ${ENV_CONFIG}
+
+        git add ${ENV_CONFIG}/
+        git commit -m "Nova versão de Configmap do $APP_NAME-ConfigMap no namespace ${ENV_CONFIG} "
+        git push origin $ARGOCD_BRANCH
+
+        if [ $? -ne 0 ]; then
+            echo "##vso[task.logissue type=error;] Git push failed. Exiting with error"
+            echo "##vso[task.complete result=Failed;]"
+            echo "##[error]Falha ao enviar o commit para o repositório $ARGOCD_REPOSITORY"
+            exit 1
+        fi
+
+        cd ${PROJECT_DIR}
+    done
+  condition: and( succeeded(), eq(variables.CONFIG_MANAGEMENT, true) )
+  displayName: "Config management validations"
+  env:
+    ENVIRONMENT: ${{ parameters.environment }}
+    DEV_NAMESPACE: ${{ parameters.dev_namespace_to_deploy }}
+    ENVIRONMENT_FOR_UNICOMM: $(ENVIRONMENT_FOR_UNICOMM)
+    HELM_RELEASE_NAMESPACE: ${{ parameters.helmReleaseNamespace }}
+    helm_release_name_prefix: ${{ parameters.helm_release_name_prefix }}
+    IS_CONFIG_MANAGEMENT_DEV: $(CONFIG_MANAGEMENT_DEV)

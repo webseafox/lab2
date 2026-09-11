@@ -1,0 +1,77 @@
+parameters:
+- name: incrementLevel
+  default: patch
+- name: qa_branch
+  type: boolean
+  default: False
+- name: s1_branch
+  type: boolean
+  default: False
+
+stages:
+- stage: pipeline_init
+  displayName: "Start pipeline"
+  pool:
+    name: $(PRIVATE_AGENT_DEFAULT)
+  jobs:
+  - job: initial_job
+    workspace:
+      clean: all
+    variables:
+      - name: QA_BRANCH
+        value: False
+      - name: S1_BRANCH
+        value: $[in(variables['System.PullRequest.targetBranchName'], 'stage/preprod')]
+    displayName: "Running Init/Bump Version"
+    steps:
+      - checkout: self
+        fetchDepth: 1
+        persistCredentials: true  
+      - bash: |
+          FILE=$(Build.SourcesDirectory)/catalog-info.yaml
+          if [ ! -f "$FILE" ]; then
+            echo "##[error] Unable to find catalog-info.yaml file $FILE"
+            exit 1
+          fi
+        displayName: "Check for catalog-info.yml"
+        name: init_bash
+
+      # - ${{ if eq(parameters.s1_branch, True) }}:
+      #   - template: /tech_products/ecmc/sap-commerce/tasks/validations/validate_target_branches_sap.yaml
+
+      - task: CopyFiles@2
+        displayName: "Copy catalog-info.yaml to Staging Directory"
+        inputs:
+          TargetFolder: "$(Build.ArtifactStagingDirectory)"
+          OverWrite: true
+          CleanTargetFolder: true
+          Contents: |
+            $(Build.SourcesDirectory)/catalog-info.yaml
+
+      - task: PublishPipelineArtifact@1
+        displayName: "Publish catalog-info.yaml"
+        inputs:
+          artifactName: "catalog-info"
+          targetPath: "$(Build.ArtifactStagingDirectory)"
+    
+      - ${{ if and(or(startsWith(variables['Build.SourceBranch'], 'refs/heads/stage/'), in(variables['Build.SourceBranch'], 'refs/heads/main', 'refs/heads/master', 'refs/heads/s1', 'refs/heads/s2', 'refs/heads/s3', 'refs/heads/s4', 'refs/heads/s5', 'refs/heads/s6')), in(variables['Build.Reason'], 'IndividualCI', 'BatchedCI')) }}:
+        - template: /tech_products/ecmc/sap-commerce/tasks/nodejs/npm_extract_version.yaml
+          parameters:
+            currentVersionVariableOut: CURRENT_VERSION
+
+        - template: /tech_products/ecmc/sap-commerce/tasks/versioning/bump_version.yaml
+          parameters:
+            currentVersion: $(export_current_version.CURRENT_VERSION)
+            newVersionVariableOut: NEW_VERSION
+            incrementLevel: ${{ parameters.incrementLevel }}
+
+        - template: /tech_products/ecmc/sap-commerce/tasks/nodejs/update_repo_version.yaml
+          parameters:
+            newVersion: $(SET_NEW_VERSION)
+            condition_version_file: and(succeeded(), eq(variables.USE_VERSION_FILE, true), eq(variables.BUMP_VERSION_ENABLED, true), or(eq(variables.flowIsQa, True), ne(variables.flowIsMain, True))))
+            condition: and(succeeded(), eq(variables.BUMP_VERSION_ENABLED, true), eq(variables.flowIsMain, True))          
+            commitNewVersion: true
+            createGitTag: false
+            workingDirectory: $(Build.SourcesDirectory)
+            workingDirectoryCore: $(Build.SourcesDirectory)/$(CORE_PROJECT)
+        

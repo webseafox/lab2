@@ -1,0 +1,172 @@
+parameters:
+  - name: project
+    type: string
+  - name: environment
+    type: string
+  - name: dryRun
+    type: boolean
+  - name: deploymentList
+    type: object
+  - name: pipelinePrefix
+    type: string
+  - name: organization
+    type: string
+
+stages:
+  - stage: report
+    displayName: "Report"
+    dependsOn: deploy
+    condition: always()
+    jobs:
+      - job: generate
+        displayName: "Generate Report"
+        variables:
+          deploymentListJson: ${{ convertToJson(parameters.deploymentList) }}
+          ${{ each deployment in parameters.deploymentList }}:
+            result_${{ replace(replace(deployment.key, '-', '_'), '.', '_') }}: $[ stageDependencies.deploy.deploy_${{ replace(replace(deployment.key, '-', '_'), '.', '_') }}.outputs['trigger.result'] ]
+        steps:
+          - task: Bash@3
+            name: report
+            displayName: "Generate Report"
+            env:
+              DEPLOYMENT_LIST_JSON: $(deploymentListJson)
+              ORGANIZATION: ${{ parameters.organization }}
+              PROJECT: ${{ parameters.project }}
+              ENVIRONMENT: ${{ parameters.environment }}
+              DRY_RUN: ${{ parameters.dryRun }}
+              BUILD_ID: $(Build.BuildId)
+              BUILD_NAME: $(Build.DefinitionName)
+              ${{ each deployment in parameters.deploymentList }}:
+                RESULT_${{ replace(replace(deployment.key, '-', '_'), '.', '_') }}: $(result_${{ replace(replace(deployment.key, '-', '_'), '.', '_') }})
+            inputs:
+              targetType: inline
+              script: |
+                url_encode() { echo "$1" | sed 's/ /%20/g'; }
+
+                PROJECT_ENCODED=$(url_encode "$PROJECT")
+                EXECUTION_DATE=$(date '+%Y-%m-%d %H:%M:%S %Z')
+                THIS_PIPELINE_URL="${ORGANIZATION}${PROJECT_ENCODED}/_build/results?buildId=${BUILD_ID}"
+
+                SUCCESS_COUNT=0
+                FAILED_COUNT=0
+                DRYRUN_COUNT=0
+                UNKNOWN_COUNT=0
+                FAILED_JSON="{}"
+                REPORT_ROWS=""
+
+                echo "##[section]Deployment Results"
+
+                while IFS= read -r entry; do
+                  KEY=$(echo "$entry" | jq -r '.key')
+                  VERSION_INPUT=$(echo "$entry" | jq -r '.value')
+                  VAR_NAME="RESULT_$(echo "$KEY" | sed 's/[-.]/_/g')"
+                  RESULT=$(printenv "$VAR_NAME" 2>/dev/null || echo "")
+                  
+                  if [ -z "$RESULT" ]; then
+                    RESULT="UNKNOWN|src.src-$KEY|N/A|N/A|N/A"
+                  fi
+                  
+                  IFS='|' read -r STATUS PIPELINE VERSION RUNID RUNURL <<< "$RESULT"
+                  
+                  echo "  $PIPELINE v$VERSION: $STATUS"
+                  
+                  case "$STATUS" in
+                    SUCCESS) ((SUCCESS_COUNT++)) || true ;;
+                    FAILED)
+                      ((FAILED_COUNT++)) || true
+                      FAILED_JSON=$(echo "$FAILED_JSON" | jq --arg k "$KEY" --arg v "$VERSION_INPUT" '. + {($k): $v}')
+                      ;;
+                    UNKNOWN)
+                      ((UNKNOWN_COUNT++)) || true
+                      FAILED_JSON=$(echo "$FAILED_JSON" | jq --arg k "$KEY" --arg v "$VERSION_INPUT" '. + {($k): $v}')
+                      ;;
+                    DRY_RUN) ((DRYRUN_COUNT++)) || true ;;
+                    *) ((UNKNOWN_COUNT++)) || true ;;
+                  esac
+                  
+                  if [ "$RUNURL" != "N/A" ]; then
+                    LINK="[$RUNID]($(url_encode "$RUNURL"))"
+                  else
+                    LINK="$RUNID"
+                  fi
+                  REPORT_ROWS="${REPORT_ROWS}| $STATUS | $PIPELINE | $VERSION | $LINK |"$'\n'
+                done < <(echo "$DEPLOYMENT_LIST_JSON" | jq -c 'to_entries[]')
+
+                TOTAL=$((SUCCESS_COUNT + FAILED_COUNT + DRYRUN_COUNT + UNKNOWN_COUNT))
+                FAIL_TOTAL=$((FAILED_COUNT + UNKNOWN_COUNT))
+
+                echo ""
+                echo "##[section]Summary"
+                echo "  Succeeded: $SUCCESS_COUNT"
+                echo "  Failed: $FAILED_COUNT"
+                echo "  Dry Run: $DRYRUN_COUNT"
+                echo "  Unknown: $UNKNOWN_COUNT"
+                echo "  Total: $TOTAL"
+
+                if [ $FAIL_TOTAL -gt 0 ]; then
+                  OVERALL_STATUS="Some deployments failed to trigger"
+                  echo ""
+                  echo "##[warning]$FAIL_TOTAL deployment(s) failed"
+                  echo ""
+                  echo "##[section]Failed Deployments JSON (for retry):"
+                  echo "$FAILED_JSON" | jq '.'
+                elif [ $DRYRUN_COUNT -gt 0 ] && [ $SUCCESS_COUNT -eq 0 ]; then
+                  OVERALL_STATUS="Dry Run Completed"
+                elif [ $SUCCESS_COUNT -gt 0 ]; then
+                  OVERALL_STATUS="All deployments succeeded"
+                else
+                  OVERALL_STATUS="Unknown status"
+                fi
+
+                REPORT_FILE="$(Build.SourcesDirectory)/deployment-report.md"
+                {
+                  echo "## Mass Deployment Report"
+                  echo ""
+                  echo "**Status:** $OVERALL_STATUS"
+                  echo ""
+                  echo "### Execution Info"
+                  echo ""
+                  echo "| Property | Value |"
+                  echo "|----------|-------|"
+                  echo "| Project | $PROJECT |"
+                  echo "| Environment | $ENVIRONMENT |"
+                  echo "| Dry Run | $DRY_RUN |"
+                  echo "| Date | $EXECUTION_DATE |"
+                  echo ""
+                  echo "### Summary"
+                  echo ""
+                  echo "| Metric | Count |"
+                  echo "|--------|-------|"
+                  echo "| Succeeded | $SUCCESS_COUNT |"
+                  echo "| Failed | $FAILED_COUNT |"
+                  echo "| Dry Run | $DRYRUN_COUNT |"
+                  echo "| Unknown | $UNKNOWN_COUNT |"
+                  echo "| **Total** | **$TOTAL** |"
+                  echo ""
+                  echo "### Deployment Details"
+                  echo ""
+                  echo "| Status | Pipeline | Version | Run ID |"
+                  echo "|--------|----------|---------|--------|"
+                  echo -n "$REPORT_ROWS"
+                } > "$REPORT_FILE"
+
+                if [ $FAIL_TOTAL -gt 0 ]; then
+                  FAILED_JSON_FORMATTED=$(echo "$FAILED_JSON" | jq '.')
+                  {
+                    echo ""
+                    echo "### Failed Deployments (for retry)"
+                    echo ""
+                    echo '```json'
+                    echo "$FAILED_JSON_FORMATTED"
+                    echo '```'
+                  } >> "$REPORT_FILE"
+                fi
+
+                {
+                  echo ""
+                  echo "---"
+                  echo "*Generated by [$BUILD_NAME #$BUILD_ID]($THIS_PIPELINE_URL)*"
+                } >> "$REPORT_FILE"
+
+                echo "##vso[task.uploadsummary]$(Build.SourcesDirectory)/deployment-report.md"
+                echo "##vso[task.setvariable variable=failedCount;isOutput=true]$FAILED_COUNT"

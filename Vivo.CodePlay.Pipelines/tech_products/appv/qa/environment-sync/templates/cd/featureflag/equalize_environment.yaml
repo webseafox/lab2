@@ -1,0 +1,869 @@
+parameters:
+  - name: targetEnvironment
+    type: string
+    default: preprod
+    displayName: 'Ambiente de destino (não permite prod)'
+
+  - name: sourceEnvironment
+    type: string
+    default: prod
+    displayName: 'Ambiente de origem'
+
+  - name: ignoreFeatureFlags
+    type: string
+    default: ''
+    displayName: 'Lista CSV de flags protegidas (não serão alteradas)'
+
+  - name: includeFeatureFlags
+    type: string
+    default: ''
+    displayName: 'Lista CSV de flags permitidas (vazio = todas)'
+
+  - name: saveSnapshot
+    type: boolean
+    default: false
+    displayName: 'Salvar snapshot mensal em /reports'
+
+  - name: dryRun
+    type: boolean
+    default: true
+    displayName: 'Somente preview (não aplica os valores no destino)'
+
+  - name: restoreSnapshot
+    type: boolean
+    default: false
+    displayName: 'Restaurar o último snapshot no destino (reverte a equalização)'
+
+variables:
+  - template: /tech_products/appv/qa/environment-sync/variables/shared.yaml
+
+stages:
+- stage: Preview
+  displayName: 'Preview da Equalização de Feature Flags'
+  jobs:
+    - job: ComputeDiff
+      displayName: 'Coletar estado atual e gerar diff'
+      pool:
+        name: GeneralPurposeLinuxAgentsCD
+      steps:
+        - checkout: self
+          persistCredentials: true
+
+        - task: Bash@3
+          displayName: 'Validar parâmetros de entrada'
+          inputs:
+            targetType: inline
+            script: |
+              set -euo pipefail
+
+              if [[ "${TARGET_ENV}" == "prod" ]]; then
+                echo "##[error] O ambiente de destino prod é proibido para equalização ou restauração."
+                exit 1
+              fi
+
+              if [[ "${RESTORE_MODE,,}" != "true" && "${TARGET_ENV}" == "${SOURCE_ENV}" ]]; then
+                echo "##[error] sourceEnvironment e targetEnvironment não podem ser iguais."
+                exit 1
+              fi
+
+              if [[ "${RESTORE_MODE,,}" == "true" ]]; then
+                echo "##[debug] restoreMode: RESTAURAÇÃO (último snapshot -> ${TARGET_ENV})"
+              else
+                echo "##[debug] restoreMode: EQUALIZAÇÃO (${SOURCE_ENV} -> ${TARGET_ENV})"
+              fi
+              echo "##[debug] targetEnvironment: ${TARGET_ENV}"
+              echo "##[debug] sourceEnvironment: ${SOURCE_ENV}"
+              echo "##[debug] applicationName: ${APPLICATION_NAME}"
+          env:
+            SOURCE_ENV: ${{ parameters.sourceEnvironment }}
+            TARGET_ENV: ${{ parameters.targetEnvironment }}
+            RESTORE_MODE: ${{ parameters.restoreSnapshot }}
+            APPLICATION_NAME: $(HOBKNOB_DEFAULT_APPLICATION)
+
+        - task: Bash@3
+          displayName: 'Consultar estado atual da aplicação no Hobknob'
+          inputs:
+            targetType: inline
+            script: |
+              set -euo pipefail
+
+              WORK_DIR="$(Pipeline.Workspace)/hobknob"
+              mkdir -p "${WORK_DIR}"
+              RESPONSE_FILE="${WORK_DIR}/response.json"
+
+              HTTP_CODE=$(curl -sS -o "${RESPONSE_FILE}" \
+                -w "%{http_code}" \
+                -H 'Accept: application/json' \
+                -X GET "$(HOBKNOB_API_HOST)/applications/${APPLICATION_NAME}")
+
+              if [[ "${HTTP_CODE}" -lt 200 || "${HTTP_CODE}" -gt 299 ]]; then
+                echo "##[error] Falha ao consultar aplicação no Hobknob. HTTP ${HTTP_CODE}."
+                exit 1
+              fi
+
+              echo "##vso[task.setvariable variable=HOBKNOB_RESPONSE_FILE]${RESPONSE_FILE}"
+          env:
+            APPLICATION_NAME: $(HOBKNOB_DEFAULT_APPLICATION)
+
+        - task: Bash@3
+          displayName: 'Formatar resultado e gerar snapshot'
+          inputs:
+            targetType: inline
+            script: |
+              set -euo pipefail
+
+              SNAPSHOT_FILE="$(Agent.TempDirectory)/snapshot.json"
+              GENERATED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+              # categoryId: 0=Simple, 1=Environment, 2=Segmented (conforme doc da API)
+              jq \
+                --arg app "${APPLICATION_NAME}" \
+                --arg generatedAt "${GENERATED_AT}" '
+                def flagsOf($catId):
+                  (.categories[($catId | tostring)]) as $cat
+                  | ($cat.columns // []) as $cols
+                  | ($cat.features // [])[]
+                  | . as $f
+                  | {
+                      name: $f.name,
+                      description: ($f.description // ""),
+                      values: (
+                        [ range(0; ($cols | length))
+                          | select($cols[.] != "" and ($f.values[.] != null))
+                          | { ($cols[.]): $f.values[.] }
+                        ] | add // {}
+                      ),
+                      application: $app,
+                      isSegmented: ($f.categoryId == 2)
+                    };
+
+                {
+                  applicationName: $app,
+                  generatedAtUtc: $generatedAt,
+                  flags: ( [flagsOf(0)] + [flagsOf(1)] + [flagsOf(2)] )
+                }
+                ' "${RESPONSE_FILE}" > "${SNAPSHOT_FILE}"
+
+              echo "##[section] Snapshot formatado gerado em ${SNAPSHOT_FILE}"
+              cat "${SNAPSHOT_FILE}"
+              echo "##vso[task.setvariable variable=HOBKNOB_SNAPSHOT_FILE]${SNAPSHOT_FILE}"
+          env:
+            APPLICATION_NAME: $(HOBKNOB_DEFAULT_APPLICATION)
+            RESPONSE_FILE: $(HOBKNOB_RESPONSE_FILE)
+
+        - task: Bash@3
+          displayName: 'Expandir flags segmentadas'
+          inputs:
+            targetType: inline
+            script: |
+              set -euo pipefail
+
+              SEGMENTED_NAMES=$(jq -r '.flags[] | select(.isSegmented == true) | .name' "${SNAPSHOT_FILE}")
+              SEGMENTED_FLAGS_JSON="[]"
+              FAILED_NAMES_FILE="$(Agent.TempDirectory)/segmented-fetch-failures.json"
+              echo '[]' > "${FAILED_NAMES_FILE}"
+
+              while IFS= read -r FEATURE_NAME; do
+                [[ -z "${FEATURE_NAME}" ]] && continue
+
+                DETAIL_FILE="$(Agent.TempDirectory)/segmented-${FEATURE_NAME}.json"
+
+                HTTP_CODE=$(curl -sS -o "${DETAIL_FILE}" \
+                  -w "%{http_code}" \
+                  -H 'Accept: application/json' \
+                  -X GET "$(HOBKNOB_API_HOST)/applications/${APPLICATION_NAME}/${FEATURE_NAME}")
+
+                if [[ "${HTTP_CODE}" -lt 200 || "${HTTP_CODE}" -gt 299 ]]; then
+                  echo "##[warning] Falha ao consultar flag segmentada '${FEATURE_NAME}'. HTTP ${HTTP_CODE}. Grupo será marcado como não equalizável."
+                  jq --arg name "${FEATURE_NAME}" '. + [$name]' "${FAILED_NAMES_FILE}" > "${FAILED_NAMES_FILE}.tmp" && mv "${FAILED_NAMES_FILE}.tmp" "${FAILED_NAMES_FILE}"
+                  rm -f "${DETAIL_FILE}"
+                  sleep 1
+                  continue
+                fi
+
+                PARSED=$(jq \
+                  --arg app "${APPLICATION_NAME}" \
+                  --arg featureName "${FEATURE_NAME}" '
+                  def leaves:
+                    if (.nodes? != null) then (.nodes[] | leaves)
+                    elif (.value? != null) then { key: .key, value: .value }
+                    else empty
+                    end;
+
+                  (.featureDescription // "") as $desc
+                  | [ .toggles[]? | leaves ]
+                  | map(
+                      (.key | split("/")) as $parts
+                      | ($parts | index($featureName)) as $idx
+                      | ($parts[($idx+1):-1] | join("/")) as $flagPath
+                      | { flagPath: $flagPath, env: $parts[-1], value: (.value == "true") }
+                    )
+                  | group_by(.flagPath)
+                  | map({
+                      name: ($featureName + "/" + .[0].flagPath),
+                      description: $desc,
+                      values: (map({ (.env): .value }) | add // {}),
+                      application: $app,
+                      isSegmented: true
+                    })
+                  ' "${DETAIL_FILE}")
+
+                SEGMENTED_FLAGS_JSON=$(jq -c -n --argjson acc "${SEGMENTED_FLAGS_JSON}" --argjson add "${PARSED}" '$acc + $add')
+
+                rm -f "${DETAIL_FILE}"
+                sleep 1
+              done <<< "${SEGMENTED_NAMES}"
+
+              jq --argjson newFlags "${SEGMENTED_FLAGS_JSON}" --argjson failures "$(cat "${FAILED_NAMES_FILE}")" '
+                .flags |= (map(select(.isSegmented != true)) + $newFlags)
+                | .segmentedFetchFailures = $failures
+              ' "${SNAPSHOT_FILE}" > "${SNAPSHOT_FILE}.tmp" && mv "${SNAPSHOT_FILE}.tmp" "${SNAPSHOT_FILE}"
+
+              echo "##[section] $(echo "${SEGMENTED_FLAGS_JSON}" | jq 'length') flags segmentadas expandidas e equalizadas no snapshot."
+
+              FAILURE_COUNT=$(jq 'length' "${FAILED_NAMES_FILE}")
+              if [[ "${FAILURE_COUNT}" -gt 0 ]]; then
+                echo "##[warning] ${FAILURE_COUNT} grupo(s) segmentado(s) não puderam ser coletados e ficarão fora da equalização:"
+                jq -r '.[] | "##[warning]   - " + .' "${FAILED_NAMES_FILE}"
+              fi
+          env:
+            APPLICATION_NAME: $(HOBKNOB_DEFAULT_APPLICATION)
+            SNAPSHOT_FILE: $(HOBKNOB_SNAPSHOT_FILE)
+
+        - ${{ if eq(parameters.restoreSnapshot, true) }}:
+          - task: Bash@3
+            displayName: 'Baixar último snapshot do branch de reports'
+            inputs:
+              targetType: inline
+              script: |
+                set -euo pipefail
+
+                BRANCH_NAME='$(REPORTS_BRANCH)'
+                REPO_ROOT='$(Build.SourcesDirectory)'
+                SNAPSHOT_GLOB="$(REPORTS_DIR)/featureflag/featureflag_snapshot_*.json"
+
+                git -C "${REPO_ROOT}" fetch origin "${BRANCH_NAME}" --depth=1 || {
+                  echo "##[error] Não foi possível buscar o branch de reports '${BRANCH_NAME}'. Não há snapshot para restaurar."
+                  exit 1
+                }
+
+                # featureflag_snapshot_YYYY-MM.json
+                LATEST=$(git -C "${REPO_ROOT}" ls-tree -r --name-only FETCH_HEAD -- "$(REPORTS_DIR)/featureflag/" \
+                  | grep -E 'featureflag_snapshot_.*\.json$' | sort | tail -n 1 || true)
+
+                if [[ -z "${LATEST}" ]]; then
+                  echo "##[error] Nenhum snapshot (${SNAPSHOT_GLOB}) encontrado no branch '${BRANCH_NAME}'. Nada para restaurar."
+                  exit 1
+                fi
+
+                RESTORE_SOURCE_FILE="$(Agent.TempDirectory)/restore-source-snapshot.json"
+                git -C "${REPO_ROOT}" show "FETCH_HEAD:${LATEST}" > "${RESTORE_SOURCE_FILE}"
+
+                echo "##[section] Snapshot de restauração: ${LATEST}"
+                jq -r '"- gerado em (UTC): " + (.metadata.generatedAtUtc // "?") + "\n- mês: " + (.metadata.monthKey // "?") + "\n- origem: " + (.metadata.sourceEnvironment // "?")' "${RESTORE_SOURCE_FILE}" || true
+                echo "##vso[task.setvariable variable=RESTORE_SOURCE_FILE]${RESTORE_SOURCE_FILE}"
+
+        - task: Bash@3
+          name: preview
+          displayName: 'Gerar prévia de equalização'
+          inputs:
+            targetType: inline
+            script: |
+              set -euo pipefail
+
+              REPORTS_PATH="$(Build.SourcesDirectory)/$(REPORTS_DIR)"
+              mkdir -p "${REPORTS_PATH}"
+
+              GENERATED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+              MONTH_KEY=$(date -u +"%Y-%m")
+
+              if [[ "${RESTORE_MODE,,}" == "true" ]]; then
+                PREVIEW_JSON="${REPORTS_PATH}/preview-${APPLICATION_NAME}-restore-to-${TARGET_ENV}.json"
+              else
+                PREVIEW_JSON="${REPORTS_PATH}/preview-${APPLICATION_NAME}-${SOURCE_ENV}-to-${TARGET_ENV}.json"
+              fi
+              PREVIEW_MD="${REPORTS_PATH}/preview-summary.md"
+
+              csv_to_json_array() {
+                printf '%s' "${1:-}" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | awk 'NF' | jq -R . | jq -s .
+              }
+              INCLUDE_JSON=$(csv_to_json_array "${INCLUDE_LIST:-}")
+              IGNORE_JSON=$(csv_to_json_array "${IGNORE_LIST:-}")
+
+              if [[ "${RESTORE_MODE,,}" == "true" ]]; then
+                # RESTAURAÇÃO: valor desejado = coluna do destino no snapshot commitado; estado atual = leitura ao vivo.
+                DESIRED_MAP=$(jq -c --arg target "${TARGET_ENV}" '
+                  [ .state.flags[]? | select(.values[$target] != null) | {key: .name, value: .values[$target]} ] | from_entries
+                ' "${RESTORE_SOURCE_FILE}")
+
+                jq \
+                  --arg target "${TARGET_ENV}" \
+                  --arg app "${APPLICATION_NAME}" \
+                  --arg generatedAt "${GENERATED_AT}" \
+                  --arg monthKey "${MONTH_KEY}" \
+                  --argjson includeList "${INCLUDE_JSON}" \
+                  --argjson ignoreList "${IGNORE_JSON}" \
+                  --argjson desired "${DESIRED_MAP}" '
+                  (.segmentedFetchFailures // []) as $fetchFailures
+                  | [ .flags[]
+                    | select((.values | length) > 0)
+                    | . as $f
+                    | ($f.values[$target]) as $tv
+                    | ($desired[$f.name]) as $dv
+                    | (if ($dv == null) then "no_snapshot_reference"
+                       elif (($includeList | length) > 0) and (($includeList | index($f.name)) == null) then "ignored_not_in_include"
+                       elif (($ignoreList | index($f.name)) != null) then "protected"
+                       elif ($dv != $tv) then "pending_change"
+                       else "unchanged" end) as $status
+                    | {
+                        featureName: $f.name,
+                        featureDescription: ($f.description // ""),
+                        isSegmented: ($f.isSegmented // false),
+                        status: $status,
+                        currentTargetValue: $tv,
+                        snapshotValue: $dv,
+                        plannedTargetValue: (if $status == "pending_change" then $dv else $tv end)
+                      }
+                  ] as $items
+                  | {
+                      metadata: { generatedAtUtc: $generatedAt, applicationName: $app, targetEnvironment: $target, monthKey: $monthKey, mode: "restore-preview" },
+                      summary: {
+                        totalScanned: ($items | length),
+                        pendingChanges: ([ $items[] | select(.status == "pending_change") ] | length),
+                        protected: ([ $items[] | select(.status == "protected") ] | length),
+                        ignored: ([ $items[] | select(.status == "ignored_not_in_include") ] | length),
+                        unchanged: ([ $items[] | select(.status == "unchanged") ] | length),
+                        noSnapshotReference: ([ $items[] | select(.status == "no_snapshot_reference") ] | length),
+                        fetchFailures: ($fetchFailures | length),
+                        writeExecution: "deferred_to_equalization_stage"
+                      },
+                      fetchFailures: $fetchFailures,
+                      items: $items
+                    }
+                  ' "${SNAPSHOT_FILE}" > "${PREVIEW_JSON}"
+              else
+                # EQUALIZAÇÃO: consome o snapshot.json já formatado (flags com values por ambiente)
+                jq \
+                  --arg source "${SOURCE_ENV}" \
+                  --arg target "${TARGET_ENV}" \
+                  --arg app "${APPLICATION_NAME}" \
+                  --arg generatedAt "${GENERATED_AT}" \
+                  --arg monthKey "${MONTH_KEY}" \
+                  --argjson includeList "${INCLUDE_JSON}" \
+                  --argjson ignoreList "${IGNORE_JSON}" '
+                  (.segmentedFetchFailures // []) as $fetchFailures
+                  | [ .flags[]
+                    | select((.values | length) > 0)
+                    | . as $f
+                    | ($f.values[$source]) as $sv
+                    | ($f.values[$target]) as $tv
+                    | (if (($includeList | length) > 0) and (($includeList | index($f.name)) == null) then "ignored_not_in_include"
+                       elif (($ignoreList | index($f.name)) != null) then "protected"
+                       elif ($sv != $tv) then "pending_change"
+                       else "unchanged" end) as $status
+                    | {
+                        featureName: $f.name,
+                        featureDescription: ($f.description // ""),
+                        isSegmented: ($f.isSegmented // false),
+                        status: $status,
+                        sourceValue: $sv,
+                        targetValue: $tv,
+                        plannedTargetValue: (if $status == "pending_change" then $sv else $tv end)
+                      }
+                  ] as $items
+                  | {
+                      metadata: { generatedAtUtc: $generatedAt, applicationName: $app, sourceEnvironment: $source, targetEnvironment: $target, monthKey: $monthKey, mode: "preview" },
+                      summary: {
+                        totalScanned: ($items | length),
+                        pendingChanges: ([ $items[] | select(.status == "pending_change") ] | length),
+                        protected: ([ $items[] | select(.status == "protected") ] | length),
+                        ignored: ([ $items[] | select(.status == "ignored_not_in_include") ] | length),
+                        unchanged: ([ $items[] | select(.status == "unchanged") ] | length),
+                        fetchFailures: ($fetchFailures | length),
+                        writeExecution: "deferred_to_equalization_stage"
+                      },
+                      fetchFailures: $fetchFailures,
+                      items: $items
+                    }
+                  ' "${SNAPSHOT_FILE}" > "${PREVIEW_JSON}"
+              fi
+
+              TOTAL_SCANNED=$(jq -r '.summary.totalScanned' "${PREVIEW_JSON}")
+              PENDING=$(jq -r '.summary.pendingChanges' "${PREVIEW_JSON}")
+              PROTECTED=$(jq -r '.summary.protected' "${PREVIEW_JSON}")
+              IGNORED=$(jq -r '.summary.ignored' "${PREVIEW_JSON}")
+              UNCHANGED=$(jq -r '.summary.unchanged' "${PREVIEW_JSON}")
+              FETCH_FAILURES=$(jq -r '.summary.fetchFailures' "${PREVIEW_JSON}")
+              NO_REF=$(jq -r '.summary.noSnapshotReference // 0' "${PREVIEW_JSON}")
+
+              if [[ "${FETCH_FAILURES}" -gt 0 ]]; then
+                echo "##[warning] ${FETCH_FAILURES} grupo(s) de flag segmentada ficaram fora desta operação (falha na coleta):"
+                jq -r '.fetchFailures[] | "##[warning]   - " + .' "${PREVIEW_JSON}"
+              fi
+              if [[ "${RESTORE_MODE,,}" == "true" && "${NO_REF}" -gt 0 ]]; then
+                echo "##[warning] ${NO_REF} flag(s) não constam no snapshot de restauração e ficarão inalteradas."
+              fi
+
+              {
+                if [[ "${RESTORE_MODE,,}" == "true" ]]; then
+                  echo "# Hobknob Restore Preview"
+                  echo ""
+                  echo "- Application: ${APPLICATION_NAME}"
+                  echo "- Restore source: último snapshot commitado (branch $(REPORTS_BRANCH))"
+                else
+                  echo "# Hobknob Equalization Preview"
+                  echo ""
+                  echo "- Application: ${APPLICATION_NAME}"
+                  echo "- Source: ${SOURCE_ENV}"
+                fi
+                echo "- Target: ${TARGET_ENV}"
+                echo "- GeneratedAt (UTC): ${GENERATED_AT}"
+                echo "- Pending changes: ${PENDING}"
+                echo "- Protected flags: ${PROTECTED}"
+                echo "- Ignored flags: ${IGNORED}"
+                echo "- Unchanged flags: ${UNCHANGED}"
+                if [[ "${RESTORE_MODE,,}" == "true" ]]; then
+                  echo "- No snapshot reference (inalteradas): ${NO_REF}"
+                fi
+                echo "- Fetch failures (grupos não avaliados): ${FETCH_FAILURES}"
+                echo ""
+                if [[ "${FETCH_FAILURES}" -gt 0 ]]; then
+                  echo "## Grupos não avaliados (falha na coleta)"
+                  echo ""
+                  jq -r '.fetchFailures[] | "- " + .' "${PREVIEW_JSON}"
+                  echo ""
+                fi
+                echo "## Flags que NÃO serão alteradas"
+                echo ""
+                echo "### Protegidas (ignorelist) — ${PROTECTED}"
+                jq -r '([.items[] | select(.status=="protected") | .featureName]) as $n | if ($n|length)==0 then "- (nenhuma)" else ($n[] | "- " + .) end' "${PREVIEW_JSON}"
+                echo ""
+                echo "### Fora do include — ${IGNORED}"
+                jq -r '([.items[] | select(.status=="ignored_not_in_include") | .featureName]) as $n | if ($n|length)==0 then "- (nenhuma)" else ($n[] | "- " + .) end' "${PREVIEW_JSON}"
+                echo ""
+                if [[ "${RESTORE_MODE,,}" == "true" ]]; then
+                  echo "### Sem referência no snapshot — ${NO_REF}"
+                  jq -r '([.items[] | select(.status=="no_snapshot_reference") | .featureName]) as $n | if ($n|length)==0 then "- (nenhuma)" else ($n[] | "- " + .) end' "${PREVIEW_JSON}"
+                  echo ""
+                fi
+                echo "### Inalteradas / já iguais — ${UNCHANGED}"
+                jq -r '([.items[] | select(.status=="unchanged") | .featureName]) as $n | if ($n|length)==0 then "- (nenhuma)" else ($n[] | "- " + .) end' "${PREVIEW_JSON}"
+                echo ""
+                echo "## Important"
+                echo ""
+                if [[ "${RESTORE_MODE,,}" == "true" ]]; then
+                  echo "This is the restore preview. After manual approval, the Equalization stage writes the"
+                  echo "snapshot value back to the target env for each pending flag listed in this report."
+                else
+                  echo "This is the preview. After manual approval, the Equalization stage applies the source"
+                  echo "value to the target env for each pending flag listed in this report."
+                fi
+              } > "${PREVIEW_MD}"
+
+              echo "##vso[task.setvariable variable=TOTAL_SCANNED;isOutput=true]${TOTAL_SCANNED}"
+              echo "##vso[task.setvariable variable=PENDING_CHANGES;isOutput=true]${PENDING}"
+              echo "##vso[task.setvariable variable=PROTECTED_FLAGS;isOutput=true]${PROTECTED}"
+              echo "##vso[task.setvariable variable=IGNORED_FLAGS;isOutput=true]${IGNORED}"
+              echo "##vso[task.setvariable variable=UNCHANGED_FLAGS;isOutput=true]${UNCHANGED}"
+              echo "##vso[task.setvariable variable=FETCH_FAILURES;isOutput=true]${FETCH_FAILURES}"
+              echo "##vso[task.setvariable variable=NO_SNAPSHOT_REFERENCE;isOutput=true]${NO_REF}"
+
+              echo "##[section] Preview summary"
+              cat "${PREVIEW_MD}"
+              echo "##vso[task.uploadsummary]${PREVIEW_MD}"
+          env:
+            APPLICATION_NAME: $(HOBKNOB_DEFAULT_APPLICATION)
+            SOURCE_ENV: ${{ parameters.sourceEnvironment }}
+            TARGET_ENV: ${{ parameters.targetEnvironment }}
+            INCLUDE_LIST: ${{ parameters.includeFeatureFlags }}
+            IGNORE_LIST: ${{ parameters.ignoreFeatureFlags }}
+            SNAPSHOT_FILE: $(HOBKNOB_SNAPSHOT_FILE)
+            RESTORE_MODE: ${{ parameters.restoreSnapshot }}
+            RESTORE_SOURCE_FILE: $(RESTORE_SOURCE_FILE)
+
+        - ${{ if and(eq(parameters.saveSnapshot, true), eq(parameters.restoreSnapshot, false)) }}:
+          - task: Bash@3
+            displayName: 'Gerar snapshot mensal do ambiente'
+            inputs:
+              targetType: inline
+              script: |
+                set -euo pipefail
+
+                REPORTS_PATH="$(Build.SourcesDirectory)/$(REPORTS_DIR)"
+                mkdir -p "${REPORTS_PATH}"
+
+                GENERATED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+                MONTH_KEY=$(date -u +"%Y-%m")
+                SNAPSHOT_PATH="${REPORTS_PATH}/featureflag_snapshot_${MONTH_KEY}.json"
+
+                jq \
+                  --arg generatedAt "${GENERATED_AT}" \
+                  --arg app "${APPLICATION_NAME}" \
+                  --arg source "${SOURCE_ENV}" \
+                  --arg target "${TARGET_ENV}" \
+                  --arg monthKey "${MONTH_KEY}" '
+                  { metadata: { generatedAtUtc: $generatedAt, applicationName: $app, snapshotEnvironment: $target, sourceEnvironment: $source, monthKey: $monthKey, overwritePolicy: "monthly" }, state: . }
+                  ' "${FORMATTED_SNAPSHOT_FILE}" > "${SNAPSHOT_PATH}"
+
+                echo "##[section] Snapshot salvo em ${SNAPSHOT_PATH}"
+            env:
+              APPLICATION_NAME: $(HOBKNOB_DEFAULT_APPLICATION)
+              SOURCE_ENV: ${{ parameters.sourceEnvironment }}
+              TARGET_ENV: ${{ parameters.targetEnvironment }}
+              FORMATTED_SNAPSHOT_FILE: $(HOBKNOB_SNAPSHOT_FILE)
+
+        - task: PublishPipelineArtifact@1
+          displayName: 'Publicar relatório de preview e snapshot'
+          inputs:
+            targetPath: '$(Build.SourcesDirectory)/$(REPORTS_DIR)'
+            artifact: reports
+            publishLocation: pipeline
+
+- stage: Approval
+  displayName: 'Aprovação Manual para Escrita'
+  dependsOn: Preview
+  condition: and(succeeded(), ${{ eq(parameters.dryRun, false) }})
+  jobs:
+    - job: WaitForApproval
+      displayName: 'Gate manual após preview'
+      pool: server
+      variables:
+        TOTAL_SCANNED:   $[ stageDependencies.Preview.ComputeDiff.outputs['preview.TOTAL_SCANNED'] ]
+        PENDING_CHANGES: $[ stageDependencies.Preview.ComputeDiff.outputs['preview.PENDING_CHANGES'] ]
+        PROTECTED_FLAGS: $[ stageDependencies.Preview.ComputeDiff.outputs['preview.PROTECTED_FLAGS'] ]
+        IGNORED_FLAGS:   $[ stageDependencies.Preview.ComputeDiff.outputs['preview.IGNORED_FLAGS'] ]
+        UNCHANGED_FLAGS: $[ stageDependencies.Preview.ComputeDiff.outputs['preview.UNCHANGED_FLAGS'] ]
+        FETCH_FAILURES:  $[ stageDependencies.Preview.ComputeDiff.outputs['preview.FETCH_FAILURES'] ]
+        NO_SNAPSHOT_REFERENCE: $[ stageDependencies.Preview.ComputeDiff.outputs['preview.NO_SNAPSHOT_REFERENCE'] ]
+      steps:
+        - task: ManualValidation@1
+          displayName: 'Aprovar continuidade da equalização'
+          timeoutInMinutes: 15
+          inputs:
+            notifyUsers: ''
+            onTimeout: reject
+            ${{ if eq(parameters.restoreSnapshot, true) }}:
+              instructions: |
+                Revise o relatório de preview no artifact reports (arquivo preview-summary.md),
+                que contém a lista completa das flags por status.
+
+                Origem: último snapshot commitado
+                Destino: ${{ parameters.targetEnvironment }}
+
+                Flags avaliadas (incluídas): $(TOTAL_SCANNED)
+                Serão alteradas: $(PENDING_CHANGES)
+                Não foi necessário alterar: $(UNCHANGED_FLAGS)
+                Protegidas (ignorelist): $(PROTECTED_FLAGS)
+                Fora do include: $(IGNORED_FLAGS)
+                Sem referência no snapshot: $(NO_SNAPSHOT_REFERENCE)
+                Grupos não avaliados (coleta): $(FETCH_FAILURES)
+
+                ATENÇÃO: ao aprovar, o stage seguinte irá RESTAURAR o valor do último snapshot nas
+                flags pendentes do relatório (revertendo a equalização no destino).
+            ${{ else }}:
+              instructions: |
+                Revise o relatório de preview no artifact reports (arquivo preview-summary.md),
+                que contém a lista completa das flags por status.
+
+                Origem: ${{ parameters.sourceEnvironment }}
+                Destino: ${{ parameters.targetEnvironment }}
+
+                Flags avaliadas (incluídas): $(TOTAL_SCANNED)
+                Serão alteradas: $(PENDING_CHANGES)
+                Não foi necessário alterar: $(UNCHANGED_FLAGS)
+                Protegidas (ignorelist): $(PROTECTED_FLAGS)
+                Fora do include: $(IGNORED_FLAGS)
+                Grupos não avaliados (coleta): $(FETCH_FAILURES)
+
+                ATENÇÃO: ao aprovar, o stage de Equalização irá APLICAR os valores de origem nas flags
+                pendentes do relatório.
+
+- stage: Equalization
+  ${{ if eq(parameters.restoreSnapshot, true) }}:
+    displayName: 'Restauração de Feature Flags (último snapshot)'
+  ${{ else }}:
+    displayName: 'Equalização de Feature Flags'
+  dependsOn:
+    - Preview
+    - Approval
+  condition: and(succeeded(), ${{ eq(parameters.dryRun, false) }})
+  variables:
+    - group: comp-framework-brasil-environment-sync-pipelines
+  jobs:
+    - job: ApplyEqualization
+      ${{ if eq(parameters.restoreSnapshot, true) }}:
+        displayName: 'Restaurar valores do snapshot no destino'
+      ${{ else }}:
+        displayName: 'Aplicar valores de origem no destino'
+      pool:
+        name: GeneralPurposeLinuxAgentsCD
+      steps:
+        - task: DownloadPipelineArtifact@2
+          displayName: 'Baixar relatório de preview'
+          inputs:
+            artifact: reports
+            path: '$(Pipeline.Workspace)/reports'
+
+        - template: /tech_products/appv/qa/environment-sync/templates/cd/featureflag/steps/authenticate.yaml
+
+        - task: Bash@3
+          name: apply
+          ${{ if eq(parameters.restoreSnapshot, true) }}:
+            displayName: 'Restaurar snapshot no Hobknob'
+          ${{ else }}:
+            displayName: 'Aplicar equalização no Hobknob'
+          inputs:
+            targetType: inline
+            script: |
+              set -euo pipefail
+
+              PREVIEW_FILE=$(find "$(Pipeline.Workspace)/reports" -maxdepth 1 -type f -name 'preview-*.json' | head -n 1 || true)
+              if [[ -z "${PREVIEW_FILE}" ]]; then
+                echo "##[error] Nenhum relatório de preview encontrado no artifact reports."
+                exit 1
+              fi
+
+              if [[ "${RESTORE_MODE,,}" == "true" ]]; then
+                MODE_LABEL="Restore"; MODE_TAG="restore-apply"; RESULT_PREFIX="restore"
+              else
+                MODE_LABEL="Equalization"; MODE_TAG="equalization-apply"; RESULT_PREFIX="equalization"
+              fi
+
+              RESULTS_DIR="$(Pipeline.Workspace)/reports"
+              RESULT_JSON="${RESULTS_DIR}/${RESULT_PREFIX}-result.json"
+              RESULT_MD="${RESULTS_DIR}/${RESULT_PREFIX}-summary.md"
+              GENERATED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+              APPLIED_FILE="$(Agent.TempDirectory)/applied.json";  echo '[]' > "${APPLIED_FILE}"
+              FAILED_FILE="$(Agent.TempDirectory)/failed.json";    echo '[]' > "${FAILED_FILE}"
+              APPLIED=0; FAILED=0
+
+              while IFS=$'\t' read -r FEATURE_NAME PLANNED IS_SEGMENTED; do
+                [[ -z "${FEATURE_NAME}" ]] && continue
+
+                # flags segmentadas usam um endpoint próprio: /{app}/{grupo}/segmented-toggles/{resto}/{env}
+                if [[ "${IS_SEGMENTED}" == "true" ]]; then
+                  GROUP_NAME="${FEATURE_NAME%%/*}"
+                  FLAG_PATH="${FEATURE_NAME#*/}"
+                  PUT_URL="$(HOBKNOB_API_HOST)/applications/${APPLICATION_NAME}/${GROUP_NAME}/segmented-toggles/${FLAG_PATH}/${TARGET_ENV}"
+                else
+                  PUT_URL="$(HOBKNOB_API_HOST)/applications/${APPLICATION_NAME}/${FEATURE_NAME}/${TARGET_ENV}"
+                fi
+
+                PUT_RESP="$(Agent.TempDirectory)/put-resp.json"
+                PUT_CODE=$(curl -sS -o "${PUT_RESP}" -w "%{http_code}" \
+                  -b "$(HOBKNOB_COOKIE_FILE)" \
+                  -H 'Content-Type: application/json' \
+                  -H 'Accept: application/json' \
+                  -X PUT "${PUT_URL}" \
+                  -d "{\"value\": ${PLANNED}}") || PUT_CODE=000
+
+                if [[ "${PUT_CODE}" -ge 200 && "${PUT_CODE}" -le 299 ]]; then
+                  echo "##[debug] OK    ${FEATURE_NAME} -> ${PLANNED} (${TARGET_ENV})."
+                  APPLIED=$((APPLIED + 1))
+                  jq --arg n "${FEATURE_NAME}" --argjson to "${PLANNED}" \
+                    '. + [{featureName:$n, to:$to}]' "${APPLIED_FILE}" > "${APPLIED_FILE}.tmp" && mv "${APPLIED_FILE}.tmp" "${APPLIED_FILE}"
+                else
+                  echo "##[warning] FALHA ${FEATURE_NAME}: PUT retornou HTTP ${PUT_CODE}. Continuando."
+                  cat "${PUT_RESP}" || true
+                  FAILED=$((FAILED + 1))
+                  jq --arg n "${FEATURE_NAME}" --argjson to "${PLANNED}" --arg code "${PUT_CODE}" \
+                    '. + [{featureName:$n, to:$to, httpCode:$code}]' "${FAILED_FILE}" > "${FAILED_FILE}.tmp" && mv "${FAILED_FILE}.tmp" "${FAILED_FILE}"
+                fi
+
+                sleep 1
+              done < <(jq -r '
+                .items[]
+                | select(.status == "pending_change")
+                | select(.plannedTargetValue != null)
+                | [.featureName, (.plannedTargetValue | tostring), ((.isSegmented // false) | tostring)] | @tsv
+              ' "${PREVIEW_FILE}")
+
+              jq -n \
+                --arg generatedAt "${GENERATED_AT}" \
+                --arg app "${APPLICATION_NAME}" \
+                --arg source "${SOURCE_ENV}" \
+                --arg target "${TARGET_ENV}" \
+                --arg requestedBy "${REQUESTED_BY}" \
+                --arg mode "${MODE_TAG}" \
+                --argjson applied "$(cat "${APPLIED_FILE}")" \
+                --argjson failed "$(cat "${FAILED_FILE}")" '
+                {
+                  metadata: { generatedAtUtc: $generatedAt, applicationName: $app, sourceEnvironment: $source, targetEnvironment: $target, requestedBy: $requestedBy, mode: $mode },
+                  summary: { applied: ($applied | length), failed: ($failed | length) },
+                  applied: $applied,
+                  failed: $failed
+                }' > "${RESULT_JSON}"
+
+              {
+                echo "# Hobknob ${MODE_LABEL} Result"
+                echo ""
+                echo "- Application: ${APPLICATION_NAME}"
+                if [[ "${RESTORE_MODE,,}" == "true" ]]; then
+                  echo "- Restore source: último snapshot commitado (branch $(REPORTS_BRANCH))"
+                else
+                  echo "- Source: ${SOURCE_ENV}"
+                fi
+                echo "- Target: ${TARGET_ENV}"
+                echo "- Requested by: ${REQUESTED_BY}"
+                echo "- GeneratedAt (UTC): ${GENERATED_AT}"
+                echo "- Applied: ${APPLIED}"
+                echo "- Failed: ${FAILED}"
+                echo ""
+                if [[ "${FAILED}" -gt 0 ]]; then
+                  echo "## Failed flags"
+                  echo ""
+                  jq -r '.failed[] | "- " + .featureName + " (HTTP " + (.httpCode // "n/a") + ")"' "${RESULT_JSON}"
+                  echo ""
+                fi
+              } > "${RESULT_MD}"
+
+              echo "##[section] ${MODE_LABEL} result"
+              cat "${RESULT_MD}"
+
+              echo "##vso[task.setvariable variable=APPLIED_FLAGS;isOutput=true]${APPLIED}"
+              echo "##vso[task.setvariable variable=FAILED_FLAGS;isOutput=true]${FAILED}"
+              echo "##vso[task.uploadsummary]${RESULT_MD}"
+
+              if [[ "${FAILED}" -gt 0 ]]; then
+                echo "##vso[task.complete result=SucceededWithIssues;]${FAILED} flag(s) falharam na operação."
+              fi
+          env:
+            APPLICATION_NAME: $(HOBKNOB_DEFAULT_APPLICATION)
+            SOURCE_ENV: ${{ parameters.sourceEnvironment }}
+            TARGET_ENV: ${{ parameters.targetEnvironment }}
+            RESTORE_MODE: ${{ parameters.restoreSnapshot }}
+            REQUESTED_BY: $(Build.RequestedFor)
+
+        - task: PublishPipelineArtifact@1
+          displayName: 'Publicar resultado da equalização'
+          inputs:
+            targetPath: '$(Pipeline.Workspace)/reports'
+            artifact: equalization-report
+            publishLocation: pipeline
+
+        - task: Bash@3
+          displayName: 'Limpar credenciais temporárias'
+          condition: always()
+          inputs:
+            targetType: inline
+            script: |
+              rm -f "$(Agent.TempDirectory)/hobknob-cookie.txt" "$(Agent.TempDirectory)/hobknob-auth-response.json" || true
+              echo "##[section] Cookie e resposta de autenticação temporários removidos."
+
+- ${{ if and(eq(parameters.saveSnapshot, true), eq(parameters.restoreSnapshot, false)) }}:
+  - stage: CommitSnapshot
+    displayName: 'Commit Snapshot Mensal em Branch Dedicada'
+    dependsOn: Preview
+    condition: succeeded()
+    jobs:
+      - job: CommitReports
+        displayName: 'Commit do snapshot'
+        pool:
+          name: GeneralPurposeLinuxAgentsCD
+        steps:
+          - checkout: self
+            persistCredentials: true
+
+          - task: DownloadPipelineArtifact@2
+            displayName: 'Baixar artifact reports'
+            inputs:
+              artifact: reports
+              path: '$(Pipeline.Workspace)/reports'
+
+          - task: Bash@3
+            displayName: 'Fazer commit do snapshot mensal'
+            inputs:
+              targetType: inline
+              script: |
+                set -euo pipefail
+
+                REPORTS_SRC_DIR="$(Pipeline.Workspace)/reports"
+                SNAPSHOT_FILE=$(find "${REPORTS_SRC_DIR}" -maxdepth 1 -type f -name 'featureflag_snapshot_*.json' | head -n 1 || true)
+
+                if [[ -z "${SNAPSHOT_FILE}" ]]; then
+                  echo "##[warning] Nenhum snapshot encontrado no artifact."
+                  exit 0
+                fi
+
+                BRANCH_NAME='$(REPORTS_BRANCH)'
+                REPO_ROOT='$(Build.SourcesDirectory)'
+                REPORTS_DST_DIR="${REPO_ROOT}/$(REPORTS_DIR)/featureflag"
+
+                git -C "${REPO_ROOT}" config --local user.email "SVC_FWAPPVIVO@telefonicati.onmicrosoft.com"
+                git -C "${REPO_ROOT}" config --local user.name "SVC_FWAPPVIVO"
+
+                git -C "${REPO_ROOT}" fetch origin "${BRANCH_NAME}" || true
+
+                if git -C "${REPO_ROOT}" show-ref --verify --quiet "refs/heads/${BRANCH_NAME}"; then
+                  git -C "${REPO_ROOT}" checkout "${BRANCH_NAME}"
+                  git -C "${REPO_ROOT}" pull --ff-only origin "${BRANCH_NAME}" || true
+                elif git -C "${REPO_ROOT}" show-ref --verify --quiet "refs/remotes/origin/${BRANCH_NAME}"; then
+                  git -C "${REPO_ROOT}" checkout --track "origin/${BRANCH_NAME}"
+                else
+                  git -C "${REPO_ROOT}" checkout -b "${BRANCH_NAME}"
+                fi
+
+                mkdir -p "${REPORTS_DST_DIR}"
+                cp -f "${SNAPSHOT_FILE}" "${REPORTS_DST_DIR}/"
+
+                git -C "${REPO_ROOT}" add "$(REPORTS_DIR)/featureflag/"
+
+                if git -C "${REPO_ROOT}" diff --cached --quiet; then
+                  echo "##[section] Snapshot já está atualizado no branch de reports."
+                  exit 0
+                fi
+
+                git -C "${REPO_ROOT}" commit -m "[CI SKIP] automation: update hobknob monthly snapshot"
+                git -C "${REPO_ROOT}" push origin "HEAD:${BRANCH_NAME}"
+
+- stage: FinalSummary
+  displayName: 'Resumo Final da Execução'
+  dependsOn:
+    - Preview
+    - Approval
+    - Equalization
+    - ${{ if and(eq(parameters.saveSnapshot, true), eq(parameters.restoreSnapshot, false)) }}:
+      - CommitSnapshot
+  condition: succeededOrFailed()
+  jobs:
+    - job: PrintSummary
+      displayName: 'Publicar métricas da execução'
+      pool:
+        name: GeneralPurposeLinuxAgentsCD
+      variables:
+        PENDING_CHANGES: $[ stageDependencies.Preview.ComputeDiff.outputs['preview.PENDING_CHANGES'] ]
+        PROTECTED_FLAGS: $[ stageDependencies.Preview.ComputeDiff.outputs['preview.PROTECTED_FLAGS'] ]
+        IGNORED_FLAGS: $[ stageDependencies.Preview.ComputeDiff.outputs['preview.IGNORED_FLAGS'] ]
+        UNCHANGED_FLAGS: $[ stageDependencies.Preview.ComputeDiff.outputs['preview.UNCHANGED_FLAGS'] ]
+        FETCH_FAILURES: $[ stageDependencies.Preview.ComputeDiff.outputs['preview.FETCH_FAILURES'] ]
+        APPLIED_FLAGS: $[ stageDependencies.Equalization.ApplyEqualization.outputs['apply.APPLIED_FLAGS'] ]
+        FAILED_FLAGS: $[ stageDependencies.Equalization.ApplyEqualization.outputs['apply.FAILED_FLAGS'] ]
+      steps:
+        - task: Bash@3
+          displayName: 'Exibir resumo da equalização'
+          inputs:
+            targetType: inline
+            script: |
+              if [[ "${RESTORE_MODE,,}" == "true" ]]; then
+                echo "##[section] Hobknob Restore Summary"
+                echo "Application: ${APPLICATION_NAME}"
+                echo "Restore source: último snapshot commitado"
+              else
+                echo "##[section] Hobknob Equalization Summary"
+                echo "Application: ${APPLICATION_NAME}"
+                echo "Source: ${SOURCE_ENV}"
+              fi
+              echo "Target: ${TARGET_ENV}"
+              echo "Pending changes: $(PENDING_CHANGES)"
+              echo "Protected flags: $(PROTECTED_FLAGS)"
+              echo "Ignored flags: $(IGNORED_FLAGS)"
+              echo "Unchanged flags: $(UNCHANGED_FLAGS)"
+              echo "Fetch failures: $(FETCH_FAILURES)"
+              echo "Applied flags: $(APPLIED_FLAGS)"
+              echo "Failed flags: $(FAILED_FLAGS)"
+          env:
+            APPLICATION_NAME: $(HOBKNOB_DEFAULT_APPLICATION)
+            SOURCE_ENV: ${{ parameters.sourceEnvironment }}
+            TARGET_ENV: ${{ parameters.targetEnvironment }}
+            RESTORE_MODE: ${{ parameters.restoreSnapshot }}

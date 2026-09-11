@@ -1,0 +1,112 @@
+parameters:
+- name: command
+  type: string
+  default: ''
+- name: environment
+  type: string
+  default: 'prd'
+- name: timeout
+  type: number
+  default: 20000
+
+variables:
+- template: provisioners/variables/load.yml
+  parameters:
+    environment: ${{parameters.environment}}
+
+stages:
+- stage: prod_new_stage
+  displayName: "Rodando no ambiente ${{ parameters.environment }} o comando ${{ parameters.command }}"
+  pool: $(PollVivoCorpSiebelAgents)
+  jobs:
+  - job: prod_new_job
+    displayName: "Job para rodar no ambiente ${{ parameters.environment }} o comando ${{ parameters.command }}"
+    steps:
+      - checkout: self
+      - checkout: CodePlayPipelines
+        fetchDepth: 0
+        fetchTags: false
+      # Validando se a variável scriptsProdNew e command estão sendo recebida corretamente
+      # Validação condicional baseada no valor do parameter command
+      - ${{ if eq(parameters.command, 'exemplo.bat') }}:
+        - script: |
+            echo "Iniciando execução do comando: ${{ parameters.command }}"
+            echo "validando se variável $(scriptsProdNew) está sendo recebida corretamente"
+            if not exist "$(Build.ArtifactStagingDirectory)\logs" mkdir "$(Build.ArtifactStagingDirectory)\logs"
+          displayName: 'Exibindo comando a ser executado no ambiente ${{ parameters.environment }}'
+          condition: always()
+
+        # Criando cabeçalho do log de execução
+        - script: |
+            echo === INICIO DA EXECUCAO === > "$(Build.ArtifactStagingDirectory)\logs\execution-${{ parameters.environment }}.log"
+            echo Data/Hora: %date% %time% >> "$(Build.ArtifactStagingDirectory)\logs\execution-${{ parameters.environment }}.log"
+            echo Comando: ${{ parameters.command }} >> "$(Build.ArtifactStagingDirectory)\logs\execution-${{ parameters.environment }}.log"
+            echo Script Path: $(scriptsProdNew)${{ parameters.command }} >> "$(Build.ArtifactStagingDirectory)\logs\execution-${{ parameters.environment }}.log"
+            echo Ambiente: ${{ parameters.environment }} >> "$(Build.ArtifactStagingDirectory)\logs\execution-${{ parameters.environment }}.log"
+            echo. >> "$(Build.ArtifactStagingDirectory)\logs\execution-${{ parameters.environment }}.log"
+          displayName: 'Criando cabeçalho do log'
+          condition: always()
+
+        # Executando script diretamente com captura de logs
+        - script: |
+            call "$(scriptsProdNew)${{ parameters.command }}" >> "$(Build.ArtifactStagingDirectory)\logs\execution-${{ parameters.environment }}.log" 2>&1
+            set SCRIPT_EXIT_CODE=%ERRORLEVEL%
+            echo. >> "$(Build.ArtifactStagingDirectory)\logs\execution-${{ parameters.environment }}.log"
+            echo === FIM DA EXECUCAO === >> "$(Build.ArtifactStagingDirectory)\logs\execution-${{ parameters.environment }}.log"
+            echo Exit Code: %SCRIPT_EXIT_CODE% >> "$(Build.ArtifactStagingDirectory)\logs\execution-${{ parameters.environment }}.log"
+            exit /b %SCRIPT_EXIT_CODE%
+          displayName: 'Executando script ${{ parameters.command }} no ambiente ${{ parameters.environment }} com captura de logs'
+          condition: always()
+          
+        # Capturando informações adicionais da execução
+        - script: |
+            echo "=== INFORMAÇÕES DA EXECUÇÃO ===" > "$(Build.ArtifactStagingDirectory)\logs\execution-summary-${{ parameters.environment }}.log"
+            echo "Data/Hora: %date% %time%" >> "$(Build.ArtifactStagingDirectory)\logs\execution-summary-${{ parameters.environment }}.log"
+            echo "Comando executado: ${{ parameters.command }}" >> "$(Build.ArtifactStagingDirectory)\logs\execution-summary-${{ parameters.environment }}.log"
+            echo "Ambiente: ${{ parameters.environment }}" >> "$(Build.ArtifactStagingDirectory)\logs\execution-summary-${{ parameters.environment }}.log"
+            echo "Working Directory: $(Build.SourcesDirectory)" >> "$(Build.ArtifactStagingDirectory)\logs\execution-summary-${{ parameters.environment }}.log"
+            echo "Script Path: $(scriptsProdNew)${{ parameters.command }}" >> "$(Build.ArtifactStagingDirectory)\logs\execution-summary-${{ parameters.environment }}.log"
+            echo "Exit Code da execução anterior: %ERRORLEVEL%" >> "$(Build.ArtifactStagingDirectory)\logs\execution-summary-${{ parameters.environment }}.log"
+            echo "=== ARQUIVOS DE LOG GERADOS ===" >> "$(Build.ArtifactStagingDirectory)\logs\execution-summary-${{ parameters.environment }}.log"
+            if exist "$(Build.ArtifactStagingDirectory)\logs\execution-${{ parameters.environment }}.log" (
+                echo "execution-${{ parameters.environment }}.log - Tamanho: " >> "$(Build.ArtifactStagingDirectory)\logs\execution-summary-${{ parameters.environment }}.log"
+                for %%i in ("$(Build.ArtifactStagingDirectory)\logs\execution-${{ parameters.environment }}.log") do echo %%~zi bytes >> "$(Build.ArtifactStagingDirectory)\logs\execution-summary-${{ parameters.environment }}.log"
+            ) else (
+                echo "execution-${{ parameters.environment }}.log - ARQUIVO NÃO ENCONTRADO" >> "$(Build.ArtifactStagingDirectory)\logs\execution-summary-${{ parameters.environment }}.log"
+            )
+          displayName: 'Gerando sumário da execução'
+          condition: always()
+
+      - ${{ else }}:
+        - script: |
+            echo "##vso[task.logissue type=error]Comando não suportado: ${{ parameters.command }}"
+            echo "##vso[task.complete result=Failed]"
+          displayName: 'Cancelando job - comando não suportado'
+          condition: always()
+
+      # Publica os logs da execução do comando
+      - task: PublishBuildArtifacts@1
+        displayName: 'Publicando logs da execução do comando'
+        condition: always()
+        inputs:
+          pathToPublish: '$(Build.ArtifactStagingDirectory)\logs'
+          artifactName: 'command-execution-logs'
+          publishLocation: 'Container'
+          
+      # Exibindo conteúdo dos logs no console para debug
+      - script: |
+          echo "=== CONTEÚDO DOS LOGS GERADOS ==="
+          if exist "$(Build.ArtifactStagingDirectory)\logs\execution-${{ parameters.environment }}.log" (
+            echo "--- execution-${{ parameters.environment }}.log ---"
+            type "$(Build.ArtifactStagingDirectory)\logs\execution-${{ parameters.environment }}.log"
+          ) else (
+            echo "Arquivo execution-${{ parameters.environment }}.log não encontrado"
+          )
+          if exist "$(Build.ArtifactStagingDirectory)\logs\execution-summary-${{ parameters.environment }}.log" (
+            echo "--- execution-summary-${{ parameters.environment }}.log ---"
+            type "$(Build.ArtifactStagingDirectory)\logs\execution-summary-${{ parameters.environment }}.log"
+          ) else (
+            echo "Arquivo execution-summary-${{ parameters.environment }}.log não encontrado"
+          )
+        displayName: 'Exibindo logs no console (debug)'
+        condition: always()

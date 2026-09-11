@@ -1,0 +1,153 @@
+parameters:
+  - name: monitoringParameters
+    type: object
+
+stages:
+  - stage: run
+    displayName: "Run"
+    pool: $(AGENT_POOL_CI)
+    jobs:
+      - ${{ each environment in split(parameters.monitoringParameters.environmentsMonitoring, ',')}}:
+          - job: ${{ environment }}
+            displayName: "${{ environment }}"
+            steps:
+              - checkout: none
+              - task: SSH@0
+                name: get_pods_nodes_status
+                displayName: "Get Pods and Nodes Status"
+                inputs:
+                  sshEndpoint: BRM_BASTION_${{ environment }}
+                  runOptions: "inline"
+                  inline: |
+                    ########################################################################################
+                    ######################################## PODS #########################################
+                    ########################################################################################
+                    echo ""
+                    echo "##[section]>>>>>>>>>>>>>>>>>>>> PODS <<<<<<<<<<<<<<<<<<<<"
+                    echo ">>>>> Collecting Pods status in the cluster ..."
+                    echo "##[group]All Pods"
+                    echo "##[command]kubectl get pods | column -t"
+                    ALL_PODS=$(kubectl get pods | column -t)
+                    echo "$ALL_PODS"
+                    echo "##[endgroup]"
+
+                    echo ">>>>> Analyzing Pods ..."
+                    POD_STATUS=""
+                    IS_POD_PROBLEM="false"
+
+                    while IFS= read -r line || [[ -n "$line" ]]; do
+                      [ -z "$line" ] && continue
+                      
+                      if [[ ${line} != *"NAME"* ]]; then
+                        IFS=' ' read -ra ADDR <<< "${line}"
+
+                        if [ -z "${ADDR[2]}" ]; then
+                          ADDR[2]="NotRecognized"
+                        fi
+
+                        if [ "${#POD_STATUS}" -gt 0 ]; then
+                          POD_STATUS+=";${ADDR[0]},${ADDR[2]},${ADDR[4]}"
+                        else
+                          POD_STATUS="${ADDR[0]},${ADDR[2]},${ADDR[4]}"
+                        fi
+                        
+                        case "${ADDR[2]}" in
+                          "Running") echo "🟢 Pod [${ADDR[0]} <> ${ADDR[2]}]" ;;
+                          "Completed") echo "🟢 Pod [${ADDR[0]} <> ${ADDR[2]}]" ;;
+                          "NotRecognized") echo "🟡 Pod [${ADDR[0]} <> ${ADDR[2]}]"
+                          IS_POD_PROBLEM="true" ;;
+                          *) echo "🔴 Pod [${ADDR[0]} <> ${ADDR[2]}]"
+                          IS_POD_PROBLEM="true" ;;
+                        esac
+                      fi
+                    done <<< "$ALL_PODS"
+
+                    if [ "$IS_POD_PROBLEM" = "true" ]; then
+                      echo "##vso[task.logissue type=warning]Some pods are not in Running or Completed state"
+                      echo "##vso[task.complete result=SucceededWithIssues;]"
+                    fi
+
+                    echo "##vso[task.setvariable variable=POD_STATUS;]$POD_STATUS"
+
+                    ########################################################################################
+                    ######################################## NODES #########################################
+                    ########################################################################################
+                    IS_NODE_PROBLEM="false"
+
+                    echo "##[section]>>>>>>>>>>>>>>>>>>>> NODES <<<<<<<<<<<<<<<<<<<<"
+                    echo ">>>>> Collecting Nodes status in the cluster ..."
+                    echo "##[group]All Nodes"
+                    echo "##[command]kubectl get nodes | column -t"
+                    ALL_NODES=$(kubectl get nodes | column -t)
+                    echo "$ALL_NODES"
+                    echo "##[endgroup]"
+
+                    echo ">>>>> Analyzing Nodes status ..."
+                    NODES_STATUS=""
+                    IS_NODE_PROBLEM="false"
+
+                    while IFS= read -r line || [[ -n "$line" ]]; do
+                      [ -z "$line" ] && continue
+                      
+                      if [[ ${line} != *"NAME"* ]]; then
+                      IFS=' ' read -ra ADDR <<< "${line}"
+                      
+                      if [ "${#NODES_STATUS}" -gt 0 ]; then
+                        NODES_STATUS+=";${ADDR[0]},${ADDR[1]},${ADDR[3]},${ADDR[4]}"
+                      else
+                        NODES_STATUS="${ADDR[0]},${ADDR[1]},${ADDR[3]},${ADDR[4]}"
+                      fi
+
+                      case "${ADDR[1]}" in
+                        "Ready") echo "🟢 Node [${ADDR[0]} <> ${ADDR[1]}]" ;;
+                        *) echo "🔴 Node [${ADDR[0]} <> ${ADDR[1]}]"
+                        IS_NODE_PROBLEM="true" ;;
+                      esac
+                      fi
+                    done <<< "$ALL_NODES"
+
+                    if [ "$IS_NODE_PROBLEM" = "true" ]; then
+                      echo "##vso[task.logissue type=warning]Some nodes are not in Ready state"
+                      echo "##vso[task.complete result=SucceededWithIssues;]"
+                    fi
+
+                    echo "##vso[task.setvariable variable=NODES_STATUS;]$NODES_STATUS"
+                  readyTimeout: "20000"
+                  failOnStdErr: false
+
+              - ${{ if contains(parameters.monitoringParameters.environmentsObservability, environment) }}:
+                  - template: ../../../tasks/observability/process_data.yml
+                    parameters:
+                      environment: "${{ environment }}"
+                      podStatus: "$(POD_STATUS)"
+                      nodesStatus: "$(NODES_STATUS)"
+
+              - template: ../../../tasks/teams/send_message_monitoring.yml
+                parameters:
+                  webhookUrl: "$(TEAMS_WEBHOOK_MONITORING)"
+                  environment: "${{ environment }}"
+                  podsStatus: $(POD_STATUS)
+                  nodesStatus: $(NODES_STATUS)
+
+      - job: observability_report_files
+        displayName: "Observability Report Files"
+        dependsOn:
+          - ${{ each environment in split(parameters.monitoringParameters.environmentsMonitoring, ',')}}:
+              - ${{ environment }}
+        condition: and(succeeded(), ne('${{ parameters.monitoringParameters.environmentsObservability }}', ''))
+        variables:
+          - ${{ each environment in split(parameters.monitoringParameters.environmentsMonitoring, ',')}}:
+              - name: ERRORS_${{ environment }}
+                value: $[ dependencies.${{ environment }}.outputs['observability_process_data.ERRORS_${{ environment }}'] ]
+              - name: NON_RUNNING_PODS_${{ environment }}
+                value: $[ dependencies.${{ environment }}.outputs['observability_process_data.NON_RUNNING_PODS_${{ environment }}'] ]
+              - name: NON_READY_NODES_${{ environment }}
+                value: $[ dependencies.${{ environment }}.outputs['observability_process_data.NON_READY_NODES_${{ environment }}'] ]
+        steps:
+          - template: ../../../task_groups/observability/history_files.yml
+            parameters:
+              sourceCodeFolder: "$(SOURCE_CODE_FOLDER)"
+              filesPath: "$(DASHBOARD_OBSERVABILITY_FILES_FOLDER_PATH)"
+              environmentsObservability: ${{ parameters.monitoringParameters.environmentsObservability }}
+              dashboardHistoryId: "$(DASHBOARD_HISTORY_ID)"
+              cleanEntries: "$(DASHBOARD_HISTORY_FILE_CLEAN_ENTRIES)"

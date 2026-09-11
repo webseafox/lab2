@@ -1,0 +1,122 @@
+parameters:
+- name: skipDeploy
+  type: boolean
+  default: False
+- name: ACRAsDefaultDockerRegistry
+  type: boolean
+  default: False
+
+variables:
+  - template:  /provisioners/app/vivoflow/nodejs/api_default/variables/load.yml
+    parameters:
+      ACRAsDefaultDockerRegistry: ${{ parameters.ACRAsDefaultDockerRegistry }}
+
+resources:
+  repositories:
+    - repository: FortifyExclusion
+      name: DevOps/Vivo.Fortify.Exclusions
+      type: git
+      ref: refs/heads/master
+      endpoint: CorePipelines
+
+stages:
+## INIT
+- template: /provisioners/app/vivoflow/nodejs/api_default/stages/init.yml
+
+### BUILD & TEST
+- template: /provisioners/app/vivoflow/nodejs/api_default/stages/build_test.yml
+
+### GATES
+- template: /provisioners/app/vivoflow/nodejs/api_default/stages/gates.yml
+
+### Security
+- template: /provisioners/app/vivoflow/nodejs/api_default/stages/security_sast_sca.yml
+  parameters:
+    fortifyExclusionRepository: FortifyExclusion
+
+## PACKAGE
+- template: /provisioners/app/vivoflow/nodejs/api_default/stages/package.yml
+
+## VALIDATIONS
+- template: /provisioners/app/vivoflow/nodejs/api_default/stages/validation.yml
+
+## DEPLOY
+- ${{ if and( ne(variables['Build.Reason'], 'PullRequest'), or( startsWith(variables['Build.SourceBranch'], 'refs/heads/develop/'), eq(variables['Build.SourceBranch'], 'refs/heads/develop'), startsWith(variables['Build.SourceBranch'], 'refs/heads/release/'), eq(variables['Build.SourceBranch'], 'refs/heads/release'), eq(variables['Build.SourceBranch'], 'refs/heads/main'), eq(variables['Build.SourceBranch'], 'refs/heads/master'), startsWith(variables['Build.SourceBranch'], 'refs/tags/develop/'), startsWith(variables['Build.SourceBranch'], 'refs/tags/release/'), startsWith(variables['Build.SourceBranch'], 'refs/tags/production/'), startsWith(variables['Build.SourceBranch'], 'refs/heads/esteira1/'), eq(variables['Build.SourceBranch'], 'refs/heads/esteira1') ) ) }}:
+  - template: /provisioners/app/vivoflow/nodejs/api_default/stages/deploy.yml
+    parameters:
+      skipDeploy: ${{ parameters.skipDeploy }}
+      azureServiceConnectionEnabled: ${{ variables.azureServiceConnectionEnabled }}
+      kubernetesServiceConnectionEnabled: ${{ variables.kubernetesServiceConnectionEnabled }}
+      ${{ if or(startsWith(variables['Build.SourceBranch'], 'refs/tags/develop/'), startsWith(variables['Build.SourceBranch'], 'refs/heads/develop/'), eq(variables['Build.SourceBranch'], 'refs/heads/develop') ) }}:
+        environment: development
+        rdm: false
+        approval: false
+        private_agent_pool: $(PRIVATE_AGENT_DEVELOPMENT)
+        kubeconfig: $(KUBECONFIG_DEVELOPMENT)
+        git_tag: $(ENABLE_GIT_TAG_DEVELOPMENT)
+        helm_release_name_prefix: $(DEFAULT_PREFIX_HELM_RELEASE_NAME_DEVELOPMENT)
+
+      ${{ if or(startsWith(variables['Build.SourceBranch'], 'refs/tags/esteira1/'), startsWith(variables['Build.SourceBranch'], 'refs/heads/esteira1/'), eq(variables['Build.SourceBranch'], 'refs/heads/esteira1') ) }}:
+        environment: esteira1
+        rdm: false
+        approval: false
+        private_agent_pool: $(PRIVATE_AGENT_ESTEIRA1)
+        kubeconfig: $(KUBECONFIG_ESTEIRA1)
+        git_tag: $(ENABLE_GIT_TAG_ESTEIRA1)
+        helm_release_name_prefix: $(DEFAULT_PREFIX_HELM_RELEASE_NAME_ESTEIRA1)
+
+      ${{ if or(startsWith(variables['Build.SourceBranch'], 'refs/tags/release/'), startsWith(variables['Build.SourceBranch'], 'refs/heads/release/'), eq(variables['Build.SourceBranch'], 'refs/heads/release') ) }}:
+        environment: homologation
+        rdm: false
+        approval: false
+        private_agent_pool: $(PRIVATE_AGENT_HOMOLOGATION)
+        kubeconfig: $(KUBECONFIG_HOMOLOGATION)
+        git_tag: $(ENABLE_GIT_TAG_HOMOLOGATION)
+        helm_release_name_prefix: $(DEFAULT_PREFIX_HELM_RELEASE_NAME_HOMOLOGATION)
+
+      ${{ if or(startsWith(variables['Build.SourceBranch'], 'refs/tags/production/'), eq(variables['Build.SourceBranch'], 'refs/heads/main'), eq(variables['Build.SourceBranch'], 'refs/heads/master') ) }}:
+        environment: production
+        rdm: true
+        approval: false
+        private_agent_pool: $(PRIVATE_AGENT_PRODUCTION)
+        kubeconfig: $(KUBECONFIG_PRODUCTION)
+        git_tag: true
+        helm_release_name_prefix: $(DEFAULT_PREFIX_HELM_RELEASE_NAME_PRODUCTION)
+
+  - ${{ if eq(variables.useArgoRolloutsDeploys, true) }}:
+    ## PROMOTE
+    - template: /provisioners/app/vivoflow/nodejs/api_default/stages/argorollouts_promote.yml
+      parameters:
+        ${{ if or(startsWith(variables['Build.SourceBranch'], 'refs/tags/develop/'), startsWith(variables['Build.SourceBranch'], 'refs/heads/develop/'), eq(variables['Build.SourceBranch'], 'refs/heads/develop') ) }}:
+          environment: development
+          kubeconfig: $(KUBECONFIG_DEVELOPMENT)
+          private_agent_pool: $(PRIVATE_AGENT_DEVELOPMENT)
+        ${{ if or(startsWith(variables['Build.SourceBranch'], 'refs/tags/release/'), startsWith(variables['Build.SourceBranch'], 'refs/heads/release/'), eq(variables['Build.SourceBranch'], 'refs/heads/release') ) }}:
+          environment: homologation
+          kubeconfig: $(KUBECONFIG_HOMOLOGATION)
+          private_agent_pool: $(PRIVATE_AGENT_HOMOLOGATION)
+        ${{ if or(startsWith(variables['Build.SourceBranch'], 'refs/tags/production/'), eq(variables['Build.SourceBranch'], 'refs/heads/main'), eq(variables['Build.SourceBranch'], 'refs/heads/master') ) }}:
+          environment: production
+          kubeconfig: $(KUBECONFIG_PRODUCTION)
+          private_agent_pool: $(PRIVATE_AGENT_PRODUCTION)
+        dependsOn: deploy
+        azureServiceConnectionEnabled: ${{ variables.azureServiceConnectionEnabled }}
+        kubernetesServiceConnectionEnabled: ${{ variables.kubernetesServiceConnectionEnabled }}
+    ## ROLLBACK
+    - template: /provisioners/app/vivoflow/nodejs/api_default/stages/argorollouts_rollback.yml
+      parameters:
+        ${{ if or(startsWith(variables['Build.SourceBranch'], 'refs/tags/develop/'), startsWith(variables['Build.SourceBranch'], 'refs/heads/develop/'), eq(variables['Build.SourceBranch'], 'refs/heads/develop') ) }}:
+          environment: development
+          kubeconfig: $(KUBECONFIG_DEVELOPMENT)
+          private_agent_pool: $(PRIVATE_AGENT_DEVELOPMENT)
+        ${{ if or(startsWith(variables['Build.SourceBranch'], 'refs/tags/release/'), startsWith(variables['Build.SourceBranch'], 'refs/heads/release/'), eq(variables['Build.SourceBranch'], 'refs/heads/release') ) }}:
+          environment: homologation
+          kubeconfig: $(KUBECONFIG_HOMOLOGATION)
+          private_agent_pool: $(PRIVATE_AGENT_HOMOLOGATION)
+        ${{ if or(startsWith(variables['Build.SourceBranch'], 'refs/tags/production/'), eq(variables['Build.SourceBranch'], 'refs/heads/main'), eq(variables['Build.SourceBranch'], 'refs/heads/master') ) }}:
+          environment: production
+          kubeconfig: $(KUBECONFIG_PRODUCTION)
+          private_agent_pool: $(PRIVATE_AGENT_PRODUCTION)
+        dependsOn: deploy
+        azureServiceConnectionEnabled: ${{ variables.azureServiceConnectionEnabled }}
+        kubernetesServiceConnectionEnabled: ${{ variables.kubernetesServiceConnectionEnabled }}

@@ -1,0 +1,213 @@
+# This YAML file defines the stages and jobs for the "Finish" stage in a pipeline.
+
+parameters:
+  - name: config
+    type: object
+  - name: flow
+    type: object
+  - name: stageSecurityOnly
+
+stages:
+  - stage: stage_finish
+    displayName: "Finish"
+    pool: $(POOL)
+    dependsOn:
+      - stage_prep
+      - ${{ if eq(parameters.flow.flow, 'CI') }}:
+          - stage_build_test
+          - stage_static_code_analysis
+          - stage_code_security_analysis
+          - stage_bundle
+          - trigger_cd
+      - ${{ if eq(parameters.flow.flow, 'CD') }}:
+          # JCR UPGRADE BRM 15: Files nao faz mais parte da cadeia de dependencias do CD.
+          # - stage_files
+          - stage_deploy
+      - ${{ if and(eq(parameters.flow.flow, 'CD'), ne(parameters.flow.cd_params.appVersion, 'LATEST'), ne(parameters.config.technology, 'helmCharts')) }}:
+          - update_assets
+    condition: always()
+    variables:
+      - name: START_TIME
+        value: $[ stageDependencies.stage_prep.app_config_keys.outputs['setStartTime.START_TIME'] ]
+      - name: VERSION
+        ${{ if eq(parameters.config.applicationParameters.applicationName, 'bi-publisher-reports') }}:
+          value: "-"
+        ${{ else }}:
+          value: $[ stageDependencies.stage_prep.version.outputs['version.VERSION'] ]
+      - ${{ if eq(parameters.flow.flow, 'CI') }}:
+          - name: CD_PIPELINE_TRIGGERED
+            value: $[ coalesce(stageDependencies.trigger_cd.triggerPipeline.outputs['trigger_pipeline.CD_PIPELINE_TRIGGERED'], False) ]
+          - name: CD_PIPELINE_TRIGGERED_URL
+            value: $[ coalesce(stageDependencies.trigger_cd.triggerPipeline.outputs['trigger_pipeline.CD_PIPELINE_TRIGGERED_URL'], False) ]
+          - name: SONARQUBE_ANALYSIS_STATUS
+            value: $[ stageDependencies.stage_static_code_analysis.analysis.outputs['break_build_on_quality_gate_failure.SONARQUBE_ANALYSIS_STATUS'] ]
+          - name: SONARQUBE_ANALYSIS_METRICKEYS_STATUS
+            value: $[ stageDependencies.stage_static_code_analysis.analysis.outputs['break_build_on_quality_gate_failure.SONARQUBE_ANALYSIS_METRICKEYS_STATUS'] ]
+          - name: SECURITY_ISSUES_CRITICAL
+            value: $[ stageDependencies.stage_code_security_analysis.fortify_scan.outputs['get_fortify_report.fortifyCritical'] ]
+          - name: SECURITY_ISSUES_HIGH
+            value: $[ stageDependencies.stage_code_security_analysis.fortify_scan.outputs['get_fortify_report.fortifyHigh'] ]
+          - name: SECURITY_ISSUES_MEDIUM
+            value: $[ stageDependencies.stage_code_security_analysis.fortify_scan.outputs['get_fortify_report.fortifyMedium'] ]
+          - name: SECURITY_ISSUES_LOW
+            value: $[ stageDependencies.stage_code_security_analysis.fortify_scan.outputs['get_fortify_report.fortifyLow'] ]
+      - ${{ if eq(parameters.flow.flow, 'CD') }}:
+          - name: REMOTE_HOST_COMMANDS_PATH
+            ${{ if eq(parameters.config.applicationParameters.applicationName, 'bi-publisher-reports') }}:
+              value: $(BIP_COMMANDS_PATH)
+            ${{ else }}:
+              value: $(OPERATION_HOST_COMMANDS_PATH)
+          - name: VALIDATION_FAILURE_APPROVAL_COMMENT
+            value: $[ stageDependencies.stage_deploy.export_manual_validation_result.outputs['details.APPROVAL_COMMENT'] ]
+    jobs:
+      - ${{ if eq(parameters.flow.flow, 'CD') }}:
+          - job: clean_environment
+            displayName: "Clean Environment"
+            condition: |
+              and(
+                ne(stageDependencies.stage_deploy.deploy.result, 'Skipped'),
+                ne(stageDependencies.stage_deploy.confirm_deploy.result, 'Failed')
+              )
+            steps:
+              - checkout: none
+              - task: SSH@0
+                displayName: "Deleting $(REMOTE_HOST_COMMANDS_PATH) in $(ENVIRONMENT) environment"
+                continueOnError: true
+                retryCountOnTaskFailure: 3
+                inputs:
+                  sshEndpoint: BRM_BASTION_$(ENVIRONMENT)
+                  runOptions: "inline"
+                  inline: |
+                    echo "##[debug] ENVIRONMENT.................................................: $(ENVIRONMENT)"
+                    echo "##[debug] REMOTE HOST COMMANDS PATH...................................: $(REMOTE_HOST_COMMANDS_PATH)"              
+
+                    echo "##[command]rm -frv $(REMOTE_HOST_COMMANDS_PATH)"
+                    rm -frv $(REMOTE_HOST_COMMANDS_PATH)
+                  readyTimeout: "20000"
+                  failOnStdErr: false
+
+          - job: deploy_approval_informations
+            displayName: "Deploy Approval Result"
+            condition: ne(stageDependencies.stage_deploy.deploy.result, 'Skipped')
+            steps:
+              - checkout: none
+              - template: ../../../tasks/bash/approval_details.yml
+                parameters:
+                  withEnvironmentApproval: true
+
+      - job: pipeline_result
+        displayName: "Pipeline Result Analysis"
+        ${{ if eq(parameters.flow.flow, 'CD') }}:
+          dependsOn:
+            - clean_environment
+            - deploy_approval_informations
+        condition: always()
+        steps:
+          - checkout: none
+          - template: ../../../tasks/bash/pipeline_result_v2.yml
+
+      - job: notification
+        displayName: "Teams Notification"
+        dependsOn:
+          - pipeline_result
+        condition: and(always(), eq(variables['DISABLE_TEAMS_NOTIFICATION'], 'false'))
+        variables:
+          - name: PIPELINE_RESULT
+            value: $[ dependencies.pipeline_result.outputs['pipeline_result.PIPELINE_RESULT'] ]
+          - name: PIPELINE_FAILED
+            value: $[ dependencies.pipeline_result.outputs['pipeline_result.PIPELINE_FAILED'] ]
+          - name: PIPELINE_STAGE_FAILED
+            value: $[ dependencies.pipeline_result.outputs['pipeline_result.PIPELINE_STAGE_FAILED'] ]
+          - name: PIPELINE_JOB_FAILED
+            value: $[ dependencies.pipeline_result.outputs['pipeline_result.PIPELINE_JOB_FAILED'] ]
+          - name: PIPELINE_TASK_FAILED
+            value: $[ dependencies.pipeline_result.outputs['pipeline_result.PIPELINE_TASK_FAILED'] ]
+          - name: PIPELINE_ERROR_MESSAGE
+            value: $[ dependencies.pipeline_result.outputs['pipeline_result.PIPELINE_ERROR_MESSAGE'] ]
+          - ${{ if eq(parameters.flow.flow, 'CD') }}:
+              - name: DEPLOY_APPROVAL_APPROVER_NAME
+                value: $[ dependencies.deploy_approval_informations.outputs['details.DEPLOY_APPROVAL_APPROVER_NAME'] ]
+              - name: DEPLOY_APPROVAL_STATUS
+                value: $[ dependencies.deploy_approval_informations.outputs['details.DEPLOY_APPROVAL_STATUS'] ]
+              - name: DEPLOY_APPROVAL_COMMENT
+                value: $[ dependencies.deploy_approval_informations.outputs['details.DEPLOY_APPROVAL_COMMENT'] ]
+        steps:
+          - checkout: none
+          - ${{ if eq(parameters.flow.flow, 'CI') }}:
+              - script: |
+                  IFS=' ' read -ra ADDR <<< "$(SONARQUBE_ANALYSIS_METRICKEYS_STATUS)"
+                  for log_line in "${ADDR[@]}"; do
+                    FORMATTED_STATIC_ANALYSIS_STATUS+="**[-]** ***$(echo ${log_line} | cut -d'=' -f1)*** _$(echo ${log_line} | cut -d'=' -f2)_<br>"
+                  done
+                  if [ -z "$FORMATTED_STATIC_ANALYSIS_STATUS" ]; then
+                    FORMATTED_STATIC_ANALYSIS_STATUS="_Stage Not Executed_"
+                  fi
+
+                  SECURITY_ANALYSIS="**[-]** ***Critical Vulnerabilities:*** _$(SECURITY_ISSUES_CRITICAL)_<br>**[-]** ***High Vulnerabilities:*** _$(SECURITY_ISSUES_HIGH)_<br>**[-]** ***Medium Vulnerabilities:*** _$(SECURITY_ISSUES_MEDIUM)_<br>**[-]** ***Low Vulnerabilities:*** _$(SECURITY_ISSUES_LOW)_"
+                  if [ -z "$SECURITY_ISSUES_CRITICAL" ] && [ -z "$SECURITY_ISSUES_HIGH" ] && [ -z "$SECURITY_ISSUES_MEDIUM" ] && [ -z "$SECURITY_ISSUES_LOW" ]; then
+                    SECURITY_ANALYSIS="_Stage Not Executed_"
+                  else
+                    echo "##[debug] SECURITY_ISSUES_CRITICAL..................................: $(SECURITY_ISSUES_CRITICAL)"
+                    echo "##[debug] SECURITY_ISSUES_HIGH......................................: $(SECURITY_ISSUES_HIGH)"
+                    echo "##[debug] SECURITY_ISSUES_MEDIUM....................................: $(SECURITY_ISSUES_MEDIUM)"
+                    echo "##[debug] SECURITY_ISSUES_LOW.......................................: $(SECURITY_ISSUES_LOW)"
+                  fi
+
+                  echo "##vso[task.setvariable variable=FORMATTED_STATIC_ANALYSIS_STATUS;isoutput=true]$FORMATTED_STATIC_ANALYSIS_STATUS"
+                  echo "##vso[task.setvariable variable=SECURITY_ANALYSIS;isoutput=true]$SECURITY_ANALYSIS"
+                name: qualityGateStatusFormatter
+                displayName: "Quality Gate Status Formatter"
+          - script: |
+              FACTS=""
+              ERROR_MESSAGE=""
+
+              if [ "$PIPELINE_TASK_FAILED" = "Manual confirmation after validation failure" ]; then
+                ERROR_MESSAGE=$(echo "$(VALIDATION_FAILURE_APPROVAL_COMMENT)" | tr -d '()')
+              else
+                ERROR_MESSAGE=$(PIPELINE_ERROR_MESSAGE)
+              fi
+
+              if [ "$(PIPELINE_RESULT)" = "Failed" ]; then
+                FACTS="{ \"name\": \"🔴 Failure Information:\", \"value\": \"- 🏗️ _$(PIPELINE_STAGE_FAILED)_ -> ⚙️ _$(PIPELINE_JOB_FAILED)_ -> 📝 _$(PIPELINE_TASK_FAILED)_ \r- 💬 **Error:** _${ERROR_MESSAGE}_ \" }"
+              else
+                FACTS="{ \"name\": \"🔴 Failure Information:\", \"value\": \"✅ Pipeline finished successfully\" }"
+              fi
+              echo "##[debug] FACTS.............................: $FACTS"
+
+              echo "##vso[task.setvariable variable=FACTS;isoutput=true]$FACTS"
+            name: factsFormatter
+            displayName: "Facts Formatter"
+          - template: ../../../tasks/teams/send_message.yml
+            parameters:
+              ${{ if eq(parameters.stageSecurityOnly, 'True') }}:
+                flow: "${{ parameters.flow.flow }} [Only Security Analysis]"
+                title: "Notification from $(APPLICATION_NAME) [Only Security Analysis]"
+                facts: '{ "name": "Security Analysis:", "value": "$(qualityGateStatusFormatter.SECURITY_ANALYSIS)" }'
+              ${{ else }}:
+                flow: ${{ parameters.flow.flow }}
+                title: "Notification from $(APPLICATION_NAME)"
+              webhookUrl: "$(TEAMS_WEBHOOK)"
+              status: $(PIPELINE_RESULT)
+              pipelineStartTime: "$(START_TIME)"
+              pipelineEndTime: "$(date +%s)"
+              ${{ if eq(parameters.stageSecurityOnly, False) }}:
+                CDPipelineTriggeredURL: $(CD_PIPELINE_TRIGGERED_URL)
+              ${{ if and(eq(parameters.flow.flow, 'CI'), eq(parameters.stageSecurityOnly, False)) }}:
+                facts: '
+                  { "name": "🛡️ Stage Security Only is selected?", "value": "_${{ parameters.config.stageSecurityOnly }}_" },
+                  { "name": "⚡ Trigger the CD Pipeline is selected?", "value": "_${{ parameters.flow.triggerCD }}_" },
+                  { "name": "⚡▶️ CD Pipeline was Triggered?", "value": "_$(CD_PIPELINE_TRIGGERED)_" }
+                  '
+                facts2: '
+                  { "name": "🔖 Application Version:", "value": "_$(VERSION)_" },
+                  { "name": "🧪🧮 Static Code Analysis:", "value": "$(qualityGateStatusFormatter.FORMATTED_STATIC_ANALYSIS_STATUS)" },
+                  { "name": "🧪🛡️ Security Analysis:", "value": "$(qualityGateStatusFormatter.SECURITY_ANALYSIS)" }
+                  '
+                facts3: "$(factsFormatter.FACTS)"
+              ${{ if eq(parameters.flow.flow, 'CD') }}:
+                facts: '
+                  { "name": "📄 Approval Status:", "value": "_$(DEPLOY_APPROVAL_STATUS)_" },
+                  { "name": "👤 Approved By:", "value": "_$(DEPLOY_APPROVAL_APPROVER_NAME)_" },
+                  { "name": "💬 Approval Comment:", "value": "_$(DEPLOY_APPROVAL_COMMENT)_" }
+                  '
+                facts2: "$(factsFormatter.FACTS)"

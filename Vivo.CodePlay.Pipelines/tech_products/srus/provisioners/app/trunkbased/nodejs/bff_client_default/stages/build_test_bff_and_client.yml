@@ -1,0 +1,133 @@
+parameters:
+- name: bumpVersionOnManual
+  type: boolean
+  default: false
+
+stages:
+- stage: build_test_bff_and_client
+  displayName: "Build & Test"
+  dependsOn:
+    - pipeline_init
+  pool: $(PRIVATE_AGENT_DEFAULT)
+  jobs:
+
+  - job: bump_version
+    displayName: Bumping Version
+    steps:
+    - template: /tech_products/srus/tasks/git/checkout_last_commit.yml
+      parameters:
+        branchName: "$(Build.SourceBranchName)"
+    - template: /tech_products/srus/tasks/nodejs/npm_extract_version.yml
+      parameters:
+        currentVersionVariableOut: API_CURRENT_VERSION
+    - template: /tech_products/srus/tasks/versioning/bump_version.yml
+      parameters:
+        currentVersion: $(export_current_version.API_CURRENT_VERSION)
+        newVersionVariableOut: API_NEW_VERSION
+        bumpVersionOnManual: ${{ parameters.bumpVersionOnManual }}
+
+  - job: build_test_bff
+    displayName: BFF - Test & Coverage
+    dependsOn: bump_version
+    steps:
+    - template: /tech_products/srus/tasks/bash/welcome.yml
+    - template: /tech_products/srus/task_groups/build/nodejs_build_test.yml
+      parameters:
+        dockerWorkDir: "/$(DOCKER_WORKDIR)/$(BFF_FOLDER_NAME)"
+        cmdBuildTest: $(CMD_BUILD_TEST_BFF)
+        artifactPublishName: "app-$(BFF_FOLDER_NAME)"
+    - template: /tech_products/srus/tasks/tests/publish_tests_result.yml
+      parameters:
+        testResultsFilesPattern: "**/junit.xml"
+        searchFolder: "$(Build.SourcesDirectory)/$(BFF_FOLDER_NAME)"  
+        publishRunAttachments: false
+        testRunTitle: "Testes Unitários - BFF"
+        condition: always()
+ 
+  - job: build_test_client
+    displayName: CLIENT - Test & Coverage
+    dependsOn: bump_version
+    steps:
+    - template: /tech_products/srus/task_groups/build/nodejs_build_test.yml
+      parameters:
+        dockerWorkDir: "/$(DOCKER_WORKDIR)/$(CLIENT_FOLDER_NAME)"
+        cmdBuildTest: $(CMD_BUILD_TEST_CLIENT)
+        artifactPublishName: "app-$(CLIENT_FOLDER_NAME)"
+    - template: /tech_products/srus/tasks/tests/publish_tests_result.yml
+      parameters:
+        testResultsFilesPattern: "**/junit.xml"
+        searchFolder: "$(Build.SourcesDirectory)/$(CLIENT_FOLDER_NAME)" 
+        publishRunAttachments: false
+        testRunTitle: "Testes Unitários - Client"
+        condition: always()
+        
+  - job: publish_tests
+    displayName: Publish Artifact
+    dependsOn: [build_test_bff,build_test_client]
+    pool: $(PRIVATE_AGENT_SHARED)
+    steps:
+    - task: DownloadPipelineArtifact@2
+      inputs:
+        downloadPath: '$(System.ArtifactsDirectory)/myArtifact'
+
+    - task: ExtractFiles@1
+      displayName: Extract Bff Files
+      inputs:
+        archiveFilePatterns: '$(System.ArtifactsDirectory)/myArtifact/app-bff/app-bff.tar'
+        destinationFolder: '$(System.DefaultWorkingDirectory)/extractedFiles/bff'
+
+    - task: ExtractFiles@1
+      displayName: Extract Client Files
+      inputs:
+        archiveFilePatterns: '$(System.ArtifactsDirectory)/myArtifact/app-client/app-client.tar'
+        destinationFolder: '$(System.DefaultWorkingDirectory)/extractedFiles/client'
+
+    - task: CopyFiles@2
+      displayName: "Copy Assets"
+      inputs: 
+        SourceFolder: '$(System.DefaultWorkingDirectory)/extractedFiles/client'
+        Contents: |
+          **/public/**
+          **/assets.json
+        TargetFolder: '$(System.DefaultWorkingDirectory)/extractedFiles/bff'
+
+    - template: /tech_products/srus/tasks/tests/publish_coverage_report.yml
+      parameters:
+        codeCoverageTool: "Cobertura"
+        reportPath: '$(System.DefaultWorkingDirectory)/extractedFiles/**/*-coverage.xml'
+        publishCoverTaskVersion: 1
+
+    - task: DeleteFiles@1
+      displayName: Clean Assets Folders
+      inputs:
+        SourceFolder: '$(System.DefaultWorkingDirectory)/extractedFiles/bff'
+        Contents: _devops
+
+    - template: /tech_products/srus/tasks/nodejs/setup_credentials.yml
+
+    - bash: |
+        cd $(System.DefaultWorkingDirectory)/extractedFiles/bff
+        cd bff
+        npm prune --production
+      displayName: Build Production Dependencies
+      
+      
+    - template: /tech_products/srus/tasks/artifacts/publish_app.yml
+      parameters:
+        pathtoPublish: '$(System.DefaultWorkingDirectory)/extractedFiles/bff'
+
+  - job: grafeas_test_coverage
+    displayName: Test Occurrence
+    dependsOn: [bump_version,build_test_bff,build_test_client]
+    variables:
+      - name: APP_VERSION
+        value: $[ dependencies.bump_version.outputs['component_bump_version.API_NEW_VERSION'] ]
+    steps:
+    - template: /tech_products/srus/tasks/catalog_info/extract_variables.yml
+    - template: /tech_products/srus/tasks/grafeas/unit_test_occurrence.yml
+      parameters:
+        dockerAppName: $(APP_NAME)
+        dockerAppVersion: $(APP_VERSION)
+        
+
+

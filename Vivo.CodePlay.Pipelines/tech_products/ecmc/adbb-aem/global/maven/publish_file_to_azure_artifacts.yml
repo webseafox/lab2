@@ -1,0 +1,187 @@
+parameters:
+  - name: artifactDir
+    type: string
+    default: "$(DEFAULT_WORKDIR_ARTIFACTS)"
+  - name: artifactName
+    type: string
+  - name: targetDir
+    type: string
+  - name: mavenSettingsLocation
+    type: string
+    default: "$(DEFAULT_MAVEN_SETTINGS)"
+  - name: azureArtifactsFeed
+    type: string
+    default: "$(AZURE_ARTIFACTS_FEED)"
+  - name: azureArtifactsOrganization
+    type: string
+    default: "$(AZURE_ARTIFACTS_ORGANIZATION)"
+  - name: azureArtifactsMavenFeedURL
+    type: string
+    default: "$(AZURE_ARTIFACTS_MAVEN_FEED_URL)"
+  - name: cmdExtractVersion
+    type: string
+    default: $(DOCKER_CMD_EXTRACT_POM_XML_VERSION)
+  - name: cmdExtractGroupId
+    type: string
+    default: $(DOCKER_CMD_EXTRACT_APP_GROUP)
+  - name: cmdExtractPackaging
+    type: string
+    default: $(DOCKER_CMD_EXTRACT_APP_PACKAGING)
+  - name: fileExtensions
+    type: string
+    default: "jar,zip,xml"
+
+steps:
+- template: /tech_products/ecmc/core-pipelines/global/general/set-output-variable.yml
+  parameters:
+    variable: VERSION
+    command: ${{ parameters.cmdExtractVersion }}
+    workDir: ${{ parameters.artifactDir }}
+
+- template: /tech_products/ecmc/core-pipelines/global/general/set-output-variable.yml
+  parameters:
+    variable: ARTIFACT_ID
+    command: $(DOCKER_CMD_EXTRACT_APP_NAME)
+    workDir: ${{ parameters.artifactDir }}
+
+- template: /tech_products/ecmc/core-pipelines/global/general/set-output-variable.yml
+  parameters:
+    variable: GROUP_ID
+    command: ${{ parameters.cmdExtractGroupId }}
+    workDir: ${{ parameters.artifactDir }}
+
+- template: /tech_products/ecmc/core-pipelines/global/general/set-output-variable.yml
+  parameters:
+    variable: PACKAGING
+    command: ${{ parameters.cmdExtractPackaging }}
+    workDir: ${{ parameters.artifactDir }}
+
+- script: |
+    FILE_EXTENSION=""
+
+    TARGET_DIR="${{ parameters.artifactDir }}/${{ parameters.targetDir }}"
+    if [[ -z ${{ parameters.targetDir }} ]]; then
+      TARGET_DIR=${{ parameters.artifactDir }}
+    fi
+
+    FILENAME=${{ parameters.artifactName }}
+    if [[ -z ${{ parameters.artifactName }}  ]]; then
+      FILENAME=${ARTIFACT_ID}-${VERSION}
+    fi
+
+    # Converte a string de extensões em um array usando o IFS (Internal Field Separator) padrão para ',' 
+    IFS=',' read -r -a extensions_array <<< "${{ parameters.fileExtensions }}"
+
+    # Percorre cada extensão e verifica se o arquivo existe
+    for extension in "${extensions_array[@]}"; do
+        if [[ -f "$TARGET_DIR/$FILENAME.$extension" ]]; then
+            FILE_EXTENSION="$extension"
+            break
+        fi
+    done
+
+    # Verifique se uma extensão foi encontrada
+    if [[ -z "$FILE_EXTENSION" ]]; then
+        echo "Erro: Não foi possível determinar o tipo de empacotamento para $ARTIFACT_ID-$VERSION"
+        exit 1
+    fi
+
+    if [[ -z "$PACKAGING" ]]; then
+      PACKAGING=$FILE_EXTENSION
+      echo "##vso[task.setvariable variable=PACKAGING;]$PACKAGING"
+    fi
+
+    ARTIFACT_FILE="${FILENAME}.${FILE_EXTENSION}"
+    echo "##vso[task.setvariable variable=ARTIFACT_FILE;]$ARTIFACT_FILE"
+    echo "##vso[task.setvariable variable=MAVEN_TARGET_DIR;]$TARGET_DIR"
+  displayName: "Setting artifact filename and target dir"
+  workingDirectory: "${{ parameters.artifactDir }}"
+
+# Injeta SYSTEM_ACCESSTOKEN diretamente no settings.xml com server ID "telefonica-vivo-brasil".
+# MavenAuthenticate@0 usa o nome do feed ("DevOps") como server ID — diferente do ID
+# configurado nos repositórios do settings.xml — causando 401 nos downloads de plugins.
+- bash: |
+    SETTINGS_FILE="${{ parameters.mavenSettingsLocation }}"
+
+    # Remove <servers> existente (pode ter sido adicionado pelo MavenAuthenticate@0 com ID errado)
+    # e injeta novo bloco com o ID correto usado pelos repositórios do settings.xml
+    awk -v token="$SYSTEM_ACCESSTOKEN" '
+      /<[[:space:]]*servers[[:space:]]*>/ { skip=1 }
+      skip && /<\/[[:space:]]*servers[[:space:]]*>/ { skip=0; next }
+      skip { next }
+      /<\/[[:space:]]*settings[[:space:]]*>/ {
+        print "  <servers>"
+        print "    <server>"
+        print "      <id>telefonica-vivo-brasil</id>"
+        print "      <username>vsts</username>"
+        print "      <password>" token "</password>"
+        print "    </server>"
+        print "  </servers>"
+      }
+      { print }
+    ' "$SETTINGS_FILE" > "${SETTINGS_FILE}.tmp" && mv "${SETTINGS_FILE}.tmp" "$SETTINGS_FILE"
+
+    echo "✓ Credenciais injetadas no settings.xml (server: telefonica-vivo-brasil)"
+  displayName: "Inject Azure Artifacts Credentials"
+  env:
+    SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+
+- script: |
+    echo "##[debug]Publishing to Azure Artifacts' feed: ${AZURE_ARTIFACTS_FEED}"
+    echo "##[debug]groupId......${GROUP_ID}"
+    echo "##[debug]artifactId......${ARTIFACT_ID}"
+    echo "##[debug]version......${VERSION}"
+    echo "##[debug]packaging......${PACKAGING}"
+    echo "##[debug]artifactFile......${ARTIFACT_FILE}"
+    echo "##[debug]mavenTargetDir/artifactFile......${MAVEN_TARGET_DIR}/${ARTIFACT_FILE}"
+
+    if [[ -z "$ARTIFACT_FILE" ]]; then
+      echo "Erro: Não foi possível determinar o nome do artefato"
+      exit 1
+    fi
+
+    if [[ ! -f ${MAVEN_TARGET_DIR}/${ARTIFACT_FILE} ]]; then
+      echo "Erro: Não foi possível encontrar o artefato ${MAVEN_TARGET_DIR}/${ARTIFACT_FILE}"
+      exit 1
+    fi
+
+    if [[ -z "$GROUP_ID" || -z "$ARTIFACT_ID" || -z "$VERSION" || -z "$PACKAGING" ]]; then
+      echo "Erro: Todos os atributos groupId, artifactId, version e packaging precisam ser fornecidos."
+      exit 1    
+    fi
+
+    # Usa Agent.TempDirectory para evitar que Maven leia o pom.xml do módulo AEM
+    # (que tem filevault-package-maven-plugin com <extensions>true</extensions>).
+    # Sem workdir com pom.xml, Maven cria um standalone-pom e não tenta resolver
+    # build extensions como filevault (que precisariam dos deps via azure-artifacts-mirror
+    # com server ID diferente do injetado pelo MavenAuthenticate@0).
+    # Versão 3.1.1 alinhada com o pluginManagement do pom.xml do projeto —
+    # é a versão que o build stage já baixou, portanto esperada no MAVEN_CACHE_FOLDER.
+    export MAVEN_OPTS="-Xmx1024m \
+      -Dmaven.wagon.http.ssl.insecure=true \
+      -Dmaven.wagon.http.ssl.allowall=true \
+      -Dmaven.wagon.http.ssl.ignore.validity.dates=true \
+      -Djavax.net.ssl.trustStoreType=jks \
+      -Daether.connector.https.securityMode=insecure \
+      -Daether.connector.basic.threads=1 \
+      -Daether.connector.http.retryHandler.count=3 \
+      -Dhttps.protocols=TLSv1.2,TLSv1.3 \
+      -Djdk.tls.client.protocols=TLSv1.2,TLSv1.3"
+
+    mvn org.apache.maven.plugins:maven-deploy-plugin:3.1.1:deploy-file \
+                          -Durl=${AZURE_ARTIFACTS_MAVEN_FEED_URL} \
+                          -DrepositoryId=${AZURE_ARTIFACTS_ORGANIZATION} \
+                          -Dfile=${MAVEN_TARGET_DIR}/${ARTIFACT_FILE} \
+                          -DgroupId=${GROUP_ID} \
+                          -DartifactId=${ARTIFACT_ID} \
+                          -Dversion=${VERSION} \
+                          -Dpackaging=${PACKAGING} \
+                          -s ${{ parameters.mavenSettingsLocation }} \
+                          -Dmaven.repo.local="${MAVEN_CACHE_FOLDER}"
+  displayName: "Publish to Azure Artifacts"
+  workingDirectory: "$(Agent.TempDirectory)"
+  env:
+    SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+    AZURE_ARTIFACTS_FEED: ${{ parameters.azureArtifactsFeed }}
+    AZURE_ARTIFACTS_ORGANIZATION: ${{ parameters.azureArtifactsOrganization }}
+    AZURE_ARTIFACTS_MAVEN_FEED_URL: ${{ parameters.azureArtifactsMavenFeedURL }}

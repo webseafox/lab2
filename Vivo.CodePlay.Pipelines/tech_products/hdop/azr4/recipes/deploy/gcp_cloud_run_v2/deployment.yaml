@@ -1,0 +1,102 @@
+parameters:
+  environment: ''
+
+jobs:
+- deployment: deployment
+  pool: GeneralPurposeLinuxAgentsCD
+  environment: 
+    name: deploy-${{ parameters.environment }}
+  strategy:
+    runOnce:   
+      deploy:
+        steps:
+        - checkout: self
+          persistCredentials: true
+        - template: /tech_products/hdop/templates/steps/get_latest_version.yaml
+        - template: /tech_products/hdop/templates/steps/execute_in_docker.yaml
+          parameters:
+            image: 'registry.telefonicabigdata.com/devops4p/docker-trivy-gcp:24.0.2-dind'
+            envs:
+              NEW_VERSION: $(get_version.VERSION)
+              CRED_FILE_PATH: /tmp/gcp_cred.json
+              GCP_CRED_FILE_B64: $(GCP_CRED_FILE_B64)
+              IMAGE_REGISTRY: $(IMAGE_REGISTRY)
+              IMAGE_NAME: $(IMAGE_NAME)
+              GCP_PROJECT_NAME: $(GCP_PROJECT_NAME)
+              USE_YAML_TO_DEPLOY: $(USE_YAML_TO_DEPLOY)
+              CLOUD_RUN_APP_NAME: $(CLOUD_RUN_APP_NAME)
+              DEPLOY_AND_EXECUTE_JOB: $(DEPLOY_AND_EXECUTE_JOB)
+              CLOUD_RUN_JOB_NAME: $(CLOUD_RUN_JOB_NAME)
+              DEPLOY_CLI_SERVICE: $(DEPLOY_CLI_SERVICE)
+              ENVIRONMENT: $(ENVIRONMENT)
+              AZDO_PROJECT: $(System.TeamProject)
+              CLOUDRUN_JOB_FILE_PATH: $(CLOUDRUN_JOB_FILE_PATH)
+              CLOUDRUN_CLI_FILE_PATH: $(CLOUDRUN_CLI_FILE_PATH)
+              CLOUDRUN_FILE_PATH: $(CLOUDRUN_FILE_PATH)
+            script: |
+              #!/bin/sh -l
+              set -e
+              sigla="${AZDO_PROJECT%% *}"
+              echo "##[debug] SIGLA: ${sigla}"
+              if [[ "${sigla}" = "VLSS" && "${ENVIRONMENT}" == "prod" ]]; then
+                export ENVIRONMENT="pro"
+                echo "##[debug] SIGLA: ${sigla} -> ENVIRONMENT set to pro"
+              fi
+              echo "##[debug] envs:
+                DEPLOY_AND_EXECUTE_JOB: ${DEPLOY_AND_EXECUTE_JOB}
+                DEPLOY_CLI_SERVICE: ${DEPLOY_CLI_SERVICE}
+                USE_YAML_TO_DEPLOY: ${USE_YAML_TO_DEPLOY}
+                CLOUD_RUN_JOB_NAME: ${CLOUD_RUN_JOB_NAME}
+                CLOUDRUN_JOB_FILE_PATH: ${CLOUDRUN_JOB_FILE_PATH}
+                CLOUDRUN_CLI_FILE_PATH: ${CLOUDRUN_CLI_FILE_PATH}
+                CLOUDRUN_FILE_PATH: ${CLOUDRUN_FILE_PATH}
+                GCP_PROJECT_NAME: ${GCP_PROJECT_NAME}
+              "
+              echo "##[debug] Initing Deploy stage"
+              echo "${GCP_CRED_FILE_B64}" | base64 -d > ${CRED_FILE_PATH}
+              FULL_IMAGE_NAME="${IMAGE_REGISTRY}/${IMAGE_NAME}:${NEW_VERSION}"
+              echo "##[debug] Updating image to $FULL_IMAGE_NAME"
+              echo "##[debug] Login to gcp project $GCP_PROJECT_NAME"
+              gcloud auth activate-service-account --key-file $CRED_FILE_PATH
+              gcloud auth list
+              if [[ "$USE_YAML_TO_DEPLOY" == "false" ]]; then
+                echo "##[debug] using params to update cloudrun"
+                gcloud run deploy $CLOUD_RUN_APP_NAME \
+                  --image=$FULL_IMAGE_NAME \
+                  --ingress=internal-and-cloud-load-balancing \
+                  --min-instances=0 \
+                  --max-instances=100 \
+                  --port=80 \
+                  --cpu=200m \
+                  --memory=256Mi \
+                  --concurrency=1 \
+                  --timeout=30 \
+                  --allow-unauthenticated \
+                  --region=southamerica-east1 \
+                  --vpc-connector=vss-serverless-connector \
+                  --vpc-egress=private-ranges-only \
+                  --project=$GCP_PROJECT_NAME
+              else
+                if [[ "$DEPLOY_AND_EXECUTE_JOB" == "true" || "$DEPLOY_AND_EXECUTE_JOB" == "True" ]]; then
+                  echo "##[debug] using ${CLOUDRUN_JOB_FILE_PATH} to update cloudrun"
+                  yq -i ".spec.template.spec.template.spec.containers[0].image = \"${FULL_IMAGE_NAME}\"" ${CLOUDRUN_JOB_FILE_PATH}
+                  cat ${CLOUDRUN_JOB_FILE_PATH}
+                  CLOUD_RUN_JOB_NAME=$(yq ".metadata.name" ${CLOUDRUN_JOB_FILE_PATH})
+                  echo "##[debug] CLOUD_RUN_JOB_NAME: ${CLOUD_RUN_JOB_NAME}"
+                  gcloud run jobs replace ${CLOUDRUN_JOB_FILE_PATH} --region=southamerica-east1 --project=${GCP_PROJECT_NAME}
+                  gcloud run jobs execute ${CLOUD_RUN_JOB_NAME} --region=southamerica-east1 --project=${GCP_PROJECT_NAME}
+                fi
+                if [[ "$DEPLOY_CLI_SERVICE" == "true" || "$DEPLOY_CLI_SERVICE" == "True" ]]; then
+                  echo "##[debug] using ${CLOUDRUN_CLI_FILE_PATH} to update cloudrun"
+                  yq -i ".spec.template.spec.containers[0].image = \"${FULL_IMAGE_NAME}\"" ${CLOUDRUN_CLI_FILE_PATH}
+                  cat ${CLOUDRUN_CLI_FILE_PATH}
+                  gcloud run services replace ${CLOUDRUN_CLI_FILE_PATH} --region=southamerica-east1 --project=${GCP_PROJECT_NAME}
+                fi
+                if [[ "$DEPLOY_SERVICE" == "true" || "$DEPLOY_SERVICE" == "True" ]]; then
+                  echo "##[debug] Using ${CLOUDRUN_FILE_PATH} to update cloudrun"
+                  yq -i ".spec.template.spec.containers[0].image = \"${FULL_IMAGE_NAME}\"" ${CLOUDRUN_FILE_PATH}
+                  cat ${CLOUDRUN_FILE_PATH}
+                  gcloud run services replace ${CLOUDRUN_FILE_PATH} --region=southamerica-east1 --project=${GCP_PROJECT_NAME}
+                fi
+              fi
+              echo "##[debug] Deploy Done!!"

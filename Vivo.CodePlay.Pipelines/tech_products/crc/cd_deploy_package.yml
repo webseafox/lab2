@@ -1,0 +1,96 @@
+parameters:
+  - name: environment
+  - name: packageName
+  - name: packageVersion
+  - name: dry_run
+  - name: CHG
+  - name: pipeline_mode
+stages:
+  - stage: CD
+    displayName: "CD - Deploy Package on ${{ parameters.environment }}"
+    pool: GeneralPurposeLinuxAgentsCD
+    jobs:
+      - deployment: deploy
+        displayName: Deploy
+        condition: and(or(eq('${{ parameters.pipeline_mode }}','CD'), eq('${{ parameters.pipeline_mode }}','CI-CD')), eq('${{ parameters.dry_run }}', 'False'))
+        environment:
+          name: deploy-${{ parameters.environment }}
+        continueOnError: false
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+              - checkout: none
+              - task: DownloadPackage@1
+                displayName: Downloading Package from Artifacts
+                inputs:
+                  packageType: upack
+                  feed: 3d53bc62-8749-4931-ae46-a443b73bc87a
+                  definition: '${{ parameters.packageName }}'
+                  version: '${{ parameters.packageVersion }}'
+                  downloadPath: '$(Pipeline.Workspace)'
+                continueOnError: true
+                timeoutInMinutes: "2"
+              - script: |
+                  if [[ "${{ parameters.environment }}" == "qa1" || "${{ parameters.environment }}" == "qa2" || "${{ parameters.environment }}" == "qa3" ]]; then
+                    echo "##vso[task.setvariable variable=DEPLOY_PATH]/home/crc"
+                  else
+                    echo "##vso[task.setvariable variable=DEPLOY_PATH]/home/runshell_next"  
+                  fi
+                displayName: Set Deploy Path for ${{ parameters.environment }}
+              - task: CopyFilesOverSSH@0
+                displayName: Transfering Package to ${{ parameters.environment }}
+                inputs:
+                  sshEndpoint: '${{ parameters.packageName }}-${{ parameters.environment }}'
+                  sourceFolder: '$(Pipeline.Workspace)/${{parameters.packageName}}'
+                  contents: '*'
+                  targetFolder: '$(DEPLOY_PATH)/${{parameters.CHG}}'
+                  readyTimeout: '20000'
+                continueOnError: false
+                timeoutInMinutes: "2"
+
+              - task: SSH@0
+                displayName: Update Pip
+                inputs:
+                  sshEndpoint: ${{ parameters.packageName }}-${{ parameters.environment }}
+                  runOptions: inline
+                  inline: |
+                    PIP_UPGRADE=$(pip install --upgrade pip)
+                    echo "##vso[task.setvariable variable=PipUpgrade]$PIP_UPGRADE"
+                continueOnError: false
+              - task: SSH@0
+                displayName: Check Package Version on ${{ parameters.environment }}
+                inputs:
+                  sshEndpoint: ${{ parameters.packageName }}-${{ parameters.environment }}
+                  runOptions: inline
+                  inline: |
+                    VERSION=$(pip show ${{ parameters.packageName }} | grep Version | awk '{print $2}')
+                    echo "##vso[task.setvariable variable=installedVersion]$VERSION"
+                continueOnError: false
+                timeoutInMinutes: "2"
+                
+              - task: SSH@0
+                displayName: Install Package Version ${{ parameters.packageVersion }} on ${{ parameters.environment }}
+                condition: and(or(eq('${{ parameters.pipeline_mode }}','CD'), eq('${{ parameters.pipeline_mode }}','CI-CD')), eq('${{ parameters.dry_run }}', 'False'), ne(variables['installedVersion'], '${{ parameters.packageVersion }}'))  
+                inputs:
+                  sshEndpoint: ${{ parameters.packageName }}-${{ parameters.environment }}
+                  runOptions: inline
+                  inline: |
+                    PACKAGE_NAME=$(ls $(DEPLOY_PATH)/${{ parameters.CHG }} | grep .whl)
+                    PACKAGE_INSTALL=$(pip install $(DEPLOY_PATH)/${{ parameters.CHG }}/$PACKAGE_NAME)
+                    echo "##vso[task.setvariable variable=PackageInstall]$PACKAGE_INSTALL"
+                continueOnError: false
+                timeoutInMinutes: "2"
+
+              - task: SSH@0
+                displayName: Running tests and validations
+                condition: ne(variables['installedVersion'], '${{ parameters.packageVersion }}')
+                inputs:
+                  sshEndpoint: ${{ parameters.packageName }}-${{ parameters.environment }}
+                  runOptions: inline
+                  inline: |
+                    touch $(DEPLOY_PATH)/validation_${{parameters.packageVersion}}.log
+                    ${{ parameters.packageName }} test-installation >>$(DEPLOY_PATH)/validation_${{parameters.packageVersion}}.log
+                    echo '##vso[task.setvariable variable=DeployValidation]$(cat $(DEPLOY_PATH)/validation_${{parameters.packageVersion}}.log | grep 'Conexão realizada com sucesso!')'
+                continueOnError: true
+                timeoutInMinutes: "2"

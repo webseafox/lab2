@@ -1,0 +1,83 @@
+stages:
+  - stage: identification
+    displayName: "Indentificação dos objetos de integração"
+    dependsOn: []
+    pool: $(GeneralPurposeLinuxAgentsCD)
+    variables:
+    - name: ALL_SESSION_IDS
+      value: ''	
+    jobs:
+      - job: "object_identification"
+        displayName: "Identificação dos objetos"
+        steps:
+          - checkout: self
+
+          - task: PowerShell@2
+            displayName: 'Gerar nome do artefato'
+            inputs:
+              targetType: 'inline'
+              script: |
+                $dateTime = Get-Date -Format "yyyyMMdd-HHmmss"
+                $artifactName = "ADM-backup-$dateTime"
+                
+                Write-Host "##vso[task.setvariable variable=artifactName]$artifactName"
+              
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publicar diretório ADM'
+            inputs:
+              pathToPublish: '$(Build.SourcesDirectory)/ADM'
+              artifactName: '$(artifactName)'
+              publishLocation: 'Container'
+
+          - task: PowerShell@2
+            displayName: "Extrair SessionId do XML"
+            name: "extrair_session_ids"
+            inputs:
+              targetType: "inline"
+              script: |
+                $allSessionIds = @()
+
+                # Caminho do arquivo de log
+                $logFilePath = "$(Build.ArtifactStagingDirectory)\logfile.txt"
+
+                # Encontrar todos os arquivos XML dentro do diretório ADM (incluindo subpastas)
+                $xmlFiles = Get-ChildItem -Path "$(Build.SourcesDirectory)\ADM" -Recurse -Filter "*.xml"
+
+                foreach ($xmlFile in $xmlFiles) {
+                    # Carregar o conteúdo do XML
+                    try {
+                        [xml]$xmlContent = Get-Content -Path $xmlFile.FullName -ErrorAction Stop
+                    } catch {
+                        $errorMessage = "Erro ao carregar o XML: $($xmlFile.FullName). Detalhes: $_"
+                        Write-Host $errorMessage
+                        $errorMessage | Out-File -FilePath $logFilePath -Append
+                        continue
+                    }
+
+                    $sessionId = $null
+
+                    # Usando XPath para encontrar a tag <SessionId>
+                    $sessionIdNode = $xmlContent.SelectSingleNode("//SessionId")
+                    
+                    if ($sessionIdNode -ne $null) {
+                        $sessionId = $sessionIdNode.InnerText
+                    }
+
+                    # Exibir o resultado e adicionar ao array se encontrado
+                    if ($sessionId) {
+                        Write-Host "SessionId: $sessionId"
+                        $allSessionIds += $sessionId
+                    } else {
+                        $message = "SessionId não encontrado no XML: $($xmlFile.FullName)"
+                        Write-Host $message
+                        $message | Out-File -FilePath $logFilePath -Append
+                    }
+                }
+
+                # Converter os SessionIds para uma string separada por vírgulas
+                $sessionIdsString = $allSessionIds -join ","
+
+                Write-Host "Todos os SessionIds: $sessionIdsString"
+
+                # Definir a variável de pipeline com todos os SessionIds
+                Write-Host "##vso[task.setvariable variable=ALL_SESSION_IDS;isOutput=true]$sessionIdsString"

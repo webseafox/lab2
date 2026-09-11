@@ -1,0 +1,127 @@
+stages:
+- stage: validate_${{ parameters.environment }}
+  displayName: Prepare Deploy
+  dependsOn:
+    - pipeline_init
+  variables:
+  - template: /tech_products/dip/provisioners/app/trunkbased/java/api_default/variables/override.yml
+    parameters:
+      environment: ${{ parameters.environment }}
+  pool: $(PRIVATE_AGENT_DEFAULT)
+  jobs:
+  - job: validate
+    steps:
+    - template: /tasks/catalog_info/extract_variables.yml@CorePipelines
+      parameters:
+        workingDirectory: $(Build.SourcesDirectory)
+        skipDownload: true
+    - template: /global/general/set-output-variable.yml@CorePipelines
+      parameters:
+        variable: APP_VERSION
+        command: ${{ replace(variables['Build.SourceBranch'], 'refs/tags/', '') }}
+    - template: /task_groups/release/run_validate.yml@CorePipelines
+      parameters:
+        environment: ${{ parameters.environment }}
+
+# Deploy QA Environments
+- stage: release_${{ parameters.environment }}
+  pool: ${{ parameters.private_agent_pool }}
+  displayName: "Deploy ${{ parameters.environment }}"
+  dependsOn:
+  - validate_${{ parameters.environment }}
+  variables:
+  - template: /tech_products/dip/provisioners/app/trunkbased/java/api_default/variables/override.yml
+    parameters:
+      environment: ${{ parameters.environment }}
+  jobs:
+  - deployment: ${{ parameters.environment }}
+    workspace:
+      clean: all
+    displayName: Deploy
+    environment: "deploy-${{ parameters.environment }}"
+    strategy:
+      runOnce:
+        preDeploy:
+          steps:
+          - template: /task_groups/deploy/run_pre_deploy.yml@CorePipelines
+        deploy:
+          steps:
+          - template: /tasks/helm/utils.yml@CorePipelines
+            parameters:
+              environment: ${{parameters.environment}}
+          - template: /tech_products/dip/dip_stages/gov_app_ns_transform.yml
+            parameters:
+              namespace: $(K8S_NAMESPACE)
+              namespaceVariableOut: "X_K8S_NAMESPACE"
+              govAppAcronymEnv: $(GOV_APP_ACRONYM_NS)
+          - ${{ if or(eq(parameters.azureServiceConnectionEnabled, true), eq(parameters.kubernetesServiceConnectionEnabled, true)) }}:
+            - template: /task_groups/release/run_deploy_with_service_connection.yml@CorePipelines
+              parameters:
+                useArgoRolloutsDeploys: ${{ parameters.useArgoRolloutsDeploys }}
+                environment: ${{ parameters.environment }}
+                helmReleaseNamePrefix: ${{ parameters.helm_release_name_prefix }}
+                useExternalEnv: ${{ parameters.useExternalEnv }} 
+                azureServiceConnectionEnabled: ${{ parameters.azureServiceConnectionEnabled }}
+                kubernetesServiceConnectionEnabled: ${{ parameters.kubernetesServiceConnectionEnabled }}
+                k8sNamespace: $(X_K8S_NAMESPACE)
+                deployStrategy: ${{ parameters.deployStrategy }}
+          - ${{ else }}:
+            - template: /task_groups/release/run_deploy.yml@CorePipelines
+              parameters:
+                useArgoRolloutsDeploys: ${{ parameters.useArgoRolloutsDeploys }}
+                environment: ${{ parameters.environment }}
+                kubeconfig: ${{ parameters.kubeconfig }}
+                helmReleaseNamePrefix: ${{ parameters.helm_release_name_prefix }}
+                useExternalEnv: ${{ parameters.useExternalEnv }}
+                k8sNamespace: $(X_K8S_NAMESPACE)
+                deployStrategy: ${{ parameters.deployStrategy }}
+          - template: /task_groups/deploy/eventhub_register_deploy_taskgroup.yml@CorePipelines
+            parameters:
+              eventHubConnection: 'EVHCodeProd'
+              componentVersion: $(HELM_IMAGE_TAG)
+              deployArtifactName: '$(HELM_IMAGE_REPOSITORY):$(HELM_IMAGE_TAG)'
+              deployArtifactType: 'container'
+              deployEnvironmentType: 'kubernetes'
+              deployEnvironmentName: ${{ parameters.environment }}
+              deployEnvironmentCluster: $(ExtractClusterInfo.K8S_CLUSTER_NAME)
+              deployEnvironmentNamespace: $(X_K8S_NAMESPACE)
+              deployEnvironmentAccessUrl: $(ExtractUrls.K8S_APP_URL_LIST)
+              annotations: 'helm-chart=$(DEFAULT_GENERIC_JAVA_CHART_NAME),helm-release=$(HELM_RELEASE_NAME),helm-chart-version=$(DEFAULT_GENERIC_JAVA_CHART_VERSION)'
+              pipelineType: 'vivo-codeplay-pipelines/dip/deploy-helm-java'
+              deployStrategy: ${{ parameters.deployStrategy }}
+
+        on:
+          success:
+            steps:
+            - template: /task_groups/release/run_pos_deploy_success.yml@CorePipelines
+            # - ${{ if and(eq(parameters.environment, 'producao'), not(eq(parameters.deployWithProdlike, true))) }}:
+            - ${{ if eq(parameters.environment, 'producao') }}:
+              # Usando temporariamente uma copia local enquanto a task nao esta na branch master do CorePipelines
+              # - template: /task_groups/release/trigger_prodlike_pipeline.yml@CorePipelines
+                - template: /tech_products/dip/dip_stages/trigger_prodlike_pipeline.yml
+            - template: /task_groups/governance/check_govapp_policies.yml@CorePipelines
+              parameters:
+                govAppBreakglass: false
+                govAppOperation: "deploy"
+                continueOnError: false
+                environment: ${{ parameters.environment }}
+                stack: "JAVA"
+              
+          failure:
+            steps:
+              - template: /task_groups/release/run_pos_deploy_failure.yml@CorePipelines
+
+# ====================================================================
+# RBQA - QA Stage | Opcional (Feature flag enable_qa_stage)
+# Variáveis vêm da Library: rbqa-test-stage-dip
+# ====================================================================
+- ${{ if and(eq(parameters.run_e2e_tests, true), or(eq(parameters.environment, 'esteira1'), eq(parameters.environment, 'esteira2'), eq(parameters.environment, 'prodlike'), eq(parameters.environment, 'preprod'))) }}:
+  - template: /tech_products/rbqa/test-execution-stage/latest/pipeline_rbqa_testexecution_stage.yml
+    parameters:
+      jira_id: $(TEST_STAGE_JIRA_ID)
+      test_environment: ${{ parameters.environment }}
+      component_test_id: $(TEST_STAGE_COMPONENT_ID)
+      octane_workspace: $(TEST_STAGE_OCTANE_WORKSPACE)
+      framework: $(TEST_STAGE_FRAMEWORK)
+      docker_image: $(TEST_STAGE_DOCKER_IMAGE)
+      dependsOn: release_${{ parameters.environment }}

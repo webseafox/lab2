@@ -1,0 +1,204 @@
+parameters:
+  - name: variableGroup
+    type: string
+    default: ""
+  - name: tags                      
+    type: string
+    default: ""
+  - name: optionals
+    type: string
+    default: ""
+  - name: framework
+    type: string
+    default: "cypress" 
+  - name: browser
+    type: string
+    default: chromium
+  - name: generate_report
+    type: boolean
+    default: false
+  - name: generate_pdf
+    type: boolean
+    default: false    
+  - name: test_environment
+    type: string
+    default: "PREPROD"
+  - name: update_octane
+    type: boolean
+    default: false
+  - name: headless
+    type: boolean
+    default: true
+  - name: retry_count
+    type: string
+    default: "0"
+  - name: parallel_workers
+    type: string
+    default: "2"
+  - name: playwright_install_browsers
+    type: boolean
+    default: false
+  - name: cucumber_profile
+    type: string
+    default: ""
+
+stages:
+  - stage: ci_test_execution
+    displayName: "Test Execution"
+    dependsOn:
+      - ci_environment
+
+    variables:      
+      - ${{ if ne(parameters.variableGroup, '') }}:
+        - group: ${{ parameters.variableGroup }}
+      - name: NEXUS_DEPS_USR
+        value: $[
+          stageDependencies.ci_environment.environment.outputs['credentials.NEXUS_DEPS_USR'] ]
+      - name: NEXUS_DEPS_PSW
+        value: $[
+          stageDependencies.ci_environment.environment.outputs['credentials.NEXUS_DEPS_PSW']]
+      - name: SCRIPTS_FOLDER
+        value: $(Agent.BuildDirectory)/checkout_env/Vivo.CodePlay.Pipelines/tech_products/rbqa/test-execution-pipeline/multiframework/scripts
+      - name: INITIALIZE_FOLDER
+        value: $(Agent.BuildDirectory)/checkout_env/Vivo.CodePlay.Pipelines/tech_products/rbqa/initialize
+      # Cypress
+      - ${{ if eq(parameters.framework, 'cypress') }}:
+        - name: CONTAINER_IMAGE
+          value: acrsharedservices01.azurecr.io/base/qa/cypress/15.15-chrome-oracle/runtime:1.0.0
+      # Playwright
+      - ${{ if or(eq(parameters.framework, 'playwright'), eq(parameters.framework, 'playwright-bdd')) }}:
+        - name: CONTAINER_IMAGE
+          value: acrsharedservices01.azurecr.io/base/qa/playwright/1.61.1-noble-oracle/runtime:1.0.0
+             
+    jobs:
+      - job: test_execution
+        timeoutInMinutes: 480
+        cancelTimeoutInMinutes: 2
+        displayName: "Execução de testes E2E"
+        pool:
+          name: GeneralPurposeLinuxAgentsCI
+          #demands:
+          #- Agent.Version -equals 3.232.3
+        steps:
+          - task: Bash@3
+            displayName: "Pre-heal workspace permissions"
+            inputs:
+              targetType: inline
+              script: |
+                WORKSPACE_SOURCES="$(Pipeline.Workspace)/s"
+
+                echo "Checking workspace permissions at: ${WORKSPACE_SOURCES}"
+                echo "Current user: $(id -u):$(id -g)"
+
+                if [ -d "${WORKSPACE_SOURCES}" ]; then
+                  echo "Workspace exists; permissions are expected to be handled by the container user mapping."
+                  if find "${WORKSPACE_SOURCES}" -maxdepth 3 -type f ! -writable -print -quit 2>/dev/null | grep -q .; then
+                    echo "##vso[task.logissue type=warning]Ainda existem arquivos sem escrita em ${WORKSPACE_SOURCES}. Verifique o mapeamento de UID/GID no docker run."
+                  else
+                    echo "Workspace permission check: OK"
+                  fi
+                else
+                  echo "Workspace folder not found yet; skipping pre-heal"
+                fi
+
+                echo "Pre-check completed"
+          - task: Bash@3
+            displayName: "Cleanup agent disk"
+            inputs:
+              targetType: inline
+              script: |
+                echo "Disk usage before cleanup:"
+                df -h
+
+                echo "Cleaning only current workspace temp artifacts..."
+                rm -rf "$(Agent.TempDirectory)/rbqa-cypress" || true
+
+                  echo "Disk usage after cleanup:"
+                  df -h
+          - task: Bash@3
+            displayName: "Pre-clean workspace (Run Results)"
+            inputs:
+              targetType: "inline"
+              script: |
+                echo "🧹 Limpando Run Results antes do checkout..."
+                rm -rf $(Build.SourcesDirectory)/RunResults || true
+                    
+          - checkout: self
+            clean: false
+
+          # Download the checkout_env artifact to get the context.
+          - download: current
+            artifact: "checkout_env"
+            displayName: Download checkout_env Artifact
+
+          - task: Docker@2
+            displayName: "Auth for Azure Container Registry"
+            inputs:
+              command: "login"
+              containerRegistry: ACR-DEVOPS
+              timeoutInMinutes: 90
+
+          - task: Bash@3
+            displayName: "Set execute permissions for scripts"
+            inputs:
+              targetType: "inline"
+              script: |
+                chmod +x $(SCRIPTS_FOLDER)/*
+                ls -lha $(SCRIPTS_FOLDER)
+
+          - task: Bash@3
+            displayName: "Executing scenario(s)"
+            inputs:
+              targetType: "inline"
+              script: exec $(SCRIPTS_FOLDER)/docker_test_execution.sh
+            env:
+              SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+              NEXUS_DEPS_USR: $(NEXUS_DEPS_USR)
+              NEXUS_DEPS_PSW: $(NEXUS_DEPS_PSW)
+              DEFAULT_MAX_MEMORY_BUILD: "$DEFAULT_MAX_MEMORY_BUILD"
+              TAGS: ${{ parameters.tags }}  
+              OPTIONALS: ${{ parameters.optionals }}
+              FRAMEWORK: ${{ parameters.framework }}
+              CONTAINER_IMAGE: $(CONTAINER_IMAGE)
+              DOCKER_WORKDIR: /app 
+              SCRIPTS_FOLDER: $(SCRIPTS_FOLDER)
+              INITIALIZE_FOLDER: $(INITIALIZE_FOLDER)
+              AGENT_TMP_DIRECTORY: $(Agent.TempDirectory)
+              ALM_USERNAME: $(ALM_USERNAME)
+              ALM_PASSWORD: $(ALM_PASSWORD)
+              ALM_HOST: $(ALM_HOST)
+              ALM_DOMAIN: $(ALM_DOMAIN)
+              ALM_UPDATE_OCTANE: ${{ parameters.update_octane }}
+              ALM_PROJECT: $(ALM_PROJECT)
+              ALM_SUITE_RUN: $(ALM_SUITE_RUN)
+              ALM_RELEASE: $(ALM_RELEASE)              
+              ALM_ENVIRONMENT: $(ALM_ENVIRONMENT)
+              UPLOAD_PDF: $(UPLOAD_PDF)
+              ALM_EVD_MANUAL_RUN: $(ALM_EVD_MANUAL_RUN)
+              ALM_UPDATE_STATUS_GT: $(ALM_UPDATE_STATUS_GT)
+              ORACLE_DB_USER: $(ORACLE_DB_USER)
+              ORACLE_DB_PASSWORD: $(ORACLE_DB_PASSWORD)
+              ORACLE_DB_CONNECT_STRING: $(ORACLE_DB_CONNECT_STRING)
+              BROWSER: ${{ parameters.browser }}
+              GENERATE_REPORT: ${{ parameters.generate_report }}
+              ENVIRONMENT: ${{ parameters.test_environment }}
+              GENERATE_PDF: ${{ parameters.generate_pdf }}
+              HEADLESS: ${{ parameters.headless }}
+              RETRY_COUNT: ${{ parameters.retry_count }}
+              PARALLEL_WORKERS: ${{ parameters.parallel_workers }}
+              PLAYWRIGHT_INSTALL_BROWSERS: ${{ parameters.playwright_install_browsers }}
+              CUCUMBER_PROFILE: ${{ parameters.cucumber_profile }}
+              TEST_TAGS: ${{ parameters.tags }}
+          
+  
+          - publish: $(Agent.TempDirectory)
+            displayName: Publish Agent Logs
+            artifact: logs
+            condition: always()
+
+          - publish: $(Build.SourcesDirectory)/RunResults
+            displayName: Publish Test Evidences
+            artifact: RunResults
+            condition: always()
+
+      

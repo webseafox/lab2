@@ -1,0 +1,517 @@
+# ==================================================================
+# Pipeline: Deploy WebLogic Universal (1 a N Ambientes)
+# ==================================================================
+# Template de CD universal e reutilizável para qualquer aplicação WebLogic
+# Suporte a número dinâmico de ambientes (1, 2, 3, 6, ou mais)
+# com orquestração automática e paralela
+#
+# ESTRATÉGIA DE AMBIENTES E EVENT HUB:
+# - Parameter "environment": Seleciona dev (testes) ou producao (produção)
+#   * dev = MOVQA3 + ROTQA4 (ambientes de teste)
+#   * producao = BRN + CIC + NDC (ambientes de produção)
+# - Deploy: Executa em TODOS os sites habilitados (via deployFlags)
+# - EventHub Registration: Registra APENAS uma vez com o environment selecionado
+#
+# DEPENDÊNCIAS OBRIGATÓRIAS (Variable Groups):
+# Abordagem recomendada:
+# - Variable group para DEV/QA:  'cred-qa' com WEBLOGIC_USER, WEBLOGIC_PASS,
+#   WLST_SCRIPT, SCRIPTS_TARGETFOLDER, ARTIFACT_TARGETFOLDER
+# - Variable group para PRODUÇÃO: 'cred-prod' com WEBLOGIC_USER, WEBLOGIC_PASS,
+#   WLST_SCRIPT, SCRIPTS_TARGETFOLDER, ARTIFACT_TARGETFOLDER
+#
+# Obs: WLST_SCRIPT (caminho do interpretador WLST), SCRIPTS_TARGETFOLDER
+# (destino dos scripts .py no servidor) e ARTIFACT_TARGETFOLDER (destino do
+# WAR no servidor) são usados nas steps de undeploy/clean-deploy e transfer
+# do stage DeployAll - sem eles no variable group, o deploy falha silenciosamente.
+#
+# Obs: As URLs do AdminServer são passadas via environments.{ENV}.adminServerUrl
+# e expandidas como ${{ env.value.adminServerUrl }} no template
+#
+# Obs: O download do artefato é feito via DownloadPackage@1 (packageType: maven),
+# consumindo o pacote Maven já publicado pelo CI (mvn deploy) no feed "DevOps" -
+# não depende de nenhum publish de Universal Package.
+#
+# Obs: SSH Endpoints (ex: SSH_WLS_ROTEAMENTO_QA_CLUSTER) devem estar 
+# configurados em "Project Settings > Service connections > SSH"
+#
+# Padrão: Pipeline Pai (application repository) estende este template
+# ==================================================================
+
+parameters:
+  # ==================================================================
+  # Parâmetros de Versionamento e Ambiente
+  # ==================================================================
+  - name: packageVersion
+    displayName: 'Versão do pacote para deploy'
+    type: string
+
+  - name: environment
+    displayName: '🎯 AMBIENTE (EventHub registra APENAS este): [dev=QA] [producao=PRD]'
+    default: producao
+    values:
+      - producao
+      - dev
+
+  - name: skipAtualizaVersionMd
+    displayName: 'Pular atualização do VERSION.md'
+    type: boolean
+    default: false
+
+  # ==================================================================
+  # Mapa de Ambientes (1 a N) - Configurado pela aplicação específica
+  # ==================================================================
+  # A estrutura é genérica: cada entrada do objeto é um ambiente
+  # Cada ambiente DEVE conter: sshEndpoint, wlstCluster e adminServerUrl
+  # ==================================================================
+  - name: environments
+    type: object
+    default: {}
+    displayName: 'Mapa de ambientes WebLogic'
+
+  # ==================================================================
+  # Parâmetros Dinâmicos de Deploy (1 a N) - Gerados pela pipeline Pai
+  # ==================================================================
+  # Cada ambiente mapeado terá um booleano correspondente
+  # O template itera dinamicamente sobre todos os ambientes
+  #
+  # Exemplos:
+  #   CCIN: deployBRN, deployCIC, deployNDC (3 flags)
+  #   ServiceAPI: deployMovelBRN, deployMovelCIC, deployMovelNDC, 
+  #              deployFixaBRN, deployFixaCIC, deployFixaNDC (6 flags)
+  #   App simples: deployProduction (1 flag)
+  # ==================================================================
+  - name: deployFlags
+    type: object
+    default: {}
+    displayName: 'Flags de deploy por ambiente'
+
+  # ==================================================================
+  # Parâmetros de Configuração de Artefatos e Reutilização
+  # ==================================================================
+  - name: artifactsFeedId
+    type: string
+    default: '3d53bc62-8749-4931-ae46-a443b73bc87a'
+    displayName: 'ID do Feed Azure Artifacts (UUID)'
+
+  - name: mavenArtifactId
+    type: string
+    displayName: 'Maven Artifact ID (groupId:artifactId) - ex: br.com.vivo:ccenter-business-integration'
+    default: ''
+
+stages:
+  # ================================================================
+  # Stage 0: Security Validation (Sempre executa - CRÍTICO)
+  # ================================================================
+  # Valida que o ambiente selecionado é compatível com flags de deploy
+  - stage: SecurityValidation
+    displayName: '🔐 Security Validation'
+    pool: GeneralPurposeLinuxAgentsCD
+    
+    jobs:
+      - job: ValidateEnvironmentConsistency
+        displayName: 'Validate Environment Consistency'
+        steps:
+          - task: PowerShell@2
+            displayName: '🔍 Check Environment vs Deploy Flags'
+            inputs:
+              targetType: 'inline'
+              script: |
+                # Ambientes DEV
+                $devEnvironments = @('ROTQA4', 'MOVQA3')
+                # Ambientes Produção
+                $prodEnvironments = @('BRN', 'CIC', 'NDC')
+                
+                # Flags habilitados (parseado do JSON)
+                $deployFlagsJson = '${{ convertToJson(parameters.deployFlags) }}'
+                $deployFlags = $deployFlagsJson | ConvertFrom-Json
+                
+                $environment = '${{ parameters.environment }}'
+                $enabledEnvironments = @()
+                
+                foreach ($prop in $deployFlags.PSObject.Properties) {
+                  if ($prop.Value -eq $true) {
+                    $enabledEnvironments += $prop.Name
+                  }
+                }
+                
+                Write-Host "=================================================="
+                Write-Host "ENVIRONMENT VALIDATION"
+                Write-Host "=================================================="
+                Write-Host "Selected Environment: $environment"
+                Write-Host "Enabled Deployments: $($enabledEnvironments -join ', ')"
+                Write-Host ""
+                
+                # Validação: DEV com ambientes de Produção
+                $prodInDev = $enabledEnvironments | Where-Object { $_ -in $prodEnvironments }
+                if ($environment -eq 'dev' -and $prodInDev.Count -gt 0) {
+                  Write-Host "##vso[task.logissue type=error]❌ SEGURANÇA VIOLADA!"
+                  Write-Host "##vso[task.logissue type=error]Você selecionou environment='dev' mas tentou deployar em: $($prodInDev -join ', ')"
+                  Write-Host "##vso[task.logissue type=error]"
+                  Write-Host "##vso[task.logissue type=error]Opções válidas para DEV:"
+                  Write-Host "##vso[task.logissue type=error]  - deployROTQA4: true"
+                  Write-Host "##vso[task.logissue type=error]  - deployMOVQA3: true"
+                  Write-Host "##vso[task.logissue type=error]"
+                  Write-Host "##vso[task.logissue type=error]Rejeição de Pipeline por CONFORMIDADE!"
+                  exit 1
+                }
+
+                # Validação: Produção com ambientes DEV
+                $devInProd = $enabledEnvironments | Where-Object { $_ -in $devEnvironments }
+                if ($environment -eq 'producao' -and $devInProd.Count -gt 0) {
+                  Write-Host "##vso[task.logissue type=error]❌ SEGURANÇA VIOLADA!"
+                  Write-Host "##vso[task.logissue type=error]Você selecionou environment='producao' mas tentou deployar em DEV: $($devInProd -join ', ')"
+                  Write-Host "##vso[task.logissue type=error]"
+                  Write-Host "##vso[task.logissue type=error]Opções válidas para Produção:"
+                  Write-Host "##vso[task.logissue type=error]  - deployBRN: true"
+                  Write-Host "##vso[task.logissue type=error]  - deployCIC: true"
+                  Write-Host "##vso[task.logissue type=error]  - deployNDC: true"
+                  Write-Host "##vso[task.logissue type=error]"
+                  Write-Host "##vso[task.logissue type=error]Rejeição de Pipeline por CONFORMIDADE!"
+                  exit 1
+                }
+
+                # Validação: Nenhum ambiente selecionado
+                if ($enabledEnvironments.Count -eq 0) {
+                  Write-Host "##vso[task.logissue type=error]❌ ERRO: Nenhum ambiente foi selecionado para deploy!"
+                  Write-Host "##vso[task.logissue type=error]Marque pelo menos um dos seguintes:"
+                  if ($environment -eq 'dev') {
+                    Write-Host "##vso[task.logissue type=error]  - deployROTQA4: true"
+                    Write-Host "##vso[task.logissue type=error]  - deployMOVQA3: true"
+                  } else {
+                    Write-Host "##vso[task.logissue type=error]  - deployBRN: true"
+                    Write-Host "##vso[task.logissue type=error]  - deployCIC: true"
+                    Write-Host "##vso[task.logissue type=error]  - deployNDC: true"
+                  }
+                  exit 1
+                }
+                
+                Write-Host "✅ Validação OK: Ambientes são compatíveis com $environment"
+                Write-Host "=================================================="
+
+  # ================================================================
+  # Stage 1: Pre-Deploy Validation (Sempre executa)
+  # ================================================================
+  - stage: PreDeployValidation
+    displayName: '🔍 Pre-Deploy Validation'
+    dependsOn: SecurityValidation
+    pool: GeneralPurposeLinuxAgentsCD
+    
+    jobs:
+      - job: ValidateAndPrepare
+        displayName: 'Validate Environment & Prepare'
+        steps:
+          # Debug: Show pipeline parameters
+          - task: Bash@3
+            inputs:
+              targetType: 'inline'
+              script: |
+                echo "===================================================="
+                echo "Pipeline Parameters:"
+                echo "===================================================="
+                echo "packageVersion: ${{ parameters.packageVersion }}"
+                echo "environment: ${{ parameters.environment }}"
+                echo "skipAtualizaVersionMd: ${{ parameters.skipAtualizaVersionMd }}"
+                echo ""
+                echo "Environments Map:"
+                echo '${{ convertToJson(parameters.environments) }}'
+                echo ""
+                echo "Deploy Flags:"
+                echo '${{ convertToJson(parameters.deployFlags) }}'
+                echo "===================================================="
+            displayName: '🔍 Debug: Show Parameters'
+            condition: eq(variables['System.Debug'], 'true')
+
+          # Checkout CodePlay para acessar scripts WLST
+          - checkout: CodePlay
+            displayName: '🔄 Checkout CodePlay (WLST scripts)'
+            fetchDepth: 1
+
+          # Transferir scripts WLST para cada ambiente habilitado
+          - ${{ each env in parameters.environments }}:
+            - ${{ if and(parameters.deployFlags[env.key], not(eq(parameters.deployFlags[env.key], false))) }}:
+              - task: CopyFilesOverSSH@0
+                displayName: '📤 Transfer WLST scripts to ${{ env.key }}'
+                inputs:
+                  sshEndpoint: '${{ env.value.sshEndpoint }}'
+                  sourceFolder: $(Build.SourcesDirectory)/tech_products/ccin/pipelines/weblogic-scripts
+                  contents: '*'
+                  targetFolder: '$(SCRIPTS_TARGETFOLDER)'
+                  readyTimeout: '20000'
+
+              - task: SSH@0
+                displayName: '🔒 Set permissions scripts ${{ env.key }}'
+                inputs:
+                  sshEndpoint: '${{ env.value.sshEndpoint }}'
+                  runOptions: 'inline'
+                  inline: 'chmod 775 $(SCRIPTS_TARGETFOLDER)/*.py'
+                  readyTimeout: '20000'
+
+              - task: SSH@0
+                displayName: '🔗 Validate SSH Connection ${{ env.key }}'
+                inputs:
+                  sshEndpoint: '${{ env.value.sshEndpoint }}'
+                  runOptions: 'inline'
+                  inline: |
+                    echo "Conectado com sucesso ao ${{ env.key }}"
+                    echo "Testando conectividade com AdminServer..."
+                    ls -lha $(SCRIPTS_TARGETFOLDER) || echo "Diretório $(SCRIPTS_TARGETFOLDER) será criado"
+                  readyTimeout: '20000'
+
+  # ================================================================
+  # Stage 2: Deploy All Environments
+  # ================================================================
+  # Jobs dinâmicos dentro de um único stage garantem que o FinalAudit
+  # possa depender dele e aguardar TODOS os deploys terminarem.
+  #
+  # Segurança: credenciais são escritas em arquivo temporário no servidor
+  # com permissões 600 e removidas imediatamente após uso (não são
+  # passadas como argumentos CLI diretos).
+  # ================================================================
+  - stage: DeployAll
+    displayName: '🚀 Deploy All Environments'
+    dependsOn: PreDeployValidation
+    pool: GeneralPurposeLinuxAgentsCD
+    
+    jobs:
+      - ${{ each env in parameters.environments }}:
+        - ${{ if and(parameters.deployFlags[env.key], not(eq(parameters.deployFlags[env.key], false))) }}:
+          - deployment: Deploy${{ env.key }}
+            displayName: 'Deploy ${{ env.key }}'
+            environment: 'deploy-${{ parameters.environment }}'
+
+            strategy:
+              runOnce:
+                deploy:
+                  steps:
+                    # Checkout do repositório para acessar scripts
+                    - checkout: self
+                      displayName: '🔄 Checkout repository'
+                      fetchDepth: 0
+                      persistCredentials: true
+
+                    # Download do WAR/package from Azure Artifacts (Maven package)
+                    - task: DownloadPackage@1
+                      displayName: '⬇️ Download package (${{ env.key }}) version ${{ parameters.packageVersion }}'
+                      inputs:
+                        packageType: 'maven'
+                        feed: '${{ parameters.artifactsFeedId }}'
+                        definition: '${{ parameters.mavenArtifactId }}'
+                        version: '${{ parameters.packageVersion }}'
+                        downloadPath: '$(Pipeline.Workspace)/artifacts'
+
+                    # Validar que o WAR foi baixado corretamente com versão esperada
+                    - task: Bash@3
+                      displayName: '✅ Validate downloaded package version'
+                      inputs:
+                        targetType: 'inline'
+                        script: |
+                          echo "=================================================="
+                          echo "PACKAGE DOWNLOAD VALIDATION"
+                          echo "=================================================="
+                          echo "Expected:"
+                          echo "  Package ID: ${{ parameters.mavenArtifactId }}"
+                          echo "  Version: ${{ parameters.packageVersion }}"
+                          echo ""
+                          echo "Downloaded artifacts:"
+                          ls -lhR $(Pipeline.Workspace)/artifacts
+                          echo ""
+                          
+                          WAR_FILE=$(find $(Pipeline.Workspace)/artifacts -name "*.war" -type f | head -1)
+                          if [ -z "$WAR_FILE" ]; then
+                            echo "##vso[task.logissue type=error]❌ ERRO: Nenhum arquivo WAR encontrado!"
+                            echo "Esperado arquivo .war do package ${{ parameters.mavenArtifactId }} v${{ parameters.packageVersion }}"
+                            exit 1
+                          fi
+                          
+                          # Validar que o nome do arquivo contém a versão esperada
+                          if ! echo "$WAR_FILE" | grep -q "${{ parameters.packageVersion }}"; then
+                            echo "##vso[task.logissue type=warning]⚠️  AVISO: Versão ${{ parameters.packageVersion }} não encontrada no nome do arquivo"
+                            echo "   Arquivo: $WAR_FILE"
+                          fi
+                          
+                          echo "✅ WAR validado:"
+                          echo "   Path: $WAR_FILE"
+                          echo "   Size: $(stat -c%s "$WAR_FILE") bytes"
+                          echo "   MD5: $(md5sum "$WAR_FILE")"
+                          echo "   Filename: $(basename "$WAR_FILE")"
+                          echo "=================================================="
+
+                    # Copiar artefato para servidor
+                    - task: CopyFilesOverSSH@0
+                      displayName: '📤 Transfer WAR to ${{ env.key }}'
+                      inputs:
+                        sshEndpoint: '${{ env.value.sshEndpoint }}'
+                        sourceFolder: '$(Pipeline.Workspace)/artifacts'
+                        contents: '**/*.war'
+                        targetFolder: '$(ARTIFACT_TARGETFOLDER)'
+                        readyTimeout: '20000'
+
+                    # Undeploy versão anterior (credenciais via arquivo temporário)
+                    # runOptions 'inline' roda tudo em uma única sessão SSH; 'commands' executa cada linha isoladamente e perde variáveis entre linhas
+                    - task: SSH@0
+                      displayName: '🗑️ Undeploy app ${{ env.key }}'
+                      inputs:
+                        sshEndpoint: '${{ env.value.sshEndpoint }}'
+                        runOptions: 'inline'
+                        inline: |
+                          CRED_FILE=$(mktemp /tmp/wlst_creds.XXXXXX)
+                          chmod 644 "$CRED_FILE"
+                          echo "$(WEBLOGIC_USER)" > "$CRED_FILE"
+                          echo "$(WEBLOGIC_PASS)" >> "$CRED_FILE"
+                          $(WLST_SCRIPT) $(SCRIPTS_TARGETFOLDER)/UndeployApp.py --cred-file "$CRED_FILE" ${{ env.value.adminServerUrl }} $(APP)
+                          STATUS=$?
+                          rm -f "$CRED_FILE"
+                          exit $STATUS
+                        readyTimeout: '20000'
+
+                    # Clean deploy versão nova (credenciais via arquivo temporário)
+                    - task: SSH@0
+                      displayName: '🚀 Clean Deploy WLST ${{ env.key }}'
+                      inputs:
+                        sshEndpoint: '${{ env.value.sshEndpoint }}'
+                        runOptions: 'inline'
+                        inline: |
+                          CRED_FILE=$(mktemp /tmp/wlst_creds.XXXXXX)
+                          chmod 644 "$CRED_FILE"
+                          echo "$(WEBLOGIC_USER)" > "$CRED_FILE"
+                          echo "$(WEBLOGIC_PASS)" >> "$CRED_FILE"
+                          sudo -u weblogic $(WLST_SCRIPT) $(SCRIPTS_TARGETFOLDER)/CleanDeployApp.py --cred-file "$CRED_FILE" ${{ env.value.adminServerUrl }} $(APP) $(ARTIFACT_TARGETFOLDER)/$(APP)-${{ parameters.packageVersion }}.war ${{ env.value.wlstCluster }} ${{ parameters.packageVersion }}
+                          STATUS=$?
+                          rm -f "$CRED_FILE"
+                          exit $STATUS
+                        readyTimeout: '20000'
+
+
+  # ================================================================
+  # Stage 3: Final Audit (Sempre executa após todos os deploys)
+  # ================================================================
+  - stage: FinalAudit
+    displayName: '📊 Final Audit & Registry'
+    dependsOn: DeployAll
+    condition: always()
+    pool: GeneralPurposeLinuxAgentsCD
+    
+    jobs:
+      - job: FinalAudit
+        displayName: 'Event Hub Registration & Version Update'
+        steps:
+          # ==============================================================
+          # Alterar nome da run para: deploy-<VERSION>-<ENVIRONMENT>
+          # ==============================================================
+          - task: PowerShell@2
+            displayName: '🏷️ Update build name with version & environment'
+            condition: always()
+            inputs:
+              targetType: 'inline'
+              script: |
+                $buildName = "deploy-${{ parameters.packageVersion }}-${{ parameters.environment }}"
+                Write-Host "Setting build name to: $buildName"
+                Write-Host "##vso[build.updatebuildnumber]$buildName"
+
+          - checkout: self
+            fetchDepth: 0
+            displayName: '🔄 Checkout repository'
+            persistCredentials: true
+
+          # Registrar no EventHub (Event Hub Tools)
+          # Registra APENAS para deploys em producao (BRN, CIC, NDC)
+          - task: VivoEventHubTools@2
+            displayName: '📡 Register deployment in Event Hub (PRODUCAO ONLY)'
+            condition: and(always(), eq('${{ parameters.environment }}', 'producao'))
+            continueOnError: true
+            inputs:
+              command: 'deploy'
+              eventHubConnection: 'EVHCodeProd'
+              componentVersion: '${{ parameters.packageVersion }}'
+              deployArtifactName: '$(APP)'
+              deployArtifactType: 'war'
+              deployEnvironmentType: 'weblogic'
+              deployEnvironmentName: '${{ parameters.environment }}'
+              annotations: 'deploy-mechanism=wlst,artifact-type=war,server-type=weblogic,deployment-count=multi-site'
+              pipelineType: 'tech_products/ccin/middleware'
+
+          # Atualizar VERSION.md (apenas se não foi skipped)
+          - ${{ if ne(parameters.skipAtualizaVersionMd, true) }}:
+            - task: PowerShell@2
+              displayName: '🏷️ Update STATUS in VERSION.md'
+              condition: succeeded()
+              inputs:
+                targetType: 'inline'
+                script: |
+                  $version = "${{ parameters.packageVersion }}"
+                  $deployDate = Get-Date -Format "dd/MM/yyyy"
+                  $file = "VERSION.md"
+                  if (Test-Path $file) {
+                    $lines = [System.Collections.Generic.List[string]](Get-Content $file)
+
+                    # Idempotência: se a versão já consta na tabela, não duplica linha
+                    $existingIndex = $lines.FindIndex({ param($l) $l -match "^\|\s*$([regex]::Escape($version))\s*\|" })
+                    if ($existingIndex -ge 0) {
+                      Write-Host "Versão $version já registrada em VERSION.md - nenhuma linha adicionada"
+                    } else {
+                      # Nova linha entra logo após o separador do cabeçalho da tabela (|---|---|)
+                      $separatorIndex = $lines.FindIndex({ param($l) $l -match '^\|[\s-]+\|[\s-]+\|\s*$' })
+                      if ($separatorIndex -lt 0) {
+                        Write-Error "Separador da tabela (|---|---|) não encontrado em VERSION.md!"
+                        exit 1
+                      }
+                      $lines.Insert($separatorIndex + 1, "|  $version  | $deployDate   |")
+                      Write-Host "Versão $version adicionada em VERSION.md - deploy em $deployDate"
+                    }
+
+                    $lastUpdated = Get-Date -Format "MMMM yyyy"
+                    $newContent = ($lines -join "`n") -replace '\*Last updated: [^*]+\*', "*Last updated: $lastUpdated*"
+                    Set-Content $file -Value $newContent -Encoding UTF8
+                  } else {
+                    Write-Error "VERSION.md não encontrado!"
+                    exit 1
+                  }
+                workingDirectory: '$(Build.SourcesDirectory)'
+
+            # Commit VERSION.md no git (não deve derrubar o job se master tiver branch policy)
+            - task: CmdLine@2
+              displayName: '📝 Commit deployment status in VERSION.md'
+              condition: succeeded()
+              continueOnError: true
+              inputs:
+                script: |
+                  git config user.email "devops-automation@telefonicati.onmicrosoft.com"
+                  git config user.name "DevOps Automation"
+                  git checkout master || git checkout -b master
+                  git add VERSION.md
+                  git commit -m "chore: marca versão ${{ parameters.packageVersion }} como deployada"
+                  git push origin master
+                workingDirectory: '$(Build.SourcesDirectory)'
+
+          # Mensagem de sucesso/falha
+          - task: PowerShell@2
+            displayName: '✅ Deployment Summary'
+            condition: always()
+            inputs:
+              targetType: 'inline'
+              script: |
+                # Parse dos ambientes habilitados
+                $deployFlagsJson = '${{ convertToJson(parameters.deployFlags) }}'
+                $deployFlags = $deployFlagsJson | ConvertFrom-Json
+                
+                $enabledEnvironments = @()
+                foreach ($prop in $deployFlags.PSObject.Properties) {
+                  if ($prop.Value -eq $true) {
+                    $enabledEnvironments += $prop.Name
+                  }
+                }
+                
+                Write-Host "===================================================="
+                Write-Host "DEPLOYMENT SUMMARY"
+                Write-Host "===================================================="
+                Write-Host "Application: $(APP)"
+                Write-Host "Version: ${{ parameters.packageVersion }}"
+                Write-Host "Environment: ${{ parameters.environment }}"
+                Write-Host ""
+                Write-Host "Deployed to:"
+                foreach ($env in ($enabledEnvironments | Sort-Object)) {
+                  Write-Host "  ✅ $env"
+                }
+                Write-Host ""
+                Write-Host "Timestamp: $(Get-Date -Format 'yyyy-MM-ddTHH:mm:ssZ')"
+                Write-Host "===================================================="

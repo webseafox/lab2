@@ -1,0 +1,138 @@
+parameters:
+  - name: convisoApiKey
+    type: string
+  - name: systemTeamProject
+    type: string
+  - name: convisoAssetName
+    type: string
+  - name: companyId
+    type: string
+    default: "430"
+  - name: graphqlUrl
+    type: string
+    default: "https://api.convisoappsec.com/graphql"
+
+steps:
+  - bash: |
+      set -e
+
+      TEAM_PROJECT="${{ parameters.systemTeamProject }}"
+      ASSET_NAME="${{ parameters.convisoAssetName }}"
+      COMPANY_ID="${{ parameters.companyId }}"
+      GRAPHQL_URL="${{ parameters.graphqlUrl }}"
+
+      echo "========================================================="
+      echo "Iniciando mapeamento de Tags e Teams na Conviso Platform"
+      echo "Projeto ADO: $TEAM_PROJECT"
+      echo "Asset Alvo: $ASSET_NAME"
+      echo "========================================================="
+
+      if [ "$COMPANY_ID" == "1345" ]; then
+        echo "Automacao desativada para a company Vivo - IaC (ID 1345)."
+        exit 0
+      fi
+
+      # Validação de projeto de exceção (ADO no padrão ID##### - projetos que NÃO devem receber tag/team)
+      # Ex: "ID000061-mvp-cloud", "ID000123-outro-projeto"
+      # Regra da Vivo: nomenclatura desses projetos não deve ser alterada e não recebem associação de tag/team.
+      if [[ "$TEAM_PROJECT" =~ ^ID[0-9]+ ]]; then
+        echo "Projeto '$TEAM_PROJECT' identificado como PROJETO EXCEÇÃO (padrão ID#####)."
+        echo "Nenhuma tag ou team será associada. Pulando para o próximo."
+        exit 0
+      fi
+
+      # Extração da Sigla (Pega a primeira palavra antes do espaço/hífen)
+      # Ex: "ABCD - My-Project" -> "ABCD"
+      # Sem exceção para o DevOps-Tests
+      SIGLA=$(echo "$TEAM_PROJECT" | awk '{print $1}')
+      echo "Sigla extraída para busca: $SIGLA"
+
+      # Override para assets de projetos DevOps
+      # Se o nome do asset na Conviso começa com "DevOps", força a sigla para DVPS,
+      # independente do TEAM_PROJECT no ADO (pois esses assets não seguem o padrão de sigla).
+      # O nome do ativo NÃO é alterado - apenas a tag/team aplicada será DVPS.
+      case "$ASSET_NAME" in
+        DevOps-*|DevOps\ *)
+          echo "Asset '$ASSET_NAME' identificado como projeto DevOps. Forçando sigla para DVPS."
+          SIGLA="DVPS"
+          ;;
+      esac
+      echo "Sigla final para tag/team: $SIGLA"
+
+      # Busca do Team ID na Conviso
+      TEAM_QUERY="{ teamsByScope(id: $COMPANY_ID, page: 1, limit: 100, params: {labelEq: \"$SIGLA\"}) { collection { id } } }"
+      TEAM_PAYLOAD=$(jq -n --arg q "$TEAM_QUERY" '{query: $q}')
+
+      TEAM_RESP=$(curl -s -X POST -H "x-api-key: $ENV_API_KEY" -H "Content-Type: application/json" -d "$TEAM_PAYLOAD" "$GRAPHQL_URL")
+      TEAM_ID=$(echo "$TEAM_RESP" | jq -r '.data.teamsByScope.collection[0].id // empty')
+
+      if [ -z "$TEAM_ID" ]; then
+        echo "Nenhum Team encontrado na Conviso para a sigla '$SIGLA'. A mutation seguirá apenas com a Tag (se aplicável)."
+      else
+        echo "Team ID encontrado: $TEAM_ID"
+      fi
+
+      # Busca do Asset e Validação/Match do nome
+      ASSET_QUERY="{ assets(companyId: \"$COMPANY_ID\", page: 1, limit: 100, search: {name: \"$ASSET_NAME\"}) { collection { id name assetsTagList teams { id } } } }"
+      ASSET_PAYLOAD=$(jq -n --arg q "$ASSET_QUERY" '{query: $q}')
+
+      ASSET_RESP=$(curl -s -X POST -H "x-api-key: $ENV_API_KEY" -H "Content-Type: application/json" -d "$ASSET_PAYLOAD" "$GRAPHQL_URL")
+
+      # Realiza o match do nome
+      MATCHED_ASSET=$(echo "$ASSET_RESP" | jq -c --arg name "$ASSET_NAME" '.data.assets.collection[] | select(.name == $name)')
+
+      if [ -z "$MATCHED_ASSET" ]; then
+        echo "O Asset com nome EXATO '$ASSET_NAME' não foi retornado pela API. O Conviso Sync falhou ou o nome está divergente."
+        exit 0
+      fi
+
+      ASSET_ID=$(echo "$MATCHED_ASSET" | jq -r '.id')
+      echo "##vso[task.setvariable variable=CONVISO_ASSET_ID]$ASSET_ID"
+
+      TAGS_COUNT=$(echo "$MATCHED_ASSET" | jq '.assetsTagList | length')
+      TEAMS_COUNT=$(echo "$MATCHED_ASSET" | jq '.teams | length')
+
+      echo "Asset ID validado: $ASSET_ID"
+      echo "Tags atuais: $TAGS_COUNT | Teams atuais: $TEAMS_COUNT"
+
+      # Avaliação e Mutation
+      if [ "$TAGS_COUNT" -eq 0 ] || [ "$TEAMS_COUNT" -eq 0 ]; then
+        echo "Asset possui Tags ou Teams vazios. Iniciando atualização..."
+
+        LOG_DETAILS=""
+
+        if [ "$TAGS_COUNT" -eq 0 ]; then
+          LOG_DETAILS="$LOG_DETAILS\n  - Tag adicionada: $SIGLA"
+        fi
+
+        # Constrói a lista de times de forma condicional para a mutation
+        if [ -n "$TEAM_ID" ]; then
+          TEAM_PARAM="teamIds: [\"$TEAM_ID\"]"
+          if [ "$TEAMS_COUNT" -eq 0 ]; then
+            LOG_DETAILS="$LOG_DETAILS\n  - Team associado: $SIGLA (ID: $TEAM_ID)"
+          fi
+        else
+          TEAM_PARAM="teamIds: []"
+          if [ "$TEAMS_COUNT" -eq 0 ]; then
+            LOG_DETAILS="$LOG_DETAILS\n  - Team NÃO associado: Nenhum Team encontrado para a sigla '$SIGLA'"
+          fi
+        fi
+
+        MUTATION_STR="mutation { updateAsset(input: {companyId: $COMPANY_ID, id: $ASSET_ID, name: \"$ASSET_NAME\", assetsTagList: [\"$SIGLA\"], $TEAM_PARAM}) { asset { id name assetsTagList teams { label } } } }"
+        MUTATION_PAYLOAD=$(jq -n --arg q "$MUTATION_STR" '{query: $q}')
+
+        UPDATE_RESP=$(curl -s -X POST -H "x-api-key: $ENV_API_KEY" -H "Content-Type: application/json" -d "$MUTATION_PAYLOAD" "$GRAPHQL_URL")
+
+        if echo "$UPDATE_RESP" | grep -q "errors"; then
+          echo "Falha ao atualizar o Asset. Resposta da API: $UPDATE_RESP"
+        else
+          echo "Asset atualizado com sucesso!"
+          echo -e "$LOG_DETAILS"
+        fi
+      else
+        echo "O Asset já possui Tags e Teams associados. Nenhuma atualização necessária."
+      fi
+    displayName: 'Conviso Platform: Sync Tags and Teams'
+    continueOnError: true
+    env:
+      ENV_API_KEY: ${{ parameters.convisoApiKey }}

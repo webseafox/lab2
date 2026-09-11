@@ -1,0 +1,77 @@
+parameters:
+- name: environment
+  type: string
+  values:
+  - esteira1
+  - esteira2
+  - preprod
+  - prodlike
+
+stages:
+- stage: PrepareDeploy_${{ parameters.environment }}
+  displayName: Prepare Deploy - ${{ parameters.environment }}
+  pool: GeneralPurposeLinuxAgentsCD
+  jobs:
+  - job: CalculateNextDeployWindow
+    displayName: "Calculate Next Deploy Window"
+    steps:
+      - task: Bash@3
+        name: CalculateDelayForNextWindow
+        displayName: "Calculate Minutes for Next Deploy Window"
+        inputs:
+          targetType: 'inline'
+          script: |
+            # Define a hora e os minutos atuais
+            HORA_ATUAL=$(date +"%H")
+            MINUTO_ATUAL=$(date +"%M")
+
+            # Define a hora da próxima janela de execução
+            if [[ $HORA_ATUAL -ge 23 || $HORA_ATUAL -lt 7 ]]; then
+                HORA_PROXIMA_JANELA="07:00"
+            elif [[ $HORA_ATUAL -ge 8 && $HORA_ATUAL -lt 12 ]]; then
+                HORA_PROXIMA_JANELA="12:00"
+            elif [[ $HORA_ATUAL -ge 13 && $HORA_ATUAL -lt 18 ]]; then
+                HORA_PROXIMA_JANELA="18:00"
+            elif [[ $HORA_ATUAL -ge 19 && $HORA_ATUAL -lt 22 ]]; then
+                HORA_PROXIMA_JANELA="22:00"
+            else
+                HORA_PROXIMA_JANELA="22:00"
+            fi
+
+            # Verifica se estamos dentro de uma janela de deploy
+            if [[ $HORA_ATUAL -ge 7 && $HORA_ATUAL -lt 8 ]] \
+                || [[ $HORA_ATUAL -ge 12 && $HORA_ATUAL -lt 13 ]] \
+                || [[ $HORA_ATUAL -ge 18 && $HORA_ATUAL -lt 19 ]] \
+                || [[ $HORA_ATUAL -ge 22 && $HORA_ATUAL -lt 23 ]]; then
+
+                echo "Estamos dentro de uma janela de deploy. O deploy será feito em 1 minuto."
+              
+              DIFF_EM_MINUTOS=1
+              
+              echo "##vso[task.setvariable variable=DIFF_EM_MINUTOS;isOutput=true]$DIFF_EM_MINUTOS"
+              
+            else
+                # Calcula a diferença entre a hora atual e a hora da próxima janela de execução em minutos
+                MINUTOS_EM_PROXIMA_JANELA=$(date -d "$HORA_PROXIMA_JANELA" +%s)
+                MINUTOS_ATUAIS=$(date -d "$HORA_ATUAL:$MINUTO_ATUAL" +%s)
+                DIFF_EM_MINUTOS=$(( ($MINUTOS_EM_PROXIMA_JANELA - $MINUTOS_ATUAIS) / 60 ))
+
+                echo "Faltam $DIFF_EM_MINUTOS minutos para a próxima janela de deploy, às $HORA_PROXIMA_JANELA."
+              
+              echo "##vso[task.setvariable variable=DIFF_EM_MINUTOS;isOutput=true]$DIFF_EM_MINUTOS"
+              
+            fi
+
+  - job: PrepareDeploy
+    displayName: "Preparing Deploy"
+    timeoutInMinutes: 720
+    cancelTimeoutInMinutes: 720
+    pool: server
+    variables:
+      DIFF_EM_MINUTOS: $[dependencies.CalculateNextDeployWindow.outputs['CalculateDelayForNextWindow.DIFF_EM_MINUTOS']] 
+    dependsOn:
+    - CalculateNextDeployWindow
+    steps:  
+      - task: Delay@1
+        inputs:
+          delayForMinutes: $(DIFF_EM_MINUTOS)

@@ -1,0 +1,122 @@
+parameters:
+  jsonPath: ''
+  filterScenarios: false
+  acceptanceCriteria: ''
+
+steps:
+  - task: Bash@3
+    displayName: Parse and filter cucumber report
+    inputs:
+      targetType: inline
+      script: |
+        set -e
+
+        echo "##[section]Starting cucumber report parsing..."
+
+        JSON_PATH="${{ parameters.jsonPath }}"
+        FILTER_SCENARIOS=$(echo "${{ parameters.filterScenarios }}" | tr '[:upper:]' '[:lower:]')
+        ACCEPTANCE_CRITERIA="${{ parameters.acceptanceCriteria }}"
+
+        echo "Path json           : $JSON_PATH"
+        echo "Filtered Scenarios  : $FILTER_SCENARIOS"
+        echo "Acceptance criteria : $ACCEPTANCE_CRITERIA"
+
+        if [ -z "$JSON_PATH" ]; then
+          echo "##[error]Parameter 'jsonPath' was not provided."
+          exit 1
+        fi
+
+        if [ ! -f "$JSON_PATH" ]; then
+          echo "##[error]The cucumber-report.json file does not exist. Run merge-validator and build to create it."
+          exit 1
+        fi
+
+        if [ "$FILTER_SCENARIOS" = "true" ]; then
+          if [ -z "$ACCEPTANCE_CRITERIA" ]; then
+            echo "##[error]acceptanceCriteria must be provided when filterScenarios is true."
+            exit 1
+          fi
+
+          echo "##[group]Filtering scenarios by acceptance criteria..."
+
+          NORMALIZED_CRITERIA=$(echo "$ACCEPTANCE_CRITERIA" | tr '[:upper:]' '[:lower:]' | tr -d ' ')
+          IFS=',' read -ra CRITERIA_ARRAY <<< "$NORMALIZED_CRITERIA"
+
+          echo "##[debug]Normalized criteria: ${CRITERIA_ARRAY[@]}"
+
+          echo "##[debug]Available URIs in JSON:"
+          jq -r '.[] | .uri // "NO_URI"' "$JSON_PATH"
+
+          echo "##[debug]Patterns extracted from URIs:"
+          AVAILABLE_PATTERNS=$(jq -r '.[] | 
+            (.uri // "") | 
+            if test("\\[([^\\]]+)\\]/([^/]+)/") then
+              (capture("\\[(?<code>[^\\]]+)\\]/(?<ct>[^/]+)/") | (.code + "/" + .ct) | ascii_downcase)
+            elif test("/([A-Za-z0-9_-]+)/([A-Za-z0-9_-]+)/[^/]+\\.feature$") then
+              (capture("/(?<code>[A-Za-z0-9_-]+)/(?<ct>[A-Za-z0-9_-]+)/[^/]+\\.feature$") | (.code + "/" + .ct) | ascii_downcase)
+            else
+              "NO_MATCH"
+            end' "$JSON_PATH")
+          echo "$AVAILABLE_PATTERNS"
+
+          MISSING_CRITERIA=()
+          for criteria in "${CRITERIA_ARRAY[@]}"; do
+            FOUND=false
+            while IFS= read -r pattern; do
+              if [ "$pattern" = "$criteria" ]; then
+                FOUND=true
+                break
+              fi
+            done <<< "$AVAILABLE_PATTERNS"
+            
+            if [ "$FOUND" = false ]; then
+              MISSING_CRITERIA+=("$criteria")
+            fi
+          done
+
+          if [ ${#MISSING_CRITERIA[@]} -gt 0 ]; then
+            echo "##[error]The following acceptance criteria were not found:"
+            for crit in "${MISSING_CRITERIA[@]}"; do
+              echo "##[error]  - $crit"
+            done
+            echo "##[error]The acceptance criteria does not exist. Validate your reports file and try again."
+            exit 1
+          fi
+
+          CRITERIA_JSON=$(printf '%s\n' "${CRITERIA_ARRAY[@]}" | jq -R . | jq -s .)
+
+          FILTERED=$(jq --argjson criteria "$CRITERIA_JSON" '
+            map(select(
+              (.uri // "") | 
+              if test("\\[([^\\]]+)\\]/([^/]+)/") then
+                (capture("\\[(?<code>[^\\]]+)\\]/(?<ct>[^/]+)/") | (.code + "/" + .ct) | ascii_downcase) as $pattern |
+                ($criteria | index($pattern)) != null
+              elif test("/([A-Za-z0-9_-]+)/([A-Za-z0-9_-]+)/[^/]+\\.feature$") then
+                (capture("/(?<code>[A-Za-z0-9_-]+)/(?<ct>[A-Za-z0-9_-]+)/[^/]+\\.feature$") | (.code + "/" + .ct) | ascii_downcase) as $pattern |
+                ($criteria | index($pattern)) != null
+              else
+                false
+              end
+            ))
+          ' "$JSON_PATH")
+
+          echo "##[debug]Filtering result:"
+          echo "$FILTERED" | jq -r '.[] | .uri // "NO_URI"'
+
+          FILTERED_COUNT=$(echo "$FILTERED" | jq 'length')
+
+          if [ "$FILTERED_COUNT" -eq 0 ]; then
+            echo "##[error]The acceptance criteria does not exist. Validate your reports file and try again."
+            exit 1
+          fi
+
+          echo "$FILTERED" > "${JSON_PATH%.json}.filtered.json"
+
+          echo "##[section]Filtered $FILTERED_COUNT scenario(s) matching criteria: ${CRITERIA_ARRAY[*]}"
+          echo "##[endgroup]"
+        else
+          cp "$JSON_PATH" "${JSON_PATH%.json}.filtered.json"
+          echo "##[section]No filtering applied. All scenarios will be processed."
+        fi
+
+        echo "##[section]Cucumber report parsing completed successfully."

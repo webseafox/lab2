@@ -1,0 +1,245 @@
+stages:
+
+- stage: build_test
+  displayName: "Build & Test"
+  dependsOn:
+  - pipeline_init
+  pool: 'GeneralPurposeLinuxAgentsCI'
+  jobs:
+  - job: bump_version
+    displayName: Bumping Version
+    condition: and(succeeded(), eq(variables.flowIsTagging, false))
+    steps:
+
+    - checkout: self
+      persistCredentials: "true"
+      clean: true
+
+    - bash: |
+        version=$(grep version pom.xml | grep -v '<?xml' | grep '<version>'|head -n 1|awk '{print $1}'| cut -d'>' -f 2 | cut -d'<' -f 1)
+        echo "##vso[task.setvariable variable=APP_CURRENT_VERSION]$version"
+        echo "##[debug] Exporting variable 'APP_CURRENT_VERSION': $version"
+      name: export_current_version
+      displayName: Extract App Version     
+
+    - task: semver-bump@1
+      displayName: Bump Version
+      condition:  or(
+                    and(succeeded(), eq(variables.BUMP_VERSION_ENABLED, 'true'), eq(variables['Build.Reason'], 'IndividualCI')), 
+                    and(succeeded(), eq(variables.BUMP_VERSION_ENABLED, 'true'), eq(variables['Build.Reason'], 'BatchedCI'))
+                  )
+      inputs:
+        VersionVariable: 'APP_CURRENT_VERSION'
+        IncrementLevel: 'patch' 
+
+    - bash: |
+        echo "##vso[task.setvariable variable=${NEW_VERSION_OUT};isOutput=true]${NEW_VERSION}"
+        echo "##[debug] Exporting variable '${NEW_VERSION_OUT}': ${NEW_VERSION}"
+      displayName: 'Defining New Component Version'
+      name: component_bump_version
+      env:
+        NEW_VERSION: $(APP_CURRENT_VERSION)
+        NEW_VERSION_OUT: "APP_NEW_VERSION"
+
+  - job: build_app
+    displayName: Build & Test   
+    dependsOn:
+      - bump_version
+    condition: and(succeeded(), eq(variables.flowIsTagging, false))
+    variables:
+    - name: APP_NEW_VERSION 
+      value: $[ dependencies.bump_version.outputs['component_bump_version.APP_NEW_VERSION'] ]
+    steps:
+
+    ## SETUP
+    - task: Cache@2
+      displayName: Cache Maven local repo
+      inputs:
+        key: 'maven | "$(Agent.OS)"'
+        path: '$(MAVEN_CACHE_FOLDER)'
+        cacheHitVar: 'CacheRestored'
+        restoreKeys: |
+          maven | "$(Agent.OS)"
+          maven
+      
+    - task: AzureKeyVault@2  
+      displayName: 'Getting AKV credentials'
+      timeoutInMinutes: 1
+      retryCountOnTaskFailure: 5  
+      inputs:    
+        azureSubscription: DevOpsSharedResources
+        KeyVaultName: $(AKV_DEVOPS_NAME)
+        SecretsFilter: 'NEXUS-DEPS-USR, NEXUS-DEPS-PSW'
+
+    - script: |
+        whoami
+        cd /home/svc_devopscorp/.m2
+        chmod u+w "/home/svc_devopscorp/.m2/settings.xml"
+        cat /home/svc_devopscorp/.m2/settings.xml
+        sed -i -E 's|<password>([^$<][^<]*)</password>|<password>${SYSTEM_ACCESSTOKEN}</password>|g' /home/svc_devopscorp/.m2/settings.xml
+        sed -i 's|<username></username>|<username>${NEXUS_DEPS_USR}</username>|g' /home/svc_devopscorp/.m2/settings.xml
+        sed -i 's|<password></password>|<password>${NEXUS_DEPS_USR}</password>|g' /home/svc_devopscorp/.m2/settings.xml
+        cp /home/svc_devopscorp/.m2/settings.xml /home/svc_devopscorp/.m2/settings_original.xml
+        echo "##vso[task.setvariable variable=SYSTEM_ACESSTOKEN;]$(System.AccessToken)"
+        echo "##vso[task.setvariable variable=SYSTEM-ACESSTOKEN;]$(System.AccessToken)"
+        echo "##vso[task.setvariable variable=NEXUS_DEPS_USR;]$(NEXUS-DEPS-USR)"
+        echo "##vso[task.setvariable variable=NEXUS_DEPS_PSW;]$(NEXUS-DEPS-PSW)"
+        ls -ltr
+      displayName: 'Backuping settings.xml on home'
+        
+    - task: ReplaceTokens@3
+      displayName: 'Configuring Settings.xml on home'
+      inputs:
+        rootDirectory: '/home/svc_devopscorp/.m2'
+        targetFiles: 'settings.xml'
+        tokenPattern: azpipelines
+        tokenPrefix: '${'
+        tokenSuffix: '}'
+
+    - task: MavenAuthenticate@0
+      inputs:
+        artifactsFeeds: '$(PACKAGE_FEED)'
+
+    - script: |
+        whoami
+        cd /home/svc_devopscorp/.m2
+        chmod u+w "/home/svc_devopscorp/.m2/settings.xml"
+        cat /home/svc_devopscorp/.m2/settings.xml
+        mv /home/svc_devopscorp/.m2/settings_original.xml /home/svc_devopscorp/.m2/settings.xml
+        ls -ltr
+        cat /home/svc_devopscorp/.m2/settings.xml
+      displayName: 'Putting the original settings.xml back on home'  
+
+    - task: ReplaceTokens@3
+      displayName: 'Configuring Settings.xml'
+      inputs:
+        rootDirectory: '$(system.defaultWorkingDirectory)'
+        targetFiles: 'settings.xml'
+        tokenPattern: azpipelines
+        tokenPrefix: '#{'
+        tokenSuffix: '}#'      
+        
+    - task: DownloadPackage@1
+      displayName: 'Download Apache Maven'
+      inputs:
+        packageType: 'upack'
+        feed: '$(PACKAGE_FEED)'
+        view: '$(PACKAGE_VIEW)'
+        definition: '$(MAVEN_PACKAGE_DEFINITION)'
+        version: '$(MAVEN_PACKAGE_VERSION)'
+        downloadPath: '$(System.ArtifactsDirectory)'
+      env:
+        HTTPS_PROXY: "http://10.240.58.39:3128"
+
+    - task: ExtractFiles@1
+      displayName: 'Extract Apache Maven'
+      inputs:
+          archiveFilePatterns: '$(System.ArtifactsDirectory)/$(MAVEN_PACKAGE_FILE)'
+          destinationFolder: '$(System.ArtifactsDirectory)/maven'
+          cleanDestinationFolder: false    
+
+    - task: DownloadPackage@1
+      displayName: 'Download Oracle JDK-8'
+      inputs:
+        packageType: 'upack'
+        feed: '$(PACKAGE_FEED)'
+        view: '$(PACKAGE_VIEW)'
+        definition: '$(JAVA_PACKAGE_DEFINITION)'
+        version: '$(JAVA_PACKAGE_VERSION)'
+        downloadPath: '$(System.ArtifactsDirectory)'
+      env:
+        HTTPS_PROXY: "http://10.240.58.39:3128"
+
+    - task: JavaToolInstaller@0
+      displayName: 'Use Java 8'
+      inputs:
+        versionSpec: 8
+        jdkArchitectureOption: x64
+        jdkSourceOption: LocalDirectory
+        jdkFile: '$(System.ArtifactsDirectory)/$(JAVA_PACKAGE_FILE)'
+        jdkDestinationDirectory: '$(System.ArtifactsDirectory)/java'
+        createExtractDirectory: false
+        
+    - task: Maven@4
+      displayName: 'Maven Clean Install'
+      inputs:
+        mavenPomFile: 'pom.xml'
+        mavenOptions: '-Xmx3072m $(MAVEN_OPTS)'
+        javaHomeOption: 'Path'
+        jdkDirectory: '$(System.ArtifactsDirectory)/$(JAVA_DIRECTORY)'
+        jdkArchitectureOption: 'x64'
+        mavenVersionOption: 'Path'
+        mavenDirectory: '$(System.ArtifactsDirectory)/$(MAVEN_DIRECTORY)'
+        goals: 'clean install -U'
+        codeCoverageRestoreOriginalPomXml: true
+        publishJUnitResults: true
+        testResultsFiles: '**/surefire-reports/TEST-*.xml'
+        codeCoverageToolOption: JaCoCo
+        codeCoverageClassFilter: '-:br.com.ericssoninovacao.nof.commons.*,-:br.com.ericssoninovacao.nof.logger.*,-:br.com.ericssoninovacao.nof.simulator.*,-:*.exception.*,-:*.model.*,-:*.constant.*,-:br.com.ericssoninovacao.nof.*.configuration.*,-:br.com.ericssoninovacao.nof.configuration.manager.configuration.*,-:br.com.ericssoninovacao.nof.configuration.manager.util.*,-:*.listener.*'
+        codeCoverageSourceDirectories: '$(System.DefaultWorkingDirectory)/nof-canonical/src/main/java/;$(System.DefaultWorkingDirectory)/nof-collector/src/main/java/;$(System.DefaultWorkingDirectory)/nof-configuration/src/main/java/;$(System.DefaultWorkingDirectory)/nof-configuration-manager/src/main/java/;$(System.DefaultWorkingDirectory)/nof-consumer/src/main/java/;$(System.DefaultWorkingDirectory)/nof-engine/src/main/java/;$(System.DefaultWorkingDirectory)/nof-enricher/src/main/java/;$(System.DefaultWorkingDirectory)/nof-expression/src/main/java/;$(System.DefaultWorkingDirectory)/nof-external-plugin/src/main/java/;$(System.DefaultWorkingDirectory)/nof-plugin/src/main/java/;$(System.DefaultWorkingDirectory)/nof-plugin-api/src/main/java/;$(System.DefaultWorkingDirectory)/nof-producer/src/main/java/;$(System.DefaultWorkingDirectory)/nof-publisher/src/main/java/;$(System.DefaultWorkingDirectory)/nof-queue/src/main/java/;$(System.DefaultWorkingDirectory)/nof-receiver/src/main/java/;$(System.DefaultWorkingDirectory)/nof-router/src/main/java/;$(System.DefaultWorkingDirectory)/nof-simulator/src/main/java/'
+
+    - task: Maven@4
+      displayName: 'Update Build POM Version'
+      inputs:
+        mavenPomFile: '$(system.defaultWorkingDirectory)/pom.xml'
+        options: '-s settings.xml'
+        mavenOptions: '-Xmx3072m $(MAVEN_OPTS)'
+        javaHomeOption: 'Path'
+        jdkDirectory: '$(System.ArtifactsDirectory)/$(JAVA_DIRECTORY)'
+        jdkArchitectureOption: 'x64'
+        mavenVersionOption: 'Path'
+        mavenDirectory: '$(System.ArtifactsDirectory)/$(MAVEN_DIRECTORY)'
+        mavenAuthenticateFeed: false
+        goals: 'versions:set -DnewVersion=$(APP_NEW_VERSION)'
+        publishJUnitResults: false
+        testResultsFiles: false
+
+    - task: CopyFiles@2
+      displayName: Copy Files Staging Directory
+      inputs:
+        SourceFolder: '$(build.sourcesdirectory)'
+        Contents: |
+          **/*
+          !.git/**/*
+        TargetFolder: '$(Build.ArtifactStagingDirectory)'
+        CleanTargetFolder: true
+        OverWrite: true
+        flattenFolders: false
+
+#    - task: UseDotNet@2
+#      displayName: 'Use .NET Core sdk 7.0.x'
+      #inputs:
+       # version: 7.0.x
+
+   # - task: PublishCodeCoverageResults@2
+    #  displayName: Publish Code Coverage
+     # inputs:
+      #  summaryFileLocation: '$(System.DefaultWorkingDirectory)/**/target/site/jacoco-aggregate/**/jacoco.xml'
+       # pathToSources: '$(System.DefaultWorkingDirectory)/nof-canonical/src/main/java/;$(System.DefaultWorkingDirectory)/nof-collector/src/main/java/;$(System.DefaultWorkingDirectory)/nof-configuration/src/main/java/;$(System.DefaultWorkingDirectory)/nof-configuration-manager/src/main/java/;$(System.DefaultWorkingDirectory)/nof-consumer/src/main/java/;$(System.DefaultWorkingDirectory)/nof-engine/src/main/java/;$(System.DefaultWorkingDirectory)/nof-enricher/src/main/java/;$(System.DefaultWorkingDirectory)/nof-expression/src/main/java/;$(System.DefaultWorkingDirectory)/nof-external-plugin/src/main/java/;$(System.DefaultWorkingDirectory)/nof-plugin/src/main/java/;$(System.DefaultWorkingDirectory)/nof-plugin-api/src/main/java/;$(System.DefaultWorkingDirectory)/nof-producer/src/main/java/;$(System.DefaultWorkingDirectory)/nof-publisher/src/main/java/;$(System.DefaultWorkingDirectory)/nof-queue/src/main/java/;$(System.DefaultWorkingDirectory)/nof-receiver/src/main/java/;$(System.DefaultWorkingDirectory)/nof-router/src/main/java/;$(System.DefaultWorkingDirectory)/nof-simulator/src/main/java/'
+        #failIfCoverageEmpty: true  
+
+    - task: PublishBuildArtifacts@1
+      displayName: Publish Build Artifacts
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+        ArtifactName: app
+        StoreAsTar: true    
+
+    - task: CopyFiles@2
+      displayName: Copy Bundles Files Staging Directory
+      inputs:
+        SourceFolder: '$(build.sourcesdirectory)'
+        Contents: |
+          **/*.jar
+          !$HOME/**/*        
+        TargetFolder: '$(Build.ArtifactStagingDirectory)'
+        CleanTargetFolder: true
+        OverWrite: true
+        flattenFolders: true
+
+    - task: PublishBuildArtifacts@1
+      displayName: Publish Bundles Artifacts
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+        ArtifactName: bundles
+        StoreAsTar: true

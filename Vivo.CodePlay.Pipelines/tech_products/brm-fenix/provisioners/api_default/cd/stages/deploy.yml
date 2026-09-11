@@ -1,0 +1,352 @@
+# This YAML file defines the deployment stages for a specific pipeline.
+# It includes parameters, stages, and jobs for deploying an application.
+
+parameters:
+  - name: config
+    type: object
+  - name: flow
+    type: object
+
+stages:
+  - stage: stage_deploy
+    displayName: "Deploy Environments"
+    pool: $(POOL)
+    dependsOn:
+      - stage_prep
+      # JCR UPGRADE BRM 15: Files nao faz mais parte da cadeia de dependencias do CD.
+      # - stage_files
+    condition: |
+      and(
+        eq(variables['DISABLE_STAGE_DEPLOY'], false),
+        in(dependencies.stage_prep.result, 'Succeeded', 'SucceededWithIssues')
+      )
+    variables:
+      - name: _APP_EXECUTION_MODE
+        value: $[ stageDependencies.stage_prep.execution_mode.outputs['mode.APP_EXECUTION_MODE'] ]
+      - name: DEPLOY_COMMANDS_TRANSPILED_FILE
+        value: deploy_commands-$(APPLICATION_NAME)_$(ENVIRONMENT)
+      - name: BC_BCWS_DEPLOY_SCRIPT_TRANSPILED
+        value: deploy_bc_bcws_transpiled.sh
+      - name: DEPLOY_LOG_FILE
+        value: deploy-logs
+      # JCR UPGRADE BRM 15: PRICING_CONFIG_COMPONENTS_TO_DEPLOY passa a ser resolvida dentro de deploy_preparation_pdc.
+      # - name: PRICING_CONFIG_COMPONENTS_TO_DEPLOY
+      #   value: $[ stageDependencies.stage_files.pdc.outputs['process_folders.PRICING_CONFIG_COMPONENTS_TO_DEPLOY'] ]
+      - name: PRICING_CONFIG_COMPONENTS_TO_DEPLOY
+        value: ""
+      - name: REMOTE_HOST_COMMANDS_PATH
+        ${{ if eq(parameters.config.applicationParameters.applicationName, 'bi-publisher-reports') }}:
+          value: $(BIP_COMMANDS_PATH)
+        ${{ else }}:
+          value: $(OPERATION_HOST_COMMANDS_PATH)
+      - name: BIP_PROD_ENVIRONMENTS
+        value: PROD_1,PROD_2
+      - name: ENABLE_HELM_RELEASE_VALIDATE
+        value: true
+    jobs:
+      - deployment: confirm_deploy
+        pool: $(POOL)
+        displayName: Approval
+        environment: $(AZURE_ENVIRONMENT)
+
+      - ${{ if and(eq(parameters.config.applicationParameters.applicationName, 'bi-publisher-reports'), eq(variables['Build.SourceBranchName'], 'master_15')) }}:
+          - ${{ each bip_prod_environments in split(variables['BIP_PROD_ENVIRONMENTS'], ',') }}:
+              - job: deploy_preparation_${{ bip_prod_environments }}
+                displayName: "Preparation [${{ bip_prod_environments }}]"
+                steps:
+                  - checkout: none
+                  - template: ../../../../task_groups/deploy/preparation.yml
+                    parameters:
+                      applicationName: ${{ parameters.config.applicationParameters.applicationName }}
+                      helmCharts: ${{ parameters.config.applicationParameters.helmCharts }}
+                      deployCommandsSourceFile: $(DEPLOY_COMMANDS_FILE)
+                      deployCommandsTargetFile: $(DEPLOY_COMMANDS_TRANSPILED_FILE)
+                      commandsFilesTargetFolder: $(Agent.BuildDirectory)/source_code/commands
+                      pricingConfigComponentsToDeploy: $(PRICING_CONFIG_COMPONENTS_TO_DEPLOY)
+                      # JCR UPGRADE BRM 15: o CD nao consome mais os artefatos da stage Files.
+                      useSourceCodeArtifact: false
+                      downloadHelmArtifacts: false
+                      sshEndpoint: BRM_BIP_${{ bip_prod_environments }}
+                      targetFolder: $(BIP_COMMANDS_PATH)/
+
+              - job: deploy_${{ bip_prod_environments }}
+                displayName: "Deploy [${{ bip_prod_environments }}]"
+                dependsOn:
+                  - deploy_preparation_${{ bip_prod_environments }}
+                condition: eq(dependencies.deploy_preparation_${{ bip_prod_environments }}.result, 'Succeeded')
+                steps:
+                  - checkout: none
+                  - template: ../../../../task_groups/deploy/deploy.yml
+                    parameters:
+                      deployCommandsFile: $(REMOTE_HOST_COMMANDS_PATH)/$(DEPLOY_COMMANDS_TRANSPILED_FILE)
+                      deployLogFile: $(DEPLOY_LOG_FILE)
+                      applicationName: ${{ parameters.config.applicationParameters.applicationName }}
+                      sshEndpoint: BRM_BIP_${{ bip_prod_environments }}
+                      displayName: "Deploy in [${{ bip_prod_environments }}]"
+
+                  - task: SSH@0
+                    displayName: "Deleting $(REMOTE_HOST_COMMANDS_PATH) in $(ENVIRONMENT) environment"
+                    continueOnError: true
+                    inputs:
+                      sshEndpoint: BRM_BIP_${{ bip_prod_environments }}
+                      runOptions: "inline"
+                      inline: |
+                        echo "##[debug] ENVIRONMENT.................................................: $(ENVIRONMENT)"
+                        echo "##[debug] REMOTE HOST COMMANDS PATH...................................: $(REMOTE_HOST_COMMANDS_PATH)"
+
+                        echo "##[command]rm -frv $(REMOTE_HOST_COMMANDS_PATH)"
+                        rm -frv $(REMOTE_HOST_COMMANDS_PATH)
+                      readyTimeout: "20000"
+                      failOnStdErr: false
+
+              - job: deploy_validate_${{ bip_prod_environments }}
+                displayName: "Validate [${{ bip_prod_environments }}]"
+                dependsOn: deploy_${{ bip_prod_environments }}
+                condition: and(succeeded('deploy_${{ bip_prod_environments }}'), eq(variables['DISABLE_DEPLOY_VALIDATE'], false))
+                steps:
+                  - checkout: none
+                  - template: ../../../../task_groups/deploy/validation.yml
+                    parameters:
+                      deployLogFile: $(DEPLOY_LOG_FILE)
+                      applicationName: ${{ parameters.config.applicationParameters.applicationName }}
+                      enableHelmReleaseValidate: ${{ variables.ENABLE_HELM_RELEASE_VALIDATE }}
+                      continueOnError: true
+      - ${{ if eq(parameters.config.technology, 'helmCharts') }}:
+          - job: deploy_preparation
+            displayName: "Helm Preparation"
+            steps:
+              - checkout: none
+              - template: ../../../../task_groups/deploy/preparation_helm.yml
+                parameters:
+                  helmChartName: ${{ replace(parameters.config.applicationParameters.helmCharts, 'package-', '') }}
+                  sshEndpoint: BRM_BASTION_$(ENVIRONMENT)
+                  buildNumber: $(Build.BuildNumber)
+
+      - ${{ if eq(parameters.config.applicationParameters.applicationName, 'pricing-design-center') }}:
+              - job: deploy_preparation_pdc
+                displayName: "Preparation PDC"
+                dependsOn:
+                  - deploy_preparation
+                condition: |
+                  and(
+                    eq(variables['_APP_EXECUTION_MODE'], 'DEPLOY'),
+                    eq(dependencies.deploy_preparation.result, 'Succeeded')
+                  )
+                steps:
+                  - checkout: none
+                  # JCR UPGRADE BRM 15: a preparacao de PDC passa a resolver pricing config localmente no CD.
+                  - template: ../../../../task_groups/deploy/preparation_pdc.yml
+                    parameters:
+                      commandsFilesTargetFolder: $(Agent.BuildDirectory)/source_code/commands
+                      deployCommandsTargetFile: $(DEPLOY_COMMANDS_TRANSPILED_FILE)
+
+      - ${{ if eq(parameters.config.technology, 'helmCharts') }}:
+          - job: deploy
+            displayName: "Helm Deploy"
+            dependsOn:
+              - deploy_preparation
+            condition: eq(dependencies.deploy_preparation.result, 'Succeeded')
+            steps:
+              - checkout: none
+              - task: SSH@0
+                name: run_deploy
+                displayName: "Helm Deploy [${{ replace(parameters.config.applicationParameters.helmCharts, 'package-', '') }}]"
+                inputs:
+                  sshEndpoint: BRM_BASTION_$(ENVIRONMENT)
+                  runOptions: inline
+                  inline: |
+                    set -euo pipefail
+
+                    TMP_PATH="/tmp/$(Build.BuildNumber)"
+                    HELM_CHART_NAME="${{ replace(parameters.config.applicationParameters.helmCharts, 'package-', '') }}"
+                    DEPLOY_COMMANDS_FILE="${TMP_PATH}/${HELM_CHART_NAME}/.azuredevops/deploy_commands"
+                    DEPLOY_LOG_FILE="${TMP_PATH}/deploy_logs.txt"
+
+                    export TMP_PATH
+                    export ENVIRONMENT="$(ENVIRONMENT)"
+                    export BRM_CORE_RELEASE_VERSION="$(BRM_CORE_RELEASE_VERSION)"
+                    export OPERATION_HOST_HELM_PATH="$(OPERATION_HOST_HELM_PATH)"
+                    export HELM_CHART_FILE="$(HELM_CHART_FILE)"
+                    export HELM_CHART_TARGET_DIR="$(OPERATION_HOST_HELM_PATH)/${HELM_CHART_NAME}"
+                    export HELM_CHART_TMP_PATH="${TMP_PATH}/${HELM_CHART_NAME}"
+                    export HELM_RELEASE_NAME="${{ parameters.config.applicationParameters.helmReleaseNames }}"
+                    export FORCE_RESTART_TARGETS="${{ parameters.flow.cd_params.forceRestartTargets }}"
+
+                    echo "##[debug] TMP_PATH..............................: ${TMP_PATH}"
+                    echo "##[debug] HELM_CHART_NAME.......................: ${HELM_CHART_NAME}"
+                    echo "##[debug] DEPLOY_COMMANDS_FILE..................: ${DEPLOY_COMMANDS_FILE}"
+                    echo "##[debug] ENVIRONMENT...........................: ${ENVIRONMENT}"
+                    echo "##[debug] BRM_CORE_RELEASE_VERSION..............: ${BRM_CORE_RELEASE_VERSION}"
+                    echo "##[debug] OPERATION_HOST_HELM_PATH..............: ${OPERATION_HOST_HELM_PATH}"
+                    echo "##[debug] HELM_CHART_FILE.......................: ${HELM_CHART_FILE}"
+                    echo "##[debug] HELM_CHART_TARGET_DIR.................: ${HELM_CHART_TARGET_DIR}"
+                    echo "##[debug] HELM_CHART_TMP_PATH...................: ${HELM_CHART_TMP_PATH}"
+                    echo "##[debug] HELM_RELEASE_NAME.....................: ${HELM_RELEASE_NAME}"
+                    echo "##[debug] FORCE_RESTART_TARGETS.................: ${FORCE_RESTART_TARGETS}"
+
+                    echo "##[command]cat ${DEPLOY_COMMANDS_FILE} | bash |& tee ${DEPLOY_LOG_FILE}"
+                    cat ${DEPLOY_COMMANDS_FILE} | bash |& tee ${DEPLOY_LOG_FILE}
+
+                    DEPLOY_LOGS=$(cat ${DEPLOY_LOG_FILE} | tr '\n' ';')
+                    echo "##vso[task.setvariable variable=DEPLOY_LOGS;]${DEPLOY_LOGS}"
+                  readyTimeout: "20000"
+                  failOnStdErr: false
+
+              - task: SSH@0
+                displayName: "Cleanup /tmp/$(Build.BuildNumber) on Bastion"
+                condition: always()
+                continueOnError: true
+                inputs:
+                  sshEndpoint: BRM_BASTION_$(ENVIRONMENT)
+                  runOptions: inline
+                  inline: |
+                    echo "##[command]rm -frv /tmp/$(Build.BuildNumber)"
+                    rm -frv /tmp/$(Build.BuildNumber)
+                  readyTimeout: "20000"
+                  failOnStdErr: false
+
+      - ${{ else }}:
+          - job: deploy
+            displayName: "Deploy"
+            steps:
+              - template: ../../../../task_groups/checkout/checkout.yml
+                parameters:
+                  repository: self
+                  path: source_code
+
+              - task: CmdLine@2
+                displayName: "Transpile and Set Remote Filename"
+                inputs:
+                  script: |
+                    set -e
+                    TIMESTAMP=$(date +%Y%m%d%H%M%S)
+                    REMOTE_FILE="${TIMESTAMP}_deploy_commands"
+                    TARGET_DIR="$(Agent.BuildDirectory)/source_code/commands"
+                    mkdir -p "${TARGET_DIR}"
+
+                    DEFINED_ENVS=$(env | cut -d= -f1 | sed 's/^/$/' | tr '\n' ' ')
+                    echo "##[debug] DEFINED_ENVS: ${DEFINED_ENVS}"
+                    envsubst "${DEFINED_ENVS}" < "$(DEPLOY_COMMANDS_FILE)" > "${TARGET_DIR}/${REMOTE_FILE}"
+                    echo "##[debug] REMOTE_FILE: ${REMOTE_FILE}"
+                    echo "##[debug] TARGET_DIR: ${TARGET_DIR}"
+                    echo "##[command]cat ${TARGET_DIR}/${REMOTE_FILE}"
+                    cat "${TARGET_DIR}/${REMOTE_FILE}"
+                    echo "##vso[task.setvariable variable=DEPLOY_COMMANDS_REMOTE_FILE;]${REMOTE_FILE}"
+
+                    MARKER_FILE="/tmp/$(APPLICATION_NAME)_$(Build.SourceBranchName)_$(Build.BuildId)"
+                    echo "##[debug] MARKER_FILE: ${MARKER_FILE}"
+                    echo "##vso[task.setvariable variable=DEPLOY_MARKER_FILE;]${MARKER_FILE}"
+
+              - task: CopyFilesOverSSH@0
+                displayName: "Transfer Deploy Commands to /tmp"
+                inputs:
+                  sshEndpoint: BRM_BASTION_$(ENVIRONMENT)
+                  sourceFolder: $(Agent.BuildDirectory)/source_code/commands
+                  contents: "$(DEPLOY_COMMANDS_REMOTE_FILE)"
+                  targetFolder: /tmp
+                  cleanTargetFolder: false
+                  readyTimeout: "20000"
+                  failOnEmptySource: true
+
+              - task: SSH@0
+                name: run_deploy
+                displayName: "Deploy [${{ parameters.config.applicationParameters.applicationName }}]"
+                inputs:
+                  sshEndpoint: BRM_BASTION_$(ENVIRONMENT)
+                  runOptions: inline
+                  inline: |
+                    set -euo pipefail
+
+                    # Permissao de leitura/escrita em /tmp para viabilizar limpeza posterior
+                    chmod -R a+rw /tmp/ 2>/dev/null || true
+
+                    # Criar arquivo marcador desta execucao
+                    touch "$(DEPLOY_MARKER_FILE)"
+
+                    DEPLOY_COMMANDS_REMOTE="/tmp/$(DEPLOY_COMMANDS_REMOTE_FILE)"
+                    DEPLOY_LOG_FILE="/tmp/$(DEPLOY_COMMANDS_REMOTE_FILE).log"
+
+                    echo "##[debug] DEPLOY_COMMANDS_REMOTE.....: ${DEPLOY_COMMANDS_REMOTE}"
+                    echo "##[debug] DEPLOY_LOG_FILE............: ${DEPLOY_LOG_FILE}"
+                    echo "##[debug] DEPLOY_MARKER_FILE.........: $(DEPLOY_MARKER_FILE)"
+                    echo "##[debug] BRM_CORE_RELEASE_VERSION...: $(BRM_CORE_RELEASE_VERSION)"
+                    echo "##[debug] ENVIRONMENT................: $(ENVIRONMENT)"
+
+                    echo "##[command]cat ${DEPLOY_COMMANDS_REMOTE} | bash |& tee ${DEPLOY_LOG_FILE}"
+                    cat "${DEPLOY_COMMANDS_REMOTE}" | bash |& tee "${DEPLOY_LOG_FILE}"
+
+                    DEPLOY_LOGS=$(cat ${DEPLOY_LOG_FILE} | tr '\n' ';')
+                    echo "##vso[task.setvariable variable=DEPLOY_LOGS;]${DEPLOY_LOGS}"
+                  readyTimeout: "20000"
+                  failOnStdErr: false
+
+              - task: SSH@0
+                displayName: "Cleanup Deploy Commands from /tmp"
+                condition: always()
+                continueOnError: true
+                inputs:
+                  sshEndpoint: BRM_BASTION_$(ENVIRONMENT)
+                  runOptions: inline
+                  inline: |
+                    DEPLOY_COMMANDS_REMOTE="/tmp/$(DEPLOY_COMMANDS_REMOTE_FILE)"
+                    DEPLOY_LOG_FILE="/tmp/$(DEPLOY_COMMANDS_REMOTE_FILE).log"
+
+                    echo "##[debug] DEPLOY_COMMANDS_REMOTE.....: ${DEPLOY_COMMANDS_REMOTE}"
+                    echo "##[debug] DEPLOY_LOG_FILE............: ${DEPLOY_LOG_FILE}"
+                    echo "##[debug] DEPLOY_MARKER_FILE.........: $(DEPLOY_MARKER_FILE)"
+
+                    echo "##[command]rm -fv ${DEPLOY_COMMANDS_REMOTE} ${DEPLOY_LOG_FILE} $(DEPLOY_MARKER_FILE)"
+                    rm -fv "${DEPLOY_COMMANDS_REMOTE}" "${DEPLOY_LOG_FILE}" "$(DEPLOY_MARKER_FILE)"
+                  readyTimeout: "20000"
+                  failOnStdErr: false
+
+              - template: ../../../../tasks/bash/create_logs_file.yml
+                parameters:
+                  inputVariableLogs: $(DEPLOY_LOGS)
+                  logsFileOutput: $(Agent.BuildDirectory)/$(DEPLOY_LOG_FILE).txt
+
+              - template: ../../../../task_groups/artifact/publish.yml
+                parameters:
+                  artifactName: $(DEPLOY_LOG_FILE)
+                  targetPath: $(Agent.BuildDirectory)/$(DEPLOY_LOG_FILE).txt
+                  isFile: true
+
+          - job: deploy_validate
+            displayName: "Validate"
+            dependsOn:
+              - deploy
+            condition: |
+              and(
+                in(dependencies.deploy.result, 'Succeeded', 'SucceededWithIssues'),
+                eq(variables['DISABLE_DEPLOY_VALIDATE'], false)
+              )
+            steps:
+              - checkout: none
+              - template: ../../../../task_groups/deploy/validation.yml
+                parameters:
+                  deployLogFile: $(DEPLOY_LOG_FILE)
+                  applicationName: ${{ parameters.config.applicationParameters.applicationName }}
+                  enableHelmReleaseValidate: ${{ variables.ENABLE_HELM_RELEASE_VALIDATE }}
+                  continueOnError: true
+
+          - job: deploy_validate_exception
+            displayName: "Validation Exception"
+            pool: server
+            dependsOn: deploy_validate
+            condition: in(dependencies.deploy_validate.result, 'SucceededWithIssues', 'Failed')
+            steps:
+              - task: ManualValidation@0
+                displayName: "Manual confirmation after validation failure"
+                timeoutInMinutes: 15
+                inputs:
+                  instructions: "The Validate Stage identified an error in the deployment. Do you want to continue anyway?"
+                  onTimeout: "reject"
+
+          - job: export_manual_validation_result
+            displayName: "Validation Exception Result"
+            dependsOn: deploy_validate_exception
+            condition: ne(dependencies.deploy_validate_exception.result, 'Skipped')
+            steps:
+              - template: ../../../../tasks/bash/approval_details.yml
+                parameters:
+                  withEnvironmentApproval: false

@@ -1,0 +1,76 @@
+parameters:
+- name: serviceConnectionSuffix
+  type: string
+  default: "$(subscriptionEnv)"
+- name: subscriptionId
+  type: string
+- name: resourceGroup
+  type: string
+- name: storageAccountName
+  type: string
+- name: environment
+  type: string
+- name: condition
+  type: object
+  default: succeeded()
+
+steps:
+- task: AzureCLI@2
+  displayName: "Upsert Allowed APIs - ${{ parameters.environment }}"
+  condition: ${{ parameters.condition }}
+  name: upsert_allowed_apis
+  inputs:
+    azureSubscription: $(serviceConnectionPrefixName)-${{ parameters.serviceConnectionSuffix }}
+    scriptType: bash
+    scriptLocation: inlineScript
+    inlineScript: |
+      set -euo pipefail
+
+      az account set --subscription "${{ parameters.subscriptionId }}"
+
+      CONFIG_FILE="$(Build.SourcesDirectory)/.azuredevops/env/${{ parameters.environment }}/client-config.json"
+      if [ ! -f "$CONFIG_FILE" ]; then
+        echo "##vso[task.logissue type=error] Client config file not found: $CONFIG_FILE"
+        exit 1
+      fi
+
+      APP_ID=$(jq -r '.id' "$CONFIG_FILE" | tr '[:upper:]' '[:lower:]')
+      APP_NAME=$(jq -r '.name' "$CONFIG_FILE")
+      echo "##[debug] Upserting allowed APIs for application: $APP_NAME ($APP_ID)"
+
+      # Get storage account key
+      ACCOUNT_KEY=$(az storage account keys list \
+        --account-name "${{ parameters.storageAccountName }}" \
+        --resource-group "${{ parameters.resourceGroup }}" \
+        --query '[0].value' -o tsv)
+
+      ALLOWED_APIS=$(jq -r '.allowed_apis // [] | .[]' "$CONFIG_FILE")
+      if [ -z "$ALLOWED_APIS" ]; then
+        echo "No allowed APIs found in config. Skipping."
+        exit 0
+      fi
+
+      API_COUNT=0
+
+      while IFS= read -r api_id; do
+        # Append environment to API ID (e.g. aura-bot-events-v1 -> aura-bot-events-v1-dev)
+        api_id_env=$(echo "${api_id}-${{ parameters.environment }}" | tr '[:upper:]' '[:lower:]')
+        echo "##[debug] Upserting allowed API: $api_id_env"
+
+        # Upsert allowed API entity
+        # PartitionKey = application ID (RowKey da tabela applications)
+        # RowKey = apiID do APIM + environment
+        az storage entity insert \
+          --table-name "allowedapis${{ parameters.environment }}" \
+          --entity \
+            PartitionKey="${APP_ID}" \
+            RowKey="${api_id_env}" \
+          --if-exists merge \
+          --account-name "${{ parameters.storageAccountName }}" \
+          --account-key "$ACCOUNT_KEY"
+
+        echo "  ✅ Allowed API '${api_id_env}' upserted."
+        API_COUNT=$((API_COUNT + 1))
+      done <<< "$ALLOWED_APIS"
+
+      echo "✅ ${API_COUNT} allowed API(s) upserted for application '${APP_NAME}'!"

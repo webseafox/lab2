@@ -1,0 +1,243 @@
+stages:
+
+- stage: build_test
+  displayName: "Build & Test"
+  dependsOn:
+  - pipeline_init
+  pool: $(PRIVATE_AGENT_SHARED)
+  jobs:
+  - job: bump_version
+    displayName: Bumping Version
+    condition: and(succeeded(), eq(variables.flowIsTagging, false))
+    steps:
+
+    - checkout: self
+      persistCredentials: "true"
+      clean: true
+
+    - bash: |
+        version=$(grep version pom.xml | grep -v '<?xml' | grep '<version>'|head -n 1|awk '{print $1}'| cut -d'>' -f 2 | cut -d'<' -f 1)
+        echo "##vso[task.setvariable variable=APP_CURRENT_VERSION]$version"
+        echo "##[debug] Exporting variable 'APP_CURRENT_VERSION': $version"
+      name: export_current_version
+      displayName: Extract App Version     
+
+    - task: semver-bump@1
+      displayName: Bump Version
+      condition:  or(
+                    and(succeeded(), eq(variables.BUMP_VERSION_ENABLED, 'true'), eq(variables['Build.Reason'], 'IndividualCI')), 
+                    and(succeeded(), eq(variables.BUMP_VERSION_ENABLED, 'true'), eq(variables['Build.Reason'], 'BatchedCI'))
+                  )
+      inputs:
+        VersionVariable: 'APP_CURRENT_VERSION'
+        IncrementLevel: 'patch' 
+
+    - bash: |
+        echo "##vso[task.setvariable variable=${NEW_VERSION_OUT};isOutput=true]${NEW_VERSION}"
+        echo "##[debug] Exporting variable '${NEW_VERSION_OUT}': ${NEW_VERSION}"
+      displayName: 'Defining New Component Version'
+      name: component_bump_version
+      env:
+        NEW_VERSION: $(APP_CURRENT_VERSION)
+        NEW_VERSION_OUT: "APP_NEW_VERSION"
+
+  - job: build_app
+    displayName: Build & Test   
+    dependsOn:
+      - bump_version
+    condition: and(succeeded(), eq(variables.flowIsTagging, false))
+    variables:
+    - name: APP_NEW_VERSION 
+      value: $[ dependencies.bump_version.outputs['component_bump_version.APP_NEW_VERSION'] ]
+    steps:
+
+    - task: AzureKeyVault@2  
+      displayName: 'Getting AKV credentials'
+      timeoutInMinutes: 1
+      retryCountOnTaskFailure: 5  
+      inputs:    
+        azureSubscription: DevOpsSharedResources
+        KeyVaultName: $(AKV_DEVOPS_NAME)
+        SecretsFilter: 'NEXUS-DEPS-USR, NEXUS-DEPS-PSW'
+
+    - task: ReplaceTokens@3
+      displayName: 'Configuring Settings.xml'
+      inputs:
+        rootDirectory: '$(system.defaultWorkingDirectory)'
+        targetFiles: 'settings.xml'
+        tokenPattern: azpipelines
+        tokenPrefix: '#{'
+        tokenSuffix: '}#'         
+
+    - task: DownloadPackage@1.238.1
+      displayName: 'Download Apache Maven'
+      inputs:
+        packageType: 'upack'
+        feed: '$(PACKAGE_FEED)'
+        view: '$(PACKAGE_VIEW)'
+        definition: '$(MAVEN_PACKAGE_DEFINITION)'
+        version: '$(MAVEN_PACKAGE_VERSION)'
+        downloadPath: '$(System.ArtifactsDirectory)'
+      env:
+        HTTPS_PROXY: "http://10.240.58.39:3128"
+
+    - task: ExtractFiles@1
+      displayName: 'Extract Apache Maven'
+      inputs:
+          archiveFilePatterns: '$(System.ArtifactsDirectory)/$(MAVEN_PACKAGE_FILE)'
+          destinationFolder: '$(System.ArtifactsDirectory)/maven'
+          cleanDestinationFolder: false    
+
+    - task: DownloadPackage@1
+      displayName: 'Download Oracle JDK-8'
+      inputs:
+        packageType: 'upack'
+        feed: '$(PACKAGE_FEED)'
+        view: '$(PACKAGE_VIEW)'
+        definition: '$(JAVA_PACKAGE_DEFINITION)'
+        version: '$(JAVA_PACKAGE_VERSION)'
+        downloadPath: '$(System.ArtifactsDirectory)'
+      env:
+        HTTPS_PROXY: "http://10.240.58.39:3128"
+
+    - task: JavaToolInstaller@0
+      displayName: 'Use Java 8'
+      inputs:
+        versionSpec: 8
+        jdkArchitectureOption: x64
+        jdkSourceOption: LocalDirectory
+        jdkFile: '$(System.ArtifactsDirectory)/$(JAVA_PACKAGE_FILE)'
+        jdkDestinationDirectory: '$(System.ArtifactsDirectory)/java'
+        createExtractDirectory: false
+
+    - task: DownloadPackage@1
+      displayName: 'Download Oracle Weblogic'
+      inputs:
+        packageType: 'upack'
+        feed: '$(PACKAGE_FEED)'
+        view: '$(PACKAGE_VIEW)'
+        definition: '$(WEBLOGIC_PACKAGE_DEFINITION)'
+        version: '$(WEBLOGIC_PACKAGE_VERSION)'
+        downloadPath: '$(System.ArtifactsDirectory)'
+      env:
+        HTTPS_PROXY: "http://10.240.58.39:3128"
+
+    - task: ExtractFiles@1
+      displayName: 'Extract Oracle Weblogic'
+      inputs:
+        archiveFilePatterns: '$(System.ArtifactsDirectory)/$(WEBLOGIC_PACKAGE_FILE)'
+        destinationFolder: '$(System.ArtifactsDirectory)/oracle'
+        cleanDestinationFolder: false
+        overwriteExistingFiles: true
+
+    - task: Maven@4
+      displayName: 'Maven install Oracle Sync'
+      inputs:
+        mavenPomFile: ''
+        options: '-Dfile=$(System.ArtifactsDirectory)/$(WEBLOGIC_MIDDLEWARE_HOME)/$(ORACLE_MAVEN_SYNC_JAR) -DpomFile=$(System.ArtifactsDirectory)/$(WEBLOGIC_MIDDLEWARE_HOME)/$(ORACLE_MAVEN_SYNC_POM)'
+        mavenOptions: '-Xmx3072m $(MAVEN_OPTS)'
+        javaHomeOption: 'Path'
+        jdkDirectory: '$(System.ArtifactsDirectory)/$(JAVA_DIRECTORY)'
+        jdkArchitectureOption: 'x64'
+        mavenVersionOption: 'Path'
+        mavenDirectory: '$(System.ArtifactsDirectory)/$(MAVEN_DIRECTORY)'
+        mavenAuthenticateFeed: false
+        goals: 'install:install-file'
+
+    - task: Maven@4
+      displayName: 'Maven Oracle Sync Push'
+      inputs:
+        mavenPomFile: ''
+        options: '-DoracleHome=$(System.ArtifactsDirectory)/$(WEBLOGIC_MIDDLEWARE_HOME)'
+        mavenOptions: '-Xmx3072m $(MAVEN_OPTS)'
+        javaHomeOption: 'Path'
+        jdkDirectory: '$(System.ArtifactsDirectory)/$(JAVA_DIRECTORY)'
+        jdkArchitectureOption: 'x64'
+        mavenVersionOption: 'Path'
+        mavenDirectory: '$(System.ArtifactsDirectory)/$(MAVEN_DIRECTORY)'
+        mavenAuthenticateFeed: false
+        goals: 'com.oracle.maven:oracle-maven-sync:push'
+      env:
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken) 
+
+    - task: Maven@4
+      displayName: 'Update Build POM Version'
+      inputs:
+        mavenPomFile: '$(system.defaultWorkingDirectory)/pom.xml'
+        options: '-s settings.xml'
+        mavenOptions: '-Xmx3072m $(MAVEN_OPTS)'
+        javaHomeOption: 'Path'
+        jdkDirectory: '$(System.ArtifactsDirectory)/$(JAVA_DIRECTORY)'
+        jdkArchitectureOption: 'x64'
+        mavenVersionOption: 'Path'
+        mavenDirectory: '$(System.ArtifactsDirectory)/$(MAVEN_DIRECTORY)'
+        mavenAuthenticateFeed: false
+        goals: 'versions:set -DnewVersion=$(APP_NEW_VERSION)'
+
+    - task: WeblogicBaseCloudBuild@1
+      displayName: 'Weblogic Build App'
+      inputs:
+        mavenPomFile: '$(system.defaultWorkingDirectory)/pom.xml'
+        options: '-s settings.xml'    
+        mavenOptions: '-Xmx3072m $(MAVEN_OPTS)'
+        javaHomeOption: 'Path'
+        jdkDirectory: '$(System.ArtifactsDirectory)/$(JAVA_DIRECTORY)'
+        jdkArchitectureOption: 'x64'
+        mavenVersionOption: 'Path'
+        mavenDirectory: '$(System.ArtifactsDirectory)/$(MAVEN_DIRECTORY)'
+        mavenAuthenticateFeed: false
+        goals: 'clean install'
+        publishJUnitResults: true
+        testResultsFiles: '**/surefire-reports/TEST-*.xml'
+      env:
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken)  
+
+    - task: UseDotNet@2
+      displayName: 'Use .NET Core sdk 7.0.x'
+      inputs:
+        version: 7.0.x
+
+    - task: PublishCodeCoverageResults@2
+      inputs:
+        codeCoverageTool: 'JaCoCo'
+        summaryFileLocation: '$(System.DefaultWorkingDirectory)/target/site/jacoco/jacoco.xml'
+        reportDirectory: '$(System.DefaultWorkingDirectory)/target/site/jacoco'
+        failIfCoverageEmpty: false
+
+    - task: CopyFiles@2
+      displayName: Copy Files Staging Directory
+      inputs:
+        SourceFolder: '$(build.sourcesdirectory)'
+        Contents: |
+          **/*
+          !.git/**/*
+        TargetFolder: '$(Build.ArtifactStagingDirectory)'
+        CleanTargetFolder: true
+        OverWrite: true
+        flattenFolders: false
+
+    - task: PublishBuildArtifacts@1
+      displayName: Publish Build Artifacts
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+        ArtifactName: app
+        StoreAsTar: true    
+
+    - task: CopyFiles@2
+      displayName: Copy Bundles Files Staging Directory
+      inputs:
+        SourceFolder: '$(build.sourcesdirectory)'
+        Contents: |
+          **/*.jar
+          !$HOME/**/*        
+        TargetFolder: '$(Build.ArtifactStagingDirectory)'
+        CleanTargetFolder: true
+        OverWrite: true
+        flattenFolders: true
+
+    - task: PublishBuildArtifacts@1
+      displayName: Publish Bundles Artifacts
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+        ArtifactName: bundles
+        StoreAsTar: true   

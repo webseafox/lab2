@@ -1,0 +1,81 @@
+parameters:
+- name: dependsOn
+  default: ""
+- name: condition
+  default: succeeded()
+
+jobs:
+- job: validate_deploy
+  dependsOn: ${{ parameters.dependsOn }}
+  condition: ${{ parameters.condition }}
+  continueOnError: true
+  displayName: "Validating Deploy on CloudHub"
+  variables:
+    - name: "HEALTH_CLIENT_ID"
+      value: $[variables[format('{0}_{1}', 'MULE_HEALTH_CLIENT_ID', upper(variables['ANYPOINT_ENVIRONMENT_IN_APPLICATION_NAME']))]]
+    - name: "HEALTH_CLIENT_SECRET"
+      value: $[variables[format('{0}_{1}', 'MULE_HEALTH_CLIENT_SECRET', upper(variables['ANYPOINT_ENVIRONMENT_IN_APPLICATION_NAME']))]]
+    - name: "MULE_GET_TOKEN_BASE_URL"
+      value: $(MULE_GET_TOKEN_HEALTH_ENDPOINT_BASE_URL)
+  steps:
+  - script: |
+      if [ "${ARTIFACT_ID: -3}" == "exp" ]; then
+        RESPONSE_GET_TOKEN="$(curl --request POST "$MULE_GET_TOKEN_BASE_URL" \
+            --header "Content-Type: application/x-www-form-urlencoded;charset=UTF-8" \
+            --header "Authorization: Basic $MULE_HEALTH_ENDPOINT_GET_TOKEN_AUTHORIZATION" \
+            -d "grant_type=password&username=${MULE_GET_TOKEN_USERNAME}&password=${MULE_GET_TOKEN_PSW}&scope=ServiceAccount.Profile")"
+
+        RESPONSE_ERROR=$(echo $RESPONSE_GET_TOKEN | jq -r '.error')
+        if [ "$RESPONSE_ERROR" != "null" ]; then
+          echo "##vso[task.logissue type=error] Failed getting token: $(echo $RESPONSE_GET_TOKEN | jq -r '.error_description')"
+          echo "##vso[task.complete result=Failed;]"
+          exit 1
+        fi
+
+        HEALTH_CHECK_TOKEN=$(echo $RESPONSE_GET_TOKEN | jq -r '.access_token')
+      fi
+      echo "##vso[task.setvariable variable=HEALTH_CHECK_TOKEN;issecret=true]$HEALTH_CHECK_TOKEN"
+    displayName: Getting token for health check
+    env:
+      MULE_GET_TOKEN_BASE_URL: $(MULE_GET_TOKEN_BASE_URL)
+      ANYPOINT_ENVIRONMENT_IN_APPLICATION_NAME: $(ANYPOINT_ENVIRONMENT_IN_APPLICATION_NAME)
+      MULE_HEALTH_ENDPOINT_GET_TOKEN_AUTHORIZATION: $(MULE_HEALTH_ENDPOINT_GET_TOKEN_AUTHORIZATION)
+      MULE_GET_TOKEN_USERNAME: $(MULE_GET_TOKEN_USERNAME)
+      MULE_GET_TOKEN_PSW: $(MULE_GET_TOKEN_PSW)
+      HTTP_PROXY: $(PROXY_SQUID_HTTP)
+      HTTPS_PROXY: $(PROXY_SQUID_HTTPS)
+      ARTIFACT_ID: $(ARTIFACT_ID)
+
+  - script: |
+      REQUEST="curl --location --request GET \"https://fenix-lb-${ENVIRONMENT_HEALTH_ENDPOINT}.telefonica.com.br/${ANYPOINT_ENVIRONMENT_IN_APPLICATION_NAME}-${ARTIFACT_ID/src-/}/healthz\" \
+          --header \"application: ${ARTIFACT_ID/src-/}\" \
+          --header \"Content-Type: application/json\" \
+          --data '{\"teste\": \"Yogi Bodhi\"}' \
+          --header \"client_id: $HEALTH_CLIENT_ID\" \
+          --header \"client_secret: $HEALTH_CLIENT_SECRET\""
+
+      if [[ "${HEALTH_CHECK_TOKEN}" != "" ]]; then
+          REQUEST+=" --header 'Authorization: Bearer ${HEALTH_CHECK_TOKEN}'"
+      fi
+
+      echo "##[debug] REQUEST: $REQUEST"
+      RESPONSE_STATUS=$(eval $REQUEST)
+      echo "##[debug] RESPONSE_STATUS: $RESPONSE_STATUS"
+
+      RESPONSE_MSG=$(echo $RESPONSE_STATUS | jq -r '.msg')
+      if [ "$RESPONSE_MSG" != "API is healthy." ]; then
+        echo "##vso[task.logissue type=error] Status of API not healthy!"
+        echo "##vso[task.complete result=Failed;]"
+        exit 1
+      else
+        echo "##[debug] API is healthy."
+      fi
+    displayName: Checking health status of API
+    continueOnError: true
+    env:
+      HTTP_PROXY: $(PROXY_AGENT_HTTP)
+      HTTPS_PROXY: $(PROXY_AGENT_HTTPS)
+      HEALTH_CHECK_TOKEN: $(HEALTH_CHECK_TOKEN)
+      HEALTH_CLIENT_ID: $(HEALTH_CLIENT_ID)
+      HEALTH_CLIENT_SECRET: $(HEALTH_CLIENT_SECRET)
+      ARTIFACT_ID: $(ARTIFACT_ID)

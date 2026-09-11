@@ -1,0 +1,162 @@
+parameters:
+- name: componentNewVersion
+  type: string
+- name: bashScript
+  type: object
+- name: condition
+  type: object
+- name: createGitTag
+  type: boolean
+  default: false
+
+steps:
+- checkout: self
+  condition: ${{ parameters.condition }}
+  persistCredentials: true
+  clean: true
+
+- checkout: ArgoCD-Production
+  condition: ${{ parameters.condition }}
+  persistCredentials: true
+  fetchDepth: 1
+  
+- bash: | 
+    git config pull.rebase true
+    git fetch -f --depth 1 origin ${BRANCH_NAME}:${BRANCH_NAME}
+    git checkout -f ${BRANCH_NAME}
+  displayName: "Preparation"
+  condition: ${{ parameters.condition }}
+  env:
+    BRANCH_NAME: "$(Build.SourceBranchName)"
+  workingDirectory: "$(Build.SourcesDirectory)/$(Build.Repository.Name)"
+
+- bash: ${{ parameters.bashScript.content }}
+  displayName: 'Update Component Version'
+  condition: and(succeeded(), ${{ parameters.condition }})
+  workingDirectory: "$(Build.SourcesDirectory)/$(Build.Repository.Name)"
+  ${{ if ne(parameters.bashScript.envs, '') }}:
+    env: ${{ parameters.bashScript.envs }}
+
+- bash: |
+    cd $K8S_NAMESPACE_PRODUCAO
+    if [ ! -f "$APP_NAME.yaml" ]; then
+      echo "##[error]Esse projeto ainda não foi disponibilizado para o ambiente de produção."
+      echo "##[error]Para desabilitar/habilitar, verifique se o parâmetros enabledCanaryReleaseWithArgoCD está com o valor False/True no arquivo yml/yaml do seu projeto (normalmente azure-pipeline.yml)"
+      echo -e "##[error]parameters > \n\tconfig >\n\t\tparams >\n\t\t\enabledCanaryReleaseWithArgoCD: True/False"
+      exit 1
+    fi
+
+    YAML_CONTAINS_ITEMS=$(yq '. | has("items")' $APP_NAME.yaml)
+    
+    if [ "$YAML_CONTAINS_ITEMS" == "true" ];then
+      IN_PRODUCTION_DOCKER_IMAGE=$(yq '.items[] | select(.kind == "Deployment") | .spec.template.spec.containers[].image' $APP_NAME.yaml)
+    else
+      IN_PRODUCTION_DOCKER_IMAGE=$(yq '. | select(.kind == "Deployment") | .spec.template.spec.containers[].image' $APP_NAME.yaml)
+    fi
+
+    IN_PRODUCTION_PARTS=(${IN_PRODUCTION_DOCKER_IMAGE//:/ })
+    IN_PRODUCTION_TAG=${IN_PRODUCTION_PARTS[1]}
+    
+    if [ "$IN_PRODUCTION_TAG" == "" ];then
+      echo "##[debug]Não foi possível recuperar a tag em execução no ambiente de produção para a aplicação $APP_NAME no ambiente de produção."
+      exit 1
+    fi
+
+    echo "##[section]A aplicação $APP_NAME possui a tag $IN_PRODUCTION_TAG no ambiente de produção"
+    echo "##vso[task.setvariable variable=IN_PRODUCTION_TAG]$IN_PRODUCTION_TAG"
+  displayName: 'Get actual version in production'
+  condition: and(succeeded(), ${{ parameters.condition }})
+  workingDirectory: "$(Build.SourcesDirectory)/argocd-production"
+
+- bash: |
+    replace_text_to_variables () {
+      local FILENAME=$1
+      local $COMPONENT_NEW_VERSION=$2
+      local IN_PRODUCTION_TAG=$3
+      
+      sed -i "s/<<CANARY_TAG>>/$COMPONENT_NEW_VERSION/g" $FILENAME
+      sed -i "s/<<TO_CANARY_WEIGHT>>/$CANARY_RELEASE_WEIGHT/g" $FILENAME
+      sed -i "s/<<IN_PRODUCTION_TAG>>/$(IN_PRODUCTION_TAG)/g" $FILENAME
+      sed -i "s/<<TO_PRODUCTION_WEIGHT>>/$REMAINING_PRODUCTION_PERCENT/g" $FILENAME
+      sed -i "s/<<CANARY_HEADER_KEY>>/$CANARY_HEADER_KEY/g" $FILENAME
+      sed -i "s/<<CANARY_HEADER_MATCH>>/$CANARY_HEADER_MATCH/g" $FILENAME
+      sed -i "s/<<CANARY_HEADER_VALUE>>/$CANARY_HEADER_VALUE/g" $FILENAME
+    }
+
+    TAG_PUSH_PARAM=""
+
+    echo "##[debug] TAG_REPO.....: ${TAG_REPO}"
+
+    cd $(Build.SourcesDirectory)/$(Build.Repository.Name)
+    
+    #CANARY TAG
+    cp ./env/prd.yaml ./env/prd_origin.yaml
+    cp ./env/prd.yaml ./env/prd_temp.yaml
+    echo "" >> ./env/prd_temp.yaml
+    
+    if [[ "${TAG_REPO}" == "true" ]]; then
+      git pull origin master
+      TAG_PUSH_PARAM="--tags"
+
+      cat ./env/prd_temp.yaml  $(CANARY_RELEASE_YAML_DIR)/with_header.yaml > ./env/prd.yaml
+      replace_text_to_variables ./env/prd.yaml $COMPONENT_NEW_VERSION $IN_PRODUCTION_TAG
+      
+      git add ./env/prd.yaml
+      TAG_NAME="${COMPONENT_NEW_VERSION}-$(CANARY_RELEASE_SUFFIX_HEADER)"
+      git commit -am "[CI SKIP] New canary version '$TAG_NAME'" --author="$BUILD_REQUESTEDFOR <$BUILD_REQUESTEDFOREMAIL>"
+      
+      echo "##[section]CRIANDO TAG ....................... : $TAG_NAME"
+      git tag $TAG_NAME
+      
+      echo "##[section]CANARY_RELEASE_WEIGHT_ENABLED ..... : $CANARY_RELEASE_WEIGHT_ENABLED"
+      if [[ "$CANARY_RELEASE_WEIGHT_ENABLED" == "true" ]]; then
+        git pull origin master
+        REMAINING_PRODUCTION_PERCENT=$((100 - $(CANARY_RELEASE_WEIGHT)))
+        echo "##[section]DIFFERENCE REMAINING .............. : $REMAINING_PRODUCTION_PERCENT (100 - $CANARY_RELEASE_WEIGHT = $REMAINING_PRODUCTION_PERCENT)"
+        cat ./env/prd_temp.yaml $(CANARY_RELEASE_YAML_DIR)/with_weight.yaml > ./env/prd.yaml
+        replace_text_to_variables ./env/prd.yaml $COMPONENT_NEW_VERSION $IN_PRODUCTION_TAG
+
+        git add ./env/prd.yaml
+        TAG_NAME="${COMPONENT_NEW_VERSION}-$(CANARY_RELEASE_SUFFIX_PERCENT)"
+        git commit -am "[CI SKIP] New canary version '$TAG_NAME'" --author="$BUILD_REQUESTEDFOR <$BUILD_REQUESTEDFOREMAIL>"
+        
+        echo "##[section]CRIANDO TAG ....................... : $TAG_NAME"
+        git tag "$TAG_NAME"
+      fi
+
+      #TAG DEFAULT
+      git pull origin master
+      mv ./env/prd_origin.yaml ./env/prd.yaml
+      git add ./env/prd.yaml
+      git commit -am "[CI SKIP] Project version has been updated. Released version '${COMPONENT_NEW_VERSION}'" --author="$BUILD_REQUESTEDFOR <$BUILD_REQUESTEDFOREMAIL>"
+      git tag ${COMPONENT_NEW_VERSION}
+      echo "##[section]CRIANDO TAG ....................... : ${COMPONENT_NEW_VERSION}"
+    fi
+    
+    git status
+    git push origin master
+
+    if [ $? -ne 0 ]; then 
+      echo "##vso[task.logissue type=error;] Git push failed. Exiting with error"
+      echo "##vso[task.complete result=Failed;]"
+      exit 1
+    fi
+
+    echo "##[command] git push origin ${TAG_PUSH_PARAM} ${BRANCH_NAME}"
+    
+    git push origin ${TAG_PUSH_PARAM} ${BRANCH_NAME}
+    
+    if [ $? -ne 0 ]; then 
+      echo "##vso[task.logissue type=error;] Git push failed. Permission denied"
+      echo "##vso[task.complete result=Failed;]"
+      exit 1
+    fi  
+
+    echo "Version updated to ${COMPONENT_NEW_VERSION}"
+  displayName: 'Commit Updated Version and Canary tags'
+  condition: and(succeeded(), ${{ parameters.condition }})
+  env:
+    COMPONENT_NEW_VERSION: ${{ parameters.componentNewVersion }}
+    BRANCH_NAME: "$(Build.SourceBranchName)"
+    TAG_REPO: "${{ lower(parameters.createGitTag) }}"
+    CANARY_HEADER_VALUE: $(CANARY_HEADER_VALUE)

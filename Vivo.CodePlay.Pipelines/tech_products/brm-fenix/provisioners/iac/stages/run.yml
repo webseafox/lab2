@@ -1,0 +1,826 @@
+parameters:
+  - name: iacParameters
+    type: object
+
+stages:
+  - stage: stage_run
+    displayName: "${{ parameters.iacParameters.action }} ${{ parameters.iacParameters.environment }}"
+    pool: $(POOL)
+    dependsOn: stage_prep
+    variables:
+      - name: CLUSTER_STATE
+        value: $[ stageDependencies.stage_prep.validations.outputs['get_cluster.CLUSTER_STATE'] ]
+      - name: NODES
+        value: $[ stageDependencies.stage_prep.validations.outputs['get_nodes.NODES'] ]
+      - name: DB_SYSTEM
+        value: $[ stageDependencies.stage_prep.validations.outputs['get_db_system.DB_SYSTEM'] ]
+      - name: DB_SYSTEM_ID
+        value: $[ stageDependencies.stage_prep.validations.outputs['get_db_system.DB_SYSTEM_ID'] ]
+      - name: DB_SYSTEM_NAME
+        value: $[ stageDependencies.stage_prep.validations.outputs['get_db_system.DB_SYSTEM_NAME'] ]
+      - name: DB_SYSTEM_STATE
+        value: $[ stageDependencies.stage_prep.validations.outputs['get_db_system.DB_SYSTEM_STATE'] ]
+      - name: DB_SYSTEM_NODE_COUNT
+        value: $[ stageDependencies.stage_prep.validations.outputs['get_db_system.DB_SYSTEM_NODE_COUNT'] ]
+      - name: DATABASE
+        value: $[ stageDependencies.stage_prep.validations.outputs['get_database.DATABASE'] ]
+      - name: DATABASE_ID
+        value: $[ stageDependencies.stage_prep.validations.outputs['get_database.DATABASE_ID'] ]
+      - name: DATABASE_NAME
+        value: $[ stageDependencies.stage_prep.validations.outputs['get_database.DATABASE_NAME'] ]
+      - name: DATABASE_STATE
+        value: $[ stageDependencies.stage_prep.validations.outputs['get_database.DATABASE_STATE'] ]
+      - name: DATABASE_UNIQUE_NAME
+        value: $[ stageDependencies.stage_prep.validations.outputs['get_database.DATABASE_UNIQUE_NAME'] ]
+      - name: PLUGGABLE_DATABASES
+        value: $[ stageDependencies.stage_prep.validations.outputs['get_pluggable_databases.PLUGGABLE_DATABASES'] ]
+    jobs:
+      - ${{ if and(ne(parameters.iacParameters.isTriggered, 'true'), ne(parameters.iacParameters.isTriggered, 'True')) }}:
+        - deployment: confirm_deploy
+          pool: $(POOL)
+          displayName: Confirm ${{ parameters.iacParameters.action }}
+          environment: ocli-$(ENVIRONMENT)
+
+      - job: preparation
+        displayName: "Preparation"
+        ${{ if eq(variables['DISABLE_CONFIRM_DEPLOY'], 'false') }}:
+          dependsOn: confirm_deploy
+        steps:
+          - checkout: none
+          - task: CmdLine@2
+            name: create_variables
+            displayName: "Create Variables"
+            inputs:
+              script: |
+                EXPECTED_STATE="STOPPED"
+                if [ "${{ parameters.iacParameters.target }}" == "environment" ]; then
+                  [ "${{ parameters.iacParameters.action }}" == "STOP" ] && EXPECTED_STATE="RUNNING"
+                elif [ "${{ parameters.iacParameters.target }}" == "database" ]; then
+                  [ "${{ parameters.iacParameters.action }}" == "STOP" ] && EXPECTED_STATE="AVAILABLE"
+                fi
+
+                MATRIX_JSON="{"
+                LIMITED_MATRIX_JSON="{"
+                RETURNED_NODES=""
+                NODE_COUNT=0
+                TOTAL_NODES=0
+                LIMITED_NODES=""
+
+                IFS=';' read -ra NODE_ARRAY <<< "$(NODES)"
+                for node_entry in "${NODE_ARRAY[@]}"; do
+                  [ -z "$node_entry" ] && continue
+                  TOTAL_NODES=$((TOTAL_NODES + 1))
+
+                  if [ "${{ parameters.iacParameters.target }}" == "environment" ]; then
+                    IFS=',' read -r NODE_ID NODE_NAME NODE_IP NODE_STATE <<< "$node_entry"
+                  elif [ "${{ parameters.iacParameters.target }}" == "database" ]; then
+                    IFS=',' read -r NODE_NAME NODE_ID NODE_FAULT_DOMAIN NODE_STATE NODE_VNIC_ID <<< "$node_entry"
+                  fi
+
+                  [ "$NODE_STATE" != "$EXPECTED_STATE" ] && continue
+
+                  NODE_COUNT=$((NODE_COUNT + 1))
+                  [ $NODE_COUNT -gt 1 ] && MATRIX_JSON+=","
+
+                  MATRIX_JSON+="\"Node $NODE_COUNT [$NODE_NAME]\": {\"index\":\"$NODE_COUNT\",\"id\":\"$NODE_ID\",\"name\":\"$NODE_NAME\",\"private_ip\":\"$NODE_IP\",\"state\":\"$NODE_STATE\"}"
+                  RETURNED_NODES="${RETURNED_NODES:+$RETURNED_NODES;}$node_entry"
+                done
+                MATRIX_JSON+="}"
+
+                AFFECTED_NODES=${{ parameters.iacParameters.numberAffectedNodes }}
+                [ "$AFFECTED_NODES" == "ALL" ] && AFFECTED_NODES=$NODE_COUNT
+
+                if [ $NODE_COUNT -lt $AFFECTED_NODES ]; then
+                  echo "##vso[task.logissue type=error]Insufficient nodes: found $NODE_COUNT, requested $AFFECTED_NODES"
+                  exit 1
+                fi
+
+                for i in $(seq 1 $AFFECTED_NODES); do
+                  node_name=$(echo $MATRIX_JSON | jq -r "to_entries[$((i-1))].key")
+                  [ "$node_name" == "null" ] && continue
+
+                  node_value=$(echo $MATRIX_JSON | jq -c ".\"$node_name\"")
+                  [ $i -gt 1 ] && LIMITED_MATRIX_JSON+=","
+                  LIMITED_MATRIX_JSON+="\"$node_name\":$node_value"
+                  LIMITED_NODES="${LIMITED_NODES:+$LIMITED_NODES;}$(echo $MATRIX_JSON | jq -r ".\"$node_name\" | \"\(.id),\(.name),\(.private_ip),\(.state)\"")"
+                done
+                LIMITED_MATRIX_JSON+="}"
+
+                NODE_IPS=""
+                NODE_IDS=""
+                IFS=';' read -ra NODE_ARRAY <<< "$LIMITED_NODES"
+                for node_entry in "${NODE_ARRAY[@]}"; do
+                  [ -z "$node_entry" ] && continue
+                  
+                  IFS=',' read -r NODE_ID NODE_NAME NODE_IP NODE_STATE <<< "$node_entry"
+                  
+                  if [ -n "$NODE_IPS" ]; then
+                    NODE_IPS="$NODE_IPS $NODE_IP"
+                  else
+                    NODE_IPS="$NODE_IP"
+                  fi
+                  
+                  if [ -n "$NODE_IDS" ]; then
+                    NODE_IDS="$NODE_IDS $NODE_ID"
+                  else
+                    NODE_IDS="$NODE_ID"
+                  fi
+                done
+
+                echo "##[debug] EXPECTED LIFECYCLE STATE .........................................: $EXPECTED_STATE"
+                echo "##[debug] ALL NODES ........................................................: $(NODES)"
+                echo "##[debug] ALL NODES COUNT ..................................................: $TOTAL_NODES"
+                echo "##[debug] NODES ${EXPECTED_STATE} COUNT ..............................................: $NODE_COUNT"
+                echo "##[debug] NUMBER AFFECTED NODES ............................................: $AFFECTED_NODES [Requested: ${{ parameters.iacParameters.numberAffectedNodes }}]"
+                echo "##[debug] LIMITED NODES ....................................................: $LIMITED_NODES"
+                echo "##[debug] NODE ID's ........................................................: $NODE_IDS"
+                if [ "${{ parameters.iacParameters.target }}" == "environment" ]; then
+                  echo "##[debug] NODE IP's ........................................................: $NODE_IPS"
+                fi
+                echo ""
+
+                echo "##[group]Nodes Matrix ($AFFECTED_NODES nodes)"
+                echo $LIMITED_MATRIX_JSON | jq .
+                echo "##[endgroup]"
+
+                echo "##vso[task.setvariable variable=NODES_MATRIX;isOutput=true]$LIMITED_MATRIX_JSON"
+                echo "##vso[task.setvariable variable=LIMITED_NODES;isOutput=true]$LIMITED_NODES"
+                echo "##vso[task.setvariable variable=NODE_IPS;isOutput=true]$NODE_IPS"
+                echo "##vso[task.setvariable variable=NODE_IDS;isOutput=true]$NODE_IDS"
+                echo "##vso[task.setvariable variable=AFFECTED_NODES;isOutput=true]$AFFECTED_NODES"
+
+      - ${{ if eq(parameters.iacParameters.action, 'STOP') }}:
+          - job: pre_stop_brm_action
+            displayName: "Pre-Stop"
+            dependsOn: preparation
+            timeoutInMinutes: 120
+            variables:
+              - name: NODE_IDS
+                value: $[ dependencies.preparation.outputs['create_variables.NODE_IDS'] ]
+              - name: NODE_IPS
+                value: $[ dependencies.preparation.outputs['create_variables.NODE_IPS'] ]
+            steps:
+              - template: ../../../task_groups/checkout/checkout.yml
+                parameters:
+                  repository: self
+                  path: source_code
+
+              - ${{ if eq(parameters.iacParameters.target, 'environment') }}:
+                - template: ../../../tasks/bash/replace_variables.yml
+                  parameters:
+                    sourceFile: $(COMMANDS_PRE_STOP_FILE)
+                    transpiledFileTargetFolder: $(Agent.BuildDirectory)/source_code/commands
+                    transpiledFileName: commands_pre-stop
+                    ${{ if eq(parameters.iacParameters.environment, 'bugfix01') }}:
+                      extraVars: "ACTION=$(ACTION);NODE_IPS=$(NODE_IPS);_OPERATION_HOST_ENVIRONMENT=BUGFIX01"
+                    ${{ else }}:
+                      extraVars: "ACTION=$(ACTION);NODE_IPS=$(NODE_IPS);_OPERATION_HOST_ENVIRONMENT=$(OPERATION_HOST_ENVIRONMENT)"
+                - template: ../../../task_groups/ssh/file_transfer.yml
+                  parameters:
+                    sshEndpoint: BRM_BASTION_$(ENVIRONMENT)
+                    targetFolder: $(COMMANDS_FILES_OPERATION_HOST_PATH)
+                    sourceFolder: $(Agent.BuildDirectory)/source_code/commands/
+                    targetEnvironment: $(OPERATION_HOST_ENVIRONMENT)
+                    fileName: commands_pre-stop
+                - task: SSH@0
+                  displayName: "BRM Actions"
+                  continueOnError: true
+                  inputs:
+                    sshEndpoint: BRM_BASTION_$(ENVIRONMENT)
+                    runOptions: "inline"
+                    inline: |
+                      cat $(COMMANDS_FILES_OPERATION_HOST_PATH)/commands_pre-stop | bash
+
+                      echo ""
+                      echo "*************************************************************************************"
+                      echo "******************** CLEANING COMMANDS FILES ON OPERATION HOST **********************"
+                      echo "*************************************************************************************"
+                      echo "##[command]rm -frv $(COMMANDS_FILES_OPERATION_HOST_PATH)"
+                      rm -frv $(COMMANDS_FILES_OPERATION_HOST_PATH)
+                    readyTimeout: "20000"
+                    failOnStdErr: false
+              
+              - ${{ if eq(parameters.iacParameters.target, 'database') }}:
+                - template: ../../../task_groups/oci/configure_oci_cli.yml
+                  parameters:
+                    ociCliFolderPath: $(OCI_CLI_FOLDER_PATH)
+                    ociCliKeyFile: $(OCI_CLI_KEY_FILE)
+                    ociCliConfigFile: $(OCI_CLI_CONFIG_FILE)
+                    ociCliConfigFileName: $(OCI_CLI_CONFIG_FILE_NAME)
+                    ociCliKeyFileName: $(OCI_CLI_KEY_FILE_NAME)
+                - task: CmdLine@2
+                  name: run_pre_stop_action
+                  displayName: "> Pré-Stop Database <"
+                  inputs:
+                    script: |
+                      echo ""
+                      echo "##[debug] COMMANDS FILE .............................................: $COMMANDS_PRE_STOP_FILE"
+                      
+                      echo ""
+                      echo "##[command]cat $COMMANDS_PRE_STOP_FILE | bash |& tee $COMMANDS_PRE_STOP_EXECUTED_LOGS.txt"
+                      echo ""
+                      cat $COMMANDS_PRE_STOP_FILE | bash |& tee $COMMANDS_PRE_STOP_EXECUTED_LOGS.txt
+
+                      LOGS=""
+                      while IFS= read -r line || [[ -n "$line" ]]; do
+                        read -r line <<<"${line//[$'\t\r\n']}"
+
+                        trim () {
+                          local str ellipsis_utf8
+                          local -i maxlen
+
+                          str="$*"
+                          maxlen="2000"
+                          ellipsis_utf8=$'\u2026'
+
+                          if (( "${#str}" > "$maxlen" )); then
+                            printf "%s%s\n" "${str:0:$maxlen}" " ${ellipsis_utf8}"
+                          else
+                            printf "%s\n" "$str"
+                          fi
+                        }
+
+                        line=$(trim $line)
+
+                        if [ "${#LOGS}" -gt 0 ]; then
+                          LOGS+=";$line"
+                        else
+                          LOGS+="$line"
+                        fi
+                      done < $COMMANDS_PRE_STOP_EXECUTED_LOGS.txt
+
+                      printf "\n\n*************************************************************************************\n"
+                      printf "**************** CLEANING COMMANDS PRE-STOP FILES ON OPERATION HOST *****************\n"
+                      printf "*************************************************************************************\n"
+                      printf "##[command]rm -frv $COMMANDS_PRE_STOP_FILE\n"
+                      rm -frv $COMMANDS_PRE_STOP_FILE
+
+                      echo "##vso[task.setvariable variable=LOGS_PRE_STOP]$LOGS"
+                - template: ../../../tasks/bash/create_logs_file.yml
+                  parameters:
+                    inputVariableLogs: $(LOGS_PRE_STOP)
+                    logsFileOutput: $(Agent.BuildDirectory)/execution_logs_pre_stop.txt
+                - template: ../../../tasks/bash/check_errors_v2.yml
+                  parameters:
+                    step: "Execution"
+                    outputFile: $(Agent.BuildDirectory)/execution_logs_pre_stop.txt
+                    continueOnError: false
+
+      - job: run
+        displayName: "Execute ${{ parameters.iacParameters.action }}"
+        dependsOn:
+          - preparation
+          - ${{ if eq(parameters.iacParameters.action, 'STOP') }}:
+              - pre_stop_brm_action
+        variables:
+          - name: LIMITED_NODES
+            value: $[ dependencies.preparation.outputs['create_variables.LIMITED_NODES'] ]
+          - name: ACTION
+            value: ${{ parameters.iacParameters.action }}
+          - name: NUMBER_AFFECTED_NODES
+            value: ${{ parameters.iacParameters.numberAffectedNodes }}
+        steps:
+          - template: ../../../task_groups/checkout/checkout.yml
+            parameters:
+              repository: self
+              path: source_code
+          - template: ../../../task_groups/oci/configure_oci_cli.yml
+            parameters:
+              ociCliFolderPath: $OCI_CLI_FOLDER_PATH
+              ociCliKeyFile: $OCI_CLI_KEY_FILE
+              ociCliConfigFile: $OCI_CLI_CONFIG_FILE
+              ociCliConfigFileName: $(OCI_CLI_CONFIG_FILE_NAME)
+              ociCliKeyFileName: $(OCI_CLI_KEY_FILE_NAME)
+          - task: CmdLine@2
+            name: run_action
+            displayName: "> ${{ parameters.iacParameters.action }} BRM <"
+            inputs:
+              script: |
+                echo ""
+                echo "##[debug] COMMANDS FILE .............................................: $COMMANDS_FILE"
+                
+                echo ""
+                echo "##[command]cat $COMMANDS_FILE | bash |& tee $COMMANDS_EXECUTED_LOGS.txt"
+                echo ""
+                cat $COMMANDS_FILE | bash |& tee $COMMANDS_EXECUTED_LOGS.txt
+
+                LOGS=""
+                while IFS= read -r line || [[ -n "$line" ]]; do
+                  read -r line <<<"${line//[$'\t\r\n']}"
+
+                  trim () {
+                    local str ellipsis_utf8
+                    local -i maxlen
+
+                    str="$*"
+                    maxlen="2000"
+                    ellipsis_utf8=$'\u2026'
+
+                    if (( "${#str}" > "$maxlen" )); then
+                      printf "%s%s\n" "${str:0:$maxlen}" " ${ellipsis_utf8}"
+                    else
+                      printf "%s\n" "$str"
+                    fi
+                  }
+
+                  line=$(trim $line)
+
+                  if [ "${#LOGS}" -gt 0 ]; then
+                    LOGS+=";$line"
+                  else
+                    LOGS+="$line"
+                  fi
+                done < $COMMANDS_EXECUTED_LOGS.txt
+
+                printf "\n\n*************************************************************************************\n"
+                printf "******************** CLEANING COMMANDS FILES ON OPERATION HOST **********************\n"
+                printf "*************************************************************************************\n"
+                printf "##[command]rm -frv $COMMANDS_FILE\n"
+                rm -frv $COMMANDS_FILE
+
+                echo "##vso[task.setvariable variable=LOGS;isoutput=true]$LOGS"
+
+      - ${{ if eq(parameters.iacParameters.action, 'START') }}:
+          - job: post_start
+            displayName: "Post-Start"
+            timeoutInMinutes: 180
+            dependsOn:
+              - preparation
+              - run
+            variables:
+              - name: NODE_IPS
+                value: $[ dependencies.preparation.outputs['create_variables.NODE_IPS'] ]
+              - name: NODE_IDS
+                value: $[ dependencies.preparation.outputs['create_variables.NODE_IDS'] ]
+            steps:
+              - template: ../../../task_groups/checkout/checkout.yml
+                parameters:
+                  repository: self
+                  path: source_code
+              - ${{ if eq(parameters.iacParameters.target, 'environment') }}:
+                - template: ../../../tasks/bash/replace_variables.yml
+                  parameters:
+                    sourceFile: $(COMMANDS_POST_START_FILE)
+                    transpiledFileTargetFolder: $(Agent.BuildDirectory)/source_code/commands
+                    transpiledFileName: commands_post-start
+                    ${{ if eq(parameters.iacParameters.environment, 'bugfix01') }}:
+                      extraVars: "ACTION=$(ACTION);_OPERATION_HOST_ENVIRONMENT=BUGFIX01;NODE_IPS=$(NODE_IPS);WAIT_NODE_READY_TIMEOUT=$(WAIT_NODE_READY_TIMEOUT);WAIT_PDC_READY_TIMEOUT=$(WAIT_PDC_READY_TIMEOUT);WAIT_PRICINGUPDATER_READY_TIMEOUT=$(WAIT_PRICINGUPDATER_READY_TIMEOUT);_ENVIRONMENT=bugfix01"
+                    ${{ else }}:
+                      extraVars: "ACTION=$(ACTION);_OPERATION_HOST_ENVIRONMENT=$(OPERATION_HOST_ENVIRONMENT);NODE_IPS=$(NODE_IPS);WAIT_NODE_READY_TIMEOUT=$(WAIT_NODE_READY_TIMEOUT);WAIT_PDC_READY_TIMEOUT=$(WAIT_PDC_READY_TIMEOUT);WAIT_PRICINGUPDATER_READY_TIMEOUT=$(WAIT_PRICINGUPDATER_READY_TIMEOUT);_ENVIRONMENT=${{ parameters.iacParameters.environment }}"                
+                - template: ../../../task_groups/ssh/file_transfer.yml
+                  parameters:
+                    sshEndpoint: BRM_BASTION_$(ENVIRONMENT)
+                    targetFolder: $(COMMANDS_FILES_OPERATION_HOST_PATH)
+                    sourceFolder: $(Agent.BuildDirectory)/source_code/commands/
+                    targetEnvironment: $(OPERATION_HOST_ENVIRONMENT)
+                    fileName: commands_post-start
+                - task: SSH@0
+                  displayName: "BRM Actions"
+                  continueOnError: true
+                  inputs:
+                    sshEndpoint: BRM_BASTION_$(ENVIRONMENT)
+                    runOptions: "inline"
+                    inline: |
+                      cat $(COMMANDS_FILES_OPERATION_HOST_PATH)/commands_post-start | bash
+
+                      echo ""
+                      echo "*************************************************************************************"
+                      echo "******************** CLEANING COMMANDS FILES ON OPERATION HOST **********************"
+                      echo "*************************************************************************************"
+                      echo "##[command]rm -frv $(COMMANDS_FILES_OPERATION_HOST_PATH)"
+                      rm -frv $(COMMANDS_FILES_OPERATION_HOST_PATH)
+                    readyTimeout: "20000"
+                    failOnStdErr: false
+              
+              - ${{ if eq(parameters.iacParameters.target, 'database') }}:
+                - template: ../../../task_groups/oci/configure_oci_cli.yml
+                  parameters:
+                    ociCliFolderPath: $(OCI_CLI_FOLDER_PATH)
+                    ociCliKeyFile: $(OCI_CLI_KEY_FILE)
+                    ociCliConfigFile: $(OCI_CLI_CONFIG_FILE)
+                    ociCliConfigFileName: $(OCI_CLI_CONFIG_FILE_NAME)
+                    ociCliKeyFileName: $(OCI_CLI_KEY_FILE_NAME)
+                - task: CmdLine@2
+                  name: run_post_start_action
+                  displayName: "> Post-Start Database <"
+                  inputs:
+                    script: |
+                      echo ""
+                      echo "##[debug] COMMANDS FILE .............................................: $COMMANDS_POST_START_FILE"
+                      
+                      echo ""
+                      echo "##[command]cat $COMMANDS_POST_START_FILE | bash |& tee $COMMANDS_POST_START_EXECUTED_LOGS.txt"
+                      echo ""
+                      cat $COMMANDS_POST_START_FILE | bash |& tee $COMMANDS_POST_START_EXECUTED_LOGS.txt
+
+                      LOGS=""
+                      while IFS= read -r line || [[ -n "$line" ]]; do
+                        read -r line <<<"${line//[$'\t\r\n']}"
+
+                        trim () {
+                          local str ellipsis_utf8
+                          local -i maxlen
+
+                          str="$*"
+                          maxlen="2000"
+                          ellipsis_utf8=$'\u2026'
+
+                          if (( "${#str}" > "$maxlen" )); then
+                            printf "%s%s\n" "${str:0:$maxlen}" " ${ellipsis_utf8}"
+                          else
+                            printf "%s\n" "$str"
+                          fi
+                        }
+
+                        line=$(trim $line)
+
+                        if [ "${#LOGS}" -gt 0 ]; then
+                          LOGS+=";$line"
+                        else
+                          LOGS+="$line"
+                        fi
+                      done < $COMMANDS_POST_START_EXECUTED_LOGS.txt
+
+                      printf "\n\n*************************************************************************************\n"
+                      printf "**************** CLEANING COMMANDS POST-START FILES ON OPERATION HOST ***************\n"
+                      printf "*************************************************************************************\n"
+                      printf "##[command]rm -frv $COMMANDS_POST_START_FILE\n"
+                      rm -frv $COMMANDS_POST_START_FILE
+
+                      echo "##vso[task.setvariable variable=LOGS_POST_START]$LOGS"
+                - template: ../../../tasks/bash/create_logs_file.yml
+                  parameters:
+                    inputVariableLogs: $(LOGS_POST_START)
+                    logsFileOutput: $(Agent.BuildDirectory)/execution_logs_pre_stop.txt
+                - template: ../../../tasks/bash/check_errors_v2.yml
+                  parameters:
+                    step: "Execution"
+                    outputFile: $(Agent.BuildDirectory)/execution_logs_pre_stop.txt
+                    continueOnError: false
+
+          - ${{ if eq(parameters.iacParameters.target, 'environment') }}:
+            - job: wait_pods
+              displayName: "Wait Pods"
+              timeoutInMinutes: 180
+              dependsOn: post_start
+              steps:
+                - checkout: none
+                - template: ../../../tasks/ssh/wait_k8s_job_pod.yml
+                  parameters:
+                    resource: "pods"
+                    sshEndpoint: BRM_BASTION_$(ENVIRONMENT)
+                    timeout: "$(WAIT_PODS_READY_TIMEOUT)"
+            - job: wait_jobs
+              displayName: "Wait Jobs"
+              dependsOn: post_start
+              steps:
+                - checkout: none
+                - template: ../../../tasks/ssh/wait_k8s_job_pod.yml
+                  parameters:
+                    resource: "jobs"
+                    sshEndpoint: BRM_BASTION_$(ENVIRONMENT)
+                    timeout: "$(WAIT_JOB_READY_TIMEOUT)"
+
+      - job: validate
+        displayName: "Validate"
+        dependsOn:
+          - preparation
+          - ${{ if eq(parameters.iacParameters.action, 'STOP') }}:
+            - pre_stop_brm_action
+          - run
+          - ${{ if eq(parameters.iacParameters.action, 'START') }}:
+              - post_start
+              - ${{ if eq(parameters.iacParameters.target, 'environment') }}:
+                - wait_pods
+                - wait_jobs
+        ${{ if and(eq(parameters.iacParameters.action, 'START'), eq(parameters.iacParameters.target, 'environment')) }}:
+          condition: |
+            and(
+              eq(dependencies.preparation.result, 'Succeeded'),
+              eq(dependencies.run.result, 'Succeeded'),
+              eq(dependencies.post_start.result, 'Succeeded'),
+              in(dependencies.wait_pods.result, 'Succeeded', 'SucceededWithIssues', 'Skipped'),
+              in(dependencies.wait_jobs.result, 'Succeeded', 'SucceededWithIssues', 'Skipped')
+            )
+        ${{ if and(eq(parameters.iacParameters.action, 'START'), eq(parameters.iacParameters.target, 'database')) }}:
+          condition: |
+            and(
+              eq(dependencies.preparation.result, 'Succeeded'),
+              eq(dependencies.run.result, 'Succeeded'),
+              eq(dependencies.post_start.result, 'Succeeded')
+            )
+        ${{ if eq(parameters.iacParameters.action, 'STOP') }}:
+          condition: |
+            and(
+              eq(dependencies.preparation.result, 'Succeeded'),
+              eq(dependencies.pre_stop_brm_action.result, 'Succeeded'),
+              eq(dependencies.run.result, 'Succeeded')
+            )
+        variables:
+          - name: LOGS
+            value: $[ dependencies.run.outputs['run_action.LOGS'] ]
+          - name: AFFECTED_NODES
+            value: $[ dependencies.preparation.outputs['create_variables.AFFECTED_NODES'] ]
+        steps:
+          - checkout: none
+          - template: ../../../tasks/bash/create_logs_file.yml
+            parameters:
+              inputVariableLogs: $(LOGS)
+              logsFileOutput: $(Agent.BuildDirectory)/execution_logs.txt
+          - template: ../../../tasks/bash/check_errors_v2.yml
+            parameters:
+              step: "Execution"
+              outputFile: $(Agent.BuildDirectory)/execution_logs.txt
+              continueOnError: false
+
+          - ${{ if eq(parameters.iacParameters.target, 'database') }}:
+            - template: ../../../task_groups/oci/collect_data_database.yml
+              parameters:
+                action: ${{ parameters.iacParameters.action }}
+                environment: $(OPERATION_HOST_ENVIRONMENT)
+                dbSystemDisplayName: $(IAC_DB_SYSTEM_DISPLAY_NAME)
+                compartmentId: $(IAC_OCI_COMPARTMENT_ID)
+                ociCliFolder: $(OCI_CLI_FOLDER)
+                ociCliFolderPath: $(OCI_CLI_FOLDER_PATH)
+                ociCliKeyFile: $(OCI_CLI_KEY_FILE)
+                ociCliConfigFile: $(OCI_CLI_CONFIG_FILE)
+                ociCliConfigFileName: $(OCI_CLI_CONFIG_FILE_NAME)
+                ociCliKeyFileName: $(OCI_CLI_KEY_FILE_NAME)
+            - task: CmdLine@2
+              name: validate_database_state
+              displayName: "Validate Database State"
+              inputs:
+                script: |
+                  set -euo pipefail
+
+                  db_state="$(get_database.DATABASE_STATE)"
+                  action="${{ parameters.iacParameters.action }}"
+                  env="${{ parameters.iacParameters.environment }}"
+                  nodes="$(get_nodes.NODES)"
+                  affected_nodes=$(AFFECTED_NODES)
+
+                  AVAILABLE_NODES_COUNT=0
+                  STOPPED_NODES_COUNT=0
+
+                  printf "##[debug] DATABASE STATE .......................................................: %s\n" "$db_state"
+                  printf "##[debug] ACTION ...............................................................: %s\n" "$action"
+                  printf "##[debug] ENVIRONMENT ..........................................................: %s\n" "$env"
+                  printf "##[debug] NODES ................................................................: %s\n" "$nodes"
+                  printf "##[debug] AFFECTED NODES .......................................................: %s\n" "$affected_nodes"
+                  printf "\n"
+                  
+                  IFS=';' read -ra node_array <<< "$nodes"
+                  for node in "${node_array[@]}"; do
+                    [ -z "$node" ] && continue
+                    # Format for database nodes: NODE_NAME,NODE_ID,NODE_FAULT_DOMAIN,NODE_STATE,NODE_VNIC_ID
+                    state=$(echo "$node" | cut -d',' -f4)
+
+                    if [ "$state" == "AVAILABLE" ]; then
+                      AVAILABLE_NODES_COUNT=$(( AVAILABLE_NODES_COUNT + 1 ))
+                    elif [ "$state" == "STOPPED" ]; then
+                      STOPPED_NODES_COUNT=$(( STOPPED_NODES_COUNT + 1 ))
+                    fi
+                  done
+
+                  if [ "$action" == "START" ]; then
+                    printf "##[debug] AVAILABLE NODES COUNT ................................................: %s\n" "$AVAILABLE_NODES_COUNT"
+                    printf "\n"
+                    
+                    if [ "$AVAILABLE_NODES_COUNT" -ge "$affected_nodes" ]; then
+                      printf "✅ All database nodes were started as requested.\n"
+                    else
+                      printf "❌ Not all database nodes were started. Expected: %s, Available: %s\n" "$affected_nodes" "$AVAILABLE_NODES_COUNT"
+                      printf "##vso[task.logissue type=error;]Not all database nodes were started. Expected: %s, Available: %s\n" "$affected_nodes" "$AVAILABLE_NODES_COUNT"
+                      printf "##vso[task.complete result=Failed;]\n"
+                    fi
+                  elif [ "$action" == "STOP" ]; then
+                    printf "##[debug] STOPPED NODES COUNT ..................................................: %s\n" "$STOPPED_NODES_COUNT"
+                    printf "\n"
+
+                    if [ "$STOPPED_NODES_COUNT" -ge "$affected_nodes" ]; then
+                      printf "✅ All database nodes were stopped as requested.\n"
+                    else
+                      printf "❌ Not all database nodes were stopped. Expected: %s, Stopped: %s\n" "$affected_nodes" "$STOPPED_NODES_COUNT"
+                      printf "##vso[task.logissue type=error;]Not all database nodes were stopped. Expected: %s, Stopped: %s\n" "$affected_nodes" "$STOPPED_NODES_COUNT"
+                      printf "##vso[task.complete result=Failed;]\n"
+                    fi
+                  fi
+          
+          - ${{ if eq(parameters.iacParameters.target, 'environment') }}:
+            - template: ../../../task_groups/oci/collect_data_cluster.yml
+              parameters:
+                action: ${{ parameters.iacParameters.action }}
+                environment: $(OPERATION_HOST_ENVIRONMENT)
+                compartmentId: $(IAC_OCI_COMPARTMENT_ID)
+                ociCliFolder: $(OCI_CLI_FOLDER)
+                ociCliFolderPath: $(OCI_CLI_FOLDER_PATH)
+                ociCliKeyFile: $(OCI_CLI_KEY_FILE)
+                ociCliConfigFile: $(OCI_CLI_CONFIG_FILE)
+                ociCliConfigFileName: $(OCI_CLI_CONFIG_FILE_NAME)
+                ociCliKeyFileName: $(OCI_CLI_KEY_FILE_NAME)
+            - task: CmdLine@2
+              name: validate_environment_state
+              displayName: "Validate Environment State"
+              inputs:
+                script: |
+                  state="$(get_cluster.CLUSTER_STATE)"
+                  action="${{ parameters.iacParameters.action }}"
+                  env="${{ parameters.iacParameters.environment }}"
+                  nodes="$(get_nodes.NODES)"
+                  affected_nodes=$(AFFECTED_NODES)
+
+                  RUNNING_NODES_COUNT=0
+                  STOPPED_NODES_COUNT=0
+
+                  echo "##[debug] BRM ENVIRONMENT STATE ................................................: $state"
+                  echo "##[debug] ACTION ...............................................................: $action"
+                  echo "##[debug] ENVIRONMENT ..........................................................: $env"
+                  echo "##[debug] NODES ................................................................: $nodes"
+                  echo "##[debug] AFFECTED NODES .......................................................: $affected_nodes"
+                  
+                  IFS=';' read -ra node_array <<< "$nodes"
+                  for node in "${node_array[@]}"; do
+                    state=$(echo "$node" | cut -d',' -f4)
+
+                    if [ "$state" == "RUNNING" ]; then
+                      RUNNING_NODES_COUNT=$(( RUNNING_NODES_COUNT + 1 ))
+                    elif [ "$state" == "STOPPED" ]; then
+                      STOPPED_NODES_COUNT=$(( STOPPED_NODES_COUNT + 1 ))
+                    fi
+                  done
+
+                  if [ "$action" == "START" ]; then
+                    echo "##[debug] RUNNING NODES COUNT ..................................................: $RUNNING_NODES_COUNT"
+                    echo ""
+                    
+                    if [ "$RUNNING_NODES_COUNT" -ge "$affected_nodes" ]; then
+                      echo "✅ All nodes were started as requested."
+                    else
+                      echo "❌ Not all nodes were started. Expected: $affected_nodes, Started: $RUNNING_NODES_COUNT"
+                      echo "##vso[task.logissue type=error;]Not all nodes were started. Expected: $affected_nodes, Started: $RUNNING_NODES_COUNT"
+                      echo "##vso[task.complete result=Failed;]"
+                    fi
+                  elif [ "$action" == "STOP" ]; then
+                    echo "##[debug] STOPPED NODES COUNT ..................................................: $STOPPED_NODES_COUNT"
+                    echo ""
+
+                    if [ "$STOPPED_NODES_COUNT" -ge "$affected_nodes" ]; then
+                      echo "✅ All nodes were stopped as requested."
+                    else
+                      echo "❌ Not all nodes were stopped. Expected: $affected_nodes, Stopped: $STOPPED_NODES_COUNT"
+                      echo "##vso[task.logissue type=error;]Not all nodes were stopped. Expected: $affected_nodes, Stopped: $STOPPED_NODES_COUNT"
+                      echo "##vso[task.complete result=Failed;]"
+                    fi
+                  fi
+
+            - task: CmdLine@2
+              name: functional_validate_brm_state
+              displayName: "Functional Validate BRM State"
+              continueOnError: true
+              inputs:
+                script: |
+                  set -euo pipefail
+
+                  ENVIRONMENT="$(echo "$(ENVIRONMENT)" | tr '[:upper:]' '[:lower:]')"
+                  TOKEN_URL="https://autenticainthml.redecorp.br/ms_oauth/oauth2/endpoints/vivooauthservice/tokens"
+                  HEALTHCHECK_URL="https://brm${ENVIRONMENT}-api.redecorp.oci/bcws/webresources/v1.0/tlf/taxcalc/product/management"
+                  RESPONSE_FILE="/tmp/brm_response.json"
+
+                  printf "##[section]Starting BRM functional validation\n"
+                  printf "##[debug]Timestamp UTC: %s\n" "$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+
+                  printf "##[section]1/2 - Retrieving access token\n"
+                  printf "##[command]curl --silent --show-error --location --request POST '$TOKEN_URL' -H 'Content-Type: application/x-www-form-urlencoded;charset=UTF-8' -H 'Authorization: Basic ***' -d 'grant_type=password&username=SVC_MULESOFT&password=***&scope=ServiceAccount.Profile'\n"
+
+                  TOKEN=$(curl --silent --show-error --location --request POST "$TOKEN_URL" \
+                            -H 'Content-Type: application/x-www-form-urlencoded;charset=UTF-8' \
+                            -H 'Authorization: Basic $(HEALTHCHECK_ENVIRONMENT_GET_TOKEN_AUTH)' \
+                            -d 'grant_type=password&username=SVC_MULESOFT&password=$(HEALTHCHECK_ENVIRONMENT_GET_TOKEN_PASS)&scope=ServiceAccount.Profile')
+
+                  if command -v jq >/dev/null 2>&1; then
+                    ACCESS_TOKEN=$(printf "%s" "$TOKEN" | jq -r '.access_token // empty')
+                  else
+                      printf "##[warning]jq not found. Falling back to grep/cut to extract access_token.\n"
+                    ACCESS_TOKEN=$(printf "%s" "$TOKEN" | grep -o '"access_token":"[^"]*' | cut -d'"' -f4)
+                  fi
+
+                  if [ -z "${ACCESS_TOKEN:-}" ]; then
+                    printf "##[error]Failed to retrieve access_token\n"
+                    exit 1
+                  fi
+
+                  printf "##[debug]Access token retrieved successfully (length=%s).\n" "$(printf "%s" "$ACCESS_TOKEN" | wc -c)"
+
+                  printf "##[section]2/2 - BRM health check\n"
+                  printf "##[command]curl --silent --show-error --insecure --location '$HEALTHCHECK_URL' --header 'Authorization: Bearer ***' --header 'Accept: application/json' --header 'Content-Type: application/json' --data '[{"classeProduto":"/service/vivo/voz/pabxVirtual","uf":"RJ","idItemCotacao":"0QLQQ00000HT68H4AT","valorBruto":"954.26"}]'\n"
+
+                  HTTP_CODE=$(curl --silent --show-error --insecure --location "$HEALTHCHECK_URL" \
+                              --header "Authorization: Bearer $ACCESS_TOKEN" \
+                              --header 'Accept: application/json' \
+                              --header 'Content-Type: application/json' \
+                              --data '[
+                                      {
+                                        "classeProduto": "/service/vivo/voz/pabxVirtual",
+                                        "uf": "RJ",
+                                        "idItemCotacao": "0QLQQ00000HT68H4AT",
+                                        "valorBruto": "954.26"
+                                      }
+                                    ]' \
+                              --write-out "%{http_code}" \
+                              --output "$RESPONSE_FILE")
+
+                  printf "##[debug]Health check HTTP status code: %s\n" "$HTTP_CODE"
+
+                  if [ -s "$RESPONSE_FILE" ]; then
+                    printf "##[section]Response body\n"
+                    if command -v jq >/dev/null 2>&1; then
+                      jq . "$RESPONSE_FILE" 2>/dev/null || cat "$RESPONSE_FILE"
+                    else
+                      cat "$RESPONSE_FILE"
+                    fi
+                  else
+                    printf "##[warning]Empty response body.\n"
+                  fi
+
+                  if [ "$HTTP_CODE" -eq 200 ]; then
+                    printf "##[section]Functional analysis OK (HTTP 200).\n"
+                  else
+                    printf "##[error]Functional analysis failed (HTTP %s).\n" "$HTTP_CODE"
+                    exit 1
+                  fi
+
+            - task: CmdLine@2
+              name: functional_validate_brm_state
+              displayName: "Functional Validate BRM State"
+              continueOnError: true
+              inputs:
+                script: |
+                  set -euo pipefail
+
+                  ENVIRONMENT="$(echo "$(ENVIRONMENT)" | tr '[:upper:]' '[:lower:]')"
+                  TOKEN_URL="https://autenticainthml.redecorp.br/ms_oauth/oauth2/endpoints/vivooauthservice/tokens"
+                  HEALTHCHECK_URL="https://brm${ENVIRONMENT}-api.redecorp.oci/bcws/webresources/v1.0/tlf/taxcalc/product/management"
+                  RESPONSE_FILE="/tmp/brm_response.json"
+
+                  printf "##[section]Starting BRM functional validation\n"
+                  printf "##[debug]Timestamp UTC: %s\n" "$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+
+                  printf "##[section]1/2 - Retrieving access token\n"
+                  printf "##[command]curl --silent --show-error --location --request POST '$TOKEN_URL' -H 'Content-Type: application/x-www-form-urlencoded;charset=UTF-8' -H 'Authorization: Basic ***' -d 'grant_type=password&username=SVC_MULESOFT&password=***&scope=ServiceAccount.Profile'\n"
+
+                  TOKEN=$(curl --silent --show-error --location --request POST "$TOKEN_URL" \
+                            -H 'Content-Type: application/x-www-form-urlencoded;charset=UTF-8' \
+                            -H 'Authorization: Basic $(HEALTHCHECK_ENVIRONMENT_GET_TOKEN_AUTH)' \
+                            -d 'grant_type=password&username=SVC_MULESOFT&password=$(HEALTHCHECK_ENVIRONMENT_GET_TOKEN_PASS)&scope=ServiceAccount.Profile')
+
+                  if command -v jq >/dev/null 2>&1; then
+                    ACCESS_TOKEN=$(printf "%s" "$TOKEN" | jq -r '.access_token // empty')
+                  else
+                      printf "##[warning]jq not found. Falling back to grep/cut to extract access_token.\n"
+                    ACCESS_TOKEN=$(printf "%s" "$TOKEN" | grep -o '"access_token":"[^"]*' | cut -d'"' -f4)
+                  fi
+
+                  if [ -z "${ACCESS_TOKEN:-}" ]; then
+                    printf "##[error]Failed to retrieve access_token\n"
+                    exit 1
+                  fi
+
+                  printf "##[debug]Access token retrieved successfully (length=%s).\n" "$(printf "%s" "$ACCESS_TOKEN" | wc -c)"
+
+                  printf "##[section]2/2 - BRM health check\n"
+                  printf "##[command]curl --silent --show-error --insecure --location '$HEALTHCHECK_URL' --header 'Authorization: Bearer ***' --header 'Accept: application/json' --header 'Content-Type: application/json' --data '[{"classeProduto":"/service/vivo/voz/pabxVirtual","uf":"RJ","idItemCotacao":"0QLQQ00000HT68H4AT","valorBruto":"954.26"}]'\n"
+
+                  HTTP_CODE=$(curl --silent --show-error --insecure --location "$HEALTHCHECK_URL" \
+                              --header "Authorization: Bearer $ACCESS_TOKEN" \
+                              --header 'Accept: application/json' \
+                              --header 'Content-Type: application/json' \
+                              --data '[
+                                      {
+                                        "classeProduto": "/service/vivo/voz/pabxVirtual",
+                                        "uf": "RJ",
+                                        "idItemCotacao": "0QLQQ00000HT68H4AT",
+                                        "valorBruto": "954.26"
+                                      }
+                                    ]' \
+                              --write-out "%{http_code}" \
+                              --output "$RESPONSE_FILE")
+
+                  printf "##[debug]Health check HTTP status code: %s\n" "$HTTP_CODE"
+
+                  if [ -s "$RESPONSE_FILE" ]; then
+                    printf "##[section]Response body\n"
+                    if command -v jq >/dev/null 2>&1; then
+                      jq . "$RESPONSE_FILE" 2>/dev/null || cat "$RESPONSE_FILE"
+                    else
+                      cat "$RESPONSE_FILE"
+                    fi
+                  else
+                    printf "##[warning]Empty response body.\n"
+                  fi
+
+                  if [ "$HTTP_CODE" -eq 200 ]; then
+                    printf "##[section]Functional analysis OK (HTTP 200).\n"
+                  else
+                    printf "##[error]Functional analysis failed (HTTP %s).\n" "$HTTP_CODE"
+                    exit 1
+                  fi

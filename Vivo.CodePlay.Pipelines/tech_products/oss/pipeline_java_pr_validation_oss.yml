@@ -1,0 +1,524 @@
+## -> Parameters:
+parameters:
+- name: environment
+  type: string
+  default: 'dev'
+
+## -> Resources:
+resources:
+  repositories:
+
+  ## -> Fortify
+  - repository: FortifyExclusion
+    name: DevOps/Vivo.Fortify.Exclusions
+    type: git
+    ref: refs/heads/master
+    endpoint: CorePipelines
+  ## -> OSSD Repository
+  - repository: OSSDevOpsHelm
+    name: 'OSSD - OSS DEVOPS/helm-oss-default'
+    type: git
+    ref: refs/heads/master
+    endpoint: CodePlay
+  - repository: OSSDevOpsSettings
+    name: 'OSSD - OSS DEVOPS/settings-oss-default'
+    type: git
+    ref: refs/heads/master
+    endpoint: CodePlay
+  - repository: OSSDevOpsExclusions
+    name: 'OSSD - OSS DEVOPS/exclusions-oss-default'
+    type: git
+    ref: refs/heads/master
+    endpoint: CodePlay
+  - repository: OSSDevOpsHosts
+    name: 'OSSD - OSS DEVOPS/hosts-oss-default'
+    type: git
+    ref: refs/heads/master
+    endpoint: CodePlay
+
+## -> Initialize global variables
+variables:
+  - template: /tech_products/oss/initialize/variables_global.yml
+  - template: /tech_products/oss/initialize/variables_java.yml
+  - template: /tech_products/oss/initialize/variables_gates.yml
+  - template: /tech_products/oss/initialize/variables_docker.yml
+  - template: /tech_products/oss/initialize/variables_helm.yml
+
+  ## -> Override global variables, with variables set in Library/Variable Groups (Pipelines)
+  ## -> Use this to change the variables on runtime
+  - group: "${{ variables['Build.Repository.Name'] }}"
+
+  - name: CORPORATE_WIKI_DOC_URL
+    value: "TBD"
+
+  ## -> Whether branch is dev, esteira1, esteira2, preprod, prodlike or producao, set environment to branch name,
+  ## -> Otherwise use parameter environment
+  - ${{ if in(variables['Build.SourceBranchName'],'dev','esteira1','esteira2','preprod','prodlike','producao' )}}:
+    - name: environment
+      value: ${{variables['Build.SourceBranchName']}}
+  - ${{ else }}:
+    - name: environment
+      value: ${{ parameters.environment }}
+
+stages:
+## -> Initialize enviroment
+- template: /tech_products/oss/initialize/default_environment.yml
+
+- stage: CI_Pipeline
+  variables:
+    - template: /tech_products/oss/initialize/variables_catalog_info.yml
+  displayName: 'CI Pipeline'
+  jobs:
+    - job: Build_And_Validate
+      displayName: 'Validate & Build'
+      pool:
+        name: $(AGENT_POOL_CI)
+      steps:
+        - checkout: self
+          displayName: Checkout Source Code
+          clean: true
+          fetchDepth: 0
+          path: source_code
+
+        - checkout: OSSDevOpsExclusions
+          displayName: Checkout OSS Exclusions
+          path: oss_exclusions
+          fetchDepth: 1
+
+        ## -> Load Flags Exclusions
+        - task: Bash@3
+          displayName: 'Load Execution Flags'
+          name: evaluate_flags
+          inputs:
+            targetType: inline
+            script: |
+              repoName="$(Build.Repository.Name)"
+              projectName="$(System.TeamProject)"
+
+              ## -> Configuration Files
+              configFileRepo="$(Pipeline.Workspace)/oss_exclusions/pr_validation.yml"
+              configFileProject="$(Pipeline.Workspace)/oss_exclusions/pr_validation_project.yml"
+              
+              echo "##[debug] Checking flags for Repo: $repoName | Project: $projectName"
+
+              ## -> default values
+              isDisableAll="false"
+              isSkipValidation="false"
+              isSkipBuild="false"
+
+              ## -> Validation pr_validation_project.yml
+              if [ -f "$configFileProject" ]; then
+                  
+                  if grep -q "^ALL .*disable_all=true" "$configFileProject"; then
+                      echo "##[warning] ALL Flag Detected: PR validation is disabled for all projects."
+                      isDisableAll="true"
+                  fi
+
+                  if grep -q "^${projectName}$" "$configFileProject" || grep -q "^${projectName}[[:space:]]" "$configFileProject"; then
+                      echo "##[warning] Project exclusion flag detected: '$projectName' is listed in exclusion file."
+                      isDisableAll="true"
+                  fi
+               else
+                  echo "##[error] Project config file not found at $configFileProject"
+                  exit 1
+                fi
+
+              ## -> Validation pr_validation.yml
+              if [[ "$isDisableAll" == "false" ]]; then
+                  if [ -f "$configFileRepo" ]; then
+                      
+                      repoConfig=$(grep "^${repoName}[[:space:]]" "$configFileRepo" || true)
+                      
+                      if [[ -n "$repoConfig" ]]; then
+                          echo "##[debug] Repo Configuration found: $repoConfig"
+                          
+                          [[ "$repoConfig" =~ "disable_all=true" ]] && isDisableAll="true"
+                          [[ "$repoConfig" =~ "skip_validation=true" ]] && isSkipValidation="true"
+                          [[ "$repoConfig" =~ "skip_build=true" ]] && isSkipBuild="true"
+                      fi
+                  else
+                      echo "##[error] Repo Config file not found at $configFileRepo"
+                      exit 1
+                  fi
+              fi
+
+              if [[ "$isDisableAll" == "true" ]]; then
+                  isSkipValidation="true"
+                  isSkipBuild="true"
+                  echo "##[warning] PIPELINE DISABLED VIA FLAG (Project or Repo exclusion)"
+              fi
+
+              echo "##vso[task.setvariable variable=isSkipValidation]$isSkipValidation"
+              echo "##vso[task.setvariable variable=isSkipBuild]$isSkipBuild"
+
+              echo "Final Flags: Valid=$isSkipValidation | Build=$isSkipBuild"
+
+        ## -> Validate Commit
+        - task: Bash@3
+          displayName: 'Validate Commit Message'
+          name: validate_commit
+          condition: and(succeeded(), ne(variables['isSkipValidation'], 'true'))
+          inputs:
+            targetType: inline
+            workingDirectory: $(Pipeline.Workspace)/source_code
+            script: |
+              if [ "$(Build.Reason)" == "PullRequest" ]; then
+                  TARGET="$(System.PullRequest.TargetBranch)"
+              else
+                  TARGET="$(Build.SourceBranchName)"
+              fi
+              TARGET="${TARGET#refs/heads/}"
+              
+              echo "##[debug] Target Branch: '$TARGET'"
+              if [[ ! "$TARGET" =~ ^(master|main|producao|prodlike|preprod|esteira[12]|dev)$ ]]; then
+                 echo "Skipping: Branch '$TARGET' is not in the official list."
+                 exit 0
+              fi
+              ## -> Validate Message
+              commitID=$(System.PullRequest.SourceCommitId)
+              MSG=$(git log -1 --pretty=%B "$commitID")
+
+              echo "##[group] Commit Message:"
+              echo "$MSG"
+              echo "##[endgroup]"
+                            
+              if [[ ! "$MSG" =~ ^(feat|fix|chore|docs|test|refactor|ci|build|perf|revert)(\(.+\))?: ]] || [[ ! "$MSG" =~ [A-Z0-9]+(-[0-9]+|[0-9]+) ]]; then
+                  echo ""
+                  echo "##[error] ❌ Invalid Commit Message Format!"
+                  echo "##[error] Requirement: <type>: <description> <ID>"
+                  echo "##[error] Example: feat: add login screen PTI-123"
+                  echo "##[error] Example: fix: resolve timeout issue INC00001"
+                  echo "##[error] For more info: https://www.conventionalcommits.org/en/v1.0.0/"
+                  exit 1
+              fi
+              echo "✅ Commit Validated"
+
+        ## -> Download NEXUS Credentials 
+        - task: AzureKeyVault@2
+          displayName: 'Getting AKV Credentials'
+          condition: and(succeeded(), ne(variables['isSkipBuild'], 'true'))
+          timeoutInMinutes: 1
+          retryCountOnTaskFailure: 5
+          inputs:
+            azureSubscription: DevOpsSharedResources
+            KeyVaultName: $(AKV_DEVOPS_NAME)
+            SecretsFilter: 'NEXUS-DEPS-USR, NEXUS-DEPS-PSW'
+
+        ########################################
+        ########################################
+        ########################################
+        - checkout: OSSDevOpsSettings
+          displayName: 'Checkout Maven Settings Repository'
+          name: checkout_settings_oss
+          path: settings_oss
+
+        ## -> Resolve Maven Settings (Custom → SIGLA → Default)
+        - task: Bash@3
+          displayName: 'Resolve Maven Settings'
+          name: resolve_settings
+          condition: succeeded()
+          continueOnError: false
+          inputs:
+            targetType: 'inline'
+            script: |
+              set -euo pipefail                
+              
+              SETTINGS_REPO_DIR="$(Pipeline.Workspace)/settings_oss"
+              APP_NAME="$(APP_NAME)"
+              AGENT_TEMP_DIR="$(Agent.TempDirectory)/maven-settings"
+
+              SIGLA=$(echo "$(GOV_APP_ACRONYM)" | tr '[:lower:]' '[:upper:]')
+              
+              mkdir -p "$AGENT_TEMP_DIR"
+              
+              echo "##[debug] Application Name: $APP_NAME"
+              echo "##[debug] Project Acronym: $SIGLA"
+              echo "##[debug] Settings Repository: $SETTINGS_REPO_DIR"
+              
+              echo "##[group] Files in settings repository:"
+              tree -a "$SETTINGS_REPO_DIR" 2>/dev/null | grep -E "\.xml$" || echo "##[debug]   (no XML files found in root)"
+              echo "##[endgroup]"
+              
+              ## -> Custom Settings (Application-Specific)
+              echo "##[section]────────────────────────────────────────"
+              echo "##[section] Searching for Custom Settings"
+              echo "##[section]────────────────────────────────────────"
+              
+              CUSTOM_SETTINGS_FILE="custom/${APP_NAME}-Settings.xml"
+              CUSTOM_SETTINGS_PATH="$SETTINGS_REPO_DIR/$CUSTOM_SETTINGS_FILE"
+              
+              echo "##[debug] Expected filename: ${APP_NAME}-Settings.xml"
+              echo "##[debug] Expected path: $CUSTOM_SETTINGS_FILE"
+              echo "##[debug] looking for the custom settings"
+              if [ -f "$CUSTOM_SETTINGS_PATH" ]; then
+                echo "##[debug] CUSTOM SETTINGS FOUND!"
+                echo "##[debug] Source: custom-application"
+                echo "##[debug] File: $CUSTOM_SETTINGS_FILE"
+                echo "##[debug] Application: $APP_NAME"
+                
+                cp "$CUSTOM_SETTINGS_PATH" "$AGENT_TEMP_DIR/settings.xml"
+                
+                # -> Export variables
+                echo "##vso[task.setvariable variable=MAVEN_SETTINGS_LOCATION]$AGENT_TEMP_DIR/settings.xml"
+                echo "##vso[task.setvariable variable=MAVEN_SETTINGS_SOURCE]custom-application"
+                
+                echo "##[section]════════════════════════════════════════"
+                echo "##[section] Resolution Summary"
+                echo "##[section]════════════════════════════════════════"
+                echo "##[section] File: $CUSTOM_SETTINGS_FILE"
+                echo "##[section] Location: $AGENT_TEMP_DIR/settings.xml"
+                echo "##[section]════════════════════════════════════════"
+                
+                exit 0
+              fi
+              
+              echo "##[debug] Custom settings NOT found"
+              echo "##[debug] Will try project acronym settings..."
+            
+              ## -> Project Acronym Settings (Team-Specific)
+              echo "##[section]────────────────────────────────────────"
+              echo "##[section] Searching for Project Acronym Settings"
+              echo "##[section]────────────────────────────────────────"
+              
+              SIGLA_SETTINGS="$SETTINGS_REPO_DIR/${SIGLA}-Settings.xml"
+              
+              echo "##[debug] Expected filename: ${SIGLA}-Settings.xml"
+              echo "##[debug] Expected path: $SIGLA_SETTINGS"
+              
+              echo "##[debug] Project Acronym: $SIGLA"
+              
+              if [ -f "$SIGLA_SETTINGS" ]; then
+                echo "##[section]PROJECT ACRONYM SETTINGS FOUND!"
+                echo "##[debug] File: ${SIGLA}-Settings.xml"
+                
+                cp "$SIGLA_SETTINGS" "$AGENT_TEMP_DIR/settings.xml"
+                
+                ## -> Export variables
+                echo "##vso[task.setvariable variable=MAVEN_SETTINGS_LOCATION]$AGENT_TEMP_DIR/settings.xml"
+                echo "##vso[task.setvariable variable=MAVEN_SETTINGS_SOURCE]Project Acronym"
+                
+                echo "##[section]════════════════════════════════════════"
+                echo "##[section] Resolution Summary"
+                echo "##[section]════════════════════════════════════════"
+                echo "##[section] File: ${SIGLA}-Settings.xml"
+                echo "##[section] Location: $AGENT_TEMP_DIR/settings.xml"
+                echo "##[section]════════════════════════════════════════"
+                
+                exit 0
+              fi
+              
+              echo "Project Acronym settings NOT found"
+              echo "Will try default settings..."
+              echo ""
+              
+              ## -> Default Settings (OSS)
+              echo "##[section]────────────────────────────────────────"
+              echo "##[section] Searching for Default Settings"
+              echo "##[section]────────────────────────────────────────"
+              
+              DEFAULT_SETTINGS="$SETTINGS_REPO_DIR/Settings-Default.xml"
+              
+              echo "##[debug] Expected filename: Settings-Default.xml"
+              echo "##[debug] Expected path: $DEFAULT_SETTINGS"
+
+              echo "##[debug] File exists? $([ -f "$DEFAULT_SETTINGS" ] && echo 'YES' || echo 'NO')"
+              
+              if [ -f "$DEFAULT_SETTINGS" ]; then
+                echo "##[section] DEFAULT SETTINGS FOUND!"
+                echo "File: Settings-Default.xml"
+                
+                cp "$DEFAULT_SETTINGS" "$AGENT_TEMP_DIR/settings.xml"
+                
+                ## -> Export variables
+                echo "##vso[task.setvariable variable=MAVEN_SETTINGS_LOCATION]$AGENT_TEMP_DIR/settings.xml"
+                echo "##vso[task.setvariable variable=MAVEN_SETTINGS_SOURCE]oss-default"
+                
+                echo "##[section]════════════════════════════════════════"
+                echo "##[section] Resolution Summary"
+                echo "##[section]════════════════════════════════════════"
+                echo "##[section] File: Settings-Default.xml"
+                echo "##[section] Location: $AGENT_TEMP_DIR/settings.xml"
+                echo "##[section]════════════════════════════════════════"
+                
+                exit 0
+              fi
+              
+              ## -> NO SETTINGS FOUND - FAIL PIPELINE
+              echo ""
+              echo "##[error]════════════════════════════════════════"
+              echo "##[error]  NO MAVEN SETTINGS FOUND"
+              echo "##[error]════════════════════════════════════════"
+              echo "##[error]"
+              echo "##[error] Tried the following locations (in order):"
+              echo "##[error]   1. custom/${APP_NAME}-Settings.xml (application-specific)"
+              echo "##[error]   2. ${SIGLA}-Settings.xml (Project Acronym specific)"
+              echo "##[error]   3. Settings-Default.xml (OSS default)"
+              echo "##[error]"
+              echo "##[error] Repository: $SETTINGS_REPO_DIR"
+              echo "##[error]"
+              echo "##[error]────────────────────────────────────────"
+              echo "##[error] Available Files in Repository"
+              echo "##[error]────────────────────────────────────────"
+              
+              echo "##[error] Root directory:"
+              ls -lah "$SETTINGS_REPO_DIR" 2>/dev/null | grep -E "\.xml$" || echo "##[error]   (no XML files found)"
+              echo "##[error]"
+              
+              if [ -d "$SETTINGS_REPO_DIR/custom" ]; then
+                echo "##[error] Custom directory:"
+                ls -lah "$SETTINGS_REPO_DIR/custom" 2>/dev/null | grep -E "\.xml$" || echo "##[error]   (no XML files found)"
+              else
+                echo "##[error] Custom directory: DOES NOT EXIST"
+              fi
+              
+              exit 1
+
+        ## -> Replace variables in settings.xml
+        - task: qetza.replacetokens.replacetokens-task.replacetokens@5
+          displayName: 'Configure Maven Settings'
+          condition: succeeded()
+          continueOnError: false
+          inputs:
+            targetFiles: $(MAVEN_SETTINGS_LOCATION)
+            tokenPattern: 'azpipelines'
+            enableTelemetry: false
+          env:
+            NEXUS_DEPS_USR: $(NEXUS_DEPS_USR)
+            NEXUS_DEPS_PSW: $(NEXUS_DEPS_PSW)
+            SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+        
+        - task: Bash@3
+          displayName: 'Validate Maven Settings (Post-Tokens)'
+          condition: succeeded()
+          inputs:
+            targetType: 'inline'
+            script: |
+              set -euo pipefail
+              
+              SETTINGS_FILE="$(MAVEN_SETTINGS_LOCATION)"  
+              SETTINGS_SOURCE="$(MAVEN_SETTINGS_SOURCE)"  
+              
+              echo ""
+              echo "Settings Source: $SETTINGS_SOURCE"
+              echo "Settings Location: $SETTINGS_FILE"
+              echo ""
+              
+              if [ ! -f "$SETTINGS_FILE" ]; then
+                echo "##[error] Settings file not found: $SETTINGS_FILE"
+                exit 1
+              fi
+              
+              echo "##[debug] Checking for unreplaced tokens..."
+              
+              if grep -q '#{.*}#' "$SETTINGS_FILE"; then
+                echo "##[error] Found unreplaced tokens in settings.xml:"
+                grep -o '#{[^}]*}#' "$SETTINGS_FILE" | sort | uniq
+                echo ""
+                echo "##[error] Possible causes:"
+                echo "##[error]   - Variable not defined in 'env:' section of replacetokens task"
+                echo "##[error]   - Variable not propagated from Library Group"
+                exit 1
+              fi
+              
+              echo "##[debug] ✓ All tokens successfully replaced"
+              
+              # Settings.xml preview
+              echo ""
+              echo "##[section] Settings.xml Preview (first 30 lines, passwords masked):"
+              echo "##[section]────────────────────────────────────────"
+              
+              head -n 30 "$SETTINGS_FILE" | \
+                sed 's/<password>.*<\/password>/<password>***MASKED***<\/password>/g' | \
+                sed 's/<username>\(.*\)<\/username>/<username>***MASKED***<\/username>/g'
+              
+              echo ""
+
+        ########################################
+        ########################################
+        ########################################
+
+        - checkout: OSSDevOpsHosts
+          displayName: Checkout Hosts OSS
+          name: checkout_hosts_oss
+          path: hosts_oss
+
+        ## -> Generate HOSTS
+        - task: Bash@3
+          displayName: Generate HOSTS
+          name: generate_hosts
+          condition: succeeded()
+          continueOnError: false
+          inputs:
+            targetType: inline
+            script: |
+
+              #Generate HOSTS
+              echo "##[debug] Generate HOSTS $(environment)"
+              
+              addHostsArgs=""
+              
+              pwd
+              find $(Pipeline.Workspace) -maxdepth 3
+              
+              dos2unix $(Pipeline.Workspace)/hosts_oss/${{ parameters.environment }}/hosts
+              while IFS= read -r line || [[ -n "$line" ]]; do
+                if [[ $line != \#* ]]; then
+                  IP=$(echo $line | awk '{print $1}')
+                  HOST=$(echo $line | awk '{print $2}')
+                  echo $HOST":"$IP
+                  addHostsArgs+="--add-host=$HOST:$IP "
+                fi
+              done < $(Pipeline.Workspace)/hosts_oss/${{ parameters.environment }}/hosts
+              
+              addHostsArgs=$(echo $addHostsArgs | sed 's/ *$//')
+              echo "##vso[task.setvariable variable=ADD_HOST_ARGS;isOutput=true]$addHostsArgs"
+
+        ## -> Build Version (Main Docker Build)
+        - task: Bash@3
+          displayName: Build Version
+          name: build_version
+          condition: and(succeeded(), ne(variables['isSkipBuild'], 'true'))
+          continueOnError: false
+          env:
+            NEXUS_DEPS_USR_VAL: $(NEXUS-DEPS-USR)
+            NEXUS_DEPS_PSW_VAL: $(NEXUS-DEPS-PSW)
+            SYSTEM_ACCESSTOKEN: $(System.AccessToken)          
+          inputs:
+            targetType: inline
+            workingDirectory: $(Pipeline.Workspace)/source_code
+            script: |
+              echo "##[debug] Environment: ${{ parameters.environment }}"
+              BUILDER_IMAGE_NAME="builder/$(Build.BuildId)"
+              
+              ## -> Grant execute permissions (Safe Mode)
+              for FILE in *.sh; do
+                if [ -f "$FILE" ]; then
+                   chmod +x "$FILE"
+                fi
+              done
+
+              docker build --no-cache \
+                --build-arg USER_ID=$(DOCKER_CMD_USERNAME) \
+                --build-arg GROUP_ID=$(DOCKER_CMD_GROUP) \
+                -t $BUILDER_IMAGE_NAME -f .azuredevops/builder.Dockerfile .
+
+                run_docker() {
+                  docker run --rm \
+                    --user="$(DOCKER_CMD_USERNAME):$(DOCKER_CMD_GROUP)" \
+                    --network host \
+                    --log-driver none \
+                    -e JAVA_OPTS_MEMORY_MAX="$(DEFAULT_MAX_MEMORY_BUILD)" \
+                    -e TZ="America/Sao_Paulo" \
+                    -e SYSTEM_ACCESSTOKEN="$(System.AccessToken)" \
+                    -e NEXUS_DEPS_USR="$NEXUS_DEPS_USR_VAL" \
+                    -e NEXUS_DEPS_PSW="$NEXUS_DEPS_PSW_VAL" \
+                    $(generate_hosts.ADD_HOST_ARGS) \
+                    -v $(pwd):/app \
+                    -v $HOME/.m2:/.m2 \
+                    -v $(MAVEN_SETTINGS_LOCATION):/.m2/settings.xml \
+                    -w $(DOCKER_WORKDIR) \
+                    "$BUILDER_IMAGE_NAME" sh -c "$1"
+                }
+
+              ## -> Main Build Command
+              run_docker "$(JAVA_CMD_BUILD) $(JAVA_CMD_BUILD_TEST) $(JAVA_CMD_OPTIONAL) -Dmaven.test.failure.ignore=false -s /.m2/settings.xml -Dmaven.repo.local=/.m2/repository -DNEXUS_DEPS_USR=$NEXUS_DEPS_USR_VAL -DNEXUS_DEPS_PSW=$NEXUS_DEPS_PSW_VAL"

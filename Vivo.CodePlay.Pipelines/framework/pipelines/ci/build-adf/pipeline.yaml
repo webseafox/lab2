@@ -1,0 +1,195 @@
+# ==================================================================
+# Pipeline: Build Azure Data Factory - CI/CD para Projetos ADF
+# -----------------------------------------------------
+# Pipeline para validação, versionamento e preparação de projetos Azure Data Factory
+# incluindo validação de código, controle de versão via Git tags e preparação
+# para deployment em múltiplos ambientes através do pipeline de CD
+# ==================================================================
+
+# Dependencies:
+# - Azure Data Factory project no repositório
+# - Estrutura de pastas padrão do ADF (/adf ou /datafactory)
+# - Service Connection para Azure configurada
+# - Extensão "Deploy Azure Data Factory" instalada no Azure DevOps
+
+parameters:
+  # ==================================================================
+  # Infraestrutura e Ambiente
+  # ==================================================================
+  - name: agentPool
+    type: string
+    default: GeneralPurposeLinuxAgentsCI
+    displayName: 'Agent Pool para execução'
+
+  # ==================================================================
+  # Configurações do Projeto ADF
+  # ==================================================================
+  - name: workingDirectory
+    type: string
+    default: $(Build.SourcesDirectory)
+    displayName: 'Diretório do projeto ADF'
+
+  - name: adfSourcePath
+    type: string
+    default: ''
+    displayName: 'Caminho da pasta do ADF no repositório'
+
+  # ==================================================================
+  # Configurações de Versionamento e Controle de Fluxo
+  # ==================================================================
+  - name: versionFile
+    type: string
+    default: 'version.txt'
+    displayName: 'Arquivo onde será salva a versão'
+
+  - name: branchingStrategy
+    type: string
+    default: 'trunkbased'
+    displayName: 'Estratégia de versionamento'
+    values:
+      - 'trunkbased'
+      - 'vivoflow'
+      - 'releaseflow'
+      - 'gitlabflow'
+      - 'gitlabflow-semantic'
+      - 'custom'
+      - 'monorepo'
+
+  - name: prValidationOnly
+    type: boolean
+    default: false
+    displayName: 'Executa apenas a validação, não publica nem gera versão'
+
+# ==================================================================
+# Variáveis Internas do Pipeline
+# ==================================================================
+variables:
+  - name: SIGLA
+    value: $[ lower(split(variables['System.TeamProject'],' ')[0]) ]
+  - name: ADF_FULL_PATH
+    value: ${{ parameters.workingDirectory }}/${{ parameters.adfSourcePath }}
+
+# ==================================================================
+# Estágios do Pipeline
+# ==================================================================
+stages:
+  # Stage 1: ADFBuild - Validação e preparação do projeto ADF
+  - stage: ADFBuild
+    displayName: 'ADF Build & Validation'
+    condition: succeeded()
+    jobs:
+    - job: BuildAndValidate
+      displayName: 'Build and Validate ADF'
+      pool: ${{ parameters.agentPool }}
+      steps:
+        # ==================================================================
+        # Configuração inicial do ambiente
+        # ==================================================================
+        - checkout: self
+          clean: true
+
+        # ==================================================================
+        # Observabilidade e debug (condicional)
+        # ==================================================================
+        - task: VivoUtilsFromVivo@1
+          displayName: 'Show Pipeline Parameters'
+          condition: eq(variables['System.Debug'], 'true')
+          inputs:
+            command: 'show-pipeline-parameters'
+            parameters: '${{ convertToJson(parameters) }}'
+
+        # ==================================================================
+        # Configuração de tags do build
+        # ==================================================================
+        - script: |
+            echo "##vso[build.addbuildtag]adf"
+            echo "##vso[build.addbuildtag]azure-data-factory"
+            echo "##vso[build.addbuildtag]build-adf"
+
+
+            echo '${{ parameters.workingDirectory }}/${{ parameters.versionFile }}'
+          displayName: 'Set Build Tags'
+
+        # ==================================================================
+        # [Versionamento] Definição da versão (VersionManager)
+        # ==================================================================
+        - task: VersionManagerVivo@8
+          displayName: 'Get Next Version'
+          inputs:
+            command: 'nextVersion'
+            branchingStrategy: ${{ parameters.branchingStrategy }}
+            versionFile: '${{ parameters.workingDirectory }}/${{ parameters.versionFile }}'
+            bumpMethod: 'patch'
+            passthroughVersion: ${{ parameters.prValidationOnly }}
+          name: VersionManagerVivo
+
+        # ==================================================================
+        # Validação estrutural - Verificação da estrutura do projeto ADF
+        # ==================================================================
+        - script: |
+            echo "##[section]Validando estrutura do projeto ADF..."
+            ADF_PATH="${{ parameters.workingDirectory }}/${{ parameters.adfSourcePath }}"
+            
+            if [ ! -d "$ADF_PATH" ]; then
+              echo "##[error]Diretório ADF não encontrado: $ADF_PATH"
+              exit 1
+            fi
+            
+            # Verificar se existe pelo menos um dos arquivos essenciais do ADF
+            if [ ! -f "$ADF_PATH/ARMTemplateForFactory.json" ] && [ ! -d "$ADF_PATH/pipeline" ] && [ ! -d "$ADF_PATH/dataset" ]; then
+              echo "##[warning]Estrutura ADF não detectada. Verificando arquivos..."
+              ls -la "$ADF_PATH"
+            fi
+            
+            echo "##[section]Estrutura do projeto ADF:"
+            find "$ADF_PATH" -type f -name "*.json" | head -20
+            echo "✅ Validação estrutural concluída"
+          displayName: 'Validate ADF Project Structure'
+
+        # ==================================================================
+        # Validação do código ADF usando extensão Azure-Player
+        # ==================================================================
+        - powershell: |
+            Test-AdfCode -RootFolder "${{ parameters.workingDirectory }}/${{ parameters.adfSourcePath }}"
+          displayName: 'Validate ADF Code'
+
+  # Stage 2: VersionCommit - Commit da versão no repositório e tagging
+  - ${{ if eq(parameters.prValidationOnly, false) }}:
+    - stage: VersionCommit
+      displayName: 'Commit Version'
+      dependsOn:
+        - ADFBuild
+      condition: succeeded()
+      jobs:
+        - job: CommitVersion
+          displayName: 'Commit Release Version'
+          pool: ${{ parameters.agentPool }}
+          steps:
+            # ==================================================================
+            # Checkout para Commit da Versão
+            # ==================================================================
+            - checkout: self
+              clean: true
+              persistCredentials: true
+              fetchDepth: 0
+
+            # ==================================================================
+            # [Versionamento] Reafirma versão e realiza commit/tag
+            # ==================================================================
+            - task: VersionManagerVivo@8
+              displayName: 'Get Next Version'
+              inputs:
+                command: 'nextVersion'
+                branchingStrategy: ${{ parameters.branchingStrategy }}
+                versionFile: '${{ parameters.workingDirectory }}/${{ parameters.versionFile }}'
+                bumpMethod: 'patch'
+              name: VersionManagerVivo
+
+            - task: VersionManagerVivo@8
+              displayName: 'Commit and Tag Version'
+              inputs:
+                command: 'commitVersion'
+                version: '$(VersionManagerVivo.VERSION)'
+                versionFile: '${{ parameters.workingDirectory }}/${{ parameters.versionFile }}'
+                createTag: true
+                pushChanges: true

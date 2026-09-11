@@ -1,0 +1,353 @@
+parameters:
+  - name: BUNDLE_NAME
+    type: string
+  - name: MANUAL_BUNDLE_VERSION
+    type: string
+  - name: AZURE_BLOB_CONTAINER_URL
+    type: string
+  - name: ROUTE_ORCHESTRATOR_URL
+    type: string
+  - name: skipReleaseCreation
+    type: boolean
+  - name: skipReleaseUpdate
+    type: boolean
+  - name: RELEASE_ENABLED_FLAG
+    type: boolean
+  - name: RELEASE_PREFETCH_FLAG
+    type: boolean
+  - name: qa_environment
+    type: string
+  - name: FEDERATED_MODULE_NAME
+    type: string
+
+stages:
+  - stage: RegisterRelease
+    displayName: Register Release
+    pool:
+      name: GeneralPurposeLinuxAgentsCI
+    dependsOn:
+      - PublishRelease
+      - KeycloakAuth
+      - ci_build
+      - cd_environment_checklist
+    condition: succeeded()
+
+    variables:
+      - name: BUNDLE_VERSION
+        ${{ if ne(parameters.MANUAL_BUNDLE_VERSION, '') }}:
+          value: ${{ trim(parameters.MANUAL_BUNDLE_VERSION) }}
+        ${{ else }}:
+          value: $[ stageDependencies.ci_build.build.outputs['new_version.NEW_VERSION'] ]
+
+      - name: KEYCLOAK_TOKEN
+        value: $[ stageDependencies.KeycloakAuth.GetKeycloakToken.outputs['CallKeycloakApi.KEYCLOAK_TOKEN'] ]
+      - name: BUNDLE_SIZE_OUTPUT
+        value: $[ stageDependencies.ci_build.build.outputs['collect_metadata.BUNDLE_SIZE_OUTPUT'] ]
+      - name: DEPENDENCIES_OUTPUT
+        value: $[ stageDependencies.ci_build.build.outputs['collect_metadata.DEPENDENCIES_OUTPUT'] ]
+      - name: IS_ROLLBACK
+        value: $[ stageDependencies.cd_environment_checklist.environment_checklist.outputs['compare_versions.IS_ROLLBACK'] ]
+      - name: ENABLED_VERSION
+        value: $[ stageDependencies.cd_environment_checklist.environment_checklist.outputs['compare_versions.ENABLED_VERSION'] ]
+
+    jobs:
+      - job: waitForValidation
+        displayName: Validação de rollback
+        pool: server
+        timeoutInMinutes: 4320 # 3 days
+        steps:
+          - task: ManualValidation@0
+            displayName: Aprovação de rollback
+            timeoutInMinutes: 1440 # 1 day
+            # Wait for approval if there is a rollback attempt in production environment
+            condition: and(succeeded(), eq(variables.IS_ROLLBACK, 'true'), eq('${{ parameters.qa_environment }}', 'prod'))
+            inputs:
+              notifyUsers: |
+                meuvivoecare.br@telefonica.com
+                ert-digital.br@telefonica.com
+                raphaels.silva@telefonica.com
+                rafaelc.gomes@telefonica.com
+                victor.pinheiro@telefonica.com
+                junior.francisco@telefonica.com
+              instructions: |
+                Foi identificado uma tentativa de ROLLBACK na execução da pipeline.
+
+                Um relatório HTML com informações sobre a execução foi gerado na aba "HTML Viewer".
+
+                Variáveis:
+                Ambiente (qa_environment): ${{ parameters.qa_environment }}
+                Rollback (IS_ROLLBACK): $(IS_ROLLBACK)
+                Versão do bundle desejado (MANUAL_BUNDLE_VERSION): ${{ parameters.MANUAL_BUNDLE_VERSION }}
+                Versão do bundle habilitado (ENABLED_VERSION): $(ENABLED_VERSION)
+
+                Tem certeza de que quer fazer isso?
+              onTimeout: "reject"
+
+      - job: register_federated_components
+        displayName: Register Federated Component
+        dependsOn:
+          - waitForValidation
+        condition: succeeded()
+        steps:
+          - checkout: self
+            displayName: Checkout Source Code
+            name: checkout_source_code
+            fetchTags: false
+            clean: true
+
+          - task: DownloadBuildArtifacts@1
+            displayName: "Download Bundle Artifact"
+            condition: succeeded()
+            inputs:
+              artifactName: ${{parameters.BUNDLE_NAME}}-$(BUNDLE_VERSION)
+              cleanDestinationFolder: false
+              parallelizationLimit: 8
+              downloadPath: $(Build.SourcesDirectory)
+
+          - task: Bash@3
+            displayName: "Normalize Module Name"
+            condition: succeeded()
+            inputs:
+              targetType: inline
+              script: |
+                # Normalize once — blob path and Route Orchestrator public_path must be consistent (both lowercase)
+                MODULE_NAME_ORIGINAL="${{parameters.FEDERATED_MODULE_NAME}}"
+                if [ -z "$MODULE_NAME_ORIGINAL" ]; then
+                  echo "##[error]FEDERATED_MODULE_NAME é obrigatório."
+                  exit 1
+                fi
+
+                MODULE_NAME_LOWER=$(echo "${{parameters.FEDERATED_MODULE_NAME}}" | tr '[:upper:]' '[:lower:]')
+                if [ "$MODULE_NAME_ORIGINAL" != "$MODULE_NAME_LOWER" ]; then
+                  echo "##[warning]FEDERATED_MODULE_NAME received as '$MODULE_NAME_ORIGINAL'. Normalizing to '$MODULE_NAME_LOWER'."
+                fi
+
+                echo "##[debug] FEDERATED_MODULE_NAME (original): '${{parameters.FEDERATED_MODULE_NAME}}'"
+                echo "##[debug] FEDERATED_MODULE_NAME (normalized): '$MODULE_NAME_LOWER'"
+                echo "##vso[task.setvariable variable=FEDERATED_MODULE_NAME_LOWER]$MODULE_NAME_LOWER"
+
+          - task: Bash@3
+            displayName: "Prepare Federated Env File"
+            condition: and(succeeded(), eq('${{ parameters.skipReleaseCreation }}', false))
+            inputs:
+              targetType: inline
+              script: |
+                ENVIRONMENT="${{parameters.qa_environment}}"
+                SOURCE_FILE="$(Build.SourcesDirectory)/src/modules/$(FEDERATED_MODULE_NAME_LOWER)/envs/.env.${ENVIRONMENT}"
+                ALT_SOURCE_FILE="$(Build.SourcesDirectory)/modules/$(FEDERATED_MODULE_NAME_LOWER)/envs/.env.${ENVIRONMENT}"
+                TARGET_DIR="$(Build.SourcesDirectory)/envs"
+                TARGET_FILE="$TARGET_DIR/.env.${ENVIRONMENT}"
+
+                echo "##[section]Preparing federated env file..."
+                echo "##[group]Env file paths"
+                echo "##[debug] Primary source file: '$SOURCE_FILE'"
+                echo "##[debug] Fallback source file: '$ALT_SOURCE_FILE'"
+                echo "##[debug] Target file: '$TARGET_FILE'"
+                echo "##[endgroup]"
+
+                if [ ! -f "$SOURCE_FILE" ]; then
+                  if [ -f "$ALT_SOURCE_FILE" ]; then
+                    SOURCE_FILE="$ALT_SOURCE_FILE"
+                  else
+                    echo "##[error]Federated env file not found. Checked '$SOURCE_FILE' and '$ALT_SOURCE_FILE'."
+                    exit 1
+                  fi
+                fi
+
+                mkdir -p "$TARGET_DIR"
+                cp "$SOURCE_FILE" "$TARGET_FILE"
+                echo "##[section]Federated env file prepared successfully."
+
+          - task: Bash@3
+            displayName: "Validate Federated Module"
+            condition: and(succeeded(), eq('${{ parameters.skipReleaseCreation }}', false))
+            env:
+              MODULE_NAME: ${{parameters.FEDERATED_MODULE_NAME}}
+              BUNDLE_DIR: $(Build.SourcesDirectory)/${{parameters.BUNDLE_NAME}}-$(BUNDLE_VERSION)
+            inputs:
+              targetType: inline
+              script: |
+                echo "##[section]Starting federated module validation..."
+                echo "##[group]Validation inputs"
+                echo "##[debug] MODULE_NAME (original): '$MODULE_NAME'"
+                echo "##[debug] BUNDLE_DIR: '$BUNDLE_DIR'"
+                echo "##[endgroup]"
+
+                if [ -z "$MODULE_NAME" ]; then
+                  echo "##[error]FEDERATED_MODULE_NAME é obrigatório."
+                  exit 1
+                fi
+
+                # Normalize to lowercase — Linux filesystem is case-sensitive for directory names
+                MODULE_NAME_LOWER=$(echo "$MODULE_NAME" | tr '[:upper:]' '[:lower:]')
+                echo "##[debug] MODULE_NAME (normalized): '$MODULE_NAME_LOWER'"
+
+                # RemoteEntry filename may include a timestamp (e.g. button-1747334400000-RemoteEntry.js)
+                # Use glob to find any *RemoteEntry*.js instead of hardcoded name
+                REMOTE_ENTRY=$(find "$BUNDLE_DIR/$MODULE_NAME_LOWER" -maxdepth 1 -name "*RemoteEntry*.js" | head -1)
+                echo "##[debug] Found RemoteEntry path: '$REMOTE_ENTRY'"
+
+                if [ -z "$REMOTE_ENTRY" ] || [ ! -f "$REMOTE_ENTRY" ]; then
+                  echo "##[error]No *RemoteEntry*.js found for module '$MODULE_NAME_LOWER' in '$BUNDLE_DIR/$MODULE_NAME_LOWER'."
+                  exit 1
+                fi
+
+                echo "##[section]Federated module '$MODULE_NAME_LOWER' validated successfully."
+
+          - task: Bash@3
+            displayName: "Set Metadata Variables"
+            condition: and(succeeded(), eq('${{ parameters.skipReleaseCreation }}', false))
+            continueOnError: true
+            inputs:
+              targetType: inline
+              script: |
+                echo "##[debug] BUNDLE_SIZE_OUTPUT: $(BUNDLE_SIZE_OUTPUT)"
+                echo "##[debug] DEPENDENCIES_OUTPUT: $(DEPENDENCIES_OUTPUT)"
+
+                if [ -z "$(BUNDLE_SIZE_OUTPUT)" ]; then
+                  echo "##[debug] BUNDLE_SIZE_OUTPUT is empty, reading from file."
+                  BUNDLE_SIZE_FILE="$(Build.SourcesDirectory)/${{parameters.BUNDLE_NAME}}-$(BUNDLE_VERSION)/metadata/bundle_size.txt"
+                  if [ -f "$BUNDLE_SIZE_FILE" ]; then
+                    BUNDLE_SIZE_VALUE=$(cat "$BUNDLE_SIZE_FILE" | tr -d '[:space:]')
+                    echo "##[debug] Read BUNDLE_SIZE_VALUE: $BUNDLE_SIZE_VALUE"
+                    BUNDLE_SIZE_OUTPUT=$BUNDLE_SIZE_VALUE
+                  else
+                    echo "##[error] Bundle size file not found at $BUNDLE_SIZE_FILE"
+                  fi
+                fi
+
+                if [ -z "$(DEPENDENCIES_OUTPUT)" ]; then
+                  echo "##[debug] DEPENDENCIES_OUTPUT is empty, reading from file."
+                  DEPENDENCIES_FILE="$(Build.SourcesDirectory)/${{parameters.BUNDLE_NAME}}-$(BUNDLE_VERSION)/metadata/dependencies.json"
+                  if [ -f "$DEPENDENCIES_FILE" ]; then
+                    DEPENDENCIES_VALUE=$(cat "$DEPENDENCIES_FILE" | tr -d '[:space:]')
+                    echo "##[debug] Read DEPENDENCIES_VALUE: $DEPENDENCIES_VALUE"
+                    DEPENDENCIES_OUTPUT=$DEPENDENCIES_VALUE
+                  else
+                    echo "##[error] Dependencies file not found at $DEPENDENCIES_FILE"
+                  fi
+                fi
+
+                echo "##vso[task.setvariable variable=BUNDLE_SIZE]$BUNDLE_SIZE_OUTPUT"
+                echo "##vso[task.setvariable variable=DEPENDENCIES]$DEPENDENCIES_OUTPUT"
+
+          - task: framework-brasil-archetype-vivo-spa-front-create-module@0
+            displayName: "Create Module - ${{parameters.FEDERATED_MODULE_NAME}}"
+            name: create_module
+            inputs:
+              AZURE_BLOB_CONTAINER_URL: ${{parameters.AZURE_BLOB_CONTAINER_URL}}
+              BUNDLE_NAME: $(FEDERATED_MODULE_NAME_LOWER)
+              KEYCLOAK_JWT: $(KEYCLOAK_TOKEN)
+              ROUTE_ORCHESTRATOR_URL: ${{parameters.ROUTE_ORCHESTRATOR_URL}}
+              IS_FEDERATED_COMPONENT: true
+
+          # Prepare and upload always run — needed even when skipReleaseCreation=true (re-upload or enable only)
+          - task: Bash@3
+            displayName: "Prepare Federated Module Directory"
+            condition: succeeded()
+            env:
+              BUNDLE_VERSION: $(BUNDLE_VERSION)
+            inputs:
+              targetType: inline
+              script: |
+                # The create-release task looks for BUILD_SOURCESDIRECTORY/BUNDLE_NAME-BUNDLE_VERSION
+                # For federated components, files live inside the parent bundle at /parent-VERSION/module/
+                # Copy the sub-module directory to the expected path so the task resolves it correctly
+                SOURCE_DIR="$(Build.SourcesDirectory)/${{parameters.BUNDLE_NAME}}-${BUNDLE_VERSION}/$(FEDERATED_MODULE_NAME_LOWER)"
+                TARGET_DIR="$(Build.SourcesDirectory)/$(FEDERATED_MODULE_NAME_LOWER)-${BUNDLE_VERSION}"
+
+                echo "##[section]Preparing federated module directory..."
+                echo "##[group]Directory details"
+                echo "##[debug] Source (sub-module dir): '$SOURCE_DIR'"
+                echo "##[debug] Target (expected by task): '$TARGET_DIR'"
+                echo "##[endgroup]"
+
+                if [ ! -d "$SOURCE_DIR" ]; then
+                  echo "##[error]Sub-module directory not found: '$SOURCE_DIR'"
+                  exit 1
+                fi
+
+                echo "##[debug] Source directory contents:"
+                ls -la "$SOURCE_DIR"
+
+                mkdir -p "$TARGET_DIR"
+                cp -r "${SOURCE_DIR}/." "${TARGET_DIR}/"
+                echo "##[section]Directory copied successfully."
+
+                echo "##[debug] Target directory contents:"
+                ls -la "$TARGET_DIR"
+
+                # create-release detects scope from *RemoteEntry*.js filename prefix.
+                # Federated components may generate RemoteEntry with a timestamp (e.g. button-1747334400000-RemoteEntry.js).
+                # webpack federation name is lowercase (matches moduleName): button -> window["button"].
+                # Find any *RemoteEntry*.js dynamically, then copy to {scope}RemoteEntry.js so create-release
+                # extracts scope = lowercase module name consistently, regardless of timestamp in original filename.
+                LOWER_NAME="$(FEDERATED_MODULE_NAME_LOWER)"
+                MODULE_SCOPE="${LOWER_NAME}"
+                REMOTE_ENTRY_DST="$TARGET_DIR/${MODULE_SCOPE}RemoteEntry.js"
+                # Exclude the destination itself to avoid self-copy if it already exists
+                REMOTE_ENTRY_SRC=$(find "$TARGET_DIR" -maxdepth 1 -name "*RemoteEntry*.js" ! -name "${MODULE_SCOPE}RemoteEntry.js" | head -1)
+                echo "##[debug] Module scope (lowercase): '$MODULE_SCOPE'"
+                echo "##[debug] Found source RemoteEntry: '$REMOTE_ENTRY_SRC'"
+                if [ -n "$REMOTE_ENTRY_SRC" ] && [ -f "$REMOTE_ENTRY_SRC" ]; then
+                  cp "$REMOTE_ENTRY_SRC" "$REMOTE_ENTRY_DST"
+                  echo "##[debug] Created scoped RemoteEntry: '${MODULE_SCOPE}RemoteEntry.js'"
+                else
+                  echo "##[warning]No *RemoteEntry*.js found in '$TARGET_DIR'. Scope auto-detection by create-release will fail."
+                fi
+
+          - task: Bash@3
+            displayName: "Upload Federated Module to Blob Storage"
+            condition: succeeded()
+            inputs:
+              targetType: inline
+              script: |
+                TARGET_DIR="$(Build.SourcesDirectory)/$(FEDERATED_MODULE_NAME_LOWER)-$(BUNDLE_VERSION)"
+                DEST="$(AZURE_STORAGE_CONTAINER_NAME)/$(AZURE_STORAGE_CONTAINER_PREFIX_PATH)/$(FEDERATED_MODULE_NAME_LOWER)/$(BUNDLE_VERSION)"
+
+                echo "##[section]Uploading federated module files to blob storage..."
+                echo "##[debug] Source: '$TARGET_DIR'"
+                echo "##[debug] Destination: '$DEST'"
+
+                az storage blob upload-batch \
+                  --verbose \
+                  --account-name $(AZURE_STORAGE_ACCOUNT_NAME) \
+                  --account-key $(AZURE_STORAGE_ACCOUNT_KEY) \
+                  --overwrite \
+                  -d "$DEST" \
+                  -s "$TARGET_DIR"
+
+                echo "##[section]Blob upload completed."
+
+          - ${{if eq(parameters.skipReleaseCreation, false) }}:
+            - task: framework-brasil-archetype-vivo-spa-front-create-release@0
+              condition: and(succeeded(), eq('${{ parameters.skipReleaseCreation }}', false))
+              displayName: "Create Release - ${{parameters.FEDERATED_MODULE_NAME}}"
+              name: create_release
+              inputs:
+                AZURE_BLOB_CONTAINER_URL: ${{parameters.AZURE_BLOB_CONTAINER_URL}}
+                BUILD_SOURCESDIRECTORY: $(Build.SourcesDirectory)
+                BUNDLE_NAME: $(FEDERATED_MODULE_NAME_LOWER)
+                BUNDLE_VERSION: $(BUNDLE_VERSION)
+                BUNDLE_SIZE: $(BUNDLE_SIZE)
+                ENVIRONMENT: ${{parameters.qa_environment}}
+                GIT_PROJECT_DIR: /
+                KEYCLOAK_JWT: $(KEYCLOAK_TOKEN)
+                ROUTE_ORCHESTRATOR_URL: ${{parameters.ROUTE_ORCHESTRATOR_URL}}
+                DEPENDENCIES: $(DEPENDENCIES)
+                IS_FEDERATED_COMPONENT: true
+
+          - task: framework-brasil-archetype-vivo-spa-front-update-release@0
+            condition: and(succeeded(), eq('${{ parameters.skipReleaseUpdate }}', false))
+            displayName: "Enable Release - ${{parameters.FEDERATED_MODULE_NAME}}"
+            inputs:
+              BUILD_SOURCESDIRECTORY: $(Build.SourcesDirectory)
+              BUNDLE_NAME: $(FEDERATED_MODULE_NAME_LOWER)
+              BUNDLE_VERSION: $(BUNDLE_VERSION)
+              ENVIRONMENT: ${{parameters.qa_environment}}
+              GIT_PROJECT_DIR: /
+              KEYCLOAK_JWT: $(KEYCLOAK_TOKEN)
+              ROUTE_ORCHESTRATOR_URL: ${{parameters.ROUTE_ORCHESTRATOR_URL}}
+              ENABLED: ${{parameters.RELEASE_ENABLED_FLAG}}
+              PREFETCH: ${{parameters.RELEASE_PREFETCH_FLAG}}
+              IS_FEDERATED_COMPONENT: true

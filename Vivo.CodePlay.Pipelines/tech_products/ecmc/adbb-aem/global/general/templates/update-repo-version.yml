@@ -1,0 +1,477 @@
+# ===============================================================
+# Template: Atualizar Versão de Repositório AEM
+# ===============================================================
+# Atualiza versões nos pom.xml utilizando Maven Versions Plugin
+# e realiza push para Azure DevOps e Adobe Cloud Manager.
+# ===============================================================
+
+parameters:
+  - name: repoName
+    type: string
+
+  - name: repoResource
+    type: string
+
+  - name: version
+    type: string
+
+  - name: branch
+    type: string
+
+  - name: baseBranch
+    type: string
+    default: 'master'
+
+  - name: dryRun
+    type: boolean
+    default: false
+
+  - name: adobePath
+    type: string
+
+  - name: commitMessagePrefix
+    type: string
+    default: 'DevOps: atualiza versão para'
+
+
+jobs:
+  - job: Update_${{ replace(parameters.repoName, '-', '_') }}
+    displayName: 'Atualizar ${{ parameters.repoName }}'
+
+    variables:
+      REPO_NAME: ${{ parameters.repoName }}
+      TARGET_BRANCH: ${{ parameters.branch }}
+      BASE_BRANCH: ${{ parameters.baseBranch }}
+      VERSION: ${{ parameters.version }}
+
+    steps:
+
+      # ========================================
+      # Checkout do repositório
+      # ========================================
+      - checkout: ${{ parameters.repoResource }}
+        persistCredentials: true
+        clean: true
+        fetchDepth: 0
+        path: s/$(REPO_NAME)
+
+
+      # ========================================
+      # Criar/Atualizar branch a partir da base
+      # ========================================
+      - bash: |
+          set -euo pipefail
+
+          echo "=========================================="
+          echo "REPOSITÓRIO: $(REPO_NAME)"
+          echo "=========================================="
+          echo "Branch base: $(BASE_BRANCH)"
+          echo "Branch destino: $(TARGET_BRANCH)"
+          echo ""
+
+          git fetch origin --prune
+
+          # Verifica se a branch base existe
+          if ! git ls-remote --exit-code --heads origin "$(BASE_BRANCH)" >/dev/null 2>&1; then
+            echo "##vso[task.logissue type=error]A branch base $(BASE_BRANCH) não existe no repositório."
+            exit 1
+          fi
+
+          echo "[section]✓ Branch base $(BASE_BRANCH) encontrada"
+          echo ""
+
+          # Alinha a branch base local com o remoto
+          echo "Criando branch local a partir de origin/$(BASE_BRANCH)..."
+          git checkout -B "$(BASE_BRANCH)" "origin/$(BASE_BRANCH)"
+
+          # Cria/recria a branch destino a partir da base
+          echo "Criando/recriando branch $(TARGET_BRANCH) a partir de $(BASE_BRANCH)..."
+          git checkout -B "$(TARGET_BRANCH)"
+
+          echo ""
+          echo "[section]✓ Branch $(TARGET_BRANCH) criada localmente a partir de $(BASE_BRANCH)"
+          echo "[section]✓ Trabalhando na branch: $(TARGET_BRANCH)"
+
+          echo "##vso[task.setvariable variable=WORKING_BRANCH]$(TARGET_BRANCH)"
+        displayName: 'Criar Branch a partir da Base'
+        workingDirectory: $(Pipeline.Workspace)/s/$(REPO_NAME)
+
+
+      # ========================================
+      # Atualizar versões nos pom.xml
+      # ========================================
+      - bash: |
+          set -euo pipefail
+
+          echo "=========================================="
+          echo "ATUALIZAÇÃO DE VERSÕES"
+          echo "=========================================="
+          echo "Versão recebida: $(VERSION)"
+          echo "Diretório: $(pwd)"
+          echo ""
+
+          NEW_VERSION="$(VERSION)"
+
+          # Se VERSION não for semver válido,
+          # utiliza a versão fallback.
+          if [[ ! "$NEW_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "[warning]⚠️ Versão '$NEW_VERSION' não é semver válida"
+            echo "[warning]→ Utilizando fallback 2.68.0"
+
+            NEW_VERSION="2.68.0"
+          fi
+
+          echo "Versão que será aplicada: $NEW_VERSION"
+          echo ""
+
+          # Disponibiliza a versão efetivamente utilizada
+          # para os próximos steps.
+          echo "##vso[task.setvariable variable=EFFECTIVE_VERSION]$NEW_VERSION"
+
+          # Valida o pom.xml principal
+          if [[ ! -f "pom.xml" ]]; then
+            echo "##vso[task.logissue type=error]pom.xml raiz não encontrado em $(pwd)"
+            exit 1
+          fi
+
+          # Define se será utilizado Maven Wrapper ou Maven instalado
+          if [[ -x "./mvnw" ]]; then
+            MVN_COMMAND="./mvnw"
+          elif command -v mvn >/dev/null 2>&1; then
+            MVN_COMMAND="mvn"
+          else
+            echo "##vso[task.logissue type=error]Maven não foi encontrado no agente."
+            exit 1
+          fi
+
+          echo "Comando Maven selecionado: $MVN_COMMAND"
+          echo ""
+
+          "$MVN_COMMAND" --version
+
+          echo ""
+          echo "Arquivos pom.xml encontrados:"
+          find . \
+            -type f \
+            -name "pom.xml" \
+            -not -path "*/target/*" \
+            | sort
+
+          echo ""
+          echo "Executando Maven Versions Plugin..."
+          echo ""
+
+          MAVEN_PLUGIN="${MAVEN_VERSIONS_PLUGIN}"
+
+          "$MVN_COMMAND" \
+            --batch-mode \
+            --no-transfer-progress \
+            "$MAVEN_PLUGIN" \
+            -DnewVersion="$NEW_VERSION" \
+            -DprocessAllModules=true \
+            -DprocessParent=true \
+            -DupdateMatchingVersions=true \
+            -DgenerateBackupPoms=false
+
+          echo ""
+          echo "[section]✓ Atualização de versões finalizada"
+
+          # Remove backups, caso alguma configuração do projeto os gere
+          find . \
+            -type f \
+            -name "pom.xml.versionsBackup" \
+            -delete
+
+          echo ""
+          echo "Arquivos modificados pelo Maven:"
+          git diff --name-only
+
+          echo ""
+
+          if git diff --quiet; then
+            echo "[warning]⚠️ Nenhuma alteração detectada"
+          else
+            echo "[section]✓ Alterações detectadas:"
+            git diff --stat
+
+            echo ""
+            echo "Resumo das alterações de versão:"
+            git diff --unified=0 -- '**/pom.xml' 'pom.xml' || true
+          fi
+        displayName: 'Atualizar pom.xml com Maven'
+        workingDirectory: $(Pipeline.Workspace)/s/$(REPO_NAME)
+
+
+      # ========================================
+      # Validar pom.xml após atualização
+      # ========================================
+      - bash: |
+          set -euo pipefail
+
+          echo "=========================================="
+          echo "VALIDAÇÃO DOS ARQUIVOS POM"
+          echo "=========================================="
+          echo ""
+
+          if [[ -x "./mvnw" ]]; then
+            MVN_COMMAND="./mvnw"
+          elif command -v mvn >/dev/null 2>&1; then
+            MVN_COMMAND="mvn"
+          else
+            echo "##vso[task.logissue type=error]Maven não foi encontrado no agente."
+            exit 1
+          fi
+
+          echo "Validando estrutura Maven..."
+          echo ""
+
+          "$MVN_COMMAND" \
+            --batch-mode \
+            --no-transfer-progress \
+            help:evaluate \
+            -Dexpression=project.version \
+            -DforceStdout \
+            -q
+
+          echo ""
+          echo "[section]✓ Estrutura Maven validada"
+        displayName: 'Validar pom.xml'
+        workingDirectory: $(Pipeline.Workspace)/s/$(REPO_NAME)
+
+
+      # ========================================
+      # Commit das alterações
+      # ========================================
+      - bash: |
+          set -euo pipefail
+
+          echo "=========================================="
+          echo "COMMIT DAS ALTERAÇÕES"
+          echo "=========================================="
+          echo ""
+
+          git config user.name "$(GIT_USER_NAME)"
+          git config user.email "$(GIT_USER_EMAIL)"
+
+          # Mostra status ANTES de adicionar
+          echo "Status do repositório (antes do git add):"
+          git status --short
+          echo ""
+
+          # Adiciona TODAS as mudanças (pom.xml e outros arquivos)
+          git add --all
+
+          # Mostra status DEPOIS de adicionar (staged files)
+          echo "Arquivos staged para commit:"
+          git diff --cached --name-status || echo "  (nenhum arquivo staged)"
+          echo ""
+
+          # Commit com --allow-empty para garantir que sempre seja criado
+          git commit --allow-empty \
+            -m "${{ parameters.commitMessagePrefix }} $(EFFECTIVE_VERSION)"
+
+          echo ""
+          echo "[section]✓ Commit realizado com sucesso"
+
+          git log -1 \
+            --pretty=format:"Commit: %H%nAutor: %an <%ae>%nMensagem: %s%nData: %ad" \
+            --date=iso
+
+          echo ""
+        displayName: 'Commit'
+        workingDirectory: $(Pipeline.Workspace)/s/$(REPO_NAME)
+
+
+      # ========================================
+      # Push para Azure DevOps
+      # ========================================
+      - bash: |
+          set -euo pipefail
+
+          echo "=========================================="
+          echo "PUSH PARA AZURE DEVOPS"
+          echo "=========================================="
+          echo "Repositório: $(REPO_NAME)"
+          echo "Branch: $(WORKING_BRANCH)"
+          echo "Versão: $(EFFECTIVE_VERSION)"
+          echo ""
+
+          # Verifica se a branch já existe no Azure
+          if git ls-remote --exit-code --heads origin "$(WORKING_BRANCH)" >/dev/null 2>&1; then
+            echo "[section]→ Branch $(WORKING_BRANCH) já existe no Azure, será atualizada"
+            
+            # Deleta a branch existente
+            echo "Deletando branch existente..."
+            git push origin ":$(WORKING_BRANCH)" || echo "[warning]Falha ao deletar (pode não existir mais)"
+            echo ""
+          fi
+
+          echo "Criando branch $(WORKING_BRANCH) no Azure..."
+          git push origin "HEAD:refs/heads/$(WORKING_BRANCH)"
+
+          echo ""
+          echo "[section]✓ Branch $(WORKING_BRANCH) criada/atualizada no Azure DevOps"
+        displayName: 'Push para Azure'
+        workingDirectory: $(Pipeline.Workspace)/s/$(REPO_NAME)
+        condition: |
+          and(
+            succeeded(),
+            eq('${{ parameters.dryRun }}', 'false')
+          )
+
+
+      # ========================================
+      # Push para Adobe Cloud Manager
+      # ========================================
+      - bash: |
+          set -euo pipefail
+
+          echo "=========================================="
+          echo "PUSH PARA ADOBE CLOUD MANAGER"
+          echo "=========================================="
+          echo "Repositório: ${{ parameters.adobePath }}"
+          echo "Branch: $(WORKING_BRANCH)"
+          echo "Versão: $(EFFECTIVE_VERSION)"
+          echo ""
+
+          # Valida as credenciais Adobe
+          if [[ -z "${ADOBE_USER:-}" ]]; then
+            echo "##vso[task.logissue type=error]Variável adobe_username não encontrada."
+            exit 1
+          fi
+
+          if [[ -z "${ADOBE_TOKEN:-}" ]]; then
+            echo "##vso[task.logissue type=error]Variável adobe_password não encontrada."
+            exit 1
+          fi
+
+          if [[ -z "${ADOBE_GIT_URL:-}" ]]; then
+            echo "##vso[task.logissue type=error]Variável adobe_git_url não encontrada."
+            exit 1
+          fi
+
+          if [[ -z "${ADOBE_PROJECT:-}" ]]; then
+            echo "##vso[task.logissue type=error]Variável adobe_project não encontrada."
+            exit 1
+          fi
+
+          # Monta a URL do repositório Adobe
+          ADOBE_URL="https://${ADOBE_USER}:${ADOBE_TOKEN}@${ADOBE_GIT_URL}/${ADOBE_PROJECT}/${{ parameters.adobePath }}"
+
+          # Adiciona ou atualiza o remote Adobe
+          if git remote get-url adobe >/dev/null 2>&1; then
+            git remote set-url adobe "$ADOBE_URL"
+          else
+            git remote add adobe "$ADOBE_URL"
+          fi
+
+          echo "Remote Adobe configurado"
+          echo ""
+          
+          # Busca informações da Adobe
+          echo "Verificando branch na Adobe..."
+          git fetch adobe 2>/dev/null || echo "Primeira sincronização ou branch não existe"
+          echo ""
+          
+          # Verifica se a branch existe na Adobe
+          if git ls-remote --exit-code --heads adobe "$(WORKING_BRANCH)" >/dev/null 2>&1; then
+            echo "[section]→ Branch $(WORKING_BRANCH) existe na Adobe, será deletada e recriada"
+            
+            # Deleta a branch existente
+            echo "Deletando branch $(WORKING_BRANCH) na Adobe..."
+            if git push adobe ":refs/heads/$(WORKING_BRANCH)" 2>&1; then
+              echo "[section]✓ Branch deletada na Adobe"
+            else
+              echo ""
+              echo "##vso[task.logissue type=error]Falha ao deletar branch $(WORKING_BRANCH) na Adobe."
+              echo "##vso[task.logissue type=error]Verifique permissões ou se há branch protection rules na Adobe."
+              exit 1
+            fi
+            
+            echo ""
+            
+            # Verifica se a branch foi realmente deletada
+            echo "Verificando deleção..."
+            git fetch adobe 2>/dev/null || true
+            
+            if git ls-remote --exit-code --heads adobe "$(WORKING_BRANCH)" >/dev/null 2>&1; then
+              echo "##vso[task.logissue type=error]Branch $(WORKING_BRANCH) ainda existe na Adobe após tentativa de deleção."
+              echo "##vso[task.logissue type=error]Pode haver branch protection rules configuradas."
+              exit 1
+            fi
+            
+            echo "[section]✓ Deleção confirmada"
+            echo ""
+          else
+            echo "[section]→ Branch $(WORKING_BRANCH) não existe na Adobe, será criada"
+            echo ""
+          fi
+          
+          echo "Criando branch $(WORKING_BRANCH) na Adobe..."
+          echo ""
+
+          if git push adobe "HEAD:refs/heads/$(WORKING_BRANCH)" ; then
+            echo ""
+            echo "[section]✓ Branch $(WORKING_BRANCH) criada/atualizada na Adobe Cloud Manager"
+            echo "[section]✓ Azure sincronizado com Adobe"
+          else
+            echo ""
+            echo "##vso[task.logissue type=error]Falha no push para Adobe. Verifique credenciais, URL e permissões."
+            exit 1
+          fi
+        displayName: 'Push para Adobe'
+        workingDirectory: $(Pipeline.Workspace)/s/$(REPO_NAME)
+        env:
+          ADOBE_USER: $(adobe_username)
+          ADOBE_TOKEN: $(adobe_password)
+          ADOBE_GIT_URL: $(adobe_git_url)
+          ADOBE_PROJECT: $(adobe_project)
+        condition: |
+          and(
+            succeeded(),
+            eq('${{ parameters.dryRun }}', 'false')
+          )
+
+
+      # ========================================
+      # Dry Run
+      # ========================================
+      - bash: |
+          set -euo pipefail
+
+          echo "=========================================="
+          echo "DRY RUN - MODO SIMULAÇÃO"
+          echo "=========================================="
+          echo "[warning]⚠️ Nenhum push foi realizado"
+          echo ""
+          echo "Repositório: $(REPO_NAME)"
+          echo "Branch base: $(BASE_BRANCH)"
+          echo "Branch destino: $(WORKING_BRANCH)"
+          echo "Versão solicitada: $(VERSION)"
+          echo "Versão aplicada: $(EFFECTIVE_VERSION)"
+          echo ""
+          echo "A branch $(WORKING_BRANCH) foi criada localmente a partir de $(BASE_BRANCH)"
+          echo ""
+
+          echo "Commit criado localmente:"
+          git log -1 --oneline
+
+          echo ""
+          echo "Arquivos presentes no commit:"
+          git show \
+            --stat \
+            --oneline \
+            --summary \
+            HEAD
+          
+          echo ""
+          echo "[section]Em modo normal, esta branch seria:"
+          echo "  1. Deletada e recriada no Azure DevOps"
+          echo "  2. Deletada e recriada no Adobe Cloud Manager"
+        displayName: 'Dry Run'
+        workingDirectory: $(Pipeline.Workspace)/s/$(REPO_NAME)
+        condition: |
+          and(
+            succeeded(),
+            eq('${{ parameters.dryRun }}', 'true')
+          )

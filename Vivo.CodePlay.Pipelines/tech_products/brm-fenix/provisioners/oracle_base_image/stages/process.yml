@@ -1,0 +1,103 @@
+parameters:
+  - name: oracleBaseImageUpdate
+    type: object
+
+stages:
+  - stage: stage_process
+    displayName: "Process Image File"
+    pool: $(POOL)
+    dependsOn:
+      - stage_prep
+      - stage_download
+    condition: |
+      and(
+        in(dependencies.stage_prep.result, 'Succeeded', 'SucceededWithIssues'),
+        in(dependencies.stage_download.result, 'Succeeded', 'Skipped')
+      )
+    variables:
+      - name: VALID_IMAGES_IN_REPOSITORY
+        value: $[ stageDependencies.stage_prep.preparation.outputs['check_images_repository.VALID_IMAGES'] ]
+    jobs:
+      - job: process
+        displayName: "Process Artifact"
+        steps:
+          - checkout: none
+
+          - script: |
+              echo "##[debug] TAR IMAGES FOLDER PATH ..................................: $(TAR_IMAGES_FOLDER_PATH)"
+
+              echo ">>>>>>>>>>>>>>>>>>>>>>>>>>> Creating .tar Images Folder"
+              echo "##[command]rm -rfv $(TAR_IMAGES_FOLDER_PATH) && mkdir -vp $(TAR_IMAGES_FOLDER_PATH)"
+              rm -rfv $(TAR_IMAGES_FOLDER_PATH) && mkdir -vp $(TAR_IMAGES_FOLDER_PATH)
+            displayName: "Create .tar/.tar.gz Images Folder"
+
+          - template: ../../../task_groups/artifact/download.yml
+            ${{ if eq(parameters.oracleBaseImageUpdate.oracleImageLink, '-') }}:
+              parameters:
+                displayName: Download Pipeline Artifact [$(SOURCE_CODE_FOLDER)]
+                artifactName: "$(SOURCE_CODE_FOLDER)"
+                targetPath: "$(SOURCE_CODE_FOLDER_PATH)"
+            ${{ else }}:
+              parameters:
+                displayName: Download Pipeline Artifact [$(DOWNLOADED_COMPACTED_IMAGES_FOLDER)]
+                artifactName: "$(DOWNLOADED_COMPACTED_IMAGES_FOLDER)"
+                targetPath: "$(DOWNLOADED_COMPACTED_IMAGES_FOLDER_PATH)"
+
+          - ${{ if eq(parameters.oracleBaseImageUpdate.oracleImageLink, '-') }}:
+              - script: |
+                  SOURCE_FOLDER="$(SOURCE_CODE_FOLDER_PATH)/$(IMAGES_FOLDER_IN_REPOSITORY)"
+
+                  echo "##[debug] VALID IMAGES IN REPOSITORY ...................................: $VALID_IMAGES_IN_REPOSITORY"
+                  echo "##[debug] SOURCE FOLDER ................................................: $SOURCE_FOLDER"
+                  echo "##[debug] TAR IMAGES FOLDER PATH .......................................: $(TAR_IMAGES_FOLDER_PATH)"
+
+                  printf "\n>>>>>>>>>> Checking and extracting valid files in the folder: $SOURCE_FOLDER \n"
+
+                  if [ -d "$SOURCE_FOLDER" ]; then
+                    for file in $VALID_IMAGES_IN_REPOSITORY; do
+                      FILE_PATH="$SOURCE_FOLDER/$file"
+
+                      if [ ! -f "$FILE_PATH" ]; then
+                        printf "\n⚠️ File $file not found in $SOURCE_FOLDER."
+                        continue
+                      fi
+
+                      printf "\n>>>>> Processing File: $file \n"
+
+                      if [[ "$file" == *.tar || "$file" == *.tar.gz ]]; then
+                        printf ">> Moving $file to $(TAR_IMAGES_FOLDER_PATH) \n"
+                        mv "$FILE_PATH" "$(TAR_IMAGES_FOLDER_PATH)" || {
+                          printf "\n❌ Error moving $file"
+                          continue
+                        }
+                      else
+                        printf "\n⚠️ Unknown file extension for the file: $file"
+                      fi
+                    done
+                  else
+                    printf "\n❌ The folder $SOURCE_FOLDER does not exist or is empty."
+                    exit 1
+                  fi
+                displayName: "Process Images in Repository"
+          - ${{ else }}:
+              - template: ../../../tasks/compressed_files/unzip_files.yml
+                parameters:
+                  zippedFilesfolderPath: "$(DOWNLOADED_COMPACTED_IMAGES_FOLDER_PATH)"
+              - script: |
+                  echo "##[debug] DOWNLOADED COMPACTED IMAGES FOLDER PATH ........................................: $(DOWNLOADED_COMPACTED_IMAGES_FOLDER_PATH)"
+                  echo "##[debug] .TAR IMAGES FOLDER PATH ........................................................: $(TAR_IMAGES_FOLDER_PATH)"
+
+                  # Move all .tar files from the image_zip folder to the images_tar folder.
+                  find $(DOWNLOADED_COMPACTED_IMAGES_FOLDER_PATH) -name "*.tar" -exec mv "{}" $(TAR_IMAGES_FOLDER_PATH) \;
+
+                  # Find all .tar files in the images_tar folder.
+                  ALL_TAR_FILES=$(find $(TAR_IMAGES_FOLDER_PATH) -name "*.tar" 2>/dev/null)
+
+                  printf "\n@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@ .tar Files: @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n $ALL_TAR_FILES\n"
+                  printf "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n"
+                displayName: Move .tar images
+
+          - template: ../../../task_groups/artifact/publish.yml
+            parameters:
+              artifactName: "$(TAR_IMAGES_FOLDER)"
+              targetPath: "$(TAR_IMAGES_FOLDER_PATH)"

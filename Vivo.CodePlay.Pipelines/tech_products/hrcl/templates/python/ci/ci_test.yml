@@ -1,0 +1,150 @@
+steps:
+
+  - task: Bash@3
+    displayName: Preparing Python Environment
+    name: preparing_python_environment
+    condition: succeeded()
+    inputs:
+      targetType: inline
+      script: |
+        echo "Criando ambiente virtual"
+        python -m venv .venv
+
+        echo "Ativando ambiente virtual"
+        source .venv/bin/activate
+
+        echo "Confirmando Utilização de Ambiente virtual"
+        which python
+
+        echo "Atualizando pip"
+        python -m pip install --upgrade pip
+
+        echo "Instalando dependências"
+        pip install -r requirements.txt
+
+  - task: Bash@3
+    displayName: Running Unit Tests
+    name: running_tests
+    condition: succeeded()
+    continueOnError: false
+    inputs:
+      targetType: inline
+      script: |
+        echo "Ativando ambiente virtual"
+        source .venv/bin/activate
+
+        echo "Confirmando Utilização de Ambiente virtual"
+        which python
+
+        echo "Executando testes para CI/CD..."
+        if [ ! -f $ENV_FILE ]; then \
+          echo "❌ Arquivo $ENV_FILE não encontrado"; \
+          exit 1; \
+        fi
+        rm -f coverage.xml .coverage junit-report.xml
+        python -m pytest tests \
+          --cov=app \
+          --cov-report=xml:coverage.xml \
+          --cov-report=term \
+          --junit-xml=junit-report.xml \
+          --tb=short \
+          --cov-config=.coveragerc
+          
+        echo "Normalizando caminhos no coverage.xml..."
+        if [ -f coverage.xml ]; then \
+          sed -i 's|filename="[^"]*\/app\/|filename="app/|g' coverage.xml; \
+          sed -i 's|<source>[^<]*\/app<\/source>|<source>app</source>|g' coverage.xml; \
+          echo "✅ coverage.xml gerado e normalizado com sucesso"; \
+        else \
+          echo "❌ Falha ao gerar coverage.xml"; \
+        fi
+        if [ -f junit-report.xml ]; then \
+          echo "✅ junit-report.xml gerado com sucesso"; \
+        else \
+          echo "❌ Falha ao gerar junit-report.xml"; \
+        fi
+
+  - task: Bash@3
+    displayName: Running Linting Tests
+    name: running_linting_tests
+    condition: succeeded()
+    continueOnError: true
+    inputs:
+      targetType: inline
+      script: |
+        echo "Ativando ambiente virtual"
+        source .venv/bin/activate
+
+        echo "Confirmando Utilização de Ambiente virtual"
+        which python
+
+        echo "Executando análise estática com Pylint..."
+        rm -f pylint-report.txt
+        python -m pylint app \
+          --output=pylint-report.txt \
+          --output-format=text \
+          --score=yes || true
+        if [ -f pylint-report.txt ]; then \
+          echo "✅ pylint-report.txt gerado com sucesso"; \
+          if grep -q "Your code has been rated at" pylint-report.txt; then \
+            echo "📊 Pontuação:"; \
+            grep "Your code has been rated at" pylint-report.txt; \
+          fi; \
+        else \
+          echo "❌ Falha ao gerar pylint-report.txt"; \
+        fi
+
+  - task: Bash@3
+    displayName: Running Bandit Tests
+    name: running_bandit_tests
+    condition: succeeded()
+    continueOnError: true
+    inputs:
+      targetType: inline
+      script: |
+        echo "Ativando ambiente virtual"
+        source .venv/bin/activate
+
+        echo "Confirmando Utilização de Ambiente virtual"
+        which python
+
+        echo "Executando análise de segurança com Bandit..."
+        rm -f bandit-report.json
+        python -m bandit -r app \
+          -f json \
+          -o bandit-report.json || true
+        if [ -f bandit-report.json ]; then \
+          echo "$✅ bandit-report.json gerado com sucesso"; \
+          echo "📊 Resumo de segurança:"; \
+          python -c "import json; data=json.load(open('bandit-report.json')); print(f'Issues encontrados: {len(data.get(\"results\", []))}'); [print(f'{r.get(\"issue_severity\", \"UNKNOWN\")}: {r.get(\"test_name\", \"N/A\")}') for r in data.get('results', [])[:5]]" 2>/dev/null || echo "Relatório gerado"; \
+        else \
+          echo "❌ Falha ao gerar bandit-report.json"; \
+        fi
+
+  - task: PublishPipelineArtifact@1
+    displayName: "Publishing Test Results"
+    inputs:
+      targetPath: '$(System.DefaultWorkingDirectory)/junit-report.xml'
+      artifactName: junit-report
+      publishLocation: 'pipeline'
+
+  - task: PublishPipelineArtifact@1
+    displayName: "Publishing Code Coverage Results"
+    inputs:
+      targetPath: '$(System.DefaultWorkingDirectory)/coverage.xml'
+      artifactName: coverage-report
+      publishLocation: 'pipeline'
+
+  - task: PublishPipelineArtifact@1
+    displayName: "Publishing Linting Results"
+    inputs:
+      targetPath: '$(System.DefaultWorkingDirectory)/pylint-report.txt'
+      artifactName: pylint-report
+      publishLocation: 'pipeline'
+
+  - task: PublishPipelineArtifact@1
+    displayName: "Publishing Bandit Results"
+    inputs:
+      targetPath: '$(System.DefaultWorkingDirectory)/bandit-report.json'
+      artifactName: bandit-report
+      publishLocation: 'pipeline'

@@ -1,0 +1,719 @@
+# ==================================================================
+# Pipeline: CI Build Java Docker - Build, Test, Security & Docker
+# -----------------------------------------------------
+# Pipeline de Integração Contínua completo para aplicações Java com Maven.
+# Realiza build, testes unitários (JUnit) com cobertura (JaCoCo), análise de 
+# qualidade (SonarQube), verificação de segurança (Fortify SAST), build Docker
+# e versionamento automático com commit/tag.
+# -----------------------------------------------------
+# Capacidades Implementadas:
+# ✅ Build & Test com cobertura JaCoCo
+# ✅ Quality Gate SonarQube parametrizável
+# ✅ Docker Build com artefatos
+# ✅ Cache Maven para performance
+# ✅ Autenticação Nexus/Azure Artifacts flexível
+# ✅ Azure App Configuration integration
+# -----------------------------------------------------
+# TODOs Futuras Melhorias:
+# - Inclusão dos estágios de segurança
+# - Inclusão de gates
+# - Mudar versionamento para o Version Manager
+# ==================================================================
+
+parameters:
+# ==================================================================
+# Infraestrutura e Ambiente
+# ==================================================================
+- name: agentPool
+  type: string
+  default: GeneralPurposeLinuxAgentsCI
+  displayName: 'Agent Pool para execução'
+
+- name: akvName
+  type: string
+  default: 'DevOpsSharedResources'
+  displayName: 'Nome do Azure Key Vault'
+
+- name: rootoption
+  type: string
+  default: 'USER=root'
+  displayName: 'execucao como root'
+
+
+
+# ==================================================================
+# Configurações de Java e Feed
+# ------------------------------------------------------------------
+# Para usar o Nexus a service connection DevOpsSharedResources deve estar criada
+# Método default de autenticação: Azure Artifacts (System.AccessToken)
+# Exemplo settings.xml esperado (usar AZURE_DEVOPS_PAT / System.AccessToken):
+# <settings xmlns="http://maven.apache.org/SETTINGS/1.0.0" ...>
+#   <servers>
+#     <server>
+#       <id>[SIGLA]</id>
+#       <username>telefonica-vivo-brasil</username>
+#       <password>${AZURE_DEVOPS_PAT}</password>
+#     </server>
+#   </servers>
+# </settings>
+# O Nome é AZURE_DEVOPS_PAT para deixar mais claro como desenvolvedor deve usar o arquivo para build local
+# Alem disso, o pom.xml deve ter o distributionManagement e repositories configurados (ver README.md)
+- name: javaVersion
+  type: string
+  default: 'openjdk-21.0.2'
+  displayName: 'Versão do Java'
+  # Versões devem ser instaladas antes: https://dev.azure.com/telefonica-vivo-brasil/DevOps/_git/Vivo.Infra.Ansible.SetupAzdoAgents?path=/roles/asdf/defaults/main.yaml
+  values:
+    - 'openjdk-21.0.2'
+    - 'openjdk-17.0.2'
+    - 'openjdk-11.0.2'
+    - 'adoptopenjdk-8.0.352+8'
+    - 'sapmachine-17.0.10'
+
+- name: useNexusToAuth
+  type: boolean
+  default: false
+  displayName: 'Usar Nexus para autenticação (true) ou Azure Artifacts (false)'
+
+- name: workingDirectory
+  type: string
+  default: $(Build.SourcesDirectory)
+  displayName: 'Diretório do projeto Java (onde está o pom.xml)'
+
+# - name: fortifyScanDirectory
+#   type: string
+#   default: $(Build.SourcesDirectory)/$(Build.Repository.Name)
+#   displayName: 'Diretório scan Fortify'
+
+- name: mavenCustomSettings
+  type: string
+  default: '.azuredevops/settings.xml'
+  displayName: 'Caminho para o settings.xml customizado do Maven'
+
+# ==================================================================
+# Configurações de Docker
+# ==================================================================
+- name: imageName
+  type: string
+  default: '$(SIGLA)/$(Build.Repository.Name)'
+  displayName: 'Nome da imagem Docker'
+
+- name: dockerfilePath
+  type: string
+  default: 'Dockerfile'
+  displayName: 'Caminho do Dockerfile'
+
+- name: registryServiceConnection
+  type: string
+  default: 'ACR-DEVOPS'
+  displayName: 'Service Connection do Registry'
+
+
+# ==================================================================
+# Controle de Fluxo e Capacidades
+# ------------------------------------------------------------------
+# Se cobertura estiver habilitada, os testes também serão executados.
+# Para configurar o Jacoco, adicione o plugin no pom.xml:
+# <plugin>
+#   <groupId>org.jacoco</groupId>
+#   <artifactId>jacoco-maven-plugin</artifactId>
+#   <version>0.8.8</version>
+#   <executions>
+#     <execution><goals><goal>prepare-agent</goal></goals></execution>
+#     <execution><id>report</id><phase>test</phase><goals><goal>report</goal></goals></execution>
+#   </executions>
+# </plugin>
+- name: prValidationOnly
+  type: boolean
+  default: false
+  displayName: 'Executa apenas a validação, não publica nem gera versão'
+
+- name: enableCache
+  type: boolean
+  default: true
+  displayName: 'Habilitar cache de dependências Maven'
+
+- name: enableTest
+  type: boolean
+  default: true
+  displayName: 'Executar testes unitários'
+
+- name: enableCoverage
+  type: boolean
+  default: true
+  displayName: 'Habilitar execução de cobertura de código'
+
+- name: runSecuritySCA
+  type: boolean
+  default: true
+  displayName: 'Executar análise de segurança (SCA)'
+
+- name: runQualityGate
+  type: boolean
+  default: false
+  displayName: 'Executar Quality Gate (SonarQube)'
+
+
+# ==================================================================
+# Configurações de Segurança
+# ==================================================================
+- name: fortifyScanDirectory
+  type: string
+  default: $(Build.SourcesDirectory)
+  displayName: 'Diretório scan Fortify'
+- name: enableFortifyExclusions
+  displayName: 'Faz checkout do repositório Fortify Exclusions'
+  type: boolean
+  default: false
+# Se enableFortifyExclusions, mude fortifyScanDirectory para $(Build.SourcesDirectory)/$(Build.Repository.Name)
+- name: fortifyExclusion
+  type: string
+  default: 'FortifyExclusion'
+  displayName: 'Repositório de exclusões Fortify (enableFortifyExclusions deve estar true)'
+
+- name: requireSecurityApproval
+  type: boolean
+  default: true
+  displayName: 'Requer aprovação manual para security gate'
+
+# ==================================================================
+# Configurações de Versionamento
+# ==================================================================
+
+- name: versionFile
+  type: string
+  default: 'pom.xml'
+  displayName: 'Arquivo de versionamento (pom.xml)'
+
+# ==================================================================
+# Configurações do Sonar
+# ==================================================================
+
+- name: useSonarConfigFile
+  type: boolean
+  default: true
+  displayName: 'Usar arquivo de configuração do SonarQube?'
+
+- name: sonarConfigFilePath
+  type: string
+  default: '.azuredevops/sonar-project.properties'
+  displayName: 'Caminho do arquivo de configuração do SonarQube'
+
+- name: sonarPollingTimeoutSec
+  type: string
+  default: '300'
+  displayName: 'Timeout do Polling SonarQube (s)'
+
+- name: sonarJavaVersion
+  type: string
+  default: 'openjdk-17.0.2'
+  displayName: 'Versão do Java para análise SonarQube'
+  values:
+    - 'openjdk-21.0.2'
+    - 'openjdk-17.0.2'
+    - 'openjdk-11.0.2'
+
+- name: sonarServiceConnection
+  type: string
+  default: 'VIVO_SONARQUBE'
+  displayName: 'Service Connection do SonarQube'
+
+- name: sonarQualityGate
+  type: string
+  default: 'AzureDevOps-Default'
+  displayName: 'Quality Gate do SonarQube'
+
+- name: sonarScannerMode
+  type: string
+  default: 'cli'
+  displayName: 'Modo do scanner SonarQube'
+  values:
+    - 'cli'
+    - 'dotnet'
+
+- name: sonarProjectKey
+  type: string
+  default: '$(System.TeamProject)-$(Build.Repository.Name)'
+  displayName: 'Chave do projeto no SonarQube'
+
+- name: sonarProjectName
+  type: string
+  default: '$(System.TeamProject)-$(Build.Repository.Name)'
+  displayName: 'Nome do projeto no SonarQube'
+
+# ==================================================================
+# Configurações de App Configuration
+# ==================================================================
+- name: useAppConfig
+  type: boolean
+  default: true
+  displayName: 'Usar Azure App Configuration para SonarQube'
+- name: appConfigAzureSubscription
+  type: string
+  default: 'DevOpsSharedResources'
+  displayName: 'Azure Subscription para App Configuration'
+- name: appConfigEndpoint
+  type: string
+  default: 'https://appcs-azdevops-shared.azconfig.io'
+  displayName: 'Endpoint do Azure App Configuration'
+
+
+variables:
+  SIGLA: $[ lower(split(variables['System.TeamProject'],' ')[0]) ]
+  POM_FILE_PATH: ${{ parameters.workingDirectory }}/${{ parameters.versionFile }}
+  MAVEN_CACHE_FOLDER: $(Pipeline.Workspace)/.m2/repository
+  MAVEN_OPTS: '-Dmaven.repo.local=$(MAVEN_CACHE_FOLDER)'
+  MAVEN_CUSTOM_SETTINGS: ${{ parameters.workingDirectory }}/${{ parameters.mavenCustomSettings }}
+  ${{ if eq(parameters.enableCache, true) }}:
+    MAVEN_REPO_LOCAL: $(MAVEN_CACHE_FOLDER)
+  ${{ if eq(parameters.enableCache, false) }}:
+    MAVEN_REPO_LOCAL: '/home/svc_devopscorp/.m2/repository'
+  # Configurações de segurança
+  DOCKER_BUILDKIT: 1
+  BUILDKIT_PROGRESS: plain
+  # Configurações de versionamento
+  CACORP_LOCATION: $(Agent.HomeDirectory)/../../certs/CACORP.pem
+
+  # Configurações de KeyVault para Segurança
+  AKV_DEVOPS_NAME: 'kv-azdevops-shared'
+
+  # Variables for Proxy
+  PROXY_SQUID_SERVER: "10.240.58.39:3128"
+  PROXY_AGENT_HTTP: "http://$(PROXY_SQUID_SERVER)"
+  PROXY_AGENT_HTTPS: "http://$(PROXY_SQUID_SERVER)"
+
+# ==================================================================
+# Estágios do Pipeline
+# ==================================================================
+stages:
+# ==================================================================
+# Stage 1: JavaBuild - Compilação, Testes e Análise de Qualidade
+# Descrição: Compila aplicação Java com Maven, executa testes unitários (JUnit),
+#            gera relatório de cobertura (JaCoCo) e executa análise SonarQube
+# ==================================================================
+- stage: JavaBuild
+  displayName: 'Build & Test Java Application'
+  condition: succeeded()
+  jobs:
+  - job: JavaBuild
+    displayName: 'Java Build & Test'
+    pool: ${{ parameters.agentPool }}
+    
+    steps:
+    # ==================================================================
+    # [Configuração Inicial] Checkout do código
+    # ==================================================================
+    - checkout: self
+
+    # ==================================================================
+    # [Observabilidade] Exibe parâmetros quando em modo debug
+    # ==================================================================
+    - task: VivoUtilsFromVivo@1
+      displayName: 'Show Pipeline Parameters'
+      condition: eq(variables['System.Debug'], 'true')
+      inputs:
+        command: 'show-pipeline-parameters'
+        parameters: '${{ convertToJson(parameters) }}'
+
+    # ==================================================================
+    # [Compliance] Verifica se o repositório está em conformidade com as políticas de configuração
+    # ==================================================================
+    - task: VivoDevOpsConfigCompliance@1
+      displayName: 'Check DevOps Config Compliance'
+      inputs:
+        workDir: ${{ parameters.workingDirectory }}
+        policySets: |
+          image-definition-files
+
+    # ==================================================================
+    # [Autenticação Opcional] Nexus via Azure Key Vault
+    # ==================================================================
+    - ${{ if eq(parameters.useNexusToAuth, true) }}:
+      - task: AzureKeyVault@2
+        displayName: 'Secrets from AKV'
+        inputs:
+          azureSubscription: "${{ parameters.akvName }}"
+          KeyVaultName: "kv-azdevops-shared"
+          SecretsFilter: >-
+            NEXUS-DEPS-USR, NEXUS-DEPS-PSW
+
+    # ==================================================================
+    # [Performance] Cache Maven (dependências)
+    # ==================================================================
+    - ${{ if eq(parameters.enableCache, true) }}:
+      # Cache do Maven para melhor performance
+      - task: Cache@2
+        displayName: 'Cache Maven dependencies'
+        inputs:
+          key: 'maven | "$(Agent.OS)" | **/pom.xml'
+          restoreKeys: |
+            maven | "$(Agent.OS)"
+            maven
+          path: $(MAVEN_CACHE_FOLDER)
+
+    # ==================================================================
+    # [Versionamento] Definição da versão (template central)
+    # ==================================================================
+    - template: /tech_products/vvat/templates/define-version-pomxml.yaml
+      parameters:
+        workingDirectory: ${{ parameters.workingDirectory }}
+        versionFile: $(POM_FILE_PATH)
+        javaVersion: ${{ parameters.javaVersion }}
+
+    # ==================================================================
+    # [Build] Compilação e empacotamento (pula testes nesta fase)
+    # ==================================================================
+    - task: Maven@4
+      displayName: "Build"
+      inputs:
+        goals: clean compile package
+        options: >-
+          -s $(MAVEN_CUSTOM_SETTINGS)
+          -Dmaven.repo.local=$(MAVEN_REPO_LOCAL)
+          -Dmaven.test.skip=true
+        mavenPomFile: $(POM_FILE_PATH)
+        mavenOptions: "-Xmx3072m"
+        mavenVersionOption: 'Path'
+        mavenDirectory: /home/svc_devopscorp/.asdf/installs/maven/3.9.9
+        javaHomeOption: "JDKVersion"
+        publishJUnitResults: false
+        workingDirectory: ${{ parameters.workingDirectory }}
+      env:
+        ASDF_JAVA_VERSION: ${{ parameters.javaVersion }}
+        MAVEN_CUSTOM_SETTINGS: $(MAVEN_CUSTOM_SETTINGS)
+        NEXUS_DEPS_USR: $(NEXUS-DEPS-USR)
+        NEXUS_DEPS_PSW: $(NEXUS-DEPS-PSW)
+        AZURE_DEVOPS_PAT: $(System.AccessToken) # O Nome é AZURE_DEVOPS_PAT para deixar mais claro como desenvolvedor deve usar o arquivo para build local
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+
+# ==================================================================
+# CAPACIDADE: TESTES UNITÁRIOS + COBERTURA (condicional enableTest)
+# Descrição: Executa testes (JUnit) e gera cobertura (JaCoCo)
+# Documentação: https://dvps-dev.redecorp.azr/portal/codeplay/capacidades/catalog/testes-unitarios
+# Pré-requisitos: plugins Surefire + JaCoCo configurados no pom.xml
+# Artefatos: relatórios JUnit XML + cobertura HTML/XML
+# ==================================================================
+    - ${{ if eq(parameters.enableTest, true) }}:
+      # ==================================================================
+      # [Testes & Cobertura] Execução de Testes Unitários e Análise JaCoCo
+      # ==================================================================
+      - task: Maven@4
+        displayName: 'Run Tests with Coverage'
+        inputs:
+          goals: 'test jacoco:report'
+          options: >-
+            -B
+            -s $(MAVEN_CUSTOM_SETTINGS)
+            -Dmaven.repo.local=$(MAVEN_REPO_LOCAL)
+          mavenPomFile: $(POM_FILE_PATH)
+          mavenOptions: "-Xmx3072m"
+          mavenVersionOption: 'Path'
+          mavenDirectory: /home/svc_devopscorp/.asdf/installs/maven/3.9.9
+          javaHomeOption: "JDKVersion"
+          publishJUnitResults: false
+          workingDirectory: ${{ parameters.workingDirectory }}
+        env:
+          ASDF_JAVA_VERSION: ${{ parameters.javaVersion }}
+          MAVEN_CUSTOM_SETTINGS: $(MAVEN_CUSTOM_SETTINGS)
+          NEXUS_DEPS_USR: $(NEXUS-DEPS-USR)
+          NEXUS_DEPS_PSW: $(NEXUS-DEPS-PSW)
+          AZURE_DEVOPS_PAT: $(System.AccessToken) # O Nome é AZURE_DEVOPS_PAT para deixar mais claro como desenvolvedor deve usar o arquivo para build local
+          SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+          
+      # ==================================================================
+      # [Publicação] Relatórios de Testes JUnit
+      # ==================================================================
+      - task: PublishTestResults@2
+        displayName: 'Publish Test Results'
+        condition: succeededOrFailed()
+        inputs:
+          testResultsFormat: 'JUnit'
+          testResultsFiles: '${{ parameters.workingDirectory }}/target/surefire-reports/*.xml'
+          failTaskOnFailedTests: true
+          mergeTestResults: true
+
+      # ==================================================================
+      # [Publicação] Relatório de Cobertura JaCoCo
+      # ==================================================================
+      - task: PublishCodeCoverageResults@2
+        displayName: 'Publish Code Coverage'
+        condition: succeededOrFailed()
+        inputs:
+          codeCoverageTool: 'JaCoCo'
+          summaryFileLocation: '${{ parameters.workingDirectory }}/target/site/jacoco/jacoco.xml'
+          reportDirectory: '${{ parameters.workingDirectory }}/target/site/jacoco'
+
+#############################################################################
+# CAPACIDADE: QUALITY GATE (SONARQUBE)
+#############################################################################
+# Descrição: Análise estática de código e quality gate
+# Documentação: https://dvps-dev.redecorp.azr/portal/codeplay/capacidades/catalog/quality-gate
+# Pré-requisitos:
+#   - Service Connection 'SonarQube' configurada
+#   - Projeto configurado no SonarQube
+#   - Quality Gate definido no SonarQube
+# Configuração: Parâmetro 'runQualityGate' = true
+# Observações: Não executa em Pull Requests
+#############################################################################
+    - ${{ if eq(parameters.runQualityGate, true) }}:
+      # ==================================================================
+      # [SonarQube] Análise Completa de Qualidade de Código
+      # ==================================================================
+      - task: SonarAnalysisFromVivo@2
+        displayName: 'SonarQube Full Analysis'
+        inputs:
+          command: 'analysis'
+          SonarQube: ${{ parameters.sonarServiceConnection }}
+          scannerMode: ${{ parameters.sonarScannerMode }}
+          ${{ if eq(parameters.useSonarConfigFile, true) }}:
+            configFile: ${{ parameters.sonarConfigFilePath }}
+          cliProjectKey: ${{ parameters.sonarProjectKey }}
+          cliProjectName: ${{ parameters.sonarProjectName }}
+          cliProjectVersion: $(VERSION)
+          qualityGate: ${{ parameters.sonarQualityGate }}
+          acronym: $(SIGLA)
+          reportPath: '$(Agent.TempDirectory)/sonar/$(Build.BuildId)/report-task.txt'
+          pollingTimeoutSec: ${{ parameters.sonarPollingTimeoutSec }}
+          useAppConfig: ${{ parameters.useAppConfig }}
+          azureSubscription: ${{ parameters.appConfigAzureSubscription }}
+          appConfigurationEndpoint: ${{ parameters.appConfigEndpoint }}
+          extraProperties: |
+            sonar.coverage.jacoco.xmlReportPaths=${{ parameters.workingDirectory }}/target/site/jacoco/jacoco.xml
+            sonar.java.binaries=${{ parameters.workingDirectory }}/target/classes
+            sonar.scanner.metadataFilePath=$(Agent.TempDirectory)/sonar/$(Build.BuildId)/report-task.txt
+            sonar.qualitygate.wait=false
+            sonar.qualitygate.timeout=${{ parameters.sonarPollingTimeoutSec }}
+        env:
+          ASDF_JAVA_VERSION: ${{ parameters.sonarJavaVersion }}
+
+    # ==================================================================
+    # [Publicação] Artefatos JAR para Próximos Stages
+    # ==================================================================
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish JAR Artifacts'
+      condition: succeeded()
+      inputs:
+        targetPath: '${{ parameters.workingDirectory }}/target'
+        artifact: 'java-artifacts'
+        publishLocation: 'pipeline'
+        parallel: true
+        pattern: '*.jar'
+
+# ==================================================================
+# Stage 2: SecurityAnalysis - Análise de Segurança SAST (Paralelo)
+# Descrição: Executa análise de segurança estática (SAST) com Fortify ScanCentral
+#            e gate de aprovação manual. Roda em paralelo com JavaBuild
+# ==================================================================
+- stage: SecurityAnalysis
+  displayName: 'Security Analysis'
+  condition: succeeded()
+  jobs:
+
+# ==================================================================
+# CAPACIDADE: FORTIFY SCAN (SAST)
+# ==================================================================
+# Descrição: Análise estática de código (SAST) usando Fortify ScanCentral e SSC, com integração à Conviso e publicação de artefatos.
+# Documentação: https://dvps-dev.redecorp.azr/portal/codeplay/capacidades/catalog/sast
+# Observações: Exporta variáveis e publica artefatos para uso no Security Gate.
+# ==================================================================
+
+#  - job: FortifyScan
+#    displayName: 'Fortify Scan'
+#    pool: ${{ parameters.agentPool }}
+#    steps:
+
+   ## -> Checkout project
+#    - checkout: self
+#      fetchTags: false
+#      fetchDepth: 1
+
+#    - template: /tech_products/vvat/templates/run-sast-scan.yaml
+#      parameters:
+#        fortifyScanDirectory: ${{ parameters.fortifyScanDirectory }}
+#        enableFortifyExclusions:  ${{ parameters.enableFortifyExclusions }}
+
+# ==================================================================
+  # CAPACIDADE: SECURITY GATE (MANUAL VALIDATION)
+# ==================================================================
+  # Descrição: Aprovação manual obrigatória após análise SAST (Fortify).
+  # Documentação: https://dvps-dev.redecorp.azr/portal/codeplay/capacidades/catalog/security-gate
+  # Pré-requisitos:
+  #   - Parâmetro 'requireSecurityApproval' = true
+  #   - Fortify Scan executado e relatório publicado como artefato
+  #   - Usuários/grupos aprovadores definidos no campo 'approvers'
+  # Configuração: Parâmetro 'requireSecurityApproval' = true
+  # Observações: Pausa o pipeline até aprovação/rejeição manual. Timeout rejeita automaticamente.
+# ==================================================================
+  # ==================================================================
+  # Job 2.2: ManualSecurity - Gate de Aprovação Manual de Segurança
+  # Descrição: Pausa pipeline para aprovação manual após análise Fortify
+  # ==================================================================
+  # - ${{ if eq(parameters.requireSecurityApproval, true) }}:
+  #   - job: ManualSecurity
+  #     displayName: 'Manual Security Approval'
+  #     dependsOn:
+  #     - FortifyScan
+  #     pool: server
+  #     steps:
+  #     - task: ManualValidation@1
+  #       timeoutInMinutes: 120
+  #       inputs:
+  #         onTimeout: 'reject'
+  #         instructions: |
+  #           Analise o relatório Fortify publicado como artefato.
+  #           Aprove ou rejeite a continuação do pipeline.
+
+
+# ==================================================================
+# CAPACIDADE: SCA SCAN (SCA)
+# ==================================================================
+# Descrição: Análise de composição de software (SCA) usando Dependency Track, com integração à Conviso e publicação de artefatos.
+# Documentação: https://dvps-dev.redecorp.azr/portal/codeplay/capacidades/catalog
+# Observações: Exporta variáveis e publica artefatos para uso no Security Gate.
+# ==================================================================
+
+  - job: SCAScan
+    displayName: 'SCA Scan'
+    condition: and(succeeded(), eq('${{ parameters.runSecuritySCA }}', 'true'))
+    pool: ${{ parameters.agentPool }}
+    steps:
+
+    ## -> Checkout project
+    - checkout: self
+      clean: true
+      fetchTags: false        
+
+#    - template: /tech_products/vvat/templates/run-sca-scan.yaml
+#      parameters:
+#        workingDirectory: ${{ parameters.workingDirectory }}  # Diretório de trabalho para o scan   
+
+# ==================================================================
+# Stage 3: DockerBuild - Construção da Imagem Docker
+# Descrição: Baixa artefatos Java, constrói imagem Docker com aplicação
+#            e opcionalmente publica no Azure Container Registry
+# ==================================================================
+- stage: DockerBuild
+  displayName: 'Docker Build'
+  dependsOn: 
+  - JavaBuild
+  - SecurityAnalysis
+  condition: and(succeeded('JavaBuild'), or(succeeded('SecurityAnalysis'), eq('${{ parameters.runSecuritySCA }}', 'false')))
+  jobs:
+  # ==================================================================
+  # Job 3.1: DockerBuild - Construção e Publicação da Imagem Docker
+  # Descrição: Baixa JARs, copia para contexto Docker, constrói e publica imagem
+  # ==================================================================
+  - job: DockerBuild
+    displayName: 'Build Docker Image'
+    pool: ${{ parameters.agentPool }}
+    
+    steps:
+    # ==================================================================
+    # [Configuração Inicial] Checkout e Download de Artefatos
+    # ==================================================================
+    - checkout: self
+
+    - task: DownloadPipelineArtifact@2
+      displayName: 'Download Java Artifacts'
+      inputs:
+        buildType: 'current'
+        artifactName: 'java-artifacts'
+        targetPath: '$(System.ArtifactsDirectory)/java-artifacts'
+
+    # ==================================================================
+    # [Versionamento] Definição da versão (template central)
+    # ==================================================================
+    - template: /tech_products/vvat/templates/define-version-pomxml.yaml
+      parameters:
+        workingDirectory: ${{ parameters.workingDirectory }}
+        versionFile: $(POM_FILE_PATH)
+        javaVersion: ${{ parameters.javaVersion }}
+
+    # ==================================================================
+    # [Preparação Docker] Cópia dos JARs para Contexto de Build
+    # ==================================================================
+    - task: CopyFiles@2
+      displayName: 'Copy JAR files'
+      inputs:
+        sourceFolder: '$(System.ArtifactsDirectory)/java-artifacts'
+        contents: '**/*.jar'
+        targetFolder: '${{ parameters.workingDirectory }}/target'
+        flattenFolders: false
+    - script: | 
+        ls -la target
+        echo "##[group] Full"
+        ls -laR
+        echo "##[endgroup]"
+      condition: eq(variables['System.Debug'], 'true')
+      displayName: 'List JAR files'
+
+    - task: CmdLine@2
+      displayName: "Print das variáveis"
+      env:
+        HTTP_PROXY: 'http://10.240.58.39:3128'
+        HTTPS_PROXY: 'http://10.240.58.39:3128'
+        NO_PROXY: 'localhost,0.0.0.0,127.0.0.1,10.244.0.0/16,192.168.0.0/16,10.129.178.173,nexus.telefonica.com.br,acrsharedservices01.azurecr.io,appcs-azdevops-shared.azconfig.io,scm.azurewebsites.net'
+      inputs:
+        script: |
+          source ~/.bashrc
+          echo "## Crontab: ${{parameters.rootoption}}"
+
+    # ==================================================================
+    # [Docker Build & Push] Construção da Imagem com Template Central
+    # ==================================================================
+    - ${{ if eq(parameters.prValidationOnly, false) }}:
+      - template: /tech_products/vvat/templates/docker-build-and-push.yaml
+        parameters:
+          imageName: ${{ parameters.imageName }}
+          imageTag: '$(VERSION)'
+          registryServiceConnection: '${{ parameters.registryServiceConnection }}'
+          runSecuritySCA: ${{ parameters.runSecuritySCA }}
+          buildArgs:
+            - 'APPLICATION_NAME=$(Build.Repository.Name)'
+            - 'APP_VERSION=$(VERSION)'
+            - 'JAR_NAME=$(Build.Repository.Name)-$(VERSION).jar'
+            - 'APPLICATION_PATH=target'          
+          dockerfilePath: ${{ parameters.dockerfilePath }}
+          buildContext: '${{ parameters.workingDirectory }}'
+          loginRegistryServiceConnections:
+            - ${{ parameters.registryServiceConnection }}
+
+# ==================================================================
+# Stage 4: VersionCommit - Commit e Tag da Versão de Release
+# Descrição: Atualiza versão no pom.xml, cria commit e tag Git
+#            Executa apenas na master, quando não é PR de validação e quando Docker push está habilitado
+# ==================================================================
+- ${{ if eq(parameters.prValidationOnly, false) }}:
+  - stage: VersionCommit
+    displayName: 'Commit Version'
+    dependsOn: 
+    - DockerBuild
+    jobs:
+    # ==================================================================
+    # Job 4.1: CommitVersion - Commit da Versão e Criação de Tag
+    # Descrição: Faz checkout com credenciais, atualiza versão e cria tag Git
+    # ==================================================================
+    - job: CommitVersion
+      displayName: 'Commit Release Version'
+      pool: ${{ parameters.agentPool }}
+      steps:
+      # ==================================================================
+      # [Git] Checkout com credenciais para push
+      # ==================================================================
+      - checkout: self
+        clean: true
+        persistCredentials: true
+        fetchDepth: 0
+
+      # ==================================================================
+      # [Versionamento] Reafirma versão e realiza commit/tag
+      # ==================================================================
+      - template: /tech_products/vvat/templates/define-version-pomxml.yaml
+        parameters:
+          workingDirectory: ${{ parameters.workingDirectory }}
+          versionFile: $(POM_FILE_PATH)
+          javaVersion: ${{ parameters.javaVersion }}
+      - template: /tech_products/vvat/templates/git-commit-version.yaml
+        parameters:
+          version: $(defineVersion.VERSION)
+          versionFile: ${{ parameters.workingDirectory }}/${{ parameters.versionFile }}

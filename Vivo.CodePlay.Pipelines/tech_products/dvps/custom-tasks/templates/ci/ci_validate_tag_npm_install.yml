@@ -1,0 +1,124 @@
+parameters:
+  - name: EXTENSION_NAME
+  - name: EXTENSION_ID
+  - name: SKIP_TESTS
+  - name: TAG
+  - name: environment
+
+stages:  
+  - stage: validateTag
+    jobs:
+      - job: CheckTag
+        displayName: CheckTag
+        steps:
+          - checkout: self
+            clean: true
+            fetchDepth: 0
+            fetchTags: true
+            persistCredentials: true
+
+          - script: |
+              git fetch --all
+              COMMIT=$(git rev-list -n 1 ${{ parameters.TAG }})
+              echo "Commit tagueado: '$COMMIT'"
+          
+              git merge-base --is-ancestor ${COMMIT} HEAD
+              MAIN_CONTAINS_TAG=$?
+              echo "TAG está na branch principal?: ${MAIN_CONTAINS_TAG}"
+
+              if [ $MAIN_CONTAINS_TAG = "0" ]; then
+                echo "A tag ${{ parameters.TAG }} pertence à branch principal. Seguindo com a execucao do pipeline."
+              else
+                echo "A tag ${{ parameters.TAG }} NAO pertence à branch principal. Interrompendo o pipeline."
+                exit 1
+              fi
+              
+            displayName: "Verifica se a tag pertence à Branch Principal"
+            name: "CommitCheck"
+ 
+  - stage: package
+    dependsOn: validateTag
+    condition: succeeded()
+    displayName: Package
+    jobs:
+      - job: package
+        displayName: Package
+        steps:
+          - checkout: self
+            clean: true
+            fetchTags: true
+            persistCredentials: true
+
+          - script: |
+              git fetch --tags
+              git checkout tags/${{ parameters.TAG }}
+            displayName: "Checkout da Tag ${{ parameters.TAG }}"
+          
+          - task: Npm@1
+            continueOnError: true
+            displayName: Npm Run clean
+            inputs:
+              command: "custom"
+              customCommand: "run clean"
+
+          - task: TfxInstaller@5
+            displayName: 'Use Node CLI for Azure DevOps'
+            inputs:
+              version: 'v0.21.1'
+              checkLatest: true
+
+          - task: Npm@1
+            displayName: Packing all
+            inputs:
+              command: "custom"
+              customCommand: "run package"
+
+          - bash: |
+
+                  if [ -f "package/vss-extension.json" ]; then
+                      EXTENSION_ROOT_FOLDER="$(Build.SourcesDirectory)/package"
+                  elif [ -f "vss-extension.json" ]; then
+                      EXTENSION_ROOT_FOLDER="$(Build.SourcesDirectory)"
+                  else
+                      echo "Arquivo vss-extension.json não foi encontrado. Não foi possível realizar o empacotamento."
+                      exit 1
+                  fi
+
+                  echo "##[debug]Extension root folder: '${EXTENSION_ROOT_FOLDER}'"
+                  
+                  VERSION="${{ parameters.TAG }}"
+                  
+                  if [ "${{ parameters.environment }}" = "preprod" ];then
+                    EXTENSION_NAME_SUFIX="- Preprod"
+                    EXTENSION_ID_SUFIX="-preprod"
+                  elif [ "${{ parameters.environment }}" = "prod" ];then
+                    EXTENSION_NAME_SUFIX=""
+                    EXTENSION_ID_SUFIX=""
+                  fi
+                  
+                  echo "##vso[task.setvariable variable=EXTENSION_ROOT_FOLDER;isOutput=true]$EXTENSION_ROOT_FOLDER"
+                  echo "##vso[task.setvariable variable=VERSION;isOutput=true]$VERSION"
+                  echo "##vso[task.setvariable variable=EXTENSION_NAME_SUFIX;isOutput=true]$EXTENSION_NAME_SUFIX"
+                  echo "##vso[task.setvariable variable=EXTENSION_ID_SUFIX;isOutput=true]$EXTENSION_ID_SUFIX"
+
+            name: packageInfo
+            
+          - task: PackageAzureDevOpsExtension@5
+            name: 'packageExtension'
+            displayName: 'Package Extension'
+            inputs:
+              rootFolder: '$(packageInfo.EXTENSION_ROOT_FOLDER)'
+              outputPath: '$(Build.ArtifactStagingDirectory)/telefonica-vivo-devops-brasil.${{ parameters.EXTENSION_ID }}$(packageInfo.EXTENSION_ID_SUFIX).vsix'
+              publisherId: 'telefonica-vivo-devops-brasil'
+              extensionName: '${{ parameters.EXTENSION_NAME }} Tasks$(packageInfo.EXTENSION_NAME_SUFIX)'
+              extensionId: '${{ parameters.EXTENSION_ID }}$(packageInfo.EXTENSION_ID_SUFIX)'
+              extensionVersion: '$(packageInfo.VERSION)'
+              updateTasksVersion: false
+              extensionVisibility: 'private'
+
+          - publish: $(Build.ArtifactStagingDirectory)
+            artifact: vsix
+            displayName: 'Publish vsix as pipeline artifact'
+            condition: succeededOrFailed()
+
+

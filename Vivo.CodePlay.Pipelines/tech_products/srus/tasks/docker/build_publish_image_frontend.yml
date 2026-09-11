@@ -1,0 +1,187 @@
+parameters:
+- name: appName
+  type: string
+- name: dockerImageName
+  type: string
+- name: dockerImageTag
+  type: string
+- name: appVersion
+  type: string
+- name: artifactFeeds
+  default: $(AZURE_ARTIFACTS_FEED)
+
+steps:
+
+- task: PipAuthenticate@1
+  displayName: 'Pip Authenticate'
+  inputs:
+    artifactFeeds: ${{ parameters.artifactFeeds }}
+    onlyAddExtraIndex: true
+  #env:
+    #http_proxy: $(PROXY_AGENT_HTTP)
+    #https_proxy: $(PROXY_AGENT_HTTPS)
+    #no_proxy: $(PROXY_AGENT_NO_PROXY)
+
+- bash: |
+    REPO_NAME=$(Build.Repository.Name)
+    if [[ "$REPO_NAME" == *"backend"* ]]; then
+        echo "##vso[task.setvariable variable=projectType]backend"
+        echo "Projeto Sirius Backend, passos referentes à lib Sirius carregados..."
+    else
+        echo "##vso[task.setvariable variable=projectType]non-backend"
+        echo "Projeto diferente de Sirius Backend, pulando passos referentes à lib Sirius..."
+    fi
+  displayName: 'Set project type based on repository name'
+
+- checkout: git://SRUS - SIRIUS/lib-telecom-negocio
+  displayName: 'Checkout lib-telecom-negocio repository'
+  persistCredentials: true
+  condition: eq(variables['projectType'], 'backend')
+
+- bash: |
+    if [[ "$(projectType)" == "backend" ]]; then
+      cd $(Build.SourcesDirectory)/lib-telecom-negocio
+      git config pull.rebase true
+      git fetch -f --depth 1 origin master:master
+      git checkout -f master
+    fi
+  displayName: "Preparation for backend"
+  workingDirectory: $(Build.SourcesDirectory)/lib-telecom-negocio
+  condition: eq(variables['projectType'], 'backend')
+
+- bash: |
+    if [[ "$(projectType)" == "backend" ]]; then
+      cd $(Build.SourcesDirectory)/lib-telecom-negocio
+      if [ -f setup.py ]; then
+          # Extrair a versão do setup.py
+          LIB_VERSION=$(grep 'version=' setup.py | head -n1 | cut -d '"' -f2)
+          if [ -n "$LIB_VERSION" ]; then
+              echo "##vso[task.setvariable variable=LIB_VERSION]$LIB_VERSION"
+              echo "Versão extraída da biblioteca: $LIB_VERSION"
+          else
+              echo "Erro: Não foi possível extrair a versão."
+              exit 1
+          fi
+      else
+          echo "Erro: Arquivo setup.py não encontrado."
+          exit 1
+      fi
+    else
+      echo "Este projeto não é do tipo 'backend'. Pulando a extração de versão."
+    fi
+  displayName: 'Extract library version from lib-telecom-negocio'
+  condition: eq(variables['projectType'], 'backend')
+
+- checkout: self
+  displayName: 'Checkout repository'
+  persistCredentials: true
+
+- bash: |
+    cd $(Build.SourcesDirectory)/$(Build.Repository.Name)
+    git config pull.rebase true
+    git fetch -f --depth 1 origin $(Build.SourceBranchName):$(Build.SourceBranchName)
+    git checkout -f $(Build.SourceBranchName)
+  displayName: "Preparation for all projects"
+
+- bash: |
+    cd $(Build.SourcesDirectory)/$(Build.Repository.Name)
+    if [[ "$(Build.SourceBranch)" =~ refs/tags/* ]]; then
+      echo "Running from a tag. Using version from requirements.artifacts."
+      
+      if [ -f requirements.artifacts ]; then
+          LIB_VERSION=$(grep 'sirius==' requirements.artifacts | cut -d '=' -f3)
+          echo "Using version from requirements.artifacts: $LIB_VERSION"
+          echo "##vso[task.setvariable variable=LIB_VERSION]$LIB_VERSION"
+      else
+          echo "requirements.artifacts not found. Exiting."
+          exit 1
+      fi
+    else
+      BRANCH_NAME=$(echo "$(Build.SourceBranch)" | cut -d'/' -f3)
+      echo "Running from a branch: $BRANCH_NAME. Checking setup.py for possible updates."
+      
+      if [ -f requirements.artifacts ]; then
+          CURRENT_LIB_VERSION=$(grep 'sirius==' requirements.artifacts | cut -d '=' -f3)
+          echo "Current version in requirements.artifacts: $CURRENT_LIB_VERSION"
+          echo "Using previously extracted version: $LIB_VERSION"
+          
+          if [ "$LIB_VERSION" != "$CURRENT_LIB_VERSION" ]; then
+              echo "Versions differ. Updating requirements.artifacts with version $LIB_VERSION"
+              sed -i "s/sirius==[0-9]*\.[0-9]*\.[0-9]*/sirius==$LIB_VERSION/" requirements.artifacts
+              git add requirements.artifacts
+              git commit -m "[CI SKIP] Atualização automática da versão do Sirius para ${LIB_VERSION}" requirements.artifacts
+              git push origin $(Build.SourceBranchName)
+          else
+              echo "Versions are the same. No update necessary."
+          fi
+      else
+          echo "requirements.artifacts not found. Exiting."
+          exit 1
+      fi
+    fi
+  displayName: 'Compare and update requirements.artifacts if needed'
+  condition: eq(variables['projectType'], 'backend')
+
+- template: /tech_products/srus/tasks/nodejs/setup_credentials.yml
+
+# ==================================================================
+# [Compliance] Verifica se o repositório está em conformidade com as políticas de configuração
+# ==================================================================
+- task: VivoDevOpsConfigCompliance@1
+  displayName: 'Check DevOps Config Compliance'
+  inputs:
+    workDir: $(DEFAULT_WORKDIR_ARTIFACTS)
+    policySets: |
+      image-definition-files
+
+- task: Docker@2
+  displayName: 'Docker Build'
+  inputs:
+    containerRegistry: $(DOCKER_DEFAULT_REGISTRY_SERVICE_CONNECTION_NAME)
+    command: build
+    repository: '${{ parameters.dockerImageName }}'
+    Dockerfile: "$(DEFAULT_WORKDIR_ARTIFACTS)/.azuredevops/runtime.Dockerfile"
+    buildContext: "$(DEFAULT_WORKDIR_ARTIFACTS)"
+    arguments: |
+      --no-cache 
+      --build-arg LIB_VERSION=$(LIB_VERSION)
+      --build-arg APPLICATION_NAME=${{ parameters.appName }} 
+      --build-arg APPLICATION_PATH=target 
+      --build-arg APP_VERSION=${{ parameters.appVersion }} 
+      --build-arg HTTP_PROXY="" 
+      --build-arg HTTPS_PROXY="" 
+      --build-arg NO_PROXY="" 
+      --build-arg EXTRA_INDEX_URL="$(PIP_EXTRA_INDEX_URL)" 
+    tags: |
+      ${{ parameters.dockerImageTag }}
+
+- template: /security/run_sca_scan_docker.yml
+  parameters: 
+    skipSecurityGate: ${{ variables['SKIP_SECURITY_GATE_SCA'] }}
+    imageSource: "acrsharedservices01.azurecr.io/$(DOCKER_IMAGE_NAME):$(DOCKER_IMAGE_TAG)"
+    
+- task: Docker@2
+  displayName: Docker Push
+  name: dockerPushImage
+  condition: and(succeeded(), eq(variables.flowIsPullRequest, false))
+  inputs:
+    containerRegistry: $(DOCKER_DEFAULT_REGISTRY_SERVICE_CONNECTION_NAME)
+    command: push
+    repository: "${{ parameters.dockerImageName }}"
+    addPipelineData: true
+    addBaseImageData: true
+    tags: |
+      ${{ parameters.dockerImageTag }}
+
+- script: |
+    echo "##[group] ${DOCKER_OUTPUT}"
+    cat ${DOCKER_OUTPUT}
+    echo "##[endgroup]"
+
+    DOCKER_DIGEST="$(cat ${DOCKER_OUTPUT} | grep "digest" | awk -F ' ' '{print $3}')"
+    echo "##[debug] DOCKER_DIGEST..........: ${DOCKER_DIGEST}"
+    echo "##vso[task.setvariable variable=DOCKER_DIGEST;isOutput=true]${DOCKER_DIGEST}"
+  displayName: Export Image Digest
+  name: docker_digest
+  env:
+    DOCKER_OUTPUT: $(dockerPushImage.DockerOutput)

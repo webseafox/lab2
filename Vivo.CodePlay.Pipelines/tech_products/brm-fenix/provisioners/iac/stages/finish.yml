@@ -1,0 +1,96 @@
+parameters:
+  - name: iacParameters
+    type: object
+
+stages:
+  - stage: stage_finish
+    displayName: "Finish"
+    pool: $(POOL)
+    dependsOn:
+      - stage_prep
+      - stage_run
+      # - ${{ if and(eq(parameters.iacParameters.action, 'START'), eq(parameters.iacParameters.target, 'environment')) }}:
+      #   - stage_trigger_qa
+    condition: always()
+    variables:
+      - name: START_TIME
+        value: $[ stageDependencies.stage_prep.validations.outputs['setStartTime.START_TIME'] ]
+      - name: BRM_PREVIOUS_STATE
+        value: $[ stageDependencies.stage_prep.validations.outputs['get_cluster.CLUSTER_STATE'] ]
+      - name: BRM_CURRENT_STATE
+        value: $[ stageDependencies.stage_run.validate.outputs['get_cluster.CLUSTER_STATE'] ]
+    jobs:
+      - ${{ if eq(variables['DISABLE_CONFIRM_DEPLOY'], 'false') }}:
+        - job: approval_informations
+          displayName: "Action Approval Informations"
+          condition: ne(stageDependencies.stage_run.run.result, 'Skipped')
+          steps:
+            - checkout: none
+            - template: ../../../tasks/bash/approval_details.yml
+              parameters:
+                withEnvironmentApproval: true
+
+      - job: pipeline_result
+        displayName: "Pipeline Result Analysis"
+        condition: always()
+        dependsOn:
+          - ${{ if eq(variables['DISABLE_CONFIRM_DEPLOY'], 'false') }}:
+            - approval_informations
+        steps:
+          - checkout: none
+          - template: ../../../tasks/bash/pipeline_result_v2.yml
+
+      - job: notification
+        displayName: "Teams Notification"
+        dependsOn:
+          - pipeline_result
+          - ${{ if eq(variables['DISABLE_CONFIRM_DEPLOY'], 'false') }}:
+            - approval_informations
+        condition: |
+          and(
+            always(),
+            eq(variables['DISABLE_TEAMS_NOTIFICATION'], 'false')
+          )
+        variables:
+          - name: PIPELINE_RESULT
+            value: $[ dependencies.pipeline_result.outputs['pipeline_result.PIPELINE_RESULT'] ]
+          - name: PIPELINE_FAILED
+            value: $[ dependencies.pipeline_result.outputs['pipeline_result.PIPELINE_FAILED'] ]
+          - name: PIPELINE_STAGE_FAILED
+            value: $[ dependencies.pipeline_result.outputs['pipeline_result.PIPELINE_STAGE_FAILED'] ]
+          - name: PIPELINE_JOB_FAILED
+            value: $[ dependencies.pipeline_result.outputs['pipeline_result.PIPELINE_JOB_FAILED'] ]
+          - name: PIPELINE_TASK_FAILED
+            value: $[ dependencies.pipeline_result.outputs['pipeline_result.PIPELINE_TASK_FAILED'] ]
+          - name: PIPELINE_ERROR_MESSAGE
+            value: $[ dependencies.pipeline_result.outputs['pipeline_result.PIPELINE_ERROR_MESSAGE'] ]
+          - name: DEPLOY_APPROVAL_APPROVER_NAME
+            value: $[ dependencies.approval_informations.outputs['details.DEPLOY_APPROVAL_APPROVER_NAME'] ]
+          - name: DEPLOY_APPROVAL_STATUS
+            value: $[ dependencies.approval_informations.outputs['details.DEPLOY_APPROVAL_STATUS'] ]
+          - name: DEPLOY_APPROVAL_COMMENT
+            value: $[ dependencies.approval_informations.outputs['details.DEPLOY_APPROVAL_COMMENT'] ]
+        steps:
+          - checkout: none
+          - script: |
+              FACTS=""
+              if [ "$(PIPELINE_RESULT)" = "Failed" ]; then
+                FACTS="{ \"name\": \"🔴 Failure Information:\", \"value\": \"- 🏗️ _$(PIPELINE_STAGE_FAILED)_ -> ⚙️ _$(PIPELINE_JOB_FAILED)_ -> 📝 _$(PIPELINE_TASK_FAILED)_ \r- 💬 **Error:** _$(PIPELINE_ERROR_MESSAGE)_ \" }"
+              fi
+              echo "##[debug] FACTS.............................: $FACTS"
+
+              echo "##vso[task.setvariable variable=FACTS;isoutput=true]$FACTS"
+            name: factsFormatter
+            displayName: "Facts Formatter"
+
+          - template: ../../../tasks/teams/send_message.yml
+            parameters:
+              flow: "$(ACTION) BRM"
+              title: "Notification from Turn Off BRM"
+              webhookUrl: "$(TEAMS_WEBHOOK_IAC)"
+              status: $(PIPELINE_RESULT)
+              pipelineStartTime: "$(START_TIME)"
+              pipelineEndTime: "$(date +%s)"
+              facts: '{ "name": "📄 Approval Status:", "value": "_$(DEPLOY_APPROVAL_STATUS)_" },{ "name": "👤 Approved By:", "value": "_$(DEPLOY_APPROVAL_APPROVER_NAME)_" },{ "name": "💬 Approval Comment:", "value": "_$(DEPLOY_APPROVAL_COMMENT)_" }'
+              facts2: '{ "name": "⬅️ BRM Previous State:", "value": "_$(BRM_PREVIOUS_STATE)_" },{ "name": "➡️ BRM Current State:", "value": "_$(BRM_CURRENT_STATE)_" }'
+              facts3: "$(factsFormatter.FACTS)"

@@ -1,0 +1,164 @@
+parameters:
+- name: taskName
+  type: string
+  default: determine_new_version
+- name: extraEnvironmentVars
+  type: object
+- name: condition
+  type: object
+  default: succeeded()
+- name: workingDirectory
+  type: string
+  default: $(Build.SourcesDirectory)
+
+steps:
+- bash: |
+    echo "[debug]Última mensagem de commit:"
+    echo "[debug]LAST_COMMIT_MESSAGE ................: ${LAST_COMMIT_MESSAGE}"
+  displayName: "Show last commit message"
+  env:
+    LAST_COMMIT_MESSAGE: $(Build.SourceVersionMessage)
+
+- task: PythonScript@0
+  inputs:
+    failOnStderr: true
+    workingDirectory: ${{ parameters.workingDirectory }}
+    scriptSource: 'inline'
+    script: |
+      from datetime import datetime
+      import os
+      import sys
+      import json
+
+      def set_not_semantic_version():
+        now = datetime.now()
+        build_id = os.getenv('BUILD_ID', '1')
+        final_version = now.strftime("%Y%m%d.%H%M%S")
+        final_version = f'{final_version}.{build_id}'
+        print(f"[debug]New not semantic version: {final_version}")
+        print(f"[debug]NEW_VERSION .........................................: {final_version}")
+        print(f"##vso[task.setvariable variable=NEW_VERSION;]{final_version}")
+        print(f"[debug]COMPONENT_VERSION ...................................: {final_version}")
+        print(f"##vso[task.setvariable variable=COMPONENT_VERSION;]{final_version}")
+        print(f"[debug]SAP_COMMERCE_OPTIONS_VERSION ........................: NOT_SEMANTIC")
+        print(f"##vso[task.setvariable variable=SAP_COMMERCE_OPTIONS_VERSION;]NOT_SEMANTIC")
+
+        return final_version
+
+      def plus_one(version, version_type='patch'):
+        print(f"[debug]Actual semantic version: {version.strip()}")
+        last_version_list = version.strip().split('.')
+
+        if len(last_version_list) != 3:
+            print("[error]Versão semântica inválida. Deve estar no formato MAJOR.MINOR.PATCH")
+            sys.exit(1)
+
+        sap_commerce_options_version='PATCH'
+
+        try:
+            if version_type == 'major':
+                plus_one = int(last_version_list[0]) + 1
+                last_version_list[0] = str(plus_one)
+                last_version_list[1] = '0'
+                last_version_list[2] = '0'
+                print(f"[debug]Incremented major version to: {plus_one}")
+                sap_commerce_options_version='MAJOR'
+
+            if version_type == 'minor':
+                plus_one = int(last_version_list[1]) + 1
+                last_version_list[1] = str(plus_one)
+                last_version_list[2] = '0'
+                print(f"[debug]Incremented minor version to: {plus_one}")
+                sap_commerce_options_version='MINOR'
+
+            if version_type == 'patch':
+                plus_one = int(last_version_list[2]) + 1
+                last_version_list[2] = str(plus_one)
+                print(f"[debug]Incremented patch version to: {plus_one}")
+
+            final_version = '.'.join(last_version_list)
+            print(f"[debug]New semantic version: {final_version}")
+            print(f"[debug]NEW_VERSION .........................................: {final_version}")
+            print(f"##vso[task.setvariable variable=NEW_VERSION;]{final_version}")
+
+            print(f"[debug]COMPONENT_VERSION ...................................: {final_version}")
+            print(f"##vso[task.setvariable variable=COMPONENT_VERSION;]{final_version}")
+
+            print(f"[debug]SAP_COMMERCE_OPTIONS_VERSION ........................: {sap_commerce_options_version}")
+            print(f"##vso[task.setvariable variable=SAP_COMMERCE_OPTIONS_VERSION;]{sap_commerce_options_version}")
+
+            return final_version
+
+        except Exception:
+            sys.exit(1)
+
+      def update_version_by_keywords(commit_msg):
+        use_semantic_version = False
+        actual_branch = os.getenv('ACTUAL_BRANCH')
+        branch_name_to_use_semantic = f'refs/heads/{os.getenv("BRANCH_NAME_TO_USE_SEMANTIC")}'
+
+        print('[debug]Branch name to use semantic versioning: ', branch_name_to_use_semantic)
+        print('[debug]Actual branch: ', actual_branch)
+        if actual_branch == branch_name_to_use_semantic:
+          print('[debug]Use semantic versioning: ', actual_branch)
+          use_semantic_version = True
+
+        if not use_semantic_version:
+            return set_not_semantic_version()
+
+        keywords_list = [{
+                "major": os.getenv('DEVFLOW_OPTIONS_TO_MAJOR_VERSION'),
+                "minor": os.getenv('DEVFLOW_OPTIONS_TO_MINOR_VERSION')
+            }
+        ]
+        file_version_path = os.getenv('FILE_VERSION_PATH')
+        is_json = file_version_path.lower().endswith('.json')
+
+        if not is_json:
+            with open(file_version_path, 'r', encoding='utf-8') as file_opened:
+                last_version = file_opened.read()
+        else:
+            with open(file_version_path, 'r', encoding='utf-8') as file_opened:
+                data = json.load(file_opened)
+                last_version = data['version']
+
+        last_version = last_version.strip()
+        final_version = last_version.strip()
+        for keywords_dict in keywords_list:
+            # Itera sobre os pares chave-valor (ex: 'major', 'valor_do_env')
+            for version_type, keywords_string in keywords_dict.items():
+
+                if not keywords_string:
+                    continue
+
+                # Itera sobre cada keyword individual (separada por vírgula)
+                for keyword in keywords_string.split(','):
+                    keyword = keyword.strip() # Remove espaços em branco
+
+                    if keyword and keyword in commit_msg:
+                        print(f'[debug]Keyword detectada: {keyword} - Incrementando versão {version_type}')
+                        final_version = plus_one(last_version, version_type)
+                        return final_version
+
+        final_version = plus_one(last_version, 'patch') #default increment
+        return final_version
+
+      last_commit_message = os.getenv('LAST_COMMIT_MESSAGE')
+      print('[debug]Debugando a mensagem de commit: ......... ', last_commit_message)
+      if not last_commit_message:
+          print("[error]Não foi possível recuperar a mensagem de commit.")
+          sys.exit(1)
+
+      #Open VERSION file by default
+      update_version_by_keywords(last_commit_message)
+  displayName: "Determine new version based on commit message"
+  name: ${{ parameters.taskName }}
+  env:
+    BUILD_ID: $(Build.BuildId)
+    LAST_COMMIT_MESSAGE: $(Build.SourceVersionMessage)
+    ACTUAL_BRANCH: $(Build.SourceBranch)
+    BRANCH_NAME_TO_USE_SEMANTIC: $(BRANCH_NAME_TO_USE_SEMANTIC)
+    ${{ each environment in parameters.extraEnvironmentVars }}:
+      ${{ environment.key }}: ${{ environment.value }}
+  condition: ${{ parameters.condition }}
+

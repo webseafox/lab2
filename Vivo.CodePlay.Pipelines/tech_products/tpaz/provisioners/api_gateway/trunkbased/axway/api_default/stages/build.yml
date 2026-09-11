@@ -1,0 +1,151 @@
+parameters:
+- name: gateway
+
+stages:
+- stage: stage_build_package
+  pool: $(PRIVATE_AGENT_DEFAULT)
+  displayName: Build & Package
+  condition: eq(variables.flowIsMain, true)
+  variables:
+    API_MANAGER_BASE_URL: $(API_MANAGER_BASE_URL_DEV)
+    ADMIN_USERNAME: $[ coalesce(variables.API_MANAGER_ADMIN_USERNAME_DEV, variables.API_MANAGER_ADMIN_USERNAME) ]
+    ADMIN_PASSWORD: $[ coalesce(variables.API_MANAGER_ADMIN_PASSWORD_DEV, variables.API_MANAGER_ADMIN_PASSWORD) ]
+  dependsOn: []
+  jobs:
+  - job: job_version_update
+    displayName: Version Update
+    steps:
+    - template: /provisioners/api_gateway/trunkbased/axway/api_default/task_groups/bump_api_version.yml
+
+  - job: job_validate
+    displayName: Validate
+    dependsOn:
+    - job_version_update
+    variables: 
+      API_VERSION: $[ dependencies.job_version_update.outputs['set_api_version.API_VERSION'] ]
+    steps:
+    - checkout: self
+    - checkout: api-manager-catalog-${{ parameters.gateway }}
+      path: $(CATALOG_CHECKOUT_PATH)
+    - checkout: CorePipelines
+      path: $(SCRIPTS_CHECKOUT_PATH)
+    - template: /tasks/axway/validate/schema.yml
+      parameters:
+        apiName: $(API_NAME)
+    - template: /tasks/axway/catalog/extract_variables.yml
+      parameters:
+        apiName: $(API_NAME)
+    - template: /tasks/axway/organizations/get_id.yml
+      parameters:
+        organizationName: $(extract_catalog_variables.ORGANIZATION_NAME)
+    - template: /tasks/axway/frontend_api/validate_virtualize.yml
+      parameters:
+        apiName: $(API_NAME)
+        apiVersion: $(API_VERSION)
+
+  - job: job_virtualize
+    displayName: Virtualize
+    condition: and(succeeded(), eq(variables.SHOULD_VIRTUALIZE, 'true'))
+    dependsOn:
+    - job_validate
+    - job_version_update
+    variables: 
+      API_VERSION: $[ dependencies.job_version_update.outputs['set_api_version.API_VERSION'] ]
+      ORGANIZATION_NAME: $[ dependencies.job_validate.outputs['extract_catalog_variables.ORGANIZATION_NAME'] ]
+      SHOULD_VIRTUALIZE: $[ dependencies.job_validate.outputs['validate_virtualize.SHOULD_VIRTUALIZE'] ]
+    steps:
+    - checkout: self
+    - template: /provisioners/api_gateway/trunkbased/axway/api_default/task_groups/upload_to_nexus.yml
+      parameters:
+        apiVersion: $(API_VERSION)
+    - template: /tasks/axway/get_old_api.yml
+      parameters:
+        name: $(API_NAME)
+    - template: /tasks/axway/frontend_api/delete.yml
+      parameters:
+        frontendApiID: $(FRONTEND_OLD_API_ID)
+    - template: /tasks/axway/backend_api/delete.yml
+      parameters:
+        backendApiID: $(BACKEND_OLD_API_ID)
+    - template: /tasks/axway/organizations/get_id.yml
+      parameters:
+        organizationName: $(ORGANIZATION_NAME)
+    - template: /provisioners/api_gateway/trunkbased/axway/api_default/task_groups/virtualization.yml
+      parameters:
+        apiName: $(API_NAME)
+        apiVersion: $(API_VERSION)
+        apiOrganizationID: $(ORGANIZATION_ID)
+        componentName: $(NEXUS_COMPONENT_NAME)
+        componentVersion: $(API_VERSION)
+
+  - job: wait_advanced_config
+    displayName: Advanced Manual Config
+    variables: 
+      API_VERSION: $[ dependencies.job_version_update.outputs['set_api_version.API_VERSION'] ]
+    dependsOn:
+    - job_virtualize
+    - job_version_update
+    pool: server    
+    timeoutInMinutes: 1440
+    steps:   
+    - task: ManualValidation@0
+      condition: and(succeeded(), eq(variables.MANUAL_VALIDATION_ENABLED, true))
+      timeoutInMinutes: 1440
+      inputs:
+        notifyUsers: "$(Build.RequestedForEmail)"
+        instructions: |
+          Siga as intruções abaixo antes de prosseguir com a aprovação manual do job:
+
+          1. Acesse o portal Axway API Manager '$(API_MANAGER_BASE_HOST_URL_DEV)'
+          2. Acesse o Frontend API '$(API_NAME)' na versão '$(API_VERSION)'
+          3. Configure manualmente as configurações avançadas desejada, NÃO publique a API manualmente
+          4. Após finalizar as configurações volte neste pipeline e prossiga em 'Resume'
+          5. A pipeline irá publicar o respectivo Frontend API, fazer o upload dos artefatos no registry e deploy com as novas configurações
+        onTimeout: "reject"
+
+  - job: job_publish
+    displayName: Publish
+    dependsOn:
+    - job_version_update
+    - job_virtualize
+    - wait_advanced_config
+    variables: 
+      API_VERSION: $[ dependencies.job_version_update.outputs['set_api_version.API_VERSION'] ]
+      FRONTEND_API_ID: $[ dependencies.job_virtualize.outputs['virtualization.FRONTEND_API_ID'] ] 
+    steps:
+    - checkout: self
+      persistCredentials: true
+    - template: /tasks/axway/frontend_api/publish.yml
+      parameters:
+        frontendApiName: $(API_NAME)
+        frontendApiID: $(FRONTEND_API_ID)
+    - template: /tasks/axway/frontend_api/get_config_file.yml
+      parameters:
+        frontendApiID: $(FRONTEND_API_ID)
+        apiVersion: $(API_VERSION)
+    - template: /tasks/axway/frontend_api/export.yml
+      parameters:
+        frontendApiID: $(FRONTEND_API_ID)
+        componentName: $(NEXUS_COMPONENT_NAME)
+        componentVersion: $(API_VERSION)
+    - template: /tasks/nexus/upload_file.yml
+      parameters:
+        displayName: "Upload .dat"
+        repository: $(NEXUS_REPOSITORY)
+        localFileLocation: "$(Agent.TempDirectory)/$(NEXUS_COMPONENT_NAME)-$(API_VERSION).dat"
+        remoteFileLocation: "$(NEXUS_COMPONENT_GROUP)/$(NEXUS_COMPONENT_NAME)/$(API_VERSION)/$(NEXUS_COMPONENT_NAME).dat"
+    - template: /tasks/nexus/upload_file.yml
+      parameters:
+        displayName: "Upload configFrontend.json"
+        repository: $(NEXUS_REPOSITORY)
+        localFileLocation: "$(Agent.TempDirectory)/configFrontend-$(API_VERSION).json"
+        remoteFileLocation: "$(NEXUS_COMPONENT_GROUP)/$(NEXUS_COMPONENT_NAME)/$(API_VERSION)/$(NEXUS_COMPONENT_NAME)-configFrontend-$(API_VERSION).json"
+        credentialsEnabled: false
+    - template: /provisioners/api_gateway/trunkbased/axway/api_default/task_groups/upload_src.yml
+      parameters:
+        repository: $(NEXUS_REPOSITORY)
+        localFileLocation: "$(Agent.TempDirectory)/$(NEXUS_COMPONENT_NAME)-$(API_VERSION).tar"
+        remoteFileLocation: "$(NEXUS_COMPONENT_GROUP)/$(NEXUS_COMPONENT_NAME)/$(API_VERSION)/$(NEXUS_COMPONENT_NAME).tar"
+    - template: /provisioners/api_gateway/trunkbased/axway/api_default/task_groups/push_api_version.yml
+      parameters:
+        apiVersion: $(API_VERSION)

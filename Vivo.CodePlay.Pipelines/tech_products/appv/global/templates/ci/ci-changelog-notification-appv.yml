@@ -1,0 +1,92 @@
+stages:
+
+- stage: ci_changelog_notification
+  displayName: "CI - Changelog Notification"
+  pool:
+    name: GeneralPurposeLinuxAgentsCI
+  dependsOn:
+    - ci_publish
+  
+  jobs:      
+  - job: notification
+    displayName: Notification
+    steps:
+
+    ## -> Clean the pipeline workspace and checkout the code.
+    ## -> 6d15af64-176c-496d-b583-fd2ae21d4df4 is the decorator for checkout.
+    - task: 6d15af64-176c-496d-b583-fd2ae21d4df4@1
+      displayName: Checkout Code
+      name: checkout_code 
+      inputs:
+        repository: self
+        persistCredentials: "true"
+        clean: true
+
+    ## -> Checkout the last commit that was pushed to the repository. 
+    ## -> Set last commit HASH to a variable. 
+    - task: Bash@3
+      displayName: Checkout Last Commit
+      name: checkout_last_commit     
+      condition: succeeded()
+      continueOnError: false
+      inputs:
+        targetType: inline
+        script: |
+          echo "##[debug] Checkout last commit from '$(Build.SourceBranchName)'"
+
+          git config pull.rebase true
+          git fetch -f --depth 1 origin $(Build.SourceBranchName):$(Build.SourceBranchName)
+          git checkout -f $(Build.SourceBranchName)
+          lastCommitHash=$(git rev-parse --short=6 HEAD)
+
+          echo "##[debug] Last commit short hash '$lastCommitHash'"          
+          echo "##vso[task.setvariable variable=SHORT_HASH]$lastCommitHash"
+
+    ## -> Send changelog.json via POST to sentinels.
+    - task: Bash@3
+      displayName: Notify
+      name: notify
+      condition: succeeded()      
+      continueOnError: false
+      inputs:
+        targetType: inline
+        script: |
+          json="$(Build.SourcesDirectory)/changelog.json"
+          if [ -f "$json" ]; then
+            echo "Changelog.json file found"
+          else
+            echo "Changelog.json file NOT found"
+            exit 1
+          fi
+
+          run_curl_deploy() {
+            response=$(curl --write-out "HTTPSTATUS:%{http_code}" --silent --output response_body.txt --request POST \
+                            --url $(SENTINELS_ENDPOINT_URL) \
+                            --header 'Content-Type: application/json' \
+                            --data @$json)
+
+            # Extract the status code
+            http_status=$(echo $response | tr -d '\n' | sed -e 's/.*HTTPSTATUS://')
+
+            # Log the response body and headers if the status code is not 202
+            if [[ $http_status -ne 202 ]]; then
+                echo '##[error] Error while executing curl command to notify sentinels. Response code: '$http_status
+                echo '##[error] Response body:'
+                cat response_body.txt
+                echo '##[error] Check [Lib Publish Failure] job in the pipeline for more information.'
+                exit 1
+            else
+                echo '##[section] Notification succeeded with status code 202.'
+            fi
+          }
+
+          run_curl_deploy
+
+    # Required CI task - Version Management
+    - task: VersionManagerVivo@8
+      displayName: "Manage Version"
+      condition: succeeded()
+      inputs:
+        versioning: "semantic"
+        tagRepository: true
+      continueOnError: true

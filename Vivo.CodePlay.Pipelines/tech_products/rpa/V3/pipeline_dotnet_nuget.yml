@@ -1,0 +1,849 @@
+variables:
+  - name: solution
+    value: "**/*.sln"
+  - name: BuildPlatform
+    value: "Any CPU"
+  - name: BuildConfiguration
+    value: "Release"
+  - name: DOTNET_VERSION
+    value: "8.x"
+  - name: NUGET_VERSION
+    value: "6.10.2"
+  - name: SIGLA
+    value: $[ lower(split(variables['System.TeamProject'],' ')[0]) ]
+  - name: DEFAULT_FEED_NAME
+    value: $[ upper(variables['SIGLA']) ]
+  - name: AZURE_FEED_NAME
+    value: $[ variables['DEFAULT_FEED_NAME'] ]
+  - name: PROJECT_GUID
+    value: 'a96e48f0-27ec-4749-98a8-97f5ba41992c'
+  - name: NUGET_AZURE_FEED_URL
+    value: 'https://pkgs.dev.azure.com/telefonica-vivo-brasil/$(PROJECT_GUID)/_packaging/$(AZURE_FEED_NAME)/nuget/v3/index.json'
+  - name: NUGET_CONFIG_PATH
+    value: '%APPDATA%\NuGet\NuGet.Config'
+  - name: VERSION_FILE_PATH
+    value: $(System.DefaultWorkingDirectory)/${{ parameters.versionFile }}
+
+parameters:
+  - name: PUBLISH_ARTIFACT_ID
+    type: string
+    default: "default-value"
+
+  - name: SONARQUBE_CONNECTION_NAME
+    type: string
+    default: "default-value"
+
+  - name: SONARQUBE_PROJECT_NAME
+    type: string
+    default: "default-value"
+
+  - name: forcePublish
+    type: string
+    default: 'no'
+    values:
+    - 'no'
+    - 'yes'
+
+  - name: allowAutomatedVersionPush
+    type: boolean
+    default: false
+    displayName: 'Permitir commit e push automático do arquivo VERSION'
+
+  - name: versionFile
+    type: string
+    default: 'VERSION'
+    displayName: 'Arquivo utilizado pela VersionManagerVivo@8 para leitura/escrita da versão'
+
+  - name: branchingStrategy
+    type: string
+    default: 'trunkbased'
+    displayName: 'Estratégia de versionamento semântico aplicada pela VersionManagerVivo@8'
+    values:
+      - 'trunkbased'
+      - 'vivoflow'
+      - 'releaseflow'
+      - 'gitlabflow'
+      - 'gitlabflow-semantic'
+      - 'custom'
+      - 'monorepo'
+
+stages:
+  - stage: BuildApplication
+    dependsOn: []
+    variables:
+      - group: RPADEVOPS
+    jobs:
+      - job: Build_Publish
+        pool:
+          name: "RPAAgents"
+          demands: "nice"
+        steps:
+          - checkout: self
+            persistCredentials: true
+
+          - task: PowerShell@2
+            displayName: 'Ensure VERSION file'
+            inputs:
+              targetType: 'inline'
+              pwsh: false
+              script: |
+                $versionFile = Join-Path "$(System.DefaultWorkingDirectory)" "VERSION"
+                if (-not (Test-Path $versionFile)) {
+                  Set-Content -Path $versionFile -Value "0.0.0"
+                  Write-Host "[VERSION] VERSION criado em $versionFile com valor 0.0.0"
+                }
+
+          # NOTA: A versao usada no build do pacote NuGet e calculada via
+          # VersionManagerVivo@8 (comando nextVersion), que le corretamente o
+          # arquivo VERSION informado em versionFile.
+          - task: VersionManagerVivo@8
+            name: BuildVersion
+            displayName: "Definition Version"
+            inputs:
+              command: 'nextVersion'
+              branchingStrategy: ${{ parameters.branchingStrategy }}
+              versionFile: $(VERSION_FILE_PATH)
+              bumpMethod: 'patch'
+
+          - task: PowerShell@2
+            name: checkDotNetBuild
+            displayName: "Verificar se .NET 8 já está instalado"
+            inputs:
+              targetType: "inline"
+              pwsh: false
+              script: |
+                $requiredMajor = 8
+                Write-Host "[INFO] Verificando se .NET SDK $requiredMajor.x já está instalado..."
+                
+                try {
+                  $dotnetVersion = & dotnet --version 2>$null
+                  if ($dotnetVersion) {
+                    $majorVersion = [int]($dotnetVersion.Split('.')[0])
+                    Write-Host "[INFO] Versão do .NET encontrada: $dotnetVersion"
+                    
+                    if ($majorVersion -ge $requiredMajor) {
+                      Write-Host "[OK] .NET SDK $dotnetVersion já está instalado. Pulando download."
+                      Write-Host "##vso[task.setvariable variable=skipDotNetInstall]true"
+                    } else {
+                      Write-Host "[WARN] Versão instalada ($dotnetVersion) é menor que a requerida ($requiredMajor.x)."
+                      Write-Host "##vso[task.setvariable variable=skipDotNetInstall]false"
+                    }
+                  } else {
+                    Write-Host "[WARN] .NET SDK não encontrado."
+                    Write-Host "##vso[task.setvariable variable=skipDotNetInstall]false"
+                  }
+                } catch {
+                  Write-Host "[WARN] Erro ao verificar .NET: $($_.Exception.Message)"
+                  Write-Host "##vso[task.setvariable variable=skipDotNetInstall]false"
+                }
+
+          - task: UseDotNet@2
+            displayName: "Use .NET $(DOTNET_VERSION)"
+            condition: and(succeeded(), ne(variables['skipDotNetInstall'], 'true'))
+            continueOnError: true
+            inputs:
+              packageType: "sdk"
+              version: "$(DOTNET_VERSION)"
+              performMultiLevelLookup: true
+
+          - task: PowerShell@2
+            displayName: "Verificar nuget.config do servidor"
+            inputs:
+              targetType: "inline"
+              pwsh: false
+              script: |
+                $ErrorActionPreference = 'Stop'
+                
+                # Caminhos possíveis do nuget.config no servidor
+                $possiblePaths = @(
+                  "$env:APPDATA\NuGet\NuGet.Config",
+                  "$(Agent.HomeDirectory)\nuget.config",
+                  "$(System.DefaultWorkingDirectory)\nuget.config"
+                )
+                
+                $foundPath = $null
+                Write-Host "[INFO] Procurando nuget.config no servidor..."
+                
+                foreach ($path in $possiblePaths) {
+                  Write-Host "[INFO] Verificando: $path"
+                  if (Test-Path $path) {
+                    $foundPath = $path
+                    Write-Host "[OK] Arquivo encontrado em: $foundPath"
+                    break
+                  }
+                }
+                
+                if (-not $foundPath) {
+                  Write-Host "##vso[task.logissue type=error]Arquivo nuget.config não encontrado no servidor."
+                  Write-Host "[ERROR] Caminhos verificados:"
+                  $possiblePaths | ForEach-Object { Write-Host "  - $_" }
+                  exit 1
+                }
+                
+                Write-Host "[INFO] Conteúdo do nuget.config:"
+                Get-Content $foundPath | ForEach-Object { Write-Host $_ }
+                
+                # Definir variável para uso posterior
+                Write-Host "##vso[task.setvariable variable=NUGET_CONFIG_PATH]$foundPath"
+                Write-Host "[INFO] Variável NUGET_CONFIG_PATH definida como: $foundPath"
+          
+          - task: DotNetCoreCLI@2
+            displayName: "Restore NuGet packages"
+            inputs:
+              command: "restore"
+              projects: "$(solution)"
+              feedsToUse: 'config'
+              nugetConfigPath: '$(NUGET_CONFIG_PATH)'
+              externalFeedCredentials: RPA_COMPONENTS_RESTORE_NUGET
+
+          - task: DotNetCoreCLI@2
+            displayName: "Build solution"
+            inputs:
+              command: "build"
+              projects: "$(solution)"
+              arguments: >
+                --configuration $(BuildConfiguration) --no-restore
+                /p:Version=$(BuildVersion.VERSION)
+                /p:AssemblyVersion=$(BuildVersion.VERSION)
+                /p:FileVersion=$(BuildVersion.VERSION)
+
+          - task: DotNetCoreCLI@2
+            displayName: "Pack NuGet package"
+            inputs:
+              command: "pack"
+              packagesToPack: "**/*.csproj"
+              packDirectory: "$(Build.ArtifactStagingDirectory)"
+              configuration: "$(BuildConfiguration)"
+              versioningScheme: 'off'
+              # O pack precisa executar build para gerar outputs como runtimeconfig.json em projetos com EnableComHosting.
+              nobuild: false
+              # Mantém a versão do pacote e dos binários consistente quando o pack recompila o projeto.
+              buildProperties: 'PackageVersion=$(BuildVersion.VERSION);PackageId=${{ parameters.PUBLISH_ARTIFACT_ID }};Version=$(BuildVersion.VERSION);AssemblyVersion=$(BuildVersion.VERSION);FileVersion=$(BuildVersion.VERSION)'
+
+          - task: PublishSymbols@2
+            displayName: 'Publish symbols path'
+            inputs:
+              SearchPattern: '**/bin/**/*.pdb'
+              PublishSymbols: false
+            continueOnError: true
+
+          - task: CopyFiles@2
+            displayName: 'Copy Files to: $(build.artifactstagingdirectory)'
+            inputs:
+              SourceFolder: '$(system.defaultworkingdirectory)'
+              Contents: '**/bin/$(BuildConfiguration)/**'
+              TargetFolder: '$(build.artifactstagingdirectory)'
+            condition: succeededOrFailed()
+
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish Artifact: drop'
+            inputs:
+              PathtoPublish: '$(build.artifactstagingdirectory)'
+            condition: succeededOrFailed()
+
+  - stage: DetectPackageOrigin
+    dependsOn: BuildApplication
+    jobs:
+      - job: DetectOrigin
+        pool:
+          name: "RPAAgents"
+          demands: "nice"
+        steps:
+          - checkout: self
+            persistCredentials: true
+
+          - task: PowerShell@2
+            name: checkDotNetDetect
+            displayName: "Verificar se .NET 8 já está instalado"
+            inputs:
+              targetType: "inline"
+              pwsh: false
+              script: |
+                $requiredMajor = 8
+                Write-Host "[INFO] Verificando se .NET SDK $requiredMajor.x já está instalado..."
+                
+                try {
+                  $dotnetVersion = & dotnet --version 2>$null
+                  if ($dotnetVersion) {
+                    $majorVersion = [int]($dotnetVersion.Split('.')[0])
+                    Write-Host "[INFO] Versão do .NET encontrada: $dotnetVersion"
+                    
+                    if ($majorVersion -ge $requiredMajor) {
+                      Write-Host "[OK] .NET SDK $dotnetVersion já está instalado. Pulando download."
+                      Write-Host "##vso[task.setvariable variable=skipDotNetInstall]true"
+                    } else {
+                      Write-Host "[WARN] Versão instalada ($dotnetVersion) é menor que a requerida ($requiredMajor.x)."
+                      Write-Host "##vso[task.setvariable variable=skipDotNetInstall]false"
+                    }
+                  } else {
+                    Write-Host "[WARN] .NET SDK não encontrado."
+                    Write-Host "##vso[task.setvariable variable=skipDotNetInstall]false"
+                  }
+                } catch {
+                  Write-Host "[WARN] Erro ao verificar .NET: $($_.Exception.Message)"
+                  Write-Host "##vso[task.setvariable variable=skipDotNetInstall]false"
+                }
+
+          - task: UseDotNet@2
+            displayName: "Use .NET $(DOTNET_VERSION)"
+            condition: and(succeeded(), ne(variables['skipDotNetInstall'], 'true'))
+            continueOnError: true
+            inputs:
+              packageType: "sdk"
+              version: "$(DOTNET_VERSION)"
+              performMultiLevelLookup: true
+
+          - task: PowerShell@2
+            displayName: "Verificar nuget.config do servidor"
+            inputs:
+              targetType: "inline"
+              pwsh: false
+              script: |
+                $ErrorActionPreference = 'Stop'
+                
+                # Caminhos possíveis do nuget.config no servidor
+                $possiblePaths = @(
+                  "$env:APPDATA\NuGet\NuGet.Config",
+                  "$(Agent.HomeDirectory)\nuget.config",
+                  "$(System.DefaultWorkingDirectory)\nuget.config"
+                )
+                
+                $foundPath = $null
+                Write-Host "[INFO] Procurando nuget.config no servidor..."
+                
+                foreach ($path in $possiblePaths) {
+                  Write-Host "[INFO] Verificando: $path"
+                  if (Test-Path $path) {
+                    $foundPath = $path
+                    Write-Host "[OK] Arquivo encontrado em: $foundPath"
+                    break
+                  }
+                }
+                
+                if (-not $foundPath) {
+                  Write-Host "##vso[task.logissue type=error]Arquivo nuget.config não encontrado no servidor."
+                  Write-Host "[ERROR] Caminhos verificados:"
+                  $possiblePaths | ForEach-Object { Write-Host "  - $_" }
+                  exit 1
+                }
+                
+                Write-Host "[INFO] Conteúdo do nuget.config:"
+                Get-Content $foundPath | ForEach-Object { Write-Host $_ }
+                
+                # Definir variável para uso posterior
+                Write-Host "##vso[task.setvariable variable=NUGET_CONFIG_FILE_PATH]$foundPath"
+                Write-Host "[INFO] Variável NUGET_CONFIG_FILE_PATH definida como: $foundPath"
+
+          - task: NuGetAuthenticate@1
+            displayName: "Authenticate NuGet"
+            inputs:
+              forceReinstallCredentialProvider: true
+              nuGetServiceConnections: RPA_COMPONENTS_RESTORE_NUGET, RPAT_COMPONENTS_NUGET
+
+          - task: PowerShell@2
+            displayName: "Listar sources configuradas"
+            inputs:
+              targetType: "inline"
+              pwsh: false
+              script: |
+                Write-Host "[INFO] Verificando sources NuGet após autenticação:"
+                dotnet nuget list source
+
+          - task: DownloadBuildArtifacts@1
+            displayName: "Download Build Artifacts for detection"
+            inputs:
+              buildType: "current"
+              downloadType: "single"
+              artifactName: "drop"
+              downloadPath: "$(System.ArtifactsDirectory)"
+
+          - task: PowerShell@2
+            name: detectSource
+            displayName: "Detectar origem do pacote"
+            inputs:
+              targetType: inline
+              pwsh: false
+              script: |
+                Set-StrictMode -Version Latest
+                $ErrorActionPreference = 'Stop'
+
+                function Get-Collection {
+                  param($Value)
+                  if ($null -eq $Value) { return @() }
+                  if ($Value -is [System.Management.Automation.PSCustomObject]) { return @($Value) }
+                  if ($Value -is [hashtable]) { return @($Value) }
+                  if ($Value -is [string]) { return @($Value) }
+                  if ($Value -is [System.Collections.IEnumerable]) { return @($Value) }
+                  return @($Value)
+                }
+
+                function Get-PropertyValue {
+                  param(
+                    [Parameter(Mandatory)] $Object,
+                    [Parameter(Mandatory)] [string[]] $PropertyNames
+                  )
+                  foreach ($name in $PropertyNames) {
+                    if ($Object.PSObject.Properties.Name -contains $name) {
+                      $value = $Object.$name
+                      if ($null -ne $value -and -not [string]::IsNullOrWhiteSpace([string]$value)) {
+                        return $value
+                      }
+                    }
+                  }
+                  return $null
+                }
+
+                function Get-NormalizedSourceRecords {
+                  param([Parameter(Mandatory)] $SearchData)
+
+                  $records = New-Object System.Collections.Generic.List[object]
+                  $stack = New-Object System.Collections.Stack
+
+                  foreach ($item in Get-Collection $SearchData) {
+                    $stack.Push($item)
+                  }
+
+                  while ($stack.Count -gt 0) {
+                    $current = $stack.Pop()
+                    if (-not $current) { continue }
+
+                    if ($current -is [System.Collections.IEnumerable] -and -not ($current -is [string]) -and -not ($current -is [System.Management.Automation.PSCustomObject]) -and -not ($current -is [hashtable])) {
+                      foreach ($child in @($current)) { $stack.Push($child) }
+                      continue
+                    }
+
+                    $props = $current.PSObject.Properties.Name
+                    foreach ($propName in $props) {
+                      $value = $current.$propName
+                      if (-not $value) { continue }
+                      if ($value -is [System.Management.Automation.PSCustomObject] -or $value -is [hashtable]) {
+                        $stack.Push($value)
+                      } elseif ($value -is [System.Collections.IEnumerable] -and -not ($value -is [string])) {
+                        foreach ($child in @($value)) { $stack.Push($child) }
+                      }
+                    }
+
+                    $packageNodes = @()
+                    if ($props -contains 'packages') {
+                      $packageNodes = Get-Collection $current.packages
+                    } elseif ($props -contains 'package') {
+                      $packageNodes = Get-Collection $current.package
+                    } else {
+                      continue
+                    }
+
+                    $packageIds = @()
+                    foreach ($pkg in $packageNodes) {
+                      $candidateId = Get-PropertyValue $pkg @('id','packageId','name')
+                      if ($candidateId) {
+                        $packageIds += $candidateId
+                      }
+                    }
+
+                    if ($packageIds.Count -eq 0) { continue }
+
+                    $sourceName = Get-PropertyValue $current @('name','sourceDisplayName','sourceName')
+                    if (-not $sourceName) { $sourceName = '<origem desconhecida>' }
+                    $sourceUrl = Get-PropertyValue $current @('url','sourceUrl','feedUrl')
+
+                    $records.Add([pscustomobject]@{
+                      SourceName = $sourceName
+                      SourceUrl  = $sourceUrl
+                      PackageIds = @($packageIds | Sort-Object -Unique)
+                    })
+                  }
+
+                  return $records `
+                    | Where-Object { @($_.PackageIds).Count -gt 0 } `
+                    | Group-Object SourceName, SourceUrl `
+                    | ForEach-Object { $_.Group | Select-Object -First 1 }
+                }
+
+                Set-Location "$(System.DefaultWorkingDirectory)"
+                $packageId = '${{ parameters.PUBLISH_ARTIFACT_ID }}'
+                
+                Write-Host "=== [DEBUG] Listando sources NuGet configuradas ==="
+                $configFilePath = "$(NUGET_CONFIG_FILE_PATH)"
+                Write-Host "[INFO] Usando nuget.config: $configFilePath"
+                Write-Host "[INFO] Executando: dotnet nuget list source --configfile `"$configFilePath`""
+                $sourcesOutput = dotnet nuget list source --configfile "$configFilePath" 2>&1
+                Write-Host $sourcesOutput
+                Write-Host "=== [DEBUG] Fim da listagem de sources ==="
+                Write-Host ""
+
+                $dotnetArgs = @('package', 'search', $packageId, '--prerelease', '--format', 'json', '--configfile', $configFilePath)
+                Write-Host "[DEBUG] Executando: dotnet $($dotnetArgs -join ' ')"
+
+                $searchOutput = & dotnet @dotnetArgs 2>&1
+                Write-Host "[DEBUG] Resposta bruta do dotnet package search:"
+                Write-Host $searchOutput
+                Write-Host "[DEBUG] Fim da resposta bruta"
+                Write-Host ""
+
+                # Filtrar warnings e extrair apenas o JSON válido
+                $jsonLines = @()
+                $inJson = $false
+                foreach ($line in $searchOutput) {
+                  $lineStr = [string]$line
+                  # Detectar início do JSON
+                  if ($lineStr -match '^\s*\{') {
+                    $inJson = $true
+                  }
+                  # Capturar apenas linhas JSON
+                  if ($inJson) {
+                    $jsonLines += $lineStr
+                  }
+                }
+                
+                $searchJson = $jsonLines -join "`n"
+                Write-Host "[DEBUG] JSON extraído (sem warnings):"
+                Write-Host $searchJson
+                Write-Host ""
+
+                if ([string]::IsNullOrWhiteSpace($searchJson)) {
+                  Write-Host "##vso[task.logissue type=error]Nenhuma resposta JSON retornada pelo dotnet package search para '$packageId'."
+                  exit 1
+                }
+
+                try {
+                  $searchData = $searchJson | ConvertFrom-Json -ErrorAction Stop
+                  Write-Host "[DEBUG] JSON parseado com sucesso. Estrutura de primeiro nível:"
+                  $searchData.PSObject.Properties | ForEach-Object { Write-Host "  Propriedade: $($_.Name)" }
+                } catch {
+                  Write-Host "##vso[task.logissue type=error]Falha ao analisar JSON do dotnet package search para '$packageId': $($_.Exception.Message)"
+                  Write-Host "[DEBUG] JSON que causou o erro:"
+                  Write-Host $searchJson
+                  exit 1
+                }
+
+                # Verificar e reportar problemas de autenticação
+                if ($searchData.PSObject.Properties.Name -contains 'searchResult') {
+                  foreach ($sourceResult in $searchData.searchResult) {
+                    if ($sourceResult.PSObject.Properties.Name -contains 'problems' -and $sourceResult.problems) {
+                      foreach ($problem in $sourceResult.problems) {
+                        $problemText = $problem.text -replace '\\u0027', "'"
+                        if ($problemText -match '401 Unauthorized|403 Forbidden') {
+                          Write-Host "##vso[task.logissue type=warning]Source '$($sourceResult.sourceName)' com erro de autenticação: $problemText"
+                        } else {
+                          Write-Host "[WARN] Source '$($sourceResult.sourceName)': $problemText"
+                        }
+                      }
+                    }
+                  }
+                }
+
+                $sourceRecords = Get-NormalizedSourceRecords -SearchData $searchData
+                
+                $recordsList = @($sourceRecords)
+                Write-Host "[DEBUG] Total de registros normalizados: $($recordsList.Count)"
+                foreach ($record in $recordsList) {
+                  Write-Host "[DEBUG]   Source: '$($record.SourceName)' | URL: '$($record.SourceUrl)' | Pacotes: $($record.PackageIds -join ', ')"
+                }
+                Write-Host ""
+
+                $matchingSources = $sourceRecords | Where-Object { $_.PackageIds -contains $packageId }
+                
+                $matchesList = @($matchingSources)
+                Write-Host "[DEBUG] Sources que contêm o pacote '$packageId': $($matchesList.Count)"
+                foreach ($match in $matchesList) {
+                  Write-Host "[DEBUG]   Match: '$($match.SourceName)' -> $($match.SourceUrl)"
+                }
+                Write-Host ""
+
+                if (-not $matchingSources) {
+                  Write-Host "[INFO] Pacote '$packageId' não encontrado em nenhuma source. Será publicado em RPAT como novo componente."
+                  
+                  # Obter a URL do RPAT da lista de sources
+                  $listSourceOutput = dotnet nuget list source 2>&1 | Out-String
+                  $lines = $listSourceOutput -split "`n"
+                  $rpatUrl = $null
+                  
+                  for ($i = 0; $i -lt $lines.Count; $i++) {
+                    $line = $lines[$i].Trim()
+                    if ($line -match "^\d+\.\s+(RPAT)\s+\[") {
+                      if ($i + 1 -lt $lines.Count) {
+                        $nextLine = $lines[$i + 1].Trim()
+                        if ($nextLine -match '^https?://') {
+                          $rpatUrl = $nextLine.Trim()
+                          break
+                        }
+                      }
+                    }
+                  }
+                  
+                  if ([string]::IsNullOrWhiteSpace($rpatUrl)) {
+                    $rpatUrl = "https://pkgs.dev.azure.com/telefonica-vivo-brasil/a96e48f0-27ec-4749-98a8-97f5ba41992c/_packaging/RPAT/nuget/v3/index.json"
+                  }
+                  
+                  Write-Host "[INFO] Definindo destino como RPAT: $rpatUrl"
+                  Write-Host "##vso[task.setvariable variable=detectedPackageId]$packageId"
+                  Write-Host "##vso[task.setvariable variable=publishSourceName;isOutput=true]RPAT"
+                  Write-Host "##vso[task.setvariable variable=publishSourceUrl;isOutput=true]$rpatUrl"
+                  exit 0
+                }
+
+                $matchingSources = $matchingSources | Group-Object SourceName | ForEach-Object { $_.Group | Select-Object -First 1 }
+                $availableNames = $matchingSources.SourceName | Where-Object { $_ } | Sort-Object -Unique
+                Write-Host "Sources candidatas: $([string]::Join(', ', $availableNames))"
+
+                $priorityRules = @(
+                  @{ Name = 'RPAT'; Predicate = { param($s) $s.SourceName -and $s.SourceName -match '(?i)RPAT' } },
+                  @{ Name = 'Nexus'; Predicate = { param($s) $s.SourceName -and $s.SourceName -match '(?i)Nexus' } }
+                )
+
+                $selectedSource = $null
+                foreach ($rule in $priorityRules) {
+                  $candidate = $matchingSources | Where-Object { & $rule.Predicate $_ } | Select-Object -First 1
+                  if ($candidate) {
+                    $selectedSource = $candidate
+                    Write-Host "Source selecionada pela prioridade '$($rule.Name)': '$($selectedSource.SourceName)'."
+                    break
+                  }
+                }
+
+                if (-not $selectedSource) {
+                  $selectedSource = $matchingSources | Select-Object -First 1
+                  Write-Host "Source selecionada por padrão: '$($selectedSource.SourceName)'."
+                }
+
+                $detectedName = $selectedSource.SourceName
+                $detectedUrl = $selectedSource.SourceUrl
+
+                # Se a URL não foi encontrada no JSON, obter da lista de sources configuradas
+                if ([string]::IsNullOrWhiteSpace($detectedUrl)) {
+                  Write-Host "[DEBUG] URL não encontrada no JSON, consultando 'dotnet nuget list source'..."
+                  
+                  $listSourceOutput = dotnet nuget list source 2>&1 | Out-String
+                  Write-Host "[DEBUG] Output de 'dotnet nuget list source':"
+                  Write-Host $listSourceOutput
+                  
+                  # Parsear a saída para encontrar a URL da source
+                  $lines = $listSourceOutput -split "`n"
+                  $foundSource = $false
+                  
+                  for ($i = 0; $i -lt $lines.Count; $i++) {
+                    $line = $lines[$i].Trim()
+                    
+                    # Procurar pela linha que contém o nome da source
+                    if ($line -match "^\d+\.\s+(.+?)\s+\[") {
+                      $sourceName = $matches[1].Trim()
+                      
+                      if ($sourceName -eq $detectedName) {
+                        $foundSource = $true
+                        Write-Host "[DEBUG] Source '$sourceName' encontrada na lista"
+                        
+                        # A próxima linha deve conter a URL
+                        if ($i + 1 -lt $lines.Count) {
+                          $nextLine = $lines[$i + 1].Trim()
+                          if ($nextLine -match '^https?://') {
+                            $detectedUrl = $nextLine.Trim()
+                            Write-Host "[DEBUG] URL extraída: $detectedUrl"
+                            break
+                          }
+                        }
+                      }
+                    }
+                  }
+                  
+                  if (-not $foundSource -or [string]::IsNullOrWhiteSpace($detectedUrl)) {
+                    Write-Host "##vso[task.logissue type=warning]Não foi possível determinar a URL para a source '$detectedName'. Usando o nome da source como fallback."
+                    $detectedUrl = $detectedName
+                  }
+                }
+
+                Write-Host "Pacote encontrado na source '$detectedName' -> $detectedUrl"
+
+                Write-Host "##vso[task.setvariable variable=detectedPackageId]$packageId"
+                Write-Host "##vso[task.setvariable variable=publishSourceName;isOutput=true]$detectedName"
+                Write-Host "##vso[task.setvariable variable=publishSourceUrl;isOutput=true]$detectedUrl"
+
+  - stage: PublishComponent
+    pool:
+          name: "RPAAgents"
+          demands: "nice"
+    dependsOn: DetectPackageOrigin
+    condition: or(
+        eq('${{ parameters.forcePublish }}', 'yes'),
+        and(succeeded(),eq(variables['Build.SourceBranch'], 'refs/heads/master'))
+      )
+    variables:
+      - group: RPADEVOPS
+      - name: publishSourceName
+        value: $[ stageDependencies.DetectPackageOrigin.DetectOrigin.outputs['detectSource.publishSourceName'] ]
+      - name: publishSourceUrl
+        value: $[ stageDependencies.DetectPackageOrigin.DetectOrigin.outputs['detectSource.publishSourceUrl'] ]
+    jobs:
+      - job: PublishComponent
+        pool:
+          name: "RPAAgents"
+          demands: "nice"
+        steps:
+          - task: PowerShell@2
+            name: checkDotNetPublish
+            displayName: "Verificar se .NET 8 já está instalado"
+            inputs:
+              targetType: "inline"
+              pwsh: false
+              script: |
+                $requiredMajor = 8
+                Write-Host "[INFO] Verificando se .NET SDK $requiredMajor.x já está instalado..."
+                
+                try {
+                  $dotnetVersion = & dotnet --version 2>$null
+                  if ($dotnetVersion) {
+                    $majorVersion = [int]($dotnetVersion.Split('.')[0])
+                    Write-Host "[INFO] Versão do .NET encontrada: $dotnetVersion"
+                    
+                    if ($majorVersion -ge $requiredMajor) {
+                      Write-Host "[OK] .NET SDK $dotnetVersion já está instalado. Pulando download."
+                      Write-Host "##vso[task.setvariable variable=skipDotNetInstall]true"
+                    } else {
+                      Write-Host "[WARN] Versão instalada ($dotnetVersion) é menor que a requerida ($requiredMajor.x)."
+                      Write-Host "##vso[task.setvariable variable=skipDotNetInstall]false"
+                    }
+                  } else {
+                    Write-Host "[WARN] .NET SDK não encontrado."
+                    Write-Host "##vso[task.setvariable variable=skipDotNetInstall]false"
+                  }
+                } catch {
+                  Write-Host "[WARN] Erro ao verificar .NET: $($_.Exception.Message)"
+                  Write-Host "##vso[task.setvariable variable=skipDotNetInstall]false"
+                }
+
+          - task: UseDotNet@2
+            displayName: "Use .NET $(DOTNET_VERSION)"
+            condition: and(succeeded(), ne(variables['skipDotNetInstall'], 'true'))
+            continueOnError: true
+            inputs:
+              packageType: "sdk"
+              version: "$(DOTNET_VERSION)"
+              performMultiLevelLookup: true
+
+          - task: DownloadBuildArtifacts@1
+            displayName: "Download Build Artifacts"
+            inputs:
+              buildType: "current"
+              downloadType: "single"
+              artifactName: "drop"
+              downloadPath: "$(System.ArtifactsDirectory)"
+
+          - task: DownloadSecureFile@1
+            name: nugetSecureFilePublish
+            displayName: "Baixar nuget.config seguro da Library"
+            inputs:
+              secureFile: 'nugetartefactsconfig'
+
+          - task: PowerShell@2
+            displayName: "Copiar nuget.config para o diretório do projeto"
+            inputs:
+              targetType: "inline"
+              pwsh: false
+              script: |
+                $ErrorActionPreference = 'Stop'
+                
+                # O arquivo seguro é baixado para $(nugetSecureFilePublish.secureFilePath)
+                $secureFilePath = "$(nugetSecureFilePublish.secureFilePath)"
+                $projectDir = "$(System.DefaultWorkingDirectory)"
+                $destinationPath = Join-Path $projectDir "nuget.config"
+                
+                Write-Host "[INFO] Copiando nuget.config seguro para o diretório do projeto"
+                Write-Host "[INFO] Origem: $secureFilePath"
+                Write-Host "[INFO] Destino: $destinationPath"
+                Write-Host "[INFO] Diretório do projeto: $projectDir"
+                
+                if (-not (Test-Path $secureFilePath)) {
+                  Write-Host "##vso[task.logissue type=error]Arquivo seguro nuget.config não encontrado em '$secureFilePath'."
+                  exit 1
+                }
+                
+                # Copiar o arquivo para o diretório do projeto
+                Copy-Item -Path $secureFilePath -Destination $destinationPath -Force
+                
+                if (Test-Path $destinationPath) {
+                  Write-Host "[OK] nuget.config copiado com sucesso para: $destinationPath"
+                  Write-Host ""
+                  Write-Host "[INFO] Verificando conteúdo do nuget.config (sem senha):"
+                  Get-Content $destinationPath | ForEach-Object {
+                    if ($_ -notmatch 'ClearTextPassword') {
+                      Write-Host $_
+                    } else {
+                      Write-Host "      <add key=`"ClearTextPassword`" value=`"***`" />"
+                    }
+                  }
+                } else {
+                  Write-Host "##vso[task.logissue type=error]Falha ao copiar nuget.config para '$destinationPath'."
+                  exit 1
+                }
+
+          - task: Bash@3
+            displayName: "Definir destino de publicação"
+            inputs:
+              targetType: "inline"
+              script: |
+                echo "Publicação direcionada para: '$(publishSourceName)' -> $(publishSourceUrl)"
+
+          - task: NuGetCommand@2
+            displayName: "Push NuGet Package para Nexus"
+            condition: contains(variables['publishSourceName'], 'Nexus')
+            inputs:
+              command: 'push'
+              packagesToPush: '$(System.ArtifactsDirectory)/drop/**/*.nupkg;!$(System.ArtifactsDirectory)/drop/**/*.symbols.nupkg'
+              nuGetFeedType: 'external'
+              publishFeedCredentials: RPA_COMPONENTS_NUGET
+              allowPackageConflicts: true
+
+          - task: NuGetToolInstaller@1
+            displayName: 'NuGet Tool Installer'
+
+          - task: NuGetAuthenticate@1
+            displayName: 'NuGet Authenticate for RPAT'
+            inputs:
+              nuGetServiceConnections: RPAT_COMPONENTS_NUGET
+            
+          - task: DotNetCoreCLI@2
+            displayName: 'Push NuGet Package to RPAT'
+            condition: contains(variables['publishSourceName'], 'RPAT')
+            inputs:
+              command: 'push'
+              searchPatternPush: '$(System.ArtifactsDirectory)/drop/*.nupkg;!$(System.ArtifactsDirectory)/drop/*.symbols.nupkg'
+              nuGetFeedType: 'internal'
+              publishVstsFeed: '$(PROJECT_GUID)/RPAT'
+  # ==================================================================
+  # STAGE: VERSION COMMIT
+  # Grava a nova versao no arquivo, cria commit + tag e faz push, apenas
+  # apos a publicacao do pacote NuGet ter sido concluida com sucesso.
+  # ==================================================================
+  - stage: VersionCommit
+    displayName: 'Commit Version'
+    dependsOn:
+      - PublishComponent
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/master'), eq('${{ parameters.allowAutomatedVersionPush }}', 'true'))
+    jobs:
+      - job: CommitVersion
+        displayName: 'Commit Release Version'
+        pool:
+          name: "RPAAgents"
+          demands: "nice"
+        steps:
+          - checkout: self
+            clean: true
+            persistCredentials: true
+            fetchDepth: 0
+
+          - task: VersionManagerVivo@8
+            displayName: 'Next version'
+            name: VersionManagerVivo
+            inputs:
+              command: 'nextVersion'
+              branchingStrategy: ${{ parameters.branchingStrategy }}
+              versionFile: $(VERSION_FILE_PATH)
+              bumpMethod: 'patch'
+
+          - task: VersionManagerVivo@8
+            displayName: 'Commit and Tag Version'
+            inputs:
+              command: 'commitVersion'
+              version: '$(VersionManagerVivo.VERSION)'
+              versionFile: $(VERSION_FILE_PATH)
+              createTag: true
+              pushChanges: true

@@ -1,0 +1,93 @@
+parameters:
+- name: serviceConnectionSuffix
+  type: string
+  default: "$(subscriptionEnv)"
+- name: subscriptionId
+  type: string
+- name: resourceGroup
+  type: string
+- name: apimName
+  type: string
+- name: environment
+  type: string
+- name: apiName
+  type: string
+- name: apiRevision
+  type: string
+- name: apiPath
+  type: string
+- name: backendUrl
+  type: string
+- name: apiRevDescription
+  type: string
+  default: "Last Modify On: $(System.TeamProject) - Build Id: $(Build.BuildId)"
+- name: isCurrentRevision
+  type: string
+  default: "false"
+- name: condition
+  type: object
+  default: succeeded()
+
+steps:
+- task: AzureCLI@2
+  displayName: "Update API Revision: ${{ parameters.apiRevision }}"
+  condition: ${{ parameters.condition }}
+  inputs:
+    azureSubscription: $(serviceConnectionPrefixName)-${{ parameters.serviceConnectionSuffix }}
+    scriptType: bash
+    scriptLocation: inlineScript
+    inlineScript: |
+      set -euo pipefail
+
+      az account set --subscription "${{ parameters.subscriptionId }}"
+
+      TOKEN=$(az account get-access-token --query accessToken -o tsv)
+      API_REV_ID="/subscriptions/${{ parameters.subscriptionId }}/resourceGroups/${{ parameters.resourceGroup }}/providers/Microsoft.ApiManagement/service/${{ parameters.apimName }}/apis/${{ parameters.apiName }}-${{ parameters.environment }};rev=${{ parameters.apiRevision }}"
+
+      echo "=== Montando payload da API Revision ==="
+      
+      # Campos base do payload
+      PAYLOAD='{
+        "properties": {
+          "serviceUrl": "${{ parameters.backendUrl }}",
+          "apiRevisionDescription": "${{ parameters.apiRevDescription }}"'
+      
+      # Campos adicionais incluidos apenas quando isCurrentRevision=true
+      # Alguns campos da API so podem ser atualizados na revisao corrente
+      if [[ "${{ parameters.isCurrentRevision }}" == "true" ]]; then
+        echo "  → Adicionando campos da revisão atual (isCurrentRevision=true)"
+        PAYLOAD="${PAYLOAD},
+          \"path\": \"${{ parameters.apiPath }}\""
+      fi
+      
+      # Fechar estrutura do payload
+      PAYLOAD="${PAYLOAD}
+        }
+      }"
+
+      API_URL="https://management.azure.com${API_REV_ID}?api-version=2024-05-01"
+
+      echo "=== Atualizando API Revision ==="
+      if [[ "${PIPELINE_DEBUG_OUTPUT:-false}" == "true" ]]; then
+        echo "  → URL: $API_URL"
+        echo "  → Request body: $PAYLOAD"
+      fi
+
+      HTTP_RESPONSE=$(curl -sS -w "\n%{http_code}" -X PATCH \
+        "$API_URL" \
+        -H "Authorization: Bearer $TOKEN" \
+        -H "Content-Type: application/json" \
+        -d "$PAYLOAD")
+
+      HTTP_BODY=$(echo "$HTTP_RESPONSE" | head -n -1)
+      HTTP_STATUS=$(echo "$HTTP_RESPONSE" | tail -n 1)
+
+      echo "  → HTTP Status: $HTTP_STATUS"
+
+      if [[ "$HTTP_STATUS" -lt 200 || "$HTTP_STATUS" -ge 300 ]]; then
+        echo "❌ Erro ao atualizar API Revision. HTTP Status: $HTTP_STATUS"
+        echo "  → Response: $HTTP_BODY"
+        exit 1
+      fi
+
+      echo "✅ API Revision atualizada com sucesso."

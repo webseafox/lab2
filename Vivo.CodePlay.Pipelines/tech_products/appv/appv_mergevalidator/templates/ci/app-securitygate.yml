@@ -1,0 +1,127 @@
+parameters:
+- name: fortifyExclusionRepository
+
+stages:
+- stage: ci_security
+  displayName: "CI - Security Gates"
+  pool:
+    name: GeneralPurposeLinuxAgentsCI
+  dependsOn:
+  - environment_init
+  - gates_environment_init
+  - ci_build
+  condition: succeeded()
+
+  variables:
+  - name: FORTIFY_SSC_CLI_TOKEN
+    value: $[ stageDependencies.gates_environment_init.environment.outputs['fortify_credentials.FORTIFY_SSC_CLI_TOKEN'] ]
+  - name: FORTIFY_SCANCENTRAL_CLIENT_TOKEN
+    value: $[ stageDependencies.gates_environment_init.environment.outputs['fortify_credentials.FORTIFY_SCANCENTRAL_CLIENT_TOKEN'] ]
+  - name: USE_FORTIFY
+    value: $[ stageDependencies.gates_environment_init.environment.outputs['evaluate_flags.USE_FORTIFY'] ]    
+  - name: USE_CONVISO
+    value: $[ stageDependencies.gates_environment_init.environment.outputs['evaluate_flags.USE_CONVISO'] ] 
+  - name: USE_CHECKMARX
+    value: $[ stageDependencies.gates_environment_init.environment.outputs['evaluate_flags.USE_CHECKMARX'] ] 
+  - name: SKIP_SECURITY_GATE
+    value: $[ stageDependencies.gates_environment_init.environment.outputs['evaluate_flags.SKIP_SECURITY_GATE'] ]
+  - name: ARTIFACT_NAME
+    value: $[ stageDependencies.ci_build.build.outputs['artifact_name.ARTIFACT_NAME'] ]
+
+  jobs:
+  
+  - job: app_config_keys
+    displayName: "Get AppSec Config Keys"
+    steps:
+    - template: /task_groups/security/get_appconfig_keys.yml@CorePipelines
+
+  - job: fortify_scan
+    dependsOn:
+    - app_config_keys
+    variables:
+      USE_FORTIFY: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_FORTIFY'] ]
+      USE_CONVISO: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_CONVISO'] ]
+      SKIP_SECURITY_GATE: $[ dependencies.app_config_keys.outputs['evaluate_flags.SKIP_SECURITY_GATE'] ]
+    condition: and(
+                succeeded(),
+                eq(variables.USE_FORTIFY, 'true'),
+                eq(variables.flowIsToReview, true),
+                not(startsWith(variables['Build.SourceBranch'], 'refs/tags/'))
+              )
+
+    displayName: "SAST Scan"
+    steps:
+    - template: /security/run_fortify_scan.yml@Codeplay
+      parameters:
+        fortifyExclusionRepository: ${{ parameters.fortifyExclusionRepository }}
+    - template: /tasks/telemetry/telemetry.yml@CorePipelines
+    
+    - task: Bash@3
+      name: set_fortify_result
+      displayName: 'Set Fortify Scan Result Variable'
+      condition: always()
+      inputs:
+        targetType: 'inline'
+        script: |
+          # Agent.JobStatus reflects the current job status after previous tasks
+          JOB_STATUS='$(Agent.JobStatus)'
+          
+          echo "Current job status: $JOB_STATUS"
+          
+          if [[ "$JOB_STATUS" == "Succeeded" || "$JOB_STATUS" == "SucceededWithIssues" ]]; then
+            echo "Fortify scan succeeded"
+            echo "##vso[task.setvariable variable=fortify_result;isOutput=true]true"
+            RESULT="true"
+          else
+            echo "Fortify scan failed or was skipped (job status: $JOB_STATUS)"
+            echo "##vso[task.setvariable variable=fortify_result;isOutput=true]false"
+            RESULT="false"
+          fi
+          
+          echo "fortify_result set to: $RESULT"
+
+  - job: sca_scan
+    dependsOn: app_config_keys
+    variables: 
+      USE_DEPENDENCY_TRACK: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_DEPENDENCY_TRACK'] ]
+      USE_CONVISO: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_CONVISO'] ]
+      SKIP_SECURITY_GATE_SCA: $[ dependencies.app_config_keys.outputs['evaluate_flags.SKIP_SECURITY_GATE_SCA'] ]
+      USE_DT_DOCKER: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_DT_DOCKER'] ]
+      ARTIFACT_NAME: $[ stageDependencies.ci_build.build.outputs['artifact_name.ARTIFACT_NAME'] ]
+      SCA_BUILD_ARTIFACT: true           
+    condition: and(
+                succeeded(),
+                eq(variables.USE_DEPENDENCY_TRACK, 'true'),
+                eq(variables.USE_DT_DOCKER, 'false'),                
+                eq(variables.flowIsToReview, true),
+                not(startsWith(variables['Build.SourceBranch'], 'refs/tags/'))
+              )
+    displayName: "SCA Scan"
+    steps:
+    - template: /security/run_sca_scan.yml@Codeplay
+      parameters:
+        buildArtifactName: $(ARTIFACT_NAME)
+    
+    - task: Bash@3
+      name: set_sca_result
+      displayName: 'Set SCA Scan Result Variable'
+      condition: always()
+      inputs:
+        targetType: 'inline'
+        script: |
+          # Agent.JobStatus reflects the current job status after previous tasks
+          JOB_STATUS='$(Agent.JobStatus)'
+          
+          echo "Current job status: $JOB_STATUS"
+          
+          if [[ "$JOB_STATUS" == "Succeeded" || "$JOB_STATUS" == "SucceededWithIssues" ]]; then
+            echo "SCA scan succeeded"
+            echo "##vso[task.setvariable variable=sca_result;isOutput=true]true"
+            RESULT="true"
+          else
+            echo "SCA scan failed or was skipped (job status: $JOB_STATUS)"
+            echo "##vso[task.setvariable variable=sca_result;isOutput=true]false"
+            RESULT="false"
+          fi
+          
+          echo "sca_result set to: $RESULT"

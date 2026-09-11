@@ -1,0 +1,268 @@
+parameters:
+- name: environment
+- name: infrastructureType
+- name: packageVersion
+- name: packageName
+- name: evenOrOdd
+  type: string
+  default: 'ODD,EVEN'
+
+stages:
+- stage: cd_deploy
+  displayName: "CD - Deploy ${{ parameters.environment }}"
+  condition: succeeded()
+  dependsOn:
+    - default_initializer_cd
+  ${{ if eq(parameters.environment, 'producao') }}:
+    pool:
+      $(PRIVATE_AGENT_PRODUCAO)
+  ${{ else }}:
+    pool:
+      $(AGENT_POOL_CD)
+
+  jobs:
+
+  - deployment: deploy
+    displayName: 'Deploy'
+    condition: and(
+      succeeded(),
+      or(
+      eq(variables['Build.SourceBranchName'],'master'),
+      eq(variables['Build.SourceBranchName'],'main'),
+      eq(variables['Build.SourceBranchName'],'prodlike'),
+      eq(variables['Build.SourceBranchName'],'preprod'),
+      eq(variables['Build.SourceBranchName'],'esteira1'),
+      eq(variables['Build.SourceBranchName'],'esteira2'),
+      eq(variables['Build.SourceBranchName'],'dev')))
+    environment:
+      name: deploy-${{ parameters.environment }}
+    continueOnError: true
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          ## -> Skip Download
+          - download: none
+
+          ## -> Checkout the source code.
+          - checkout: self
+            displayName: Checkout Source Code
+            name: checkout_source_code
+            clean: true
+            path: source_code
+            submodules: recursive
+
+          ## -> Rename Package
+          - task: Bash@3
+            displayName: 'Rename Package Name and Package Version'
+            name: packages
+            condition: succeeded()
+            inputs:
+              targetType: 'inline'
+              script: |
+                to_kebab_case() {
+                    echo "$1" | sed -r 's/([a-z])([A-Z])/\1-\L\2/g' | tr '[:upper:]' '[:lower:]'
+                }
+
+                package_name="${{ parameters.packageName }}"
+                package_version="${{ parameters.packageVersion }}"
+
+                kebab_package_name=$(to_kebab_case "$package_name")
+                kebab_package_version=$(to_kebab_case "$package_version")
+
+                echo "##vso[task.setvariable variable=ORIGINAL_PACKAGE_NAME]$package_name"
+                echo "##vso[task.setvariable variable=ORIGINAL_PACKAGE_VERSION]$package_version"
+                echo "##vso[task.setvariable variable=KEBAB_CASE_PACKAGE_NAME]$kebab_package_name"
+                echo "##vso[task.setvariable variable=KEBAB_CASE_PACKAGE_VERSION]$kebab_package_version"
+
+                echo "Package name: $package_name"
+                echo "Package version: $package_version"
+                echo "Package name (kebab case): $kebab_package_name"
+                echo "Package version (kebab case): $kebab_package_version"
+
+          ## -> Download a Universal Package
+          - task: UniversalPackages@0
+            displayName: Download a Universal Package
+            inputs:
+              command: download
+              vstsFeed: "3d53bc62-8749-4931-ae46-a443b73bc87a"
+              vstsFeedPackage: "$(KEBAB_CASE_PACKAGE_NAME)"
+              vstsPackageVersion: "1.0.0-${{ parameters.packageVersion }}"
+              downloadDirectory: "$(Pipeline.Workspace)"
+
+          ## -> Get Package Name
+          - task: Bash@3
+            displayName: 'Get Package Data'
+            condition: succeeded()
+            inputs:
+              targetType: 'inline'
+              script: |
+                artifactPath="$(Pipeline.Workspace)/$(KEBAB_CASE_PACKAGE_NAME)"
+                artifact=$(ls -1 "$artifactPath" | head -n 1)
+
+                echo "##[debug] Package Name: $(KEBAB_CASE_PACKAGE_NAME)"
+                echo "##[debug] Package Version: 1.0.0-${{ parameters.packageVersion }}"
+                echo "##[debug] Artifact: $artifact"
+
+                echo "##vso[task.setvariable variable=ARTIFACT_ID]${{ parameters.packageName }}"
+                echo "##vso[task.setvariable variable=ARTIFACT_FILE]$artifact"
+                echo "##vso[task.setvariable variable=ARTIFACT_PATH]$artifactPath"
+
+          ## -> Set Weblogic Environment
+          - task: Bash@3
+            displayName: Set Weblogic Environment
+            name: weblogic_environment
+            condition: succeeded()
+            inputs:
+              targetType: inline
+              workingDirectory: $(Pipeline.Workspace)/source_code
+              script: |
+
+                echo "##[section] Package folder"
+                echo "##[debug] Using environment: ${{ parameters.environment }}"
+                packageFolder="vv30_deployment_1.0.0-${{ parameters.packageVersion }}"
+                echo "##[debug] packageFolder: $packageFolder"
+
+                echo "##[section] Variables from weblogic file"
+                echo "##[debug] Looking for weblogic.(yml,yaml) file..."
+                weblogicConfigFile=$(find $(Pipeline.Workspace)/source_code/.azuredevops/config/${{ parameters.environment }} -name 'weblogic*')
+
+                if [ -z $weblogicConfigFile ] ; then
+                  echo "##[error] weblogic.(yml,yaml) not found at $weblogicConfigFile. Aborting..."
+                  exit 1
+                fi
+
+                set_config_variable() {
+                  local configKey=$1
+                  local defaultValue=$2
+                  local configValue=$(grep "$configKey:" $weblogicConfigFile | grep -v '^#' | awk '{print $2}' | tr -d '\r\n')
+
+                  if [ -z "$configValue" ] && [ "$configKey" != "WEBLOGIC_PROPERTIES_SERVER_FILE" ]; then
+                    echo "##[warning] $configKey not found at $weblogicConfigFile."
+                    if [ -n "$defaultValue" ]; then
+                      echo "##[warning] Using default value: $defaultValue"
+                      configValue=$defaultValue
+                    else
+                      echo "##[error] No value found for $configKey and no default value provided. Exiting."
+                      exit 1
+                    fi
+                  fi
+
+                  echo "##[debug] $configKey: $configValue"
+                  echo "##vso[task.setvariable variable=$configKey;isOutput=true]$configValue"
+
+                }
+
+                ## -> VARIABLES FROM weblogic.yml
+                set_config_variable "WEBLOGIC_TIMEOUT" 300
+                set_config_variable "WEBLOGIC_ADMIN_SERVER_URL"
+                set_config_variable "WEBLOGIC_CLUSTER"
+
+                echo "##[section] Variables from library variables"
+                environmentWeblogic=$(echo "${{ parameters.environment }}" | tr 'a-z' 'A-Z')
+                [[ "${{ parameters.environment }}" =~ ^(preprod|prodlike|esteira1|esteira2)$ ]] && environmentWeblogic="QA"
+                echo "##[debug] Using environment weblogic as: $environmentWeblogic"
+
+                set_library_variable() {
+                  local varName=$1
+                  local outputVarName=$2
+                  local varValue=${!varName}
+
+                  if [ -z "$varValue" ]; then
+                    echo "##[error] '$varName' not found in the library variables."
+                    exit 1
+                  else
+                    echo "##[debug] $outputVarName: $varValue"
+                    echo "##vso[task.setvariable variable=$outputVarName;isOutput=true]$varValue"
+                  fi
+                }
+
+                ##-> WEBLOGIC_USER / WEBLOGIC_PASS
+                set_library_variable "${environmentWeblogic}_WEBLOGIC_USER" "WEBLOGIC_USER"
+
+                case "$environmentWeblogic" in
+                  DEV) weblogicPass=$(DEV_WEBLOGIC_PASS) ;;
+                  QA) weblogicPass=$(QA_WEBLOGIC_PASS) ;;
+                  PRODUCAO) weblogicPass=$(PRODUCAO_WEBLOGIC_PASS) ;;
+                esac
+                if [ -z $weblogicPass ] ; then
+                  echo "##[error] '${environmentWeblogic}_WEBLOGIC_PASS' not found in the library variables."
+                  exit 1;
+                else
+                  echo "##[debug] WEBLOGIC_PASS: $weblogicPass"
+                  echo "##vso[task.setvariable variable=WEBLOGIC_PASS;isOutput=true]$weblogicPass"
+                fi
+
+          - template: /tech_products/dvps/scripts/weblogic-12.2/StartServers.yml
+            parameters:
+              WEBLOGIC_USER: $(weblogic_environment.WEBLOGIC_USER)
+              WEBLOGIC_PASS: $(weblogic_environment.WEBLOGIC_PASS)
+              WEBLOGIC_ADMIN_SERVER_URL: $(weblogic_environment.WEBLOGIC_ADMIN_SERVER_URL)
+              WEBLOGIC_TIMEOUT: $(weblogic_environment.WEBLOGIC_TIMEOUT)
+
+          - template: /tech_products/dvps/scripts/weblogic-12.2/UndeployAppRetired.yml
+            parameters:
+              WEBLOGIC_USER: $(weblogic_environment.WEBLOGIC_USER)
+              WEBLOGIC_PASS: $(weblogic_environment.WEBLOGIC_PASS)
+              WEBLOGIC_ADMIN_SERVER_URL: $(weblogic_environment.WEBLOGIC_ADMIN_SERVER_URL)
+              ARTIFACT_ID: $(ARTIFACT_ID)
+              
+          - template: /tech_products/dvps/scripts/weblogic-12.2/HotDeployApp.yml
+            parameters:
+              WEBLOGIC_USER: $(weblogic_environment.WEBLOGIC_USER)
+              WEBLOGIC_PASS: $(weblogic_environment.WEBLOGIC_PASS)
+              WEBLOGIC_ADMIN_SERVER_URL: $(weblogic_environment.WEBLOGIC_ADMIN_SERVER_URL)
+              ARTIFACT_ID: $(ARTIFACT_ID)
+              APPLICATIONS_SERVER_PATH_ARTIFACT_ID: $(ARTIFACT_PATH)
+              ARTIFACT_FILE: $(ARTIFACT_FILE)
+              WEBLOGIC_CLUSTER: $(weblogic_environment.WEBLOGIC_CLUSTER) 
+
+        on:
+          failure:
+            steps:
+            - task: CatchLogsToLocalDirectoryFromVivo@4
+              displayName: Dump logs and metas
+              inputs:
+                dumpDir: $(Build.ArtifactStagingDirectory)/audit
+            - task: PublishBuildArtifacts@1
+              displayName: 'Push Logs to Artifacts'
+              inputs:
+                ArtifactName: audit
+                PathtoPublish: $(Build.ArtifactStagingDirectory)/audit
+          success:
+            steps:
+            - task: CatchLogsToLocalDirectoryFromVivo@4
+              displayName: Dump logs and metas
+              inputs:
+                dumpDir: $(Build.ArtifactStagingDirectory)/audit
+            - task: PublishBuildArtifacts@1
+              displayName: 'Push Logs to Artifacts'
+              inputs:
+                ArtifactName: audit
+                PathtoPublish: $(Build.ArtifactStagingDirectory)/audit
+
+  ## -> Job for stop -> clear cache -> star weblogic servers
+  - ${{ each parity in split(parameters.evenOrOdd,',') }}:
+    - job: ${{ parity }}_servers_restart
+      displayName: ${{ parity }} Servers Restart
+      variables:
+        WEBLOGIC_USER: $[ dependencies.deploy.outputs['deploy.weblogic_environment.WEBLOGIC_USER'] ]
+        WEBLOGIC_PASS: $[ dependencies.deploy.outputs['deploy.weblogic_environment.WEBLOGIC_PASS'] ]
+        WEBLOGIC_TIMEOUT: $[ dependencies.deploy.outputs['deploy.weblogic_environment.WEBLOGIC_TIMEOUT'] ]
+        WEBLOGIC_ADMIN_SERVER_URL: $[ dependencies.deploy.outputs['deploy.weblogic_environment.WEBLOGIC_ADMIN_SERVER_URL'] ]
+      ${{ if eq(parity, 'odd') }}:
+        dependsOn:
+        - deploy
+        condition: eq(dependencies.deploy.result, 'Succeeded')
+      ${{ else }}:
+        dependsOn:
+        - deploy
+        - ODD_servers_restart
+        condition: or(
+          eq(dependencies.ODD_servers_restart.result, 'Succeeded'),
+          eq(dependencies.ODD_servers_restart.result, 'SucceededWithIssues'))
+      steps:
+        - template: cd_deploy_weblogic_clear_cache_catalogo.yml
+          parameters:
+            environment: ${{ parameters.environment }}
+            parity: ${{ parity }}

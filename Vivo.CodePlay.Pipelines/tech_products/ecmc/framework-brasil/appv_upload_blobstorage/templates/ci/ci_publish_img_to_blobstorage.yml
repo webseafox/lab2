@@ -1,0 +1,178 @@
+parameters:
+  - name: qa_environment
+    type: string
+    default: 'hml'
+    values:
+      - 'hml'
+      - 'prod'
+  - name: createNewBlob
+    type: boolean
+  - name: containerName
+    type: string
+  - name: AZURE_STORAGE_ACCOUNT_NAME
+    type: string
+  - name: AZURE_STORAGE_ACCOUNT_KEY
+    type: string
+  - name: autoOptimizeImages
+    type: boolean
+
+stages:
+- stage: upload_blobstorage
+  displayName: "Create and Upload"
+  pool:
+    name: GeneralPurposeLinuxAgentsCI
+  dependsOn:
+  - environment_init
+
+#DefaultDevopsAgents
+
+  ## -> Loads variables from other stages.
+  variables:
+  - name: NEXUS_DEPS_USR
+    value: $[ stageDependencies.nodejs_environment_init.environment.outputs['credentials.NEXUS_DEPS_USR'] ]
+  - name: NEXUS_DEPS_PSW
+    value: $[ stageDependencies.nodejs_environment_init.environment.outputs['credentials.NEXUS_DEPS_PSW'] ]
+  - name: containerName
+    value: $(echo "${{ parameters.containerName }}" | xargs)    
+  
+  jobs:      
+  - job: Publish
+    displayName: Create and Publish
+    condition: succeeded()
+    steps:
+
+    ## -> Clean the pipeline workspace and checkout the code.
+    ## -> 6d15af64-176c-496d-b583-fd2ae21d4df4 is the decorator for checkout.
+    - task: 6d15af64-176c-496d-b583-fd2ae21d4df4@1
+      displayName: Checkout Code
+      name: checkout_code 
+      inputs:
+        repository: self
+        persistCredentials: "true"
+        clean: true
+
+    ## -> Checkout the last commit that was pushed to the repository. 
+    ## -> Set last commit HASH to a variable. 
+    - task: Bash@3
+      displayName: Checkout Last Commit
+      name: checkout_last_commit
+      condition: succeeded()
+      continueOnError: false
+      inputs:
+        targetType: inline
+        script: |
+          echo "##[debug] Checkout last commit from '$(Build.SourceBranchName)'"
+
+          git config pull.rebase true
+          git fetch -f --depth 1 origin $(Build.SourceBranchName):$(Build.SourceBranchName)
+          git checkout -f $(Build.SourceBranchName)
+          lastCommitHash=$(git rev-parse --short=6 HEAD)
+
+          echo "##[debug] Last commit short hash '$lastCommitHash'"
+          echo "##vso[task.setvariable variable=SHORT_HASH]$lastCommitHash"
+
+    - task: Bash@3
+      displayName: create azure container
+      name: validations
+      condition: and(succeeded(), eq('${{parameters.createNewBlob}}', true))
+      continueOnError: false
+      inputs:
+        targetType: inline
+        script: |
+          echo "Uploading folder to container with same name ${{parameters.containerName}}"
+
+
+          az storage container create \
+          --verbose \
+          --account-name ${{parameters.AZURE_STORAGE_ACCOUNT_NAME}} \
+          --account-key ${{parameters.AZURE_STORAGE_ACCOUNT_KEY}} \
+          -n ${{parameters.containerName}}
+
+
+          echo "Container ${{parameters.containerName}} created successfully"
+
+    # ==================================================================
+    # [Compliance] Verifica se o repositório está em conformidade com as políticas de configuração
+    # ==================================================================
+    - task: VivoDevOpsConfigCompliance@1
+      displayName: 'Check DevOps Config Compliance'
+      inputs:
+        workDir: $(System.DefaultWorkingDirectory)
+        policySets: |
+          image-definition-files
+
+    - task: Bash@3
+      displayName: Optimize images
+      name: optimize_images
+      condition: and(succeeded(), eq('${{parameters.autoOptimizeImages}}', true))
+      continueOnError: false
+      inputs:
+        targetType: 'inline'
+        workingDirectory: $(System.DefaultWorkingDirectory)
+        script: |
+          echo "Current working directory:"
+          pwd
+          echo "Directory contents:"
+          ls -la
+          
+          docker build -t image-optimizer -f .azuredevops/image-optimizer.Dockerfile .
+          docker run --rm \
+            --workdir /workspace \
+            -v $(System.DefaultWorkingDirectory):/workspace \
+            image-optimizer \
+            /workspace/${{parameters.containerName}}
+
+          # Check for changes early
+          if [[ -z "$(git status --porcelain)" ]]; then
+            echo "No changes to commit"
+            exit 0
+          fi
+
+          # Commit changes
+          git add .
+          git commit -m "[CI SKIP] Images optimized and webp versions created" --author="$BUILD_REQUESTEDFOR <$BUILD_REQUESTEDFOREMAIL>"
+          
+          # Push changes
+          echo "##[command] git push origin $(Build.SourceBranchName)"
+          git push origin $(Build.SourceBranchName)
+          
+          if [ $? -ne 0 ]; then 
+            echo "##vso[task.logissue type=error;] Git push failed. Permission denied"
+            echo "##vso[task.complete result=Failed;]"
+            exit 1
+          fi
+          
+          echo "Images optimized and committed successfully"
+
+    - task: Bash@3
+      displayName: "Upload files to blob storage"
+      name: upload_files
+      condition: succeeded()
+      continueOnError: false
+      inputs:
+        targetType: inline
+        script: |
+
+          echo "##[debug] Looking for project folder..."
+                valuesFile=$(find $(Build.SourcesDirectory)/${{parameters.containerName}})
+
+                if [ -z $valuesFile ] ; then
+                  echo "##[error] ${{parameters.containerName}} not found. Aborting..."
+                  exit 1;
+                fi      
+
+          echo "##[debug] $valuesFile found successfully"
+
+
+          echo "Uploading folder to container with same name ${{parameters.containerName}}"
+          set -e
+          az storage blob upload-batch \
+          --verbose \
+          --account-name ${{parameters.AZURE_STORAGE_ACCOUNT_NAME}} \
+          --account-key ${{parameters.AZURE_STORAGE_ACCOUNT_KEY}} \
+          --overwrite \
+          -d ${{parameters.containerName}} \
+          -s "$(Build.SourcesDirectory)/${{parameters.containerName}}"
+
+
+          echo "Folder uploaded successfully"

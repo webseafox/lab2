@@ -1,0 +1,55 @@
+stages:
+- stage: stage_build
+  pool: $(PRIVATE_AGENT_DEFAULT)
+  displayName: Build
+  dependsOn: []
+  jobs:
+  - job: job_set_version
+    displayName: Set Version
+    steps:
+    - checkout: self
+      persistCredentials: true
+      clean: true
+    - template: /provisioners/api_gateway/trunkbased/axway/node_manager/task_groups/bump_version.yml
+
+  - job: job_build
+    displayName: Build
+    dependsOn:
+    - job_set_version
+    variables:
+      APP_VERSION: $[ dependencies.job_set_version.outputs['set_version.APP_VERSION'] ]
+    steps:
+    - checkout: self
+    - template: /tasks/nexus/download_file.yml
+      parameters:
+        repository: integracao-libfiles
+        remoteFileLocation: "files/apigateway/projpack/$(PROJPACK_VERSION)/projpack-$(PROJPACK_VERSION).zip"
+        displayName: "Download projpack"
+    - task: ExtractFiles@1
+      displayName: Extract projpack
+      inputs:
+        archiveFilePatterns: "$(Agent.TempDirectory)/projpack-$(PROJPACK_VERSION).zip"
+        destinationFolder: $(Agent.TempDirectory)
+        cleanDestinationFolder: false
+    - script: |
+        echo "##[debug] PACKER_LOCATION.................: ${PACKER_LOCATION}"
+        echo "##[debug] API_GATEWAY_PACKAGE_TYPE........: ${API_GATEWAY_PACKAGE_TYPE}"
+        echo "##[debug] OUTPUT_NAME.....................: ${OUTPUT_NAME}"
+        echo "##[debug] OUTPUT_DIR......................: ${OUTPUT_DIR}"
+
+        ${PACKER_LOCATION} --create --replace --passphrase-none --name=${OUTPUT_NAME} --type=${API_GATEWAY_PACKAGE_TYPE} --add ./src --projpass-none --dir=${OUTPUT_DIR}
+      displayName: Build
+      workingDirectory: $(Build.SourcesDirectory)
+      env:
+        PACKER_LOCATION: "$(Agent.TempDirectory)/projpack-$(PROJPACK_VERSION)/apigateway/posix/bin/projpack"
+        OUTPUT_DIR: $(Build.ArtifactStagingDirectory)
+        OUTPUT_NAME: "nodemanager-$(APP_VERSION)"
+    - template: /tasks/artifacts/publish_pipeline.yml
+      parameters:
+        artifactName: nodemanager
+    - template: /tasks/nexus/upload_file.yml
+      parameters:
+        repository: $(NEXUS_REPOSITORY_MANAGER)
+        localFileLocation: $(Build.ArtifactStagingDirectory)/nodemanager-$(APP_VERSION).$(API_GATEWAY_PACKAGE_TYPE)
+        remoteFileLocation: br/com/vivo/gateway/$(VAR_COMPONENT_NAME_NEXUS)/$(APP_VERSION)/$(VAR_COMPONENT_NAME_NEXUS)-$(APP_VERSION).$(API_GATEWAY_PACKAGE_TYPE)
+        credentialsEnabled: false

@@ -1,0 +1,176 @@
+
+parameters:
+- name: envSchedule
+
+steps:
+- task: CmdLine@2
+  displayName: "Schedule Analyze"
+  name: schedule_analyze
+  inputs:
+    script: |
+      # ---- log helpers ------------------------------------------------------
+      _sep()   { echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"; }
+      _sep2()  { echo "──────────────────────────────────────────────────────"; }
+      _info()  { echo "  ℹ  $*"; }
+      _ok()    { echo "  ✔  $*"; }
+      _warn()  { echo "  ⚠  $*"; }
+      _miss()  { echo "     ✗  $*"; }
+      _match() { echo "     ✔  $*"; }
+      # -----------------------------------------------------------------------
+      
+      _segment_matches() {
+        local seg="$1"
+        local cur="$2"
+        local min_val="$3"
+        local max_val="$4"
+
+        local step=1
+        if [[ "$seg" == */* ]]; then
+          step="${seg#*/}"
+          seg="${seg%%/*}"
+        fi
+
+        local lo hi
+        if [[ "$seg" == "*" ]]; then
+          lo=$min_val; hi=$max_val
+        elif [[ "$seg" == *-* ]]; then
+          lo="${seg%-*}"; hi="${seg#*-}"
+        else
+          lo="$seg"; hi="$seg"
+        fi
+
+        local v
+        for (( v=lo; v<=hi; v+=step )); do
+          [[ "$cur" -eq "$v" ]] && return 0
+        done
+        return 1
+      }
+
+      cron_field_matches() {
+        local field="$1" current="$2" min_val="$3" max_val="$4"
+        [[ "$field" == "*" ]] && return 0
+        local IFS=',' ; local -a parts
+        read -ra parts <<< "$field"
+        for part in "${parts[@]}"; do
+          _segment_matches "$part" "$current" "$min_val" "$max_val" && return 0
+        done
+        return 1
+      }
+      
+      cron_matches_now() {
+        local cron_expr="$1"
+        local c_min c_hour c_dom c_month c_dow
+        read -r c_min c_hour c_dom c_month c_dow <<< "$cron_expr"
+
+        local now_min now_hour now_dom now_month now_dow
+        now_min=$(date +%-M)
+        now_hour=$(date +%-H)
+        now_dom=$(date +%-d)
+        now_month=$(date +%-m)
+        now_dow=$(date +%u)
+        [[ "$now_dow" -eq 7 ]] && now_dow=0   # ISO 7=Sun -> cron 0=Sun
+
+        echo "       now   : min=${now_min} hour=${now_hour} dom=${now_dom} month=${now_month} dow=${now_dow}"
+        echo "       cron  : min=${c_min}  hour=${c_hour}  dom=${c_dom}  month=${c_month}  dow=${c_dow}"
+        echo "       (minute ignored -- match valid for the entire scheduled hour)"
+
+        cron_field_matches "$c_hour"  "$now_hour"  0 23 || { _miss "MISS  -> hour  : now=${now_hour}  expr=${c_hour}";    return 1; }
+        cron_field_matches "$c_dom"   "$now_dom"   1 31 || { _miss "MISS  -> dom   : now=${now_dom}   expr=${c_dom}";     return 1; }
+        cron_field_matches "$c_month" "$now_month" 1 12 || { _miss "MISS  -> month : now=${now_month} expr=${c_month}";   return 1; }
+        cron_field_matches "$c_dow"   "$now_dow"   0  6 || { _miss "MISS  -> dow   : now=${now_dow}   expr=${c_dow}";     return 1; }
+
+        _match "MATCH"
+        return 0
+      }
+
+      # ── START ──────────────────────────────────────────────────────────────
+      _sep
+      echo "  SCHEDULE ANALYZE"
+      _sep
+      _info "Current time  : $(date '+%Y-%m-%d %H:%M:%S %Z')"
+      _info "Weekday       : $(date '+%A') (ISO dow=$(date +%u) -> cron dow=$( [[ $(date +%u) -eq 7 ]] && echo 0 || date +%u ))"
+      _info "Input         : ${{ parameters.envSchedule }}"
+      _sep2
+
+      MATCHES_JSON="[]"
+      block_idx=0
+
+      IFS=';' read -ra ENV_BLOCKS <<< "${{ parameters.envSchedule }}"
+      total_blocks=${#ENV_BLOCKS[@]}
+      _info "Configured environments: $total_blocks"
+      _sep2
+
+      for block in "${ENV_BLOCKS[@]}"; do
+        (( block_idx++ )) || true
+
+        env_name="${block%%\[*}"
+        inner="${block#*\[}"
+        inner="${inner%\]}"
+
+        cron_start=$(echo "$inner" | grep -oP '^(\S+ ){4}\S+(?=,)')
+        cron_stop=$(echo  "$inner" | grep -oP '(?<=,)(\S+ ){4}\S+$')
+
+        echo "  [${block_idx}/${total_blocks}] Environment: ${env_name}"
+        echo "       START cron : ${cron_start}"
+        echo "       STOP  cron : ${cron_stop}"
+
+        matched_action=""
+        matched_cron=""
+
+        echo "     -> Checking START:"
+        if cron_matches_now "$cron_start"; then
+          matched_action="START"
+          matched_cron="$cron_start"
+        else
+          echo "     -> Checking STOP:"
+          if cron_matches_now "$cron_stop"; then
+            matched_action="STOP"
+            matched_cron="$cron_stop"
+          fi
+        fi
+
+        if [[ -n "$matched_action" ]]; then
+          _ok "MATCH: env=[${env_name}] action=[${matched_action}] cron=[${matched_cron}]"
+          entry=$(jq -cn \
+            --arg e "$env_name" \
+            --arg a "$matched_action" \
+            --arg c "$matched_cron" \
+            '{env: $e, action: $a, cron: $c}')
+          MATCHES_JSON=$(echo "$MATCHES_JSON" | jq -c ". + [$entry]")
+        else
+          _warn "No match for [${env_name}] at current time"
+        fi
+        _sep2
+      done
+
+      count=$(echo "$MATCHES_JSON" | jq 'length')
+
+      # ── FINAL RESULT ───────────────────────────────────────────────────────
+      _sep
+      echo "  FINAL RESULT"
+      _sep
+      if [[ "$count" -gt 0 ]]; then
+        _ok "$count environment(s) matched:"
+        echo "$MATCHES_JSON" | jq -r '.[] | "     * \(.env)  ->  \(.action)  [\(.cron)]"'
+      else
+        _warn "No environment matched at current time"
+      fi
+
+      MATRIX_JSON=$(echo "$MATCHES_JSON" | jq -c 'reduce .[] as $item (
+        {};
+        . + { ($item.env + "_" + $item.action): { "ENV": $item.env, "ACTION": $item.action } }
+      )')
+
+      _sep2
+      _info "Matrix JSON   : $MATRIX_JSON"
+      _info "Matches JSON  : $MATCHES_JSON"
+      _sep
+
+      # ── OUTPUT VARIABLES ───────────────────────────────────────────────────
+      if [[ "$count" -gt 0 ]]; then
+        echo "##vso[task.setvariable variable=SCHEDULE_MATCHED;isOutput=true]true"
+      else
+        echo "##vso[task.setvariable variable=SCHEDULE_MATCHED;isOutput=true]false"
+      fi
+      echo "##vso[task.setvariable variable=SCHEDULE_MATCHES_JSON;isOutput=true]$MATCHES_JSON"
+      echo "##vso[task.setvariable variable=SCHEDULE_MATRIX_JSON;isOutput=true]$MATRIX_JSON"

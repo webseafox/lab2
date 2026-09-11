@@ -1,0 +1,120 @@
+
+variables:
+- name: System.debug
+  value: "true"
+
+# - name: DOCKER_IMAGE_NAME
+#   value: conv86/micro-service-conv86-spring-boot
+
+  # IMAGE_REGISTRY: "conv86-docker.nexus.telefonica.com.br" #"10.129.178.173:5017"
+  # IMAGE_NAME: "conv86/micro-service-conv86-spring-boot"
+stages:
+- stage: stage_build_push_to_docker
+  displayName: Push to Docker
+  # pool: VivoAzureCloudSharedAgents
+  pool: 
+    name: DefaultDevopsAgents
+    demands:
+    - Agent.Name -equals BRTAZLTS0085CO.azagent004
+  jobs:
+  - job: job_push_to_docker
+    displayName: Push to Docker
+    continueOnError: False
+    variables:
+    - name: HTTP_PROXY
+      value: "http://10.240.58.39:3128" 
+    - name: HTTPS_PROXY
+      value: "http://10.240.58.39:3128" 
+    - name: NO_PROXY
+      value: "localhost,0.0.0.0,127.0.0.1,10.244.0.0/16,192.168.0.0/16,10.129.178.173,nexus.telefonica.com.br,acrsharedservices01.azurecr.io,appcs-azdevops-shared.azconfig.io,scm.azurewebsites.net"
+
+    steps:
+    - checkout: none
+    # - task: DownloadBuildArtifacts@1
+    #   displayName: Download Artifact
+    #   inputs:
+    #     buildType: 'current'
+    #     downloadPath: '$(System.ArtifactsDirectory)'
+    - task: DownloadPipelineArtifact@1
+      displayName: 'Download Pipeline Artifact'
+      inputs:
+        project: 'MIGR-Processum2'
+        pipeline: 'src.src-apuracao-codeplay-v2-ci'
+        buildVersionToDownload: 'specific'
+        buildId: '379700'
+        buildType: 'specific'
+        # itemPattern: |
+        #   bin/**/*.*ar
+        #   bin/**/pom.xml
+        downloadPath: '$(System.ArtifactsDirectory)'
+        cleanDestinationFolder: true
+
+    - task: XmlParseFromVivo@4
+      displayName: Get Main Info
+      name: pom_info
+      inputs:
+        type: 'file'
+        origin: $(System.ArtifactsDirectory)/bin/pom.xml
+        jpaths: |
+          var POM_XML_VERSION = .project.version._text
+          var POM_XML_ARTIFACT_ID = .project.artifactId._text
+          var POM_XML_GROUP_ID = .project.groupId._text
+        
+    - task: YamlParseFromVivo@4
+      displayName: Get Metadata Info
+      name: catalog_info
+      inputs:
+        type: 'file'
+        origin: $(System.ArtifactsDirectory)/bin/catalog-info.yaml
+        jpaths: |
+          var CATALOG_YAML_ACRONYM = .metadata.annotations['techarch.governance-app.acronym']
+          var CATALOG_YAML_MODULE = .metadata.annotations['techarch.governance-app.module']
+          var CATALOG_YAML_SONAR_PROJECT_KEY = .metadata.annotations['sonarqube.org/project-key']
+          var CATALOG_YAML_JAVA_LANGUAGE_VERSION = .metadata.annotations['arqtech.telefonica.com.br/language-version']
+          var CATALOG_YAML_NAME = .metadata.name
+    
+    # ==================================================================
+    # [Compliance] Verifica se o repositório está em conformidade com as políticas de configuração
+    # ==================================================================
+    - task: VivoDevOpsConfigCompliance@1
+      displayName: 'Check DevOps Config Compliance'
+      inputs:
+        workDir: $(System.ArtifactsDirectory)/bin
+        policySets: |
+          image-definition-files
+
+    - task: Docker@2
+      displayName: Docker Build
+      condition: succeeded()
+      inputs:
+        containerRegistry: ACR-DEVOPS
+        command: build
+        repository: $(CATALOG_YAML_ACRONYM)/$(Build.Repository.Name)
+        Dockerfile: $(System.ArtifactsDirectory)/bin/.azuredevops/runtime.Dockerfile
+        buildContext: $(System.ArtifactsDirectory)/bin
+        arguments: >-
+          --no-cache 
+          --build-arg APPLICATION_NAME=$(CATALOG_YAML_NAME)
+          --build-arg APP_VERSION=$(POM_XML_VERSION) 
+          --build-arg APPLICATION_PATH=target 
+          --build-arg HTTP_PROXY="$(HTTP_PROXY)"
+          --build-arg HTTPS_PROXY="$(HTTPS_PROXY)"
+          --build-arg NO_PROXY="$(NO_PROXY)"
+
+        tags: >
+          $(POM_XML_VERSION)-SNAPSHOT
+          
+    - task: Docker@2
+      displayName: Push to (Docker)
+      name: docker_push
+      condition: succeeded()
+      inputs:
+        containerRegistry: ACR-DEVOPS
+        command: push
+        arguments:
+          "\
+          acrsharedservices01.azurecr.io\
+          /$(CATALOG_YAML_ACRONYM)\
+          /$(CATALOG_YAML_NAME)\
+          :$(POM_XML_VERSION)-SNAPSHOT\
+          "

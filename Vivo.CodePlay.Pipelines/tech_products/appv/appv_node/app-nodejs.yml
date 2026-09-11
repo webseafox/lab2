@@ -1,0 +1,245 @@
+## -> Parameters:
+parameters:
+  - name: setEnvironment
+    type: string
+    default: ""
+
+  - name: deployOnly
+    type: boolean
+    default: False
+
+  - name: gatesEnabled
+    type: boolean
+    default: False
+
+  - name: setProduction
+    type: boolean
+    default: False
+
+  - name: setVersion
+    type: string
+    default: ""
+
+  - name: libOnly
+    type: boolean
+    default: False
+
+  - name: reuseArtifacts
+    type: boolean
+    default: False
+
+  - name: forceUpgrade
+    type: boolean
+    default: False
+
+  - name: setTimeout
+    type: string
+    default: "300s"
+
+  - name: notifyChangelog
+    type: boolean
+    default: False
+
+  - name: setQaDeploy
+    type: boolean
+    default: False
+
+  - name: argoDeploy
+    type: boolean
+    default: False
+
+  - name: forceSync
+    type: boolean
+    default: False
+
+  - name: resourcesAndHpaValues
+    type: object
+    default:
+      resources:
+        limits:
+          cpu: unchanged
+          memory: unchanged
+        requests:
+          cpu: unchanged
+          memory: unchanged
+      hpa:
+        minReplicas: unchanged
+        maxReplicas: unchanged
+        targetCPUUtilizationPercentage: unchanged
+        targetMemoryUtilizationPercentage: unchanged
+
+## -> Resources:
+resources:
+  repositories:
+    - repository: FortifyExclusion
+      name: DevOpsVivo.Fortify.Exclusions
+      type: git
+      ref: refs/heads/master
+      endpoint: CorePipelines
+
+    - repository: CorePipelines
+      name: DevOpsVivo.Core.Pipelines
+      type: git
+      ref: refs/heads/master
+      endpoint: CorePipelines
+
+    - repository: Codeplay
+      name: DevOps/Vivo.CodePlay.Pipelines
+      type: git
+      ref: refs/heads/master
+      endpoint: CorePipelines
+      
+
+## -> Initialize global variables
+variables:
+  - template: /tech_products/appv/global/initialize/variables-global.yml
+    parameters:
+      setQaDeploy: "${{ parameters.setQaDeploy }}"
+      setEnvironment: "${{ parameters.setEnvironment }}"
+  - template: /tech_products/appv/global/initialize/variables-nodejs.yml
+  - template: /tech_products/appv/global/initialize/variables-docker.yml
+  - template: /tech_products/appv/global/initialize/variables-gates.yml
+
+  #switch temporario para habilitar deploy argo para fb-app-vivo em preprod
+  - name: argoDeploy
+    ${{if or( contains(variables['Build.Repository.Name'], 'fb-app-vivo'), contains(variables['Build.Repository.Name'], 'framework-brasil'))}}:
+      value: True
+    ${{ else }}:
+      value: False
+
+  - ${{ if eq(parameters.gatesEnabled, False) }}:
+      - name: NODEJS_CMD_BUILD_TEST
+        value: echo "Skipping tests as it has already been done in merge validator or Gate is disabled."
+
+  ## -> Override global variables, with variables set in Library/Variable Groups (Pipelines)
+  ## -> Use this to change the variables on runtime
+  - group: "${{ variables['Build.DefinitionName'] }}"
+
+  - ${{if or( contains(variables['Build.Repository.Name'], 'fb-app-vivo'), contains(variables['Build.Repository.Name'], 'framework-brasil'))}}:
+      - group: argo-cd
+
+  - template: /tech_products/appv/global/initialize/variables-argocd.yml
+    parameters:
+      setEnvironment: ${{parameters.setEnvironment}}
+
+  - ${{ if eq(parameters.reuseArtifacts, True) }}:
+      - group: nexus-project-variables
+
+  - name: CORPORATE_WIKI_DOC_URL
+    value: "TBD"
+  - name: versionLog
+    value: "${{ parameters.setVersion }}"
+  - name: environmentLog
+    value: "${{ parameters.setEnvironment }}"
+
+stages:
+  # -> Initialize pipeline enviroment
+  - template: /tech_products/appv/global/initialize/nodejs-environment.yml
+
+  # -> Buildpack
+  - ${{ if and(eq(parameters.deployOnly, False), eq(parameters.setProduction, False)) }}:
+      ## -> Build for CI - NodeJS
+      - template: /tech_products/appv/appv_node/templates/ci/app-build-nodejs-ci.yml
+        parameters:
+          setVersion: "${{ parameters.setVersion }}"
+          reuseArtifacts: "${{ parameters.reuseArtifacts }}"
+
+      ## -> initialize gates environment
+      - ${{ if eq(parameters.gatesEnabled, True) }}:
+          - template: /tech_products/appv/global/initialize/gates-environment.yml
+          - template: /tech_products/appv/appv_node/templates/ci/app-qualitygate.yml
+          - template: /tech_products/appv/appv_node/templates/ci/app-securitygate.yml
+            parameters:
+              fortifyExclusionRepository: FortifyExclusion
+
+      ## -> Publish Build for CI - NodeJS
+      - ${{ if eq(parameters.reuseArtifacts, False) }}:
+          - template: /tech_products/appv/appv_node/templates/ci/app-publish-nodejs-ci.yml
+            parameters:
+              gatesEnabled: "${{parameters.gatesEnabled}}"
+
+      - ${{ if and(eq(parameters.notifyChangelog, True), eq(parameters.reuseArtifacts, False)) }}:
+          - template: /tech_products/appv/global/templates/ci/ci-changelog-notification-appv.yml
+
+      ## -> Package for CI - NodeJS
+      - ${{ if eq(parameters.libOnly, False) }}:
+          - template: /tech_products/appv/appv_node/templates/ci/app-package-nodejs-ci.yml
+            parameters:
+              setEnvironment: "${{ parameters.setEnvironment }}"
+              reuseArtifacts: "${{ parameters.reuseArtifacts }}"
+
+          ## -> Deploy for CD - NodeJS - ArgoCD
+          - ${{ if eq(variables.argoDeploy, True) }}:
+              - template: /tech_products/appv/appv_node/templates/cd/app-environment-checklist-cd.yml
+                parameters:
+                  setEnvironment: "${{ parameters.setEnvironment }}"
+                  setVersion: "${{ parameters.setVersion }}"
+              - template: /tech_products/appv/global/templates/cd/cd-deploy-only-argo.yml
+                parameters:
+                  setEnvironment: "${{ parameters.setEnvironment }}"
+                  setVersion: "${{ parameters.setVersion }}"
+                  deployOnly: "${{ parameters.deployOnly }}"
+                  forceSync: "${{ or(parameters.forceSync, parameters.forceUpgrade) }}"
+                  resourcesAndHpaValues: "${{ parameters.resourcesAndHpaValues }}"
+
+          ## -> Deploy for CD - NodeJS - Helm Upgrade
+          - ${{ if eq(variables.argoDeploy, False) }}:
+              - template: /tech_products/appv/global/initialize/deploy-environment.yml
+              - template: /tech_products/appv/appv_node/templates/cd/app-deploy-helm-nodejs-cd.yml
+                parameters:
+                  setEnvironment: "${{ parameters.setEnvironment }}"
+                  namespace: "${{ parameters.setEnvironment }}"
+
+  # -> Deploy only PREPROD
+  - ${{ if and(ne(parameters.deployOnly, False), eq(parameters.setProduction, False)) }}:
+      - ${{ if eq(variables.argoDeploy, True) }}:
+          - template: /tech_products/appv/appv_node/templates/cd/app-environment-checklist-cd.yml
+            parameters:
+              setEnvironment: "${{ parameters.setEnvironment }}"
+              setVersion: "${{ parameters.setVersion }}"
+          - template: /tech_products/appv/global/templates/cd/cd-deploy-only-argo.yml
+            parameters:
+              setEnvironment: "${{ parameters.setEnvironment }}"
+              setVersion: "${{ parameters.setVersion }}"
+              deployOnly: "${{ parameters.deployOnly }}"
+              forceSync: "${{ or(parameters.forceSync, parameters.forceUpgrade) }}"
+              resourcesAndHpaValues: "${{ parameters.resourcesAndHpaValues }}"
+
+      - ${{ if eq(variables.argoDeploy, False) }}:
+          - template: /tech_products/appv/global/initialize/deploy-environment.yml
+          - template: /tech_products/appv/appv_node/templates/cd/app-deploy-only-helm-nodejs-cd.yml
+            parameters:
+              setEnvironment: "${{ parameters.setEnvironment }}"
+              namespace: "${{ parameters.setEnvironment }}"
+              setVersion: "${{ parameters.setVersion }}"
+              setProduction: "${{ parameters.setProduction }}"
+              forceUpgrade: "${{ parameters.forceUpgrade }}"
+              setTimeout: "${{ parameters.setTimeout }}"
+              setQaDeploy: "${{ parameters.setQaDeploy }}"
+
+  # -> Deploy only PROD
+  - ${{ if and(ne(parameters.deployOnly, True), eq(parameters.setProduction, True)) }}:
+      - ${{ if eq(variables.argoDeploy, True) }}:
+          - template: /tech_products/appv/appv_node/templates/cd/app-environment-checklist-cd.yml
+            parameters:
+              setEnvironment: "${{ parameters.setEnvironment }}"
+              setVersion: "${{ parameters.setVersion }}"
+          - template: /tech_products/appv/global/templates/cd/cd-deploy-only-argo.yml
+            parameters:
+              setEnvironment: "${{ parameters.setEnvironment }}"
+              setVersion: "${{ parameters.setVersion }}"
+              deployOnly: "${{ parameters.deployOnly }}"
+              forceSync: "${{ or(parameters.forceSync, parameters.forceUpgrade) }}"
+              setProduction: "${{ parameters.setProduction }}"
+              resourcesAndHpaValues: "${{ parameters.resourcesAndHpaValues }}"
+
+      - ${{ if eq(variables.argoDeploy, False) }}:
+          - template: /tech_products/appv/global/initialize/deploy-environment-prod.yml
+          - template: /tech_products/appv/appv_node/templates/cd/app-deploy-only-prod-helm-nodejs.yml
+            parameters:
+              setEnvironment: "${{ parameters.setEnvironment }}"
+              namespace: "${{ parameters.setEnvironment }}"
+              setVersion: "${{ parameters.setVersion }}"
+              setProduction: "${{ parameters.setProduction }}"
+              forceUpgrade: "${{ parameters.forceUpgrade }}"
+              setTimeout: "${{ parameters.setTimeout }}"

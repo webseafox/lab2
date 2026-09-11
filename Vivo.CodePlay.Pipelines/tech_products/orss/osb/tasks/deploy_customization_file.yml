@@ -1,0 +1,74 @@
+parameters:
+- name: qa_environment
+  type: string
+
+stages:
+- stage: deploy_customization_files
+  displayName: Deploy Customization Files - ${{ upper(parameters.qa_environment) }}
+  pool: $(PRIVATE_AGENT_DEFAULT_CD)
+  jobs:
+  - job: Deploy
+    steps:
+      - checkout: none
+
+      - bash: |
+          TAG_VERSION=`echo $(Build.SourceBranchName) | sed 's/CUST-\(.*\)/\1/'`
+
+          echo "##vso[task.setvariable variable=TAG_VERSION]$TAG_VERSION"
+          if [ "${{ parameters.qa_environment }}" = "esteira1" ]; then
+            FILE_TO_DEPLOY="customization_file-$TAG_VERSION.e1.xml"
+          elif [ "${{ parameters.qa_environment }}" = "esteira2" ]; then
+            FILE_TO_DEPLOY="customization_file-$TAG_VERSION.e2.xml"
+          else
+            FILE_TO_DEPLOY="customization_file-$TAG_VERSION.pre-prod.xml"
+          fi
+          echo "##vso[task.setvariable variable=FILE_TO_DEPLOY]$FILE_TO_DEPLOY"
+        displayName: "Identify Environment"
+
+      - task: Docker@2
+        displayName: "Login Docker ACR"
+        inputs:
+          containerRegistry: 'ACR-DEVOPS'
+          command: 'login'
+
+      - task: DownloadPackage@1
+        displayName: "Download Osb Deployer"
+        inputs:
+          packageType: 'upack'
+          feed: '/3d53bc62-8749-4931-ae46-a443b73bc87a'
+          view: 
+          definition: 'osb-deploy-customization-file'
+          version: '1.1.0'
+          downloadPath: '$(Build.SourcesDirectory)'
+
+      - task: AzureKeyVault@2
+        displayName: Get Nexus credentials
+        inputs:
+          azureSubscription: DevOpsSharedResources
+          KeyVaultName: kv-azdevops-shared
+          SecretsFilter: 'NEXUS-DEFAULT-USR, NEXUS-DEFAULT-PSW'
+
+      - bash: |
+          curl -u $(NEXUS-DEFAULT-USR):$(NEXUS-DEFAULT-PSW) -O "https://nexus.telefonica.com.br/repository/$(NEXUS_PUBLISH_REPOSITORY)/br/com/vivo/pipelines/commit/customization_file/$(TAG_VERSION)/$FILE_TO_DEPLOY"
+        displayName: "Download Customization from Nexus"
+        
+      - bash: |          
+          docker run --rm --entrypoint sh \
+            -v $(Build.SourcesDirectory):/builds \
+            -w / \
+            --hostname azdevops-daet \
+            --dns=$(PRIMARY_DNS) \
+            --dns=$(SECONDARY_DNS) \
+            --dns-search=redecorp.br \
+            --add-host $(QA_${{ upper(parameters.qa_environment) }}_DEPLOY_HOST_LISTENER_NAME):$(QA_${{ upper(parameters.qa_environment) }}_DEPLOY_HOST_IP) \
+            $(JAVA_IMAGE) \
+            -c "cd builds; 
+            java -jar osb-deploy-customization-file-1.1.jar \
+              -i $(FILE_TO_DEPLOY) \
+              -dh $(QA_${{ upper(parameters.qa_environment) }}_DEPLOY_HOST) \
+              -dp $(QA_${{ upper(parameters.qa_environment) }}_DEPLOY_PORT) \
+              -mr $(TAG_VERSION) \
+              -u $(PIPELINE_DEPLOYER_USER) \
+              -p $(PIPELINE_DEPLOYER_PASS) \
+              2>&1 | tee -i"
+        displayName: "Deploy to OSB"

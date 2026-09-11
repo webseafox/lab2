@@ -1,0 +1,102 @@
+# ==================================================================
+# Resolve o settings.xml do Maven de acordo com o repositório de artefatos alvo.
+# ------------------------------------------------------------------
+# Controlado pela variável de runtime ARTIFACT_REPOSITORY:
+#   - 'nexus' (default / variável ausente): baixa settings.xml e settings-security.xml
+#     como Secure Files (comportamento legado).
+#   - 'azure_artifacts': usa o settings.xml versionado no repositório, no caminho
+#     MAVEN_CUSTOM_SETTINGS_PATH (default '.azuredevops/settings.xml'), somado ao
+#     global settings do agente (MAVEN_GLOBAL_SETTINGS_PATH).
+#
+# Exporta:
+#   MAVEN_SETTINGS          -> caminho do settings.xml
+#   MAVEN_SETTINGS_SECURITY -> caminho do settings-security.xml (vazio no modo Azure)
+#   MAVEN_SETTINGS_ARGS     -> argumentos prontos para o comando mvn
+# ==================================================================
+parameters:
+  - name: nameSuffix
+    type: string
+    default: ''
+
+steps:
+- task: DownloadSecureFile@1
+  name: maven_settings_security_file${{ parameters.nameSuffix }}
+  displayName: 'Download custom security.xml from secure file'
+  condition: and(succeeded(), ne(variables['ARTIFACT_REPOSITORY'], 'azure_artifacts'))
+  inputs:
+    secureFile: 'settings-security.xml'
+
+- task: DownloadSecureFile@1
+  name: maven_settings_file${{ parameters.nameSuffix }}
+  displayName: 'Download custom settings.xml from secure file'
+  condition: and(succeeded(), ne(variables['ARTIFACT_REPOSITORY'], 'azure_artifacts'))
+  inputs:
+    secureFile: settings.xml
+
+- script: |
+    echo "##vso[task.setvariable variable=MAVEN_SETTINGS_SECURITY]$(maven_settings_security_file${{ parameters.nameSuffix }}.secureFilePath)"
+    echo "##vso[task.setvariable variable=MAVEN_SETTINGS]$(maven_settings_file${{ parameters.nameSuffix }}.secureFilePath)"
+  displayName: 'Set Maven Settings Vars (Nexus)'
+  condition: and(succeeded(), ne(variables['ARTIFACT_REPOSITORY'], 'azure_artifacts'))
+
+- bash: |
+    SETTINGS_PATH="${MAVEN_CUSTOM_SETTINGS_PATH}"
+
+    if [ -z "${SETTINGS_PATH}" ]; then
+      SETTINGS_PATH=".azuredevops/settings.xml"
+    fi
+
+    case "${SETTINGS_PATH}" in
+      /*) ;;
+      *) SETTINGS_PATH="${SOURCES_DIRECTORY}/${SETTINGS_PATH}" ;;
+    esac
+
+    echo "##[debug] ARTIFACT_REPOSITORY.........: azure_artifacts"
+    echo "##[debug] MAVEN_CUSTOM_SETTINGS_PATH..: ${SETTINGS_PATH}"
+
+    if [ ! -f "${SETTINGS_PATH}" ]; then
+      echo "##vso[task.logissue type=error]O arquivo settings.xml não foi encontrado em '${SETTINGS_PATH}'. Versione o arquivo no repositório ou ajuste 'envs.MAVEN_CUSTOM_SETTINGS_PATH'."
+      echo "##[error]O arquivo settings.xml não foi encontrado em '${SETTINGS_PATH}'"
+      exit 1
+    fi
+
+    echo "##vso[task.setvariable variable=MAVEN_SETTINGS]${SETTINGS_PATH}"
+    echo "##vso[task.setvariable variable=MAVEN_SETTINGS_SECURITY]"
+  displayName: 'Set Maven Settings Vars (Azure Artifacts)'
+  condition: and(succeeded(), eq(variables['ARTIFACT_REPOSITORY'], 'azure_artifacts'))
+  env:
+    SOURCES_DIRECTORY: $(Build.SourcesDirectory)
+
+- bash: |
+    SETTINGS_ARGS="-s ${MAVEN_SETTINGS}"
+
+    if [ "${ARTIFACT_REPOSITORY}" == "azure_artifacts" ]; then
+      GLOBAL_SETTINGS="${MAVEN_GLOBAL_SETTINGS_PATH}"
+
+      if [ -z "${GLOBAL_SETTINGS}" ]; then
+        GLOBAL_SETTINGS="/home/svc_devopscorp/.m2/settings.xml"
+      fi
+
+      if [ -f "${GLOBAL_SETTINGS}" ]; then
+        SETTINGS_ARGS="-gs ${GLOBAL_SETTINGS} ${SETTINGS_ARGS}"
+      else
+        echo "##[warning]Global settings '${GLOBAL_SETTINGS}' não encontrado no agente, seguindo apenas com '-s'"
+      fi
+    elif [ -n "${MAVEN_SETTINGS_SECURITY}" ]; then
+      SETTINGS_ARGS="${SETTINGS_ARGS} -Dsettings.security=${MAVEN_SETTINGS_SECURITY}"
+    fi
+
+    echo "##[debug] MAVEN_SETTINGS_ARGS.........: ${SETTINGS_ARGS}"
+    echo "##vso[task.setvariable variable=MAVEN_SETTINGS_ARGS]${SETTINGS_ARGS}"
+  displayName: 'Set Maven Settings Args'
+
+- bash: |
+    if [ -z "${AZURE_DEVOPS_PAT}" ]; then
+      echo "##vso[task.logissue type=error]ARTIFACT_REPOSITORY=azure_artifacts, mas AZURE_DEVOPS_PAT está vazio. Adicione 'env: AZURE_DEVOPS_PAT: \$(System.AccessToken)' ao step Maven, do contrário o Maven envia a senha literal '\${AZURE_DEVOPS_PAT}' ao feed e recebe 401."
+      echo "##[error]AZURE_DEVOPS_PAT está vazio no modo azure_artifacts"
+      exit 1
+    fi
+  displayName: 'Guard: AZURE_DEVOPS_PAT presente (Azure Artifacts)'
+  condition: and(succeeded(), eq(variables['ARTIFACT_REPOSITORY'], 'azure_artifacts'))
+  env:
+    AZURE_DEVOPS_PAT: $(System.AccessToken)

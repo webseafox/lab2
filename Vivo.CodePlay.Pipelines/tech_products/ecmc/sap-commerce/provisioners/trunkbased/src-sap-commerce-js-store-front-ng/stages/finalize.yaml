@@ -1,0 +1,62 @@
+
+stages:
+- stage: finalize
+  dependsOn:
+  - pipeline_init
+  - build_test
+    # - security
+  - gate
+  displayName: "Finalize"
+  pool: $(PRIVATE_AGENT_DEFAULT)
+  condition: and(
+              succeeded(),
+              eq(variables.flowIsMain, True),
+              eq(variables.flowIsTriggerCI, True)
+            )
+  jobs:
+    - job: job_submodule_update_version
+      condition: succeeded()
+      displayName: "Commit new version in repository"
+      variables:
+        - name: APP_VERSION
+          value: $[ dependencies.pipeline_init.outputs['bump_version.component_bump_version.NEW_VERSION'] ]
+        - name: JS_STORE_FRONT_GIT_CURRENT_SHA
+          value: $[ dependencies.pipeline_init.initial_job.outputs['submodule_update_version.JS_STORE_FRONT_GIT_CURRENT_SHA'] ]
+      steps:
+        - checkout: self
+          fetchDepth: 1
+          persistCredentials: true       
+        - template: /tech_products/ecmc/sap-commerce/tasks/catalog_info/extract_variables.yaml
+          parameters:
+            workingDirectory: $(Build.SourcesDirectory)
+        - ${{ if and(in(variables['Build.SourceBranch'], 'refs/heads/main', 'refs/heads/master'), in(variables['Build.Reason'], 'IndividualCI', 'BatchedCI')) }}:
+          - template: /tech_products/ecmc/sap-commerce/tasks/nodejs/update_repo_version.yaml
+            parameters:
+              newVersion: $(APP_VERSION)
+              condition: and(succeeded(), eq(variables.BUMP_VERSION_ENABLED, true))
+              commitNewVersion: false
+              createGitTag: true
+              downloadDistFolder: true
+              workingDirectory: $(Build.SourcesDirectory)
+              workingDirectoryCore: $(Build.SourcesDirectory)/$(CORE_PROJECT)
+
+    - job: job_commit_hash_to_core
+      condition: succeeded()
+      dependsOn:
+      - job_submodule_update_version
+      variables:
+        - name: JS_STORE_FRONT_GIT_CURRENT_SHA
+          value: $[ dependencies.job_submodule_update_version.outputs['send_tag_dist_to_repository.JS_STORE_FRONT_GIT_CURRENT_SHA'] ]
+      displayName: "Update submodule/Commit hash and tag"
+      steps:
+        - checkout: CloudSapCommerce
+          persistCredentials: true
+        - ${{ if and(in(variables['Build.SourceBranch'], 'refs/heads/main', 'refs/heads/master'), in(variables['Build.Reason'], 'IndividualCI', 'BatchedCI')) }}:
+          - template: /tech_products/ecmc/sap-commerce/tasks/nodejs/update_repo_version.yaml
+            parameters:
+              newVersion: $(APP_VERSION)
+              condition: and(succeeded(), eq(variables.BUMP_VERSION_ENABLED, true))
+              createGitTag: true
+              workingDirectory: $(Build.SourcesDirectory)/$(Build.Repository.Name)
+              workingDirectoryCore: $(Build.SourcesDirectory)
+              repoIsCore: true

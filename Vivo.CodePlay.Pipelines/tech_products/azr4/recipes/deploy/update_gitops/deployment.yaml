@@ -1,0 +1,253 @@
+parameters:
+  environment: ''
+
+jobs:
+- deployment: deployment
+  pool: GeneralPurposeLinuxAgentsCD
+  environment: 
+    name: deploy-${{ parameters.environment }}
+  strategy:
+    runOnce:   
+      deploy:
+        steps:
+        - checkout: self
+          persistCredentials: true
+          path: source
+        - checkout: gitops
+          persistCredentials: true
+          clean: true
+          path: gitops
+          fetchDepth: 0
+        - template: /tech_products/azr4/templates/steps/get_latest_version.yaml
+        - task: Bash@3
+          name: 'checkout_to_branch'
+          continueOnError: false
+          displayName: 'Checkout to GitOps Repository'
+          env:
+            LAST_VERSION: $(read_and_update_manifest.LAST_VERSION)
+            NEW_VERSION: $(get_version.VERSION)
+            BRANCH_NAME: $(Build.SourceBranchName)
+            AZDO_PROJECT: $(System.TeamProject)
+            ENVIRONMENT: ${{ parameters.environment }}
+            USE_MAIN_BRANCH_ONLY: $(USE_MAIN_BRANCH_ONLY)
+          inputs:
+            targetType: inline
+            script: |
+              #!/bin/bash
+              set -e
+              cd $(Agent.BuildDirectory)/gitops
+              git branch -a
+              git fetch --all
+              sigla="${AZDO_PROJECT%% *}"
+              echo "##[debug] SIGLA: ${sigla}, ENVIRONMENT: ${ENVIRONMENT}, USE_MAIN_BRANCH_ONLY: ${USE_MAIN_BRANCH_ONLY}"
+              if [[ "${sigla}" = "ATZA" && "${ENVIRONMENT}" == "prod" ]]; then
+                  export BRANCH_NAME="master"
+                  echo "##[debug] SIGLA: ${sigla} -> BRANCH_NAME set to ${BRANCH_NAME}"
+              fi
+              if [[ "${USE_MAIN_BRANCH_ONLY}" == "true" ]]; then
+                  export BRANCH_NAME="main"
+                  echo "##[debug] USE_MAIN_BRANCH_ONLY is true -> BRANCH_NAME set to ${BRANCH_NAME}"
+              fi
+              echo "##vso[task.setvariable variable=BRANCH_NAME;isOutput=true]$BRANCH_NAME"
+              git switch ${BRANCH_NAME}
+              git pull
+        - task: Bash@3
+          name: read_and_update_manifest
+          displayName: 'Read and Update Manifest'
+          continueOnError: false
+          env:
+            MANIFEST_PATH: $(MANIFEST_PATH)
+            GITOPS_UPDATE_TYPE: $(GITOPS_UPDATE_TYPE)
+            NEW_VERSION: $(get_version.VERSION)
+          inputs:
+            targetType: inline
+            script: |
+              #!/bin/bash
+
+              set -e
+
+              update_k8s_manifest() {
+                  local manifest="$1"
+                  local image=($(parse_get_k8s_manifest "$manifest"))
+                  if [[ ${#image[@]} -ne 2 ]]; then
+                      echo "##[error] Error: could not get image from manifest"
+                      exit 1
+                  fi
+                  local last_version="${image[1]}"
+                  local new_image="${image[0]}:${NEW_VERSION}"
+                  echo "##vso[task.setvariable variable=LAST_VERSION;isOutput=true]${last_version}" >&2
+                  echo "##[debug] change ${last_version} -> ${NEW_VERSION}" >&2
+                  echo $(parse_update_k8s_manifest "$manifest" "$new_image")
+              }
+
+              parse_get_k8s_manifest() {
+                  local manifest="$1"
+                  if [ "$(echo "$manifest" | jq -r '.kind')" == "CronJob" ]; then
+                      echo "##[debug] Cronjob detected, parsing image..." >&2
+                      image=$(echo "$manifest" | jq -r '.spec.jobTemplate.spec.template.spec.containers[0].image' | tr ':' '\n')
+                  else
+                      echo "##[debug] Deployment detected, updating image..." >&2
+                      image=($(echo "$manifest" | jq -r '.spec.template.spec.containers[0].image' | tr ':' ' '))
+                  fi
+                  echo "##[debug] image: ${image[@]}" >&2
+                  echo ${image[@]}
+              }
+
+              parse_update_k8s_manifest() {
+                  local manifest="$1"
+                  local new_image="$2"
+                  if [ "$(echo "$manifest" | jq -r '.kind')" == "CronJob" ]; then
+                      echo "##[debug] Cronjob detected, updating image..." >&2
+                      echo $(echo "$manifest" | jq --arg new_image "$new_image" '.spec.jobTemplate.spec.template.spec.containers[0].image = $new_image')
+                  else
+                      echo "##[debug] Deployment detected, updating image..." >&2
+                      echo $(echo "$manifest" | jq --arg new_image "$new_image" '.spec.template.spec.containers[0].image = $new_image')
+                  fi
+              }
+
+              update_kustomization_manifest() {
+                  echo "##[debug] Updating kustomization Manifest" >&2
+                  local manifest="$1"
+                  local last_version=$(echo "$manifest" | jq -r '.images[0].newTag')
+                  echo "##[debug] Last version: ${last_version} -> New Version: ${NEW_VERSION}" >&2
+                  echo "##vso[task.setvariable variable=LAST_VERSION;isOutput=true]${last_version}" >&2
+                  echo $(echo "$manifest" | jq --arg new_version "$NEW_VERSION" '.images[0].newTag = $new_version')
+              }
+
+              update_helm_manifest() {
+                  echo "##[debug] Updating helm Manifest" >&2
+                  local manifest="$1"
+                  local last_version=$(echo "$manifest" | jq -r '.image.tag')
+                  echo "##[debug] Last version: ${last_version} -> New Version: ${NEW_VERSION}" >&2
+                  echo "##vso[task.setvariable variable=LAST_VERSION;isOutput=true]${last_version}" >&2
+                  echo $(echo "$manifest" | jq --arg version "$NEW_VERSION" '.image.tag = $version')
+              }
+
+              update_az_container_app_manifest() {
+                  echo "##[debug] Updating az Container App Manifest" >&2
+                  local manifest="$1"
+                  local image=$(echo "$manifest" | jq -r '.properties.template.containers[0].image' | tr ':' '\n')
+                  local last_version=$(echo "$image" | jq -r '.[1] // "null"')
+                  local new_image=$(echo "$image" | jq -r '.[0]'):${NEW_VERSION}
+                  echo "##[debug] Last version: ${last_version} -> New Version: ${NEW_VERSION}" >&2
+                  echo "##vso[task.setvariable variable=LAST_VERSION;isOutput=true]${last_version}" >&2
+                  echo $(echo "$manifest" | jq --arg new_image "$new_image" '.properties.template.containers[0].image = $new_image')
+              }
+
+              update_crossplane_containerapp() {
+                  echo "##[debug] Updating Crossplane Manifest" >&2
+                  local manifest="$1"
+                  local image=$(echo "$manifest" | jq -r '.spec.forProvider.template[0].container[0].image' | tr ':' '\n')
+                  local last_version=$(echo "$image" | jq -r '.[1] // "null"')
+                  local new_image=$(echo "$image" | jq -r '.[0]'):${NEW_VERSION}
+                  echo "##[debug] Last version: ${last_version} -> New Version: ${NEW_VERSION}" >&2
+                  echo "##vso[task.setvariable variable=LAST_VERSION;isOutput=true]${last_version}" >&2
+                  echo $(echo "$manifest" | jq --arg new_image "$new_image" '.spec.forProvider.template[0].container[0].image = $new_image')
+              }
+
+              check_env_var() {
+                  local var_name="$1"
+                  local var_value="${!var_name}"
+                  if [[ -z "$var_value" ]]; then
+                      echo "##[error] Error: $var_name is not set"
+                      exit 1
+                  fi
+                  echo "##[debug] $var_name is set to $var_value" >&2
+              }
+              
+              cd $(Agent.BuildDirectory)/gitops
+              check_env_var "MANIFEST_PATH"
+              check_env_var "GITOPS_UPDATE_TYPE"
+              check_env_var "NEW_VERSION"
+
+              echo "##[debug] reading ${MANIFEST_PATH}"
+              if [ ! -f ${MANIFEST_PATH} ]; then
+                  echo "##[error] Error: ${MANIFEST_PATH} not found"
+                  exit 1
+              fi
+              manifest=$(cat ${MANIFEST_PATH} | yq e -o=json)
+              echo $manifest
+              if [ "${GITOPS_UPDATE_TYPE}" == "helm" ]; then
+                  manifest=$(update_helm_manifest "$manifest")
+              elif [ "${GITOPS_UPDATE_TYPE}" == "kustomization" ]; then
+                  manifest=$(update_kustomization_manifest "$manifest")
+              elif [ "${GITOPS_UPDATE_TYPE}" == "az-container-apps" ]; then
+                  manifest=$(update_az_container_app_manifest "$manifest")
+              elif [ "${GITOPS_UPDATE_TYPE}" == "corssplane-containerapp" ]; then
+                  manifest=$(update_crossplane_containerapp "$manifest")
+              else
+                  manifest=$(update_k8s_manifest "$manifest")
+              fi
+              yml=$(echo "$manifest" | yq e -P)
+              m=$(echo "$manifest" | yq e -o=json > /dev/null)
+              if [[ "$m" == "null" ]]; then
+                echo "##[error] Error: Invalid YAML"
+                exit 1
+              fi
+              echo "${yml}" > ./${MANIFEST_PATH}
+              if [[ ! -s "$MANIFEST_PATH" ]]; then
+                  echo "##[error] Error: ${MANIFEST_PATH} is empty"
+                  exit 1
+              fi
+              cat ${MANIFEST_PATH}
+        - task: Bash@3
+          name: 'publish_changes'
+          continueOnError: false
+          displayName: 'Publish to GitOps Repository'
+          env:
+            LAST_VERSION: $(read_and_update_manifest.LAST_VERSION)
+            NEW_VERSION: $(get_version.VERSION)
+            BRANCH_NAME: $(checkout_to_branch.BRANCH_NAME)
+          inputs:
+            targetType: inline
+            script: |
+              #!/bin/bash
+              set -e
+              cd $(Agent.BuildDirectory)/gitops
+              git config user.email "azuredevops@telefonica.com"
+              git config user.name "Azure DevOps"
+              git branch -a
+              git fetch --all
+              git switch ${BRANCH_NAME}
+              git add ${MANIFEST_PATH}
+              if [ -z "$(git status --porcelain)" ]; then
+                echo "##[debug] No changes to commit, ${MANIFEST_PATH} is up to date"
+                exit 0
+              fi
+              git commit -m "[CI SKIP] Deploy new version '${LAST_VERSION} -> ${NEW_VERSION}'" --author="$BUILD_REQUESTEDFOR <$BUILD_REQUESTEDFOREMAIL>"
+              git push origin ${BRANCH_NAME}
+              if [ $? -ne 0 ]; then 
+                echo "##vso[task.logissue type=error;] Git push failed. Permission denied"
+                echo "##vso[task.complete result=Failed;]"
+                exit 1
+              fi  
+              echo "##[debug] Version updated to ${LAST_VERSION} -> ${NEW_VERSION} in environment ${ENVIRONMENT}"
+        - task: Bash@3
+          displayName: '[IMPORTANT!!] ARGOCD DESLIGADO'
+          condition: always()
+          inputs:
+            targetType: inline
+            script: |         
+              echo "##[error]╔════════════════════════════════════════════════════════════════╗"
+              echo "##[error]║  PIPELINE DESCONTINUADO - AÇÃO NECESSÁRIA                     ║"
+              echo "##[error]╚════════════════════════════════════════════════════════════════╝"
+              echo "##[error]"
+              echo "##[error]⚠️  PROBLEMA:"
+              echo "##[error]   • O ArgoCD foi desligado desde 27/03/2026"
+              echo "##[error]   • Este pipeline NÃO realiza o deploy/sync no ambiente"
+              echo "##[error]   • Manifestos são apenas atualizados no repositório GitOps"
+              echo "##[error]"
+              echo "##[error]✅ SOLUÇÃO:"
+              echo "##[error]   • Um novo modelo de pipeline foi desenvolvido"
+              echo "##[error]   • Consulte a documentação interativa de migração:"
+              echo "##[error]   📖 https://dvps-dev.redecorp.azr/migracao-argocd-telefonicabigdata/"
+              echo "##[error]"
+              echo "##[error]📚 DOCUMENTAÇÃO:"
+              echo "##[error]   • Motivos da descontinuação e novo fluxo:"
+              echo "##[error]   📖 https://dvps-dev.redecorp.azr/portal/code/casos-de-uso/migracao-argocd"
+              echo "##[error]"
+              echo "##[error]💬 SUPORTE:"
+              echo "##[error]   • Dúvidas e discussões:"
+              echo "##[error]   💬 https://dvps.redecorp.azr/portal/codeplay/codeplay/canal"
+              echo "##[error]"
+              exit 1

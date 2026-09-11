@@ -1,0 +1,116 @@
+stages:
+- stage: check_not_null_columns
+  displayName: "Check New Columns for NOT NULL Constraint"
+  dependsOn: pipeline_init
+  pool: $(GENERAL_PURPOSE_CD_AGENT)
+  jobs:
+    - job: build
+      timeoutInMinutes: 0
+      displayName: 'Check New Columns for NOT NULL Constraint'
+      steps:
+      - checkout: self
+        persistCredentials: true
+        fetchDepth: 0
+
+      - script: |
+            #!/bin/bash
+
+            RED='\033[0;31m'
+            GREEN='\033[0;32m'
+            YELLOW='\033[0;33m'
+            BLUE='\033[0;34m'
+            NC='\033[0m'
+            current_directory=$(pwd)
+
+            git fetch origin
+
+            merge_base=$(git merge-base HEAD origin/master 2>/dev/null || git merge-base HEAD origin/main)
+
+            if [ -z "$merge_base" ]; then
+                echo -e "${RED}Erro: Não foi possível determinar o ponto de divergência da branch atual com a master/main.${NC}"
+                exit 1
+            fi
+
+            extract_columns_from_xml() {
+                local file_path=$1
+                local attributes=$(xmllint --xpath '//attribute/modifiers[@optional="false"]/parent::attribute' "$file_path" 2>/dev/null)
+                if [ -z "$attributes" ]; then
+                    return
+                fi
+                
+                echo "$attributes" | while IFS= read -r line; do
+                    local qualifier=$(echo "$line" | sed -n 's/.*qualifier="\([^"]*\)".*/\1/p')
+                    if [ -n "$qualifier" ]; then
+                        echo "$qualifier"
+                    fi
+                done
+            }
+
+            print_error_header() {
+                printf "
+                ${YELLOW}=================================================================================================================================\n
+                ${RED}                                                          PIPELINE FALHOU\n
+                ${YELLOW}=================================================================================================================================\n
+                ${RED}ERRO: O pipeline falhou! Novas colunas com 'optional=\"false\"' foram detectadas, o que não é recomendado.\n
+                ${YELLOW}VERIFICAÇÃO: Verifique se essas novas colunas com 'optional=\"false\"' são realmente necessárias e reavalie a necessidade de mantê-las.\n
+                ${YELLOW}AÇÃO: Colunas com 'optional=\"false\"' podem causar problemas durante o deploy sem downtime no SAP Hybris Commerce Cloud. Evite adicionar novas colunas 'NOT NULL'.\n
+                ${RED}NOTA: Novas colunas com 'optional=\"false\"' não são recomendadas, pois podem causar falhas em cenários de deploy contínuo.\n
+                ${YELLOW}=================================================================================================================================\n"
+            }
+
+            check_new_columns() {
+                local current_columns=$1
+                local previous_columns=$2
+                local file_path=$3
+                local is_new_file=$4
+
+                local has_error=false
+
+                while IFS= read -r current_qualifier; do
+                    if [ "$is_new_file" = true ]; then
+                        printf "${YELLOW}Aviso: Arquivo novo '$file_path'. Coluna NOT NULL encontrada: '$current_qualifier'.\n${NC}"
+                        has_error=true
+                    else
+                        if ! grep -q "$current_qualifier" <<< "$previous_columns"; then
+                            printf "${RED}Erro: Nova coluna '$current_qualifier' é NOT NULL no arquivo $file_path\n${NC}"
+                            has_error=true
+                        fi
+                    fi
+                done <<< "$current_columns"
+
+                if [ "$has_error" = true ]; then
+                    print_error_header
+                    exit 1
+                fi
+            }
+
+            has_any_error=false
+
+            git diff --name-status "$merge_base" HEAD -- '*.xml' | while IFS=$'\t' read -r status file_path; do
+                if [ "$status" = "A" ]; then
+                    printf "${YELLOW}Aviso: Arquivo novo detectado '$file_path'. Verificando atributos...\n${NC}"
+                    new_columns=$(extract_columns_from_xml "$file_path")
+
+                    if [ -n "$new_columns" ]; then
+                        check_new_columns "$new_columns" "" "$file_path" true
+                        has_any_error=true
+                    else
+                        printf "${GREEN}Nenhum atributo NOT NULL encontrado em arquivo novo '$file_path'.\n${NC}"
+                    fi
+                else
+                    relative_path=$(realpath --relative-to="$current_directory" "$file_path")
+                    current_columns=$(extract_columns_from_xml "$file_path")
+                    previous_content=$(git show "$merge_base:$relative_path" 2>/dev/null)
+                    previous_columns=$(extract_columns_from_xml <(echo "$previous_content"))
+
+                    if [ -n "$current_columns" ]; then
+                        check_new_columns "$current_columns" "$previous_columns" "$file_path" false
+                        has_any_error=true
+                    fi
+                fi
+            done
+
+            if [ "$has_any_error" = false ]; then
+                printf "${GREEN}Nenhuma nova coluna NOT NULL encontrada.\n${NC}"
+            fi
+        displayName: 'Check for New Columns with NOT NULL Constraint'

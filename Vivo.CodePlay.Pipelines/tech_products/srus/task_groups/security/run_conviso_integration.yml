@@ -1,0 +1,343 @@
+parameters:
+- name: skipSecurityGate
+  default: false
+- name: azureSubscription
+  default: "$(APP_CONFIGURATION_AZURE_SUBSCRIPTION)"
+- name: appConfigurationEndpoint
+  default: "$(APP_CONFIGURATIN_ENDPOINT)"
+
+steps:
+  - task: AzureKeyVault@2
+    displayName: 'Getting AKV credentials'
+    timeoutInMinutes: 1
+    retryCountOnTaskFailure: 5  
+    inputs:    
+      azureSubscription: DevOpsSharedResources    
+      KeyVaultName: $(AKV_DEVOPS_NAME)
+      SecretsFilter: 'FORTIFY-SSC-CLI-TOKEN, CONVISO-API-KEY'
+    condition: and(eq(variables['FORTIFY-SSC-CLI-TOKEN'], ''), eq(variables['CONVISO-API-KEY'], ''))
+
+  - task: AzureAppConfiguration@8
+    displayName: 'Download configuration keys'
+    timeoutInMinutes: 1
+    retryCountOnTaskFailure: 5
+    inputs:
+      azureSubscription: ${{ parameters.azureSubscription }}
+      AppConfigurationEndpoint: ${{ parameters.appConfigurationEndpoint }}
+      KeyFilter: "RT_CONVISO_NEW_INTEGRATION"
+      Label: 'VIVO-CORE-PIPELINES'
+    condition: eq(variables['RT_CONVISO_NEW_INTEGRATION'], '')
+    #env:
+      #HTTPS_PROXY: $(PROXY_AGENT_HTTPS)
+      #HTTP_PROXY: $(PROXY_AGENT_HTTP)
+      #NO_PROXY: $(PROXY_AGENT_NO_PROXY)
+
+  # Busca o ID do projeto no FORTIFY
+  - bash: |
+        FORTIFY_APP_DEFAULT_NAME="${FORTIFY_APP_DEFAULT_NAME// /%20}"
+        FORTIFY_TOKEN=$(echo -n ${FORTIFY_SSC_CLI_TOKEN} | base64)
+
+        REQUEST_QUERY="project.name:${FORTIFY_APP_DEFAULT_NAME},name:${FORTIFY_APP_DEFAULT_VERSION}"
+        REQUEST_PARAMS="fields=id&start=0&limit=200&fulltextsearch=false&includeInactive=false&myAssignedIssues=false&onlyIfHasIssues=false&q=$REQUEST_QUERY"
+        
+        RESPONSE=$(curl --cacert ${CACORP_LOCATION} -s -g \
+        -X GET "${FORTIFY_SSC_ENDPOINT}api/v1/projectVersions?${REQUEST_PARAMS}" \
+        --header 'Accept: application/json' \
+        --header "Authorization: FortifyToken $FORTIFY_TOKEN")
+
+        PROJECT_ID=$(echo $RESPONSE | jq .data[0].id)
+
+        echo "##vso[task.setvariable variable=fortifyProjectId]$PROJECT_ID"
+        echo "Exportando ID do Projeto '${PROJECT_ID}' no Fortify para variável 'fortifyProjectId'."
+    env:
+      CACORP_LOCATION: "$(CACORP_LOCATION)"
+      FORTIFY_SSC_CLI_TOKEN: "$(FORTIFY-SSC-CLI-TOKEN)"
+      FORTIFY_APP_DEFAULT_NAME: "$(FORTIFY_APP_DEFAULT_NAME)"
+      FORTIFY_APP_DEFAULT_VERSION: "$(FORTIFY_APP_DEFAULT_VERSION)"
+      FORTIFY_SSC_ENDPOINT: "$(FORTIFY_SSC_ENDPOINT)"
+    displayName: "Getting Fortify Project ID"
+
+    #Associa projeto no conviso
+  - bash: |
+        sleep 5s
+        RESPONSE=$(curl -s -S -g -X POST "${CONVISO_APP_ENDPOINT}/api/v2/integrations/scanners/fortify/associate_project" \
+        --proxy "${PROXY_AGENT_HTTPS}" \
+        --header 'Content-Type: application/json' \
+        --header "x-api-key: ${CONVISO_API_KEY}" \
+        --data '{"company_id": '${CONVISO_COMPANY_ID}',"project_id": "'${FORTIFY_PROJECT_ID}'"}')
+
+        ASSOCIATION_ID=$(echo $RESPONSE | jq .data.id)
+        PROJECT_ID=$(echo $RESPONSE | jq .data.project.id)
+        
+        ERROR=$(echo $RESPONSE | jq '.error.status_type // empty')
+        if [[ ! -z "$ERROR" ]]; then
+          MESSAGE=$(echo $RESPONSE | jq '.error.details // empty')
+          echo "##vso[task.logissue type=error;] An error occurred while requesting Conviso API. ${ERROR} - ${MESSAGE}"
+          echo "##vso[task.complete result=Failed;]"
+          exit
+        fi
+        
+        echo "##vso[task.setvariable variable=${CONVISO_PROJECT_ID_OUT}]$PROJECT_ID"
+        echo "Exportando ID do Projeto '${PROJECT_ID}' no Conviso para variável '${CONVISO_PROJECT_ID_OUT}'."
+        
+        echo "##vso[task.setvariable variable=${CONVISO_ASSOCIATION_ID_OUT}]$ASSOCIATION_ID"
+        echo "Exportando ID da Associação '${ASSOCIATION_ID}' do Conviso com o Fortify para variável '${CONVISO_ASSOCIATION_ID_OUT}'."
+    env:
+      CONVISO_APP_ENDPOINT: "$(CONVISO_APP_ENDPOINT)"
+      CONVISO_API_KEY: "$(CONVISO-API-KEY)"
+      FORTIFY_PROJECT_ID: "$(fortifyProjectId)"
+      CONVISO_COMPANY_ID: "$(CONVISO_COMPANY_ID)"
+      CONVISO_PROJECT_ID_OUT: "CONVISO_PROJECT_ID"
+      CONVISO_ASSOCIATION_ID_OUT: "CONVISO_ASSOCIATION_ID"
+      PROXY_AGENT_HTTPS: "$(PROXY_AGENT_HTTPS)"
+    displayName: "Getting Conviso Association and Project IDs"
+
+  # Executa o sync no Conviso 
+  - bash: |
+        echo "##[debug]RT_CONVISO_NEW_INTEGRATION....: ${RT_CONVISO_NEW_INTEGRATION}"
+
+        if [ "${RT_CONVISO_NEW_INTEGRATION}" = "true" ]; then
+          syncStartDateTime=$(date -u +"%Y-%m-%dT%H:%M:%S%z")
+
+          echo "##vso[task.setvariable variable=SYNC_START_DATE_TIME]$syncStartDateTime" 
+          echo "##[debug]Exportando Data e Hora atual '${syncStartDateTime}' para variável 'SYNC_START_DATE_TIME'."
+
+          sleep 5s
+
+          RESPONSE=$(curl -s -S -g -X POST "${CONVISO_APP_ENDPOINT}/api/v2/integrations/scanners/fortify/synchronize" \
+          --proxy "${PROXY_AGENT_HTTPS}" \
+          --header 'Content-Type: application/json' \
+          --header "x-api-key: ${CONVISO_API_KEY}" \
+          --data '{"company_id": '${CONVISO_COMPANY_ID}',"integration_association_id": "'${CONVISO_ASSOCIATION_ID}'"}')
+
+          TRACK_KEY=$(echo $RESPONSE | jq -r .data.job.track_key)
+          ASSET_ID=$(echo $RESPONSE | jq -r .data.asset.id)
+
+          echo "Track ID da Sync '${TRACK_KEY}' do Conviso."
+          
+          echo "##vso[task.setvariable variable=convisoAssetId]$ASSET_ID"
+          echo "##[debug]Exportando Asset ID da Sync '${ASSET_ID}' do Conviso para variável 'convisoAssetId'."
+        else
+          sleep 5s
+          RESPONSE=$(curl -s -S -g -X POST "${CONVISO_APP_ENDPOINT}/api/v2/integrations/scanners/fortify/synchronize" \
+          --proxy "${PROXY_AGENT_HTTPS}" \
+          --header 'Content-Type: application/json' \
+          --header "x-api-key: ${CONVISO_API_KEY}" \
+          --data '{"company_id": '${CONVISO_COMPANY_ID}',"integration_association_id": "'${CONVISO_ASSOCIATION_ID}'"}')
+
+          TRACK_KEY=$(echo $RESPONSE | jq -r .data.job.track_key)
+          
+          echo "##vso[task.setvariable variable=convisoTrackId]$TRACK_KEY"
+          echo "Exportando Track ID da Sync '${TRACK_KEY}' do Conviso para variável 'convisoTrackId'."
+        fi
+    env:
+      CONVISO_APP_ENDPOINT: "$(CONVISO_APP_ENDPOINT)"
+      CONVISO_API_KEY: "$(CONVISO-API-KEY)"
+      CONVISO_ASSOCIATION_ID: "$(CONVISO_ASSOCIATION_ID)"
+      CONVISO_COMPANY_ID: "$(CONVISO_COMPANY_ID)"
+      PROXY_AGENT_HTTPS: "$(PROXY_AGENT_HTTPS)"
+      RT_CONVISO_NEW_INTEGRATION: "$(RT_CONVISO_NEW_INTEGRATION)"
+    displayName: "Starting Conviso Synchronization and Getting Track Key / Asset ID"
+
+  # Busca o Status do sync no Conviso
+  - bash: |
+        echo "##[debug]RT_CONVISO_NEW_INTEGRATION....: ${RT_CONVISO_NEW_INTEGRATION}"
+
+        if [ "${RT_CONVISO_NEW_INTEGRATION}" = "true" ]; then
+          sleep 5s
+          i="0"
+          retries="10"
+          echo "Aguardando Sincronização finalizar"
+          while [[ $i -lt $retries ]]
+          do
+              DATA="{\"operationName\":null,\"variables\":{},\"query\":\"{ syncStatus(assetId: ${CONVISO_ASSET_ID}, integration: FORTIFY, startDate: \\\"${SYNC_START_DATE_TIME}\\\") { status failureReason } }\"}"
+              echo $DATA
+              RESPONSE_RAW=$(curl -s -S -w "\n%{http_code}" "${CONVISO_GRAPHQL_ENDPOINT}" \
+                --proxy "${PROXY_AGENT_HTTPS}" \
+                --header "Content-Type: application/json" \
+                --header "x-api-key: ${CONVISO_API_KEY}" \
+                --data-raw "${DATA}")
+
+              RESPONSE=$(sed '$d' <<< "$RESPONSE_RAW")
+              RESPONSE_CODE=$(tail -n1 <<< "$RESPONSE_RAW")
+
+              echo "##[debug]RESPONSE.........: ${RESPONSE}"
+              echo "##[debug]RESPONSE_CODE....: ${RESPONSE_CODE}"
+              
+              SYNC_STATUS=$(echo $RESPONSE | jq -r .data.syncStatus.status)
+              echo "Status atual da Sincronização: ${SYNC_STATUS}"
+
+              if [[ "$SYNC_STATUS" == "succeeded" ]]
+              then
+                  echo "Sincronização finalizada com sucesso"
+                  exit 0
+              fi
+              sleep 30s
+              i=$[$i+1]
+          done
+
+          echo "##vso[task.logissue type=error;]Tempo esgotado - A Sincronização não foi finalizada, tente rodar novamente."
+          echo "##vso[task.complete result=Failed;]"
+        else
+          sleep 5s
+          i="0"
+          retries="10"
+          API_URL="${CONVISO_APP_ENDPOINT}/api/v2/integrations/scanners/job/${CONVISO_TRACK_KEY}"
+
+          echo "Aguardando Sincronização finalizar"
+          while [[ $i -lt $retries ]]
+          do
+              SYNC_STATUS=$(curl -s -S -X GET ${API_URL} \
+              --proxy "${PROXY_AGENT_HTTPS}" \
+              --header "x-api-key: ${CONVISO_API_KEY}" | jq -r .data.status)
+
+              echo "Status atual da Sincronização: ${SYNC_STATUS}"
+
+              if [[ "$SYNC_STATUS" == "completed" ]]
+              then
+                  echo "Sincronização finalizada com sucesso"
+                  exit 0
+              fi
+              sleep 30s
+              i=$[$i+1]
+          done
+
+          echo "##vso[task.logissue type=error;]Tempo esgotado - A Sincronização não foi finalizada, tente rodar novamente."
+          echo "##vso[task.complete result=Failed;]"
+        fi
+    env:
+      CONVISO_APP_ENDPOINT: "$(CONVISO_APP_ENDPOINT)"
+      CONVISO_GRAPHQL_ENDPOINT: "$(CONVISO_GRAPHQL_ENDPOINT)"
+      CONVISO_API_KEY: "$(CONVISO-API-KEY)"
+      CONVISO_TRACK_KEY: "$(convisoTrackId)"
+      CONVISO_ASSET_ID: "$(convisoAssetId)"
+      PROXY_AGENT_HTTPS: "$(PROXY_AGENT_HTTPS)"
+      SYNC_START_DATE_TIME: "$(syncStartDateTime)"
+      SYNC_START_DATE_TIME_NEW: "$(SYNC_START_DATE_TIME)"
+      RT_CONVISO_NEW_INTEGRATION: "$(RT_CONVISO_NEW_INTEGRATION)"
+    displayName: "Getting Conviso Synchronization status"
+
+  # Busca API Code do Projeto no Conviso
+  - bash: |
+        RESPONSE=$(curl -s -S "${CONVISO_GRAPHQL_ENDPOINT}" \
+        --proxy "${PROXY_AGENT_HTTPS}" \
+        --header 'Content-Type: application/json' \
+        --header "x-api-key: ${CONVISO_API_KEY}" \
+        --data-raw '{"operationName":null,"variables":{},"query":"{ projects(params: { idEq: '${CONVISO_PROJECT_ID}' }) { collection { apiCode } } }"}')
+
+        API_CODE=$(echo $RESPONSE | jq -r .data.projects.collection[0].apiCode)
+
+        echo "##vso[task.setvariable variable=convisoProjectApiCode]$API_CODE"
+        echo "##[debug]Exportando API CODE '${API_CODE}' do Projeto do Conviso para variável 'convisoProjectApiCode'."
+    env:
+      CONVISO_GRAPHQL_ENDPOINT: "$(CONVISO_GRAPHQL_ENDPOINT)"
+      CONVISO_API_KEY: "$(CONVISO-API-KEY)"
+      CONVISO_PROJECT_ID: "$(CONVISO_PROJECT_ID)"
+      PROXY_AGENT_HTTPS: "$(PROXY_AGENT_HTTPS)"
+    displayName: "Getting Conviso Project API CODE"
+
+  # Busca Vulnerabilidades não avaliadas
+  - bash: |
+        EVALUATION_STATUS=0 # ID do Status 'Not Evaluated'
+        FILTER='scopeId: '${CONVISO_COMPANY_ID}', projectKey: \"'${CONVISO_PROJECT_API_CODE}'\", evaluationStatus: '${EVALUATION_STATUS}''
+        FIELDS="integrationName category titleEn descriptionEn evaluationStatus businessSeverity originalSeverity technicalSeverity"
+        DATA='{"operationName":null,"variables":{},"query":"{ findings(page: 0, params: { '$FILTER' }) { collection { '$FIELDS' } } }"}'
+
+        RESPONSE=$(curl -s -S "${CONVISO_GRAPHQL_ENDPOINT}" \
+        --proxy "${PROXY_AGENT_HTTPS}" \
+        --header 'Content-Type: application/json' \
+        --header "x-api-key: ${CONVISO_API_KEY}" \
+        --data-raw "${DATA}")
+
+        echo "Vulnerabilidades ainda não avaliadas:"
+        echo $RESPONSE | jq .data.findings.collection
+    env:
+      CONVISO_GRAPHQL_ENDPOINT: "$(CONVISO_GRAPHQL_ENDPOINT)"
+      CONVISO_API_KEY: "$(CONVISO-API-KEY)"
+      CONVISO_PROJECT_API_CODE: "$(convisoProjectApiCode)"
+      CONVISO_COMPANY_ID: "$(CONVISO_COMPANY_ID)"
+      PROXY_AGENT_HTTPS: "$(PROXY_AGENT_HTTPS)"
+    displayName: "Getting Conviso Vulnerabilities Not Evaluated"
+
+  # Busca o dados do Security Gate
+  - bash: |
+        echo "##[debug]RT_CONVISO_NEW_INTEGRATION....: ${RT_CONVISO_NEW_INTEGRATION}"
+
+        if [ "${RT_CONVISO_NEW_INTEGRATION}" = "true" ]; then
+          SG_STATUS_TO_BE_BLOCKED="IDENTIFIED IN_PROGRESS"
+          DATA="{\"operationName\":null,\"variables\":{},\"query\":\"{ issuesStats(companyId: ${CONVISO_COMPANY_ID}, filters: {assetIds: [${CONVISO_ASSET_ID}], integrationTypes: Fortify, statuses: [$SG_STATUS_TO_BE_BLOCKED]}) { severities { count value } } }\"}"
+              
+          RESPONSE=$(curl -s -S "${CONVISO_GRAPHQL_ENDPOINT}" \
+            --proxy "${PROXY_AGENT_HTTPS}" \
+            --header "Content-Type: application/json" \
+            --header "x-api-key: ${CONVISO_API_KEY}" \
+            --data-raw "${DATA}")
+
+          CRITICAL_SEVERITY_COUNT=$(echo $RESPONSE | jq -r .data.issuesStats.severities[4].count)
+          HIGH_SEVERITY_COUNT=$(echo $RESPONSE | jq -r .data.issuesStats.severities[3].count)
+
+          if [ "$CRITICAL_SEVERITY_COUNT" -gt "${SG_SEVERITY_CRITICAL}" ]; then
+            echo "##vso[task.logissue type=error;]A Análise encontrou Vulnerabilidades Críticas: $CRITICAL_SEVERITY_COUNT"
+            echo "##vso[task.complete result=Failed;]"
+            exit
+          fi
+
+          if [ "$HIGH_SEVERITY_COUNT" -gt "${SG_SEVERITY_HIGH}" ]; then
+            echo "##vso[task.logissue type=error;]A Análise encontrou Vulnerabilidades Altas: $HIGH_SEVERITY_COUNT"
+            echo "##vso[task.complete result=Failed;]"
+            exit
+          fi
+
+          echo "A Análise finalizou sem Vulnerabilidades Identificadas"
+          exit 0
+        else
+          CRITICAL=$([[ -n ${SG_SEVERITY_CRITICAL} ]] && echo -n '"critical": { "maximum": '${SG_SEVERITY_CRITICAL}' }' || echo -n "")
+          HIGH=$([[ -n ${SG_SEVERITY_HIGH} ]] && echo -n '"high": { "maximum": '${SG_SEVERITY_HIGH}' }' || echo -n "")
+          MEDIUM=$([[ -n ${SG_SEVERITY_MEDIUM} ]] && echo -n '"medium": { "maximum": '${SG_SEVERITY_MEDIUM}' }' || echo -n "")
+          LOW=$([[ -n ${SG_SEVERITY_LOW} ]] && echo -n '"low": { "maximum": '${SG_SEVERITY_LOW}' }' || echo -n "")
+
+          DATA_SEVERITY=$(echo -n ${CRITICAL})
+          DATA_SEVERITY=$(echo -n ${DATA_SEVERITY}; [[ -n ${DATA_SEVERITY} ]] && [[ -n ${HIGH} ]] && echo -n ","; echo -n ${HIGH})
+          DATA_SEVERITY=$(echo -n ${DATA_SEVERITY}; [[ -n ${DATA_SEVERITY} ]] && [[ -n ${MEDIUM} ]] && echo -n ","; echo -n ${MEDIUM})
+          DATA_SEVERITY=$(echo -n ${DATA_SEVERITY}; [[ -n ${DATA_SEVERITY} ]] && [[ -n ${LOW} ]] && echo -n ","; echo -n ${LOW})
+          
+          DATA='{ "api_code": "'${CONVISO_PROJECT_API_CODE}'","rules": [{ "from": "any", "severity": { '${DATA_SEVERITY}' } }] }'
+          
+          RESPONSE=$(curl -s -S -g -X POST "${CONVISO_APP_ENDPOINT}/api/v3/security_gate/vulnerabilities" \
+          --proxy "${PROXY_AGENT_HTTPS}" \
+          --header 'Content-Type: application/json' \
+          --header "x-api-key: ${CONVISO_API_KEY}" \
+          --data "${DATA}")
+
+          LOCKED=$(echo $RESPONSE | jq .locked)
+
+          if [[ "${LOCKED}" == "true" ]]
+          then
+            echo "##vso[task.logissue type=error;]A análise encontrou vulnerabilidades. Entre em contato com o Security Champion do seu projeto."
+            echo $RESPONSE | jq .summary
+            echo "##vso[task.complete result=Failed;]"
+            exit
+          fi
+
+          echo "A análise finalizou sem vulnerabilidades identificadas."
+          exit 0
+        fi
+    env:
+      CONVISO_APP_ENDPOINT: "$(CONVISO_APP_ENDPOINT)"
+      CONVISO_PROJECT_API_CODE: "$(convisoProjectApiCode)"
+      CONVISO_GRAPHQL_ENDPOINT: "$(CONVISO_GRAPHQL_ENDPOINT)"
+      CONVISO_API_KEY: "$(CONVISO-API-KEY)"
+      CONVISO_ASSET_ID: "$(convisoAssetId)"
+      CONVISO_COMPANY_ID: "$(CONVISO_COMPANY_ID)"
+      SG_SEVERITY_CRITICAL: "0"
+      SG_SEVERITY_HIGH: "0"
+      SG_SEVERITY_MEDIUM: ""
+      SG_SEVERITY_LOW: ""
+      PROXY_AGENT_HTTPS: "$(PROXY_AGENT_HTTPS)"
+      RT_CONVISO_NEW_INTEGRATION: "$(RT_CONVISO_NEW_INTEGRATION)"
+    continueOnError: true
+    displayName: "Getting Security Gate Data and Validate"
+
+  - template: /tech_products/srus/tasks/bash/security_gate_validation.yml
+    parameters:
+      skipSecurityGate: ${{ parameters.skipSecurityGate }}

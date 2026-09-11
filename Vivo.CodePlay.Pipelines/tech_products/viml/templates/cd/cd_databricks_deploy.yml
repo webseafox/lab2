@@ -1,0 +1,290 @@
+parameters:
+  - name: environmentName
+    type: string
+  - name: variableGroupName
+    type: string
+  - name: repoName
+    type: string
+  - name: repoUrl
+    type: string
+  - name: repoPathDatabricks
+    type: string
+  - name: runTrain
+    type: boolean
+  - name: runEvaluate
+    type: boolean
+  - name: runPredict
+    type: boolean
+
+jobs:
+- job: Deploy
+  displayName: "Deploy Databricks (${{ parameters.environmentName }})"
+  pool:
+    name: GeneralPurposeLinuxAgentsCD
+
+  variables:
+    - group: ${{ parameters.variableGroupName }}
+
+  steps:
+    - checkout: self
+
+    # =========================
+    # Create Databricks Token
+    # =========================
+    - bash: |
+        set -e
+
+        echo "🔐 Gerando token para o Databricks..."
+
+        # Pega direto das variáveis de ambiente (já injetadas pelo Azure DevOps)
+        TENANT_ID="${SVP_TENANT_ID_DATABRICKS_ML}"
+        CLIENT_ID="${SVP_CLIENT_ID_DATABRICKS_ML}"
+        CLIENT_SECRET="${SVP_KEY_DATABRICKS_ML}"
+        WORKSPACE_URL="${WORKSPACE_URL_DATABRICKS}"
+
+        # Validação
+        if [ -z "$TENANT_ID" ] || [ -z "$CLIENT_ID" ] || [ -z "$CLIENT_SECRET" ] || [ -z "$WORKSPACE_URL" ]; then
+          echo "❌ Variáveis de ambiente não configuradas corretamente."
+          exit 1
+        fi
+
+        # 1. Obter token do Azure AD
+        TOKEN_RESPONSE=$(curl -s -X POST "https://login.microsoftonline.com/${TENANT_ID}/oauth2/token" \
+          -H "Content-Type: application/x-www-form-urlencoded" \
+          -d "grant_type=client_credentials" \
+          -d "client_id=${CLIENT_ID}" \
+          -d "client_secret=${CLIENT_SECRET}" \
+          -d "resource=2ff814a6-3304-4ab8-85cb-cd0e6f879c1d")
+
+        ACCESS_TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r '.access_token')
+
+        if [ -z "$ACCESS_TOKEN" ] || [ "$ACCESS_TOKEN" == "null" ]; then
+          echo "❌ Falha ao obter token do Azure"
+          echo "$TOKEN_RESPONSE"
+          exit 1
+        fi
+
+        # 2. Criar token no Databricks
+        CREATE_TOKEN_RESPONSE=$(curl -s -X POST "${WORKSPACE_URL}/api/2.0/token/create" \
+          -H "Authorization: Bearer $ACCESS_TOKEN" \
+          -H "Content-Type: application/json" \
+          -d '{"lifetime_seconds": 3600, "comment": "Token via SP"}')
+
+        TOKEN_VALUE=$(echo "$CREATE_TOKEN_RESPONSE" | jq -r '.token_value')
+
+        if [ -n "$TOKEN_VALUE" ] && [ "$TOKEN_VALUE" != "null" ]; then
+          echo "✅ Token criado com sucesso!"
+          echo "##vso[task.setvariable variable=DATABRICKS_TOKEN;issecret=true]$TOKEN_VALUE"
+        else
+          echo "❌ Falha ao criar token"
+          echo "$CREATE_TOKEN_RESPONSE"
+          exit 1
+        fi
+
+      displayName: "Create Databricks Token"
+      env:
+        SVP_KEY_DATABRICKS_ML: $(SVP_KEY_DATABRICKS_ML)
+
+    # =========================
+    # Sync Repo to Databricks
+    # =========================
+    - bash: |
+        set -e
+
+        echo "🔁 Sincronizando repositório com o Databricks..."
+
+        # === Configurações ===
+        REPO_URL="${REPO_URL}"
+        REPO_PROVIDER="azureDevOpsServices"
+        REPO_PATH="${REPO_PATH_DATABRICKS}"
+        REPO_BRANCH="${BUILD_SOURCEBRANCHNAME}"
+
+        echo "📌 Branch alvo: $REPO_BRANCH"
+        echo "📂 Caminho destino: $REPO_PATH"
+
+        # Variáveis adicionais para Git Credentials
+        WORKSPACE_URL_DATABRICKS="${WORKSPACE_URL_DATABRICKS}"
+        DATABRICKS_TOKEN="${DATABRICKS_TOKEN}"
+        GIT_USERNAME="${GIT_USERNAME}"
+        GIT_PERSONAL_ACCESS_TOKEN="${GIT_PERSONAL_ACCESS_TOKEN}"
+
+        # Validações básicas
+        if [[ -z "$WORKSPACE_URL_DATABRICKS" || -z "$DATABRICKS_TOKEN" ]]; then
+          echo "❌ WORKSPACE_URL_DATABRICKS ou DATABRICKS_TOKEN não definidos!"
+          exit 1
+        fi
+
+        if [[ -z "$REPO_URL" || -z "$REPO_PATH" ]]; then
+          echo "❌ REPO_URL ou REPO_PATH_DATABRICKS não definidos!"
+          exit 1
+        fi
+
+        if [[ -z "$GIT_PERSONAL_ACCESS_TOKEN" || -z "$GIT_USERNAME" ]]; then
+          echo "⚠️ Aviso: GIT_USERNAME ou GIT_PERSONAL_ACCESS_TOKEN não definidos. Pode haver falha ao acessar repositório privado."
+        fi
+
+        # --- Passo 1: Gerenciar Git Credentials no Databricks ---
+
+        echo "🔐 Configurando credenciais Git no Databricks..."
+
+        # Listar credenciais existentes
+        existing_creds=$(curl -s -X GET \
+          -H "Authorization: Bearer $DATABRICKS_TOKEN" \
+          -H "Content-Type: application/json" \
+          "$WORKSPACE_URL_DATABRICKS/api/2.0/git-credentials")
+
+        # Verificar se já existe credencial para o usuário
+        cred_id=$(echo "$existing_creds" | jq -r --arg user "$GIT_USERNAME" '.credentials[] | select(.git_username == $user) | .credential_id')
+
+        if [[ -n "$cred_id" ]]; then
+          echo "🔄 Atualizando credenciais existentes (ID: $cred_id)..."
+          curl -s -X PATCH "$WORKSPACE_URL_DATABRICKS/api/2.0/git-credentials/$cred_id" \
+            -H "Authorization: Bearer $DATABRICKS_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n \
+              --arg gp "$REPO_PROVIDER" \
+              --arg gu "$GIT_USERNAME" \
+              --arg pat "$GIT_PERSONAL_ACCESS_TOKEN" \
+              '{git_provider: $gp, git_username: $gu, personal_access_token: $pat}')" >/dev/null
+        else
+          echo "➕ Criando nova credencial Git..."
+          curl -s -X POST "$WORKSPACE_URL_DATABRICKS/api/2.0/git-credentials" \
+            -H "Authorization: Bearer $DATABRICKS_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n \
+              --arg gp "$REPO_PROVIDER" \
+              --arg gu "$GIT_USERNAME" \
+              --arg pat "$GIT_PERSONAL_ACCESS_TOKEN" \
+              '{git_provider: $gp, git_username: $gu, personal_access_token: $pat}')" >/dev/null
+        fi
+
+        # --- Passo 2: Verificar se repositório já existe ---
+
+        echo "📍 Verificando se o repositório já existe em: $REPO_PATH"
+
+        EXISTING_REPO=$(curl -s -H "Authorization: Bearer ${DATABRICKS_TOKEN}" \
+          "${WORKSPACE_URL_DATABRICKS}/api/2.0/repos?path=${REPO_PATH}")
+
+        REPO_ID=$(echo "$EXISTING_REPO" | jq -r '.repos[0].id // empty')
+
+        if [[ -n "$REPO_ID" ]]; then
+          echo "✅ Repositório já existe no Databricks (ID: $REPO_ID). Fazendo atualização..."
+
+          UPDATE_RESPONSE=$(curl -s -X PATCH "${WORKSPACE_URL_DATABRICKS}/api/2.0/repos/${REPO_ID}" \
+            -H "Authorization: Bearer ${DATABRICKS_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg branch "$REPO_BRANCH" '{branch: $branch}')")
+
+          if echo "$UPDATE_RESPONSE" | jq -e '.error_code' >/dev/null; then
+            echo "❌ Falha ao atualizar repositório: $UPDATE_RESPONSE"
+
+            if echo "$UPDATE_RESPONSE" | grep -q "GIT_UNKNOWN_REF"; then
+              echo "🗑️ Deletando repositório e recriando com branch '${REPO_BRANCH}'..."
+              curl -s -X DELETE "${WORKSPACE_URL_DATABRICKS}/api/2.0/repos/${REPO_ID}" \
+                -H "Authorization: Bearer ${DATABRICKS_TOKEN}"
+
+              # Criar novo repo
+              CREATE_RESPONSE=$(curl -s -X POST "${WORKSPACE_URL_DATABRICKS}/api/2.0/repos" \
+                -H "Authorization: Bearer ${DATABRICKS_TOKEN}" \
+                -H "Content-Type: application/json" \
+                -d "$(jq -n \
+                  --arg url "$REPO_URL" \
+                  --arg provider "$REPO_PROVIDER" \
+                  --arg path "$REPO_PATH" \
+                  '{url: $url, provider: $provider, path: $path}')")
+
+              NEW_ID=$(echo "$CREATE_RESPONSE" | jq -r '.id // empty')
+
+              if [[ -n "$NEW_ID" ]]; then
+                echo "📦 Repositório recriado com ID $NEW_ID. Trocando branch para '$REPO_BRANCH'..."
+                PATCH_RESPONSE=$(curl -s -X PATCH "${WORKSPACE_URL_DATABRICKS}/api/2.0/repos/${NEW_ID}" \
+                  -H "Authorization: Bearer ${DATABRICKS_TOKEN}" \
+                  -H "Content-Type: application/json" \
+                  -d "$(jq -n --arg branch "$REPO_BRANCH" '{branch: $branch}')")
+
+                if echo "$PATCH_RESPONSE" | jq -e '.error_code' >/dev/null; then
+                  echo "❌ Falha ao trocar branch após recriação: $PATCH_RESPONSE"
+                  exit 1
+                else
+                  echo "✅ Repositório recriado e branch '${REPO_BRANCH}' aplicada com sucesso."
+                fi
+              else
+                echo "❌ Erro ao recriar repositório: $CREATE_RESPONSE"
+                exit 1
+              fi
+            else
+              exit 1
+            fi
+          else
+            echo "✅ Atualização realizada com sucesso para a branch '${REPO_BRANCH}'."
+          fi
+        else
+          echo "➕ Repositório não encontrado. Criando novo em: $REPO_PATH"
+
+          CREATE_RESPONSE=$(curl -s -X POST "${WORKSPACE_URL_DATABRICKS}/api/2.0/repos" \
+            -H "Authorization: Bearer ${DATABRICKS_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n \
+              --arg url "$REPO_URL" \
+              --arg provider "$REPO_PROVIDER" \
+              --arg path "$REPO_PATH" \
+              '{url: $url, provider: $provider, path: $path}')")
+
+          NEW_ID=$(echo "$CREATE_RESPONSE" | jq -r '.id // empty')
+
+          if [[ -n "$NEW_ID" ]]; then
+            echo "✅ Repositório criado com sucesso (ID: $NEW_ID). Alterando branch para '${REPO_BRANCH}'..."
+
+            PATCH_RESPONSE=$(curl -s -X PATCH "${WORKSPACE_URL_DATABRICKS}/api/2.0/repos/${NEW_ID}" \
+              -H "Authorization: Bearer ${DATABRICKS_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d "$(jq -n --arg branch "$REPO_BRANCH" '{branch: $branch}')")
+
+            if echo "$PATCH_RESPONSE" | jq -e '.error_code' >/dev/null; then
+              echo "❌ Falha ao trocar branch após criação: $PATCH_RESPONSE"
+              exit 1
+            else
+              echo "✅ Branch '${REPO_BRANCH}' aplicada com sucesso após criação."
+            fi
+          else
+            echo "❌ Falha ao criar repositório. Resposta:"
+            echo "$CREATE_RESPONSE"
+            exit 1
+          fi
+        fi
+
+      displayName: "Sync Repo to Databricks"
+      env:
+        DATABRICKS_TOKEN: $(DATABRICKS_TOKEN)
+        WORKSPACE_URL_DATABRICKS: $(WORKSPACE_URL_DATABRICKS)
+        REPO_URL: ${{ parameters.repoUrl }}
+        REPO_PATH_DATABRICKS: ${{ parameters.repoPathDatabricks }}
+        GIT_USERNAME: $(GIT_USERNAME)
+        GIT_PERSONAL_ACCESS_TOKEN: $(GIT_PERSONAL_ACCESS_TOKEN)
+
+    # =========================
+    # Deploy Jobs (Template)
+    # =========================
+    - template: cd_databricks_deploy_job.yml
+      parameters:
+        jobType: train
+        displayName: "Deploy Train Job"
+        enabled: ${{ parameters.runTrain }}
+        repoName: ${{ parameters.repoName }}
+        repoPathDatabricks: ${{ parameters.repoPathDatabricks }}
+
+    - template: cd_databricks_deploy_job.yml
+      parameters:
+        jobType: evaluate
+        displayName: "Deploy Evaluate Job"
+        enabled: ${{ parameters.runEvaluate }}
+        repoName: ${{ parameters.repoName }}
+        repoPathDatabricks: ${{ parameters.repoPathDatabricks }}
+
+    - template: cd_databricks_deploy_job.yml
+      parameters:
+        jobType: predict
+        displayName: "Deploy Predict Job"
+        enabled: ${{ parameters.runPredict }}
+        repoName: ${{ parameters.repoName }}
+        repoPathDatabricks: ${{ parameters.repoPathDatabricks }}

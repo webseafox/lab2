@@ -1,0 +1,175 @@
+# This YAML file defines the build and test stage of a pipeline for a specific technology product.
+# stage_files foi absorvida neste stage: checkout de source + shared-files, build, unit-test e publish acontecem aqui diretamente.
+
+parameters:
+  - name: config
+    type: object
+  - name: flow
+    type: object
+
+stages:
+  # stage_build_test depende apenas de stage_prep (stage_files removida - absorvida neste stage).
+  - stage: stage_build_test
+    displayName: "Build & Unit Test"
+    pool: $(POOL)
+    dependsOn:
+      - stage_prep
+    condition: |
+      or(
+        and(
+          eq(variables['STAGE_SECURITY_ONLY'], True),
+          ne(variables['TECHNOLOGY'], 'onlyHelmUpdate'),
+          ne(variables['APPLICATION_NAME'], 'bi-publisher-reports')
+        ),
+        and(
+          eq(variables['STAGE_SECURITY_ONLY'], False),
+          ne(variables['TECHNOLOGY'], 'onlyHelmUpdate'),
+          ne(variables['APPLICATION_NAME'], 'bi-publisher-reports'),
+          in(dependencies.stage_prep.result, 'Succeeded', 'SucceededWithIssues')
+        )
+      )
+    variables:
+      - name: VERSION
+        ${{ if eq(parameters.config.stageSecurityOnly, 'True') }}:
+          value: 99.99.99-sca
+        ${{ if eq(parameters.config.stageSecurityOnly, 'False') }}:
+          value: $[ stageDependencies.stage_prep.version.outputs['version.VERSION'] ]
+      - name: _APP_EXECUTION_MODE # Utilizado pelos jobs de helm chart (ECE) e PDC, movidos de stage_files.
+        value: $[ stageDependencies.stage_prep.execution_mode.outputs['mode.APP_EXECUTION_MODE'] ]
+    jobs:
+      # O job install faz checkout direto de source + shared-files, executa o build se necessario,
+      # e publica o artefato. Roda para todas as tecnologias com source real (exceto helmCharts e onlyHelmUpdate).
+      - job: install
+        displayName: "Install"
+        condition: |
+          and(
+            ne(variables['TECHNOLOGY'], 'helmCharts'),
+            ne(variables['TECHNOLOGY'], 'onlyHelmUpdate')
+          )
+        steps:
+          # Checkout direto de source_code e shared-files (absorvido de stage_files)
+          - template: ../../../../task_groups/checkout/checkout.yml
+            parameters:
+              repository: self
+              path: source_code
+
+          - template: ../../../../task_groups/checkout/checkout.yml
+            parameters:
+              repository: shared-files
+              path: source_code/shared
+
+          - script: |
+              set -euo pipefail
+
+              echo "##[section] Preparando arquivos para upload..."
+
+              echo "##[command]Removendo diretorios .git..."
+              find "$(Pipeline.Workspace)/source_code" -type d -name ".git" -prune -exec rm -rfv {} +
+
+              POM_FILE="$(Pipeline.Workspace)/source_code/pom.xml"
+              if [ -f "${POM_FILE}" ]; then
+                echo "##[section] Atualizando versao do pom.xml para $(VERSION) ..."
+                mvn -f "${POM_FILE}" -DnewVersion="$(VERSION)" -DgenerateBackupPoms=false versions:set
+              else
+                echo "##[debug] Nenhum pom.xml encontrado. Pulando update de versao."
+              fi
+            displayName: "Prepare files for upload"
+            failOnStderr: false
+
+          # Se a tecnologia for 'java', executa o build Maven.
+          - ${{ if eq(parameters.config.technology, 'java') }}:
+              - template: ../../../../task_groups/build/java.yml
+                parameters:
+                  settingsXmlFile: "settings-brm.xml"
+                  pomFile: "$(Pipeline.Workspace)/source_code/pom.xml"
+
+          # Se a aplicacao for 'db-upgrade', executa o script de pacotes de DB.
+          - ${{ if eq(parameters.config.applicationParameters.applicationName, 'db-upgrade') }}:
+              - template: ../../../../tasks/build/db_upgrade.yml
+                parameters:
+                  scriptName: script-db-upgrade_v2.0.sh
+                  scriptPath: $(Pipeline.Workspace)/source_code
+
+          # Publica o artefato final unico, substituindo o ciclo source_with_shared_files_raw -> source_with_shared_files.
+          - template: ../../../../task_groups/artifact/publish.yml
+            parameters:
+              artifactName: source_with_shared_files
+              targetPath: $(Pipeline.Workspace)/source_code
+
+      # Unit test mantido como job separado: Azure DevOps nao suporta condition em referencias de template como step.
+      - job: unit_test
+        displayName: "Unit Test"
+        dependsOn: install
+        condition: |
+          and(
+            in(dependencies.install.result, 'Succeeded', 'SucceededWithIssues'),
+            eq(variables['DISABLE_UNIT_TEST'], false),
+            eq(variables['TECHNOLOGY'], 'java'),
+            eq(variables['STAGE_SECURITY_ONLY'], False)
+          )
+        steps:
+          - checkout: none
+          - template: ../../../../task_groups/artifact/download.yml
+            parameters:
+              displayName: Download Pipeline Artifact [source_with_shared_files]
+              artifactName: source_with_shared_files
+              targetPath: $(Agent.BuildDirectory)/source_code
+          - template: ../../../../task_groups/unit_test/java.yml
+            parameters:
+              settingsXmlFile: "settings-brm.xml"
+              pomFile: "$(Agent.BuildDirectory)/source_code/pom.xml"
+
+      # Jobs de helm chart movidos de stage_files.
+      # Em fluxo CI, apenas executam para elastic-charging-engine.
+      - ${{ if ne(parameters.config.applicationParameters.helmCharts, '') }}:
+          - ${{ each helm_chart in split(parameters.config.applicationParameters.helmCharts, ',') }}:
+              - job: ${{ replace(helm_chart,'-','_') }}
+                displayName: "${{ replace(helm_chart, 'package-', '') }}"
+                condition: |
+                  or(
+                    eq(variables['APPLICATION_NAME'], 'elastic-charging-engine'),
+                    eq(variables['FLOW'], 'CD')
+                  )
+                steps:
+                  - template: ../../../../task_groups/checkout/checkout.yml
+                    parameters:
+                      repository: "${{ replace(helm_chart, 'package-', '') }}"
+                      path: ${{ replace(helm_chart, 'package-', '') }}
+                  - ${{ if and(eq(parameters.flow.flow, 'CI'), eq(helm_chart, 'package-oc-cn-ece-helm-chart')) }}:
+                      - template: ../../../../tasks/ece/update_flags.yml
+                        parameters:
+                          helmChart: ${{ replace(helm_chart, 'package-', '') }}
+                          eceExecutionMode: $(_APP_EXECUTION_MODE)
+                  - ${{ if and(or(eq(parameters.flow.flow, 'CI'), and(eq(parameters.flow.flow, 'CD'), ne(parameters.flow.cd_params.appVersion, 'LATEST'))), not(and(eq(parameters.config.applicationParameters.applicationName, 'pricing-design-center'), eq(helm_chart, 'package-oc-cn-op-job-helm-chart'))), ne(parameters.config.applicationParameters.applicationName, 'oracle-communications-offline-mediation-controller'), not(and(eq(parameters.config.applicationParameters.applicationName, 'elastic-charging-engine'), eq(helm_chart, 'package-oc-cn-helm-chart')))) }}:
+                      - template: ../../../../tasks/helm/update_version.yml
+                        parameters:
+                          condition: eq(variables['FLOW'], 'CD')
+                          helmChart: ${{ replace(helm_chart, 'package-', '') }}
+                          helmChartFile: $(HELM_CHART_FILE)
+                          helmChartVersionKey: $(HELM_CHART_VERSION_KEY)
+                          ${{ if eq(parameters.config.applicationParameters.applicationName, 'elastic-charging-engine') }}:
+                            applicationVersion: $(CONTAINER_IMAGE_NAME):$(VERSION)
+                          ${{ if in(parameters.config.applicationParameters.applicationName, 'billingcare', 'billingcare-extension', 'pricing-design-center') }}:
+                            applicationVersion: :$(VERSION)
+                          ${{ if notIn(parameters.config.applicationParameters.applicationName, 'billingcare', 'billingcare-extension', 'pricing-design-center', 'elastic-charging-engine') }}:
+                            applicationVersion: $(VERSION)
+                  - template: ../../../../task_groups/artifact/publish.yml
+                    parameters:
+                      artifactName: ${{ replace(helm_chart, 'package-', '') }}
+                      targetPath: $(Pipeline.Workspace)/${{ replace(helm_chart, 'package-', '') }}
+
+      # Job PDC movido de stage_files.
+      - ${{ if eq(parameters.config.applicationParameters.applicationName, 'pricing-design-center') }}:
+          - job: pdc
+            displayName: "Pricing-Design-Center Process"
+            condition: eq(variables['_APP_EXECUTION_MODE'], 'DEPLOY')
+            steps:
+              - template: ../../../../task_groups/checkout/checkout.yml
+                parameters:
+                  repository: "git://CLDM - CLOUD BRM/obrm-pricing-config@$(Build.SourceBranchName)"
+                  path: pricing-config
+
+              - template: ../../../../task_groups/pdc/process_files.yml
+                parameters:
+                  workingDirectory: $(Pipeline.Workspace)/pricing-config/pricing_config
+                  XMLFilesFolderToDeploy: $(Agent.BuildDirectory)/pricing-config-components-to-deploy

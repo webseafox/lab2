@@ -1,0 +1,84 @@
+parameters:
+- name: 'image'
+  type: string
+  default: '' 
+- name: 'command'
+  type: string
+  default: '/bin/bash /app/azdo-script.sh'
+- name: 'args'
+  type: string
+  default: ''
+- name: script
+  type: string
+  default: ''
+- name: envs
+  type: object
+  default:
+    - key: 'EXAMPLE'
+      value: 'example'
+- name: 'dockerConnection'
+  type: string
+  default: 'registry-telefonicabigdata'
+
+steps:
+- task: Docker@2
+  displayName: 'Login to Docker Registry'
+  inputs:
+    command: 'login'
+    containerRegistry: ${{ parameters.dockerConnection }}
+
+- task: Bash@3
+  name: 'execute_command'
+  displayName: "Execute command in docker"
+  continueOnError: false
+  inputs:
+    targetType: 'inline'
+    script: |
+      rm -f ${ENVS_FILE}
+      while read -r -d '' line; do 
+          [[ ! $line =~ ^(PATH|SCRIPT|COMMAND|HOME)= ]] && printf '%s\n' "$line" >> ${ENVS_FILE}
+      done < <(env -0)
+      if [ -n "$SCRIPT" ]; then
+        echo "##[debug] Creating .command-script.sh"
+        echo "$SCRIPT" > azdo-script.sh
+      fi
+      echo "##[debug] Running command: $COMMAND"
+      echo "##[command] docker run --rm \
+      -v $PWD:/app \
+      -v $AGENT_HOME:/home/devops \
+      --user=\"$(id -u):$(id -g)\" \
+      --network host \
+      --log-driver none \
+      -e COMMAND=\"$COMMAND\" \
+      -e HOME=/home/devops \
+      --env-file ${ENVS_FILE} \
+      ${ARGS} \
+      ${DOCKER_IMAGE} \
+      sh -c \"cd /app && $COMMAND\""
+      docker run --rm -v $PWD:/app \
+      -v $AGENT_HOME:/home/devops \
+      --user="$(id -u):$(id -g)" \
+      --network host \
+      --log-driver none \
+      -e COMMAND="$COMMAND" \
+      -e HOME=/home/devops \
+      --env-file ${ENVS_FILE} \
+      ${ARGS} \
+      ${DOCKER_IMAGE} \
+      sh -c "cd /app && $COMMAND"
+      status_code=$?
+      if [ $status_code -ne 0 ]; then
+        echo "##vso[task.logissue type=error] Failed to run command: $1"
+        echo "##vso[task.complete result=Failed;]"
+      fi
+      rm -rf ${ENVS_FILE}
+      echo "##[debug] $command finished with status_code ${status_code}"
+  env:
+    COMMAND: ${{ parameters.command }}
+    DOCKER_IMAGE: ${{ parameters.image }}
+    SCRIPT: ${{ parameters.script }}
+    ARGS: ${{ parameters.args  }}
+    ENVS_FILE: .docker-devops-envs
+    AGENT_HOME: $(Agent.TempDirectory)
+    ${{ each env in parameters.envs }}:
+      ${{ env.key }}: ${{ env.value }}

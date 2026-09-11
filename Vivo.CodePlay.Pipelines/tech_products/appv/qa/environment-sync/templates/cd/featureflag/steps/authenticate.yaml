@@ -1,0 +1,48 @@
+steps:
+  - task: Bash@3
+    displayName: 'Autenticar na API do Hobknob'
+    inputs:
+      targetType: inline
+      script: |
+        set -euo pipefail
+
+        if [[ -z "${SYSTEM_USER_HOBKNOB_USERNAME:-}" || -z "${SYSTEM_USER_HOBKNOB_PASSWORD:-}" ]]; then
+          echo "##[error] Variáveis SYSTEM_USER_HOBKNOB_USERNAME e/ou SYSTEM_USER_HOBKNOB_PASSWORD não encontradas na Library."
+          exit 1
+        fi
+
+        if [[ "${SYSTEM_USER_HOBKNOB_USERNAME}" == *'$('* || "${SYSTEM_USER_HOBKNOB_PASSWORD}" == *'$('* ]]; then
+          echo "##[error] As variáveis não foram resolvidas pelo variable group 'comp-framework-brasil-environment-sync-pipelines'. Confira o nome exato das chaves na Library (Key Vault não aceita underscore, pode ser hífen)."
+          exit 1
+        fi
+
+        COOKIE_FILE="$(Agent.TempDirectory)/hobknob-cookie.txt"
+        RESPONSE_FILE="$(Agent.TempDirectory)/hobknob-auth-response.json"
+        AUTH_PAYLOAD=$(jq -n \
+          --arg username "${SYSTEM_USER_HOBKNOB_USERNAME}" \
+          --arg password "${SYSTEM_USER_HOBKNOB_PASSWORD}" \
+          '{username: $username, password: $password}')
+
+        HTTP_CODE=$(curl -sS -o "${RESPONSE_FILE}" \
+          -w "%{http_code}" \
+          -c "${COOKIE_FILE}" \
+          -H 'Content-Type: application/json' \
+          -X POST "$(HOBKNOB_API_AUTH)" \
+          -d "${AUTH_PAYLOAD}")
+
+        if [[ "${HTTP_CODE}" -lt 200 || "${HTTP_CODE}" -gt 299 ]]; then
+          echo "##[error] Falha ao autenticar no Hobknob. HTTP ${HTTP_CODE}."
+          echo "##[debug] Resposta da API:"
+          cat "${RESPONSE_FILE}" || true
+          exit 1
+        fi
+
+        if [[ ! -s "${COOKIE_FILE}" ]]; then
+          echo "##[error] Cookie de autenticação não foi gerado."
+          exit 1
+        fi
+
+        echo "##vso[task.setvariable variable=HOBKNOB_COOKIE_FILE]${COOKIE_FILE}"
+    env:
+      SYSTEM_USER_HOBKNOB_USERNAME: $(SYSTEM_USER_HOBKNOB_USERNAME)
+      SYSTEM_USER_HOBKNOB_PASSWORD: $(SYSTEM_USER_HOBKNOB_PASSWORD)

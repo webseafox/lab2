@@ -1,0 +1,86 @@
+parameters:
+- name: dockerWorkdir
+  default: $(DOCKER_WORKDIR)
+- name: cmdBuildTest
+  type: string
+- name: appDependenciesCachePath
+  type: string
+  default: ""
+- name: appDependenciesCacheFolder
+  type: string
+  default: ""
+- name: mutationTestsEnable
+  type: boolean
+  default: False
+
+steps:
+- task: Docker@2
+  displayName: 'Login ACR (imagem base)'
+  continueOnError: true
+  inputs:
+    containerRegistry: $(DOCKER_ACR_REGISTRY_SERVICE_CONNECTION_NAME)
+    command: login
+
+# ==================================================================
+# [Compliance] Verifica se o repositório está em conformidade com as políticas de configuração
+# ==================================================================
+- task: VivoDevOpsConfigCompliance@1
+  displayName: 'Check DevOps Config Compliance'
+  inputs:
+    policySets: |
+      image-definition-files
+
+- bash: |
+    echo "##[debug] HTTPS_PROXY..........................: ${HTTPS_PROXY}"
+    echo "##[debug] HTTP_PROXY...........................: ${HTTP_PROXY}"
+    echo "##[debug] NO_PROXY.............................: ${NO_PROXY}"
+    echo "##[debug] parameters.appDependenciesCachePath..: '${{ parameters.appDependenciesCachePath }}'"
+
+    BUILDER_IMAGE_NAME="builder/node"
+    docker build --no-cache --pull -t $BUILDER_IMAGE_NAME -f .azuredevops/builder.Dockerfile .
+
+    NPM_CACHE_VOLUME=""
+    if [ -n "${{ parameters.appDependenciesCachePath }}" ]; then
+      NPM_CACHE_FOLDER_CONTAINER="/tmp/${{ parameters.appDependenciesCacheFolder }}"
+      rm -rf ${{ parameters.appDependenciesCachePath }}/*
+      NPM_CACHE_VOLUME="-e NPM_CONFIG_CACHE=${NPM_CACHE_FOLDER_CONTAINER} -v ${{ parameters.appDependenciesCachePath }}:${NPM_CACHE_FOLDER_CONTAINER}"
+
+      echo "##[debug] parameters.appDependenciesCachePath....: ${{ parameters.appDependenciesCachePath }}"
+      echo "##[debug] parameters.appDependenciesCacheFolder..: ${{ parameters.appDependenciesCacheFolder }}"
+      echo "##[debug] parameters.mutationTestsEnable.........: ${{ parameters.mutationTestsEnable }}"
+      echo "##[debug] app cache volume.......................: ${NPM_CACHE_VOLUME}"
+    fi
+
+    COMMAND_BUILD=${COMMAND_BUILD_TEST}
+
+    # TODO: Remove this rule when migrate all nodejs projects
+    if [[ "${{ parameters.mutationTestsEnable }}" == "True" || "${{ parameters.mutationTestsEnable }}" == "true" ]]; then
+      echo "##[debug] Mutation tests enabled"
+      COMMAND_BUILD=${COMMAND_BUILD_TEST_MUTATION}
+    fi
+
+    echo "##[debug] Command to be executed................: $COMMAND_BUILD"
+
+    docker run --rm \
+      --user="$(DOCKER_CMD_USERNAME):$(DOCKER_CMD_GROUP)" \
+      --network host \
+      --log-driver none \
+      -e NPM_CONFIG_USERCONFIG="/tmp/.npmrc" \
+      -e HTTPS_PROXY="$HTTPS_PROXY" \
+      -e HTTP_PROXY="$HTTP_PROXY" \
+      -e NO_PROXY="$NO_PROXY" \
+      -v $(pwd):/app \
+      -v ${NPM_TEMP_FILE_PATH}:/tmp/.npmrc \
+      -w ${DOCKER_WORKDIR} \
+      ${NPM_CACHE_VOLUME} \
+      $BUILDER_IMAGE_NAME sh -c "$COMMAND_BUILD"
+
+  displayName: Build & Test & Coverage
+  env:
+    DOCKER_WORKDIR: "${{ parameters.dockerWorkdir }}"
+    COMMAND_BUILD_TEST: "${{ parameters.cmdBuildTest }}"
+    COMMAND_BUILD_TEST_MUTATION: $(CMD_BUILD_TEST_MUTATION)
+    NPM_TEMP_FILE_PATH: $(DEFAULT_NPMRC_TEMP_FILE_PATH)
+    HTTPS_PROXY: $(PROXY_AGENT_HTTPS)
+    HTTP_PROXY: $(PROXY_AGENT_HTTP)
+    NO_PROXY: $(PROXY_AGENT_NO_PROXY)

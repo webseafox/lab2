@@ -1,0 +1,205 @@
+parameters:
+- name: gateway
+- name: environments
+  type: object
+  default: []
+
+stages:
+- stage: stage_package_publish
+  pool: $(PRIVATE_AGENT_DEFAULT)
+  displayName: Package & Publish
+  dependsOn:
+  - stage_build
+  variables:
+    APP_VERSION: $[ stageDependencies.stage_build.job_set_version.outputs['set_version.APP_VERSION'] ]
+    PARENT_IMAGE: "$(IMAGE_REGISTRY_MICROSSERVICOS)/apigw-base:7.7.2"
+  jobs:
+  - job: job_package_publish
+    displayName: Publish Image
+    steps:
+    - checkout: none
+    - task: Docker@2
+      displayName: Docker login
+      inputs:
+        containerRegistry: $(DOCKER_REGISTRY_SERVICE_CONNECTION_NAME)
+        command: login
+
+    - template: /tasks/nexus/download_files.yml
+      parameters:
+        repository: integracao-libfiles
+        remoteFileLocation:
+        - files/libs/zip/zip-3.0-11.el7.x86_64.rpm
+        - files/apigateway/emt-scripts/$(EMT_SCRIPT_VERION)/emt-scripts-$(EMT_SCRIPT_VERION).tar.gz
+        localFileLocation: $(Agent.TempDirectory)
+    
+    - task: ExtractFiles@1
+      displayName: Extract emt-scripts
+      inputs:
+        archiveFilePatterns: "$(Agent.TempDirectory)/emt-scripts-$(EMT_SCRIPT_VERION).tar.gz"
+        destinationFolder: $(Agent.TempDirectory)/emt-scripts
+        cleanDestinationFolder: false
+    
+    - template: /tasks/nexus/download_files.yml
+      parameters:
+        repository: $(NEXUS_REPOSITORY)
+        credentialsEnabled: false
+        remoteFileLocation:
+        - br/com/vivo/gateway/$(VAR_COMPONENT_NAME_NEXUS)/$(APP_VERSION)/$(VAR_COMPONENT_NAME_NEXUS)-$(APP_VERSION).pol
+        - br/com/vivo/gateway/$(VAR_COMPONENT_NAME_NEXUS)/$(APP_VERSION)/jvm.xml
+        localFileLocation: $(Agent.TempDirectory)
+    
+    - task: DownloadSecureFile@1
+      name: license
+      displayName: license
+      inputs:
+        secureFile: license
+    
+    - script: |
+        echo "##[command] Copy jvm.xml"
+        mkdir -p ./tmp/apigateway/conf
+        cp jvm.xml tmp/apigateway/conf/jvm.xml
+        ls -la tmp/apigateway/conf
+      displayName: jvm.xml
+      workingDirectory: $(Agent.TempDirectory)
+    
+    - script: |
+        echo "##[command] Create license.lic"
+        cat license > license.lic
+        ls -la
+      displayName: license
+      workingDirectory: $(Agent.TempDirectory)
+
+    - ${{ each env in parameters.environments }}:
+      - template: /tasks/nexus/download_files.yml
+        parameters:
+          displayName: "[${{ env }}] Download .props & .env"
+          repository: $(NEXUS_REPOSITORY)
+          credentialsEnabled: false
+          remoteFileLocation:
+          - br/com/vivo/gateway/$(VAR_COMPONENT_NAME_NEXUS)/$(APP_VERSION)/$(VAR_COMPONENT_NAME_NEXUS)-$(APP_VERSION)-${{ env }}.props
+          - br/com/vivo/gateway/$(VAR_COMPONENT_NAME_NEXUS)/$(APP_VERSION)/$(VAR_COMPONENT_NAME_NEXUS)-$(APP_VERSION)-${{ env }}.env
+          localFileLocation: $(Agent.TempDirectory)
+      - task: DownloadSecureFile@1
+        name: certFile_${{ env }}
+        displayName: "[${{ env }}] DefaultDomain-cert-${{ parameters.gateway }}-${{ env }}.pem"
+        inputs:
+          secureFile: "DefaultDomain-cert-${{ parameters.gateway }}-${{ env }}.pem"
+      - task: DownloadSecureFile@1
+        name: keyFile_${{ env }}
+        displayName: "[${{ env }}] DefaultDomain-key-${{ parameters.gateway }}-${{ env }}.pem"
+        inputs:
+          secureFile: "DefaultDomain-key-${{ parameters.gateway }}-${{ env }}.pem"
+      - script: |
+          echo "##[group] Create certs/${{ env }}/DefaultDomain"
+          mkdir -p ./certs/${{ env }}/DefaultDomain
+          cp "DefaultDomain-cert-${{ parameters.gateway }}-${{ env }}.pem" certs/${{ env }}/DefaultDomain/DefaultDomain-cert.pem
+          cp "DefaultDomain-key-${{ parameters.gateway }}-${{ env }}.pem" certs/${{ env }}/DefaultDomain/DefaultDomain-key.pem
+          ls -la certs/${{ env }}/DefaultDomain
+          echo "##[endgroup]"
+        displayName: "[${{ env }}] certs"
+        workingDirectory: $(Agent.TempDirectory)
+      
+      - ${{ if eq(env, 'prod') }}:
+        - script: |
+            mkdir -p ./tmp/apigateway/groups/emt-group/emt-service/conf
+            echo 'changeme' > tmp/pass.txt
+
+            sed -r -i 's/CASSANDRA.HOST1=([0-9]{1,3}\.){3}[0-9]{1,3}/CASSANDRA.HOST1=cassandra1/' ${PROPS_FILE}
+            sed -r -i 's/CASSANDRA.HOST2=([0-9]{1,3}\.){3}[0-9]{1,3}/CASSANDRA.HOST2=cassandra2/' ${PROPS_FILE}
+            sed -r -i 's/CASSANDRA.HOST3=([0-9]{1,3}\.){3}[0-9]{1,3}/CASSANDRA.HOST3=cassandra3/' ${PROPS_FILE}
+            awk '/^env.CASSANDRA.KEYSPACE=/ {sub(/$/, "_emt")}1' ${PROPS_FILE} > tmp/apigateway/groups/emt-group/emt-service/conf/envSettings.props
+            
+            ls -la tmp/apigateway/groups/emt-group/emt-service/conf
+            echo "##[group] Show envSettings.props"
+            cat tmp/apigateway/groups/emt-group/emt-service/conf/envSettings.props
+            echo "##[endgroup]"
+          displayName: '[${{ env }}] envSettings.props'
+          condition: 
+          workingDirectory: $(Agent.TempDirectory)
+          env:
+            PROPS_FILE: "$(VAR_COMPONENT_NAME_NEXUS)-$(APP_VERSION)-${{ env }}.props"
+      - ${{ else }}:
+        - script: |
+            mkdir -p ./tmp/apigateway/groups/emt-group/emt-service/conf
+            echo 'changeme' > tmp/pass.txt
+
+            cp ${PROPS_FILE} > tmp/apigateway/groups/emt-group/emt-service/conf/envSettings.props
+
+            ls -la tmp/apigateway/groups/emt-group/emt-service/conf
+            echo "##[group] Show envSettings.props"
+            cat tmp/apigateway/groups/emt-group/emt-service/conf/envSettings.props
+            echo "##[endgroup]"
+          displayName: '[${{ env }}] envSettings.props'
+          workingDirectory: $(Agent.TempDirectory)
+          env:
+            PROPS_FILE: "$(VAR_COMPONENT_NAME_NEXUS)-$(APP_VERSION)-${{ env }}.props"
+
+      - script: |
+          echo "##[debug] GROUP_ID................: ${GROUP_ID}"
+          echo "##[debug] MERGE_DIR...............: ${MERGE_DIR}"
+          echo "##[debug] LICENSE.................: ${LICENSE}"
+          echo "##[debug] POL_FILE................: ${POL_FILE}"
+          echo "##[debug] ENV_FILE................: ${ENV_FILE}"
+          echo "##[debug] DOMAIN_KEY_PASS_FILE....: ${DOMAIN_KEY_PASS_FILE}"
+          echo "##[debug] DOMAIN_CERT.............: ${DOMAIN_CERT}"
+          echo "##[debug] DOMAIN_KEY..............: ${DOMAIN_KEY}"
+          echo "##[debug] PARENT_IMAGE............: ${PARENT_IMAGE}"
+          echo "##[debug] OUT_IMAGE...............: ${OUT_IMAGE}"
+          echo "##[debug] ASDF_PYTHON_VERSION.....: ${ASDF_PYTHON_VERSION}"
+
+          python2 emt-scripts/build_gw_image.py \
+          --group-id="${GROUP_ID}" \
+          --merge-dir="${MERGE_DIR}" \
+          --license="${LICENSE}" \
+          --pol="${POL_FILE}" \
+          --env="${ENV_FILE}" \
+          --domain-key-pass-file="${DOMAIN_KEY_PASS_FILE}" \
+          --domain-cert="${DOMAIN_CERT}" \
+          --domain-key="${DOMAIN_KEY}"  \
+          --parent-image="${PARENT_IMAGE}" \
+          --out-image="${OUT_IMAGE}"
+        displayName: "[${{ env }}] Build"
+        workingDirectory: $(Agent.TempDirectory)
+        env:
+          GROUP_ID: "$(GROUP_ID_PREFIX)-${{ env }}"
+          PARENT_IMAGE: $(PARENT_IMAGE)
+          MERGE_DIR: "$(Agent.TempDirectory)/tmp/apigateway"
+          LICENSE: "license.lic"
+          POL_FILE: "$(VAR_COMPONENT_NAME_NEXUS)-$(APP_VERSION).pol"
+          ENV_FILE: "$(VAR_COMPONENT_NAME_NEXUS)-$(APP_VERSION)-${{ env }}.env"
+          DOMAIN_KEY_PASS_FILE: "tmp/pass.txt"
+          DOMAIN_CERT: "certs/${{ env }}/DefaultDomain/DefaultDomain-cert.pem"
+          DOMAIN_KEY: "certs/${{ env }}/DefaultDomain/DefaultDomain-key.pem"
+          OUT_IMAGE: "$(IMAGE_REGISTRY_MICROSSERVICOS)/$(IMAGE_NAME_PREFIX)-${{ env }}:$(APP_VERSION)"
+          ASDF_PYTHON_VERSION: $(ASDF_PYTHON_VERSION)
+      
+      - script: |
+          echo "##[debug] DOCKER_IMAGE.......: ${DOCKER_IMAGE}"
+          echo "##[debug] IMAGE_NAME.........: ${IMAGE_NAME}"
+
+          echo "##[command] docker images | grep ${IMAGE_NAME}"
+          docker images | grep ${IMAGE_NAME}
+
+          echo "##[command] docker push ${DOCKER_IMAGE}"
+          docker push ${DOCKER_IMAGE}
+
+          if [ $? -ne 0 ]; then
+            echo "##[error] Docker push failed. Exiting with error."
+            exit 1
+          fi
+        displayName: Docker push
+        env:
+          DOCKER_IMAGE: "$(IMAGE_REGISTRY_MICROSSERVICOS)/$(IMAGE_NAME_PREFIX)-${{ env }}:$(APP_VERSION)"
+          IMAGE_NAME: "$(IMAGE_NAME_PREFIX)-${{ env }}"
+      
+      - script: |
+          echo "##[command] docker images"
+          docker images
+
+          echo "##[command] docker rmi ${DOCKER_IMAGE}"
+          docker rmi ${DOCKER_IMAGE}
+        displayName: '[${{ env }}] Docker clean up'
+        condition: always()
+        continueOnError: true
+        env:
+          DOCKER_IMAGE: "$(IMAGE_REGISTRY_MICROSSERVICOS)/$(IMAGE_NAME_PREFIX)-${{ env }}:$(APP_VERSION)"

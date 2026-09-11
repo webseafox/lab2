@@ -1,0 +1,158 @@
+parameters:
+- name: dockerWorkDir
+  type: string
+  default: $(DOCKER_WORKDIR)
+- name: cmdNodeTest
+  type: string
+- name: dockerFileLocation
+  type: string
+  default: "$(Build.SourcesDirectory)/$DOCKERFILE_TEST_COMPONENTS"
+- name: isDevelopment
+  type: boolean
+  default: False
+
+steps:
+# ==================================================================
+# [Compliance] Verifica se o repositório está em conformidade com as políticas de configuração
+# ==================================================================
+- task: VivoDevOpsConfigCompliance@1
+  displayName: 'Check DevOps Config Compliance'
+  inputs:
+    policySets: |
+      image-definition-files
+
+- bash: |
+    DOCKER_IMAGE_BROWSERS_VERSION+="-$(Build.BuildId)"
+    cd $FOLDER_BASE_SRC
+    CONTAINER_DIR_BASE="$(Build.SourcesDirectory)/$FOLDER_BASE_SRC"
+    docker build -t $DOCKER_IMAGE_BROWSERS_VERSION -f ${{ parameters.dockerFileLocation }} .
+    echo "##[section]BUILD DA IMAGEM DOCKER SENDO EXECUTADO"
+    BUILD_IMAGE_OK=$(echo $?)
+    if [[ $BUILD_IMAGE_OK != 0 ]]; then
+      echo "##[error]Não foi possível finalizar o build da imagem. Verifique os logs acima"
+      exit 1
+    fi
+
+    echo "##[section]AGUARDE O INÍCIO DOS TESTES"
+    echo "##[section]SERÁ EXECUTADO $CMD_NODE_TEST"
+
+    docker run --rm $DOCKER_ENVS_CHROME_TEST -e HTTPS_PROXY="$HTTPS_PROXY" \
+      -e HTTP_PROXY="$HTTP_PROXY" -e NO_PROXY="$NO_PROXY" --network host \
+      -v $(pwd):$CONTAINER_DIR_BASE -w "$CONTAINER_DIR_BASE" \
+      -u $(DOCKER_CMD_USERNAME):$(DOCKER_CMD_GROUP) \
+      $DOCKER_IMAGE_BROWSERS_VERSION /bin/sh -c "$CMD_NODE_TEST"
+
+    TESTS_OK=$(echo $?)
+    if [[ $TESTS_OK != 0 ]]; then
+      echo "##[error] Erro nos testes da aplicação. Verifique os logs acima"
+      exit 1
+    fi
+
+  displayName: "Npm Install And Run Tests"
+  env:
+    CMD_NODE_TEST: ${{ parameters.cmdNodeTest }}
+    CUSTOM_HTTPS_PROXY: $(PROXY_AGENT_HTTP)
+    CUSTOM_HTTP_PROXY: $(PROXY_AGENT_HTTP)
+    CUSTOM_NO_PROXY: $(PROXY_AGENT_NO_PROXY)
+  condition: succeeded()
+
+- ${{ if eq(parameters.isDevelopment, False) }}:
+  - bash: |
+      DOCKER_IMAGE_BROWSERS_VERSION+="-$(Build.BuildId)"
+      cd $FOLDER_BASE_SRC
+
+      mkdir -p $(CODE_ANALISYS_OUTPUT_DIR)
+
+      CONTAINER_DIR_BASE="$(Build.SourcesDirectory)/$FOLDER_BASE_SRC"
+      chmod +x $(CODE_ANALISYS_OUTPUT_DIR)
+
+      echo "##[section]EXECUTANDO $CMD_RUN_LINT_CI $CONTAINER_DIR_BASE"
+      docker run --rm -e ESLINT_JSON_OUTPUT_FILE="$ESLINT_JSON_OUTPUT_FILE" -e HTTPS_PROXY="$CUSTOM_HTTPS_PROXY" -e HTTP_PROXY="$CUSTOM_HTTP_PROXY" -e NO_PROXY="$CUSTOM_NO_PROXY" --network host -v $(pwd):$CONTAINER_DIR_BASE -w "$CONTAINER_DIR_BASE" -u $(DOCKER_CMD_USERNAME):$(DOCKER_CMD_GROUP) $DOCKER_IMAGE_BROWSERS_VERSION /bin/sh -c "$CMD_RUN_LINT_CI"
+
+      JSON_VALIDATE=$(jq -re '.' $ESLINT_JSON_OUTPUT_FILE)
+      LINT_OK=$(echo $?)
+
+      if [[ $LINT_OK != 0 ]]; then
+        echo "##[error] Erro ao executar $CMD_RUN_LINT_CI. Verifique os logs acima"
+        exit 1
+      fi
+    displayName: "Run Lint Ci"
+    env:
+      CMD_NODE_TEST: ${{ parameters.cmdNodeTest }}
+      CUSTOM_HTTPS_PROXY: $(PROXY_AGENT_HTTP)
+      CUSTOM_HTTP_PROXY: $(PROXY_AGENT_HTTP)
+      CUSTOM_NO_PROXY: $(PROXY_AGENT_NO_PROXY)
+      ESLINT_JSON_OUTPUT_FILE: $(ESLINT_JSON_OUTPUT_FILE)
+    condition: succeeded()
+
+  - bash: |
+      DOCKER_IMAGE_BROWSERS_VERSION+="-$(Build.BuildId)"
+      cd $FOLDER_BASE_SRC
+      CONTAINER_DIR_BASE="$(Build.SourcesDirectory)/$FOLDER_BASE_SRC"
+
+      echo "##[section]LISTANDO ARQUIVOS"
+      ls -la
+      if [ -d "dist" ]; then
+        echo "##[section]DIST FOLDER EXISTE"
+        echo "##[section]LISTANDO ARQUIVOS DIST FOLDER"
+        ls dist
+
+        echo "##[section]REMOVENDO DIST FOLDER"
+        rm -rf dist
+      fi
+
+      echo "##[section]EXECUTANDO $CMD_BUILD_TEST"
+      docker run --rm -e HTTPS_PROXY="$CUSTOM_HTTPS_PROXY" -e HTTP_PROXY="$CUSTOM_HTTP_PROXY" -e NO_PROXY="$CUSTOM_NO_PROXY" --network host -v $(pwd):$CONTAINER_DIR_BASE -w "$CONTAINER_DIR_BASE" -u $(DOCKER_CMD_USERNAME):$(DOCKER_CMD_GROUP) $DOCKER_IMAGE_BROWSERS_VERSION /bin/sh -c "$CMD_BUILD_TEST"
+
+      BUILD_OK=$(echo $?)
+
+      if [[ $BUILD_OK != 0 ]]; then
+        echo "##[error] Erro ao executar $CMD_BUILD_TEST. Verifique os logs acima"
+        exit 1
+      fi
+      echo "##[section]Build concluído"
+    displayName: "Build Application"
+    env:
+      CUSTOM_HTTPS_PROXY: $(PROXY_AGENT_HTTP)
+      CUSTOM_HTTP_PROXY: $(PROXY_AGENT_HTTP)
+      CUSTOM_NO_PROXY: $(PROXY_AGENT_NO_PROXY)
+    condition: succeeded()
+
+  - task: CopyFiles@2
+    displayName: "Copy Dist Folder to Artifacts"
+    inputs:
+      SourceFolder: $(Build.SourcesDirectory)/$(FOLDER_BASE_SRC)
+      TargetFolder: "$(Build.ArtifactStagingDirectory)"
+      OverWrite: true
+      Contents: |
+        $(Build.SourcesDirectory)/$(FOLDER_BASE_SRC)/dist/**
+    env:
+      CUSTOM_HTTPS_PROXY: $(PROXY_AGENT_HTTP)
+      CUSTOM_HTTP_PROXY: $(PROXY_AGENT_HTTP)
+      CUSTOM_NO_PROXY: $(PROXY_AGENT_NO_PROXY)
+    condition: and(succeeded(), eq(variables.GENERATE_DIST_FOLDER, True))
+
+  - task: PublishPipelineArtifact@1
+    displayName: "Publish Dist Folder  To Artifacts"
+    inputs:
+      artifactName: "dist_$(System.JobAttempt)"
+      targetPath: "$(Build.ArtifactStagingDirectory)"
+    condition: and(succeeded(), eq(variables.GENERATE_DIST_FOLDER, True))
+
+  - task: CopyFiles@2
+    displayName: "Copy Test Results to Staging Directory"
+    inputs:
+      SourceFolder: $(Build.SourcesDirectory)/$(FOLDER_BASE_SRC)
+      TargetFolder: "$(Build.ArtifactStagingDirectory)"
+      OverWrite: true
+      Contents: |
+        $(Build.SourcesDirectory)/$(FOLDER_BASE_SRC)/$(CODE_ANALISYS_OUTPUT_DIR)/**
+        $(Build.SourcesDirectory)/$(FOLDER_BASE_SRC)/$(COVERAGE_TEST_OUTPUT_DIR)/**
+    condition: succeededOrFailed()
+
+  - task: PublishPipelineArtifact@1
+    displayName: "Publish Test Results To Artifacts"
+    inputs:
+      artifactName: "test-results"
+      targetPath: "$(Build.ArtifactStagingDirectory)"
+    condition: succeededOrFailed()

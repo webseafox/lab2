@@ -1,0 +1,190 @@
+#########################################
+##  Script: StartServers.yml           ##
+##  Weblogic 12.2                      ##
+#########################################
+
+parameters:  
+  - name: WEBLOGIC_USER
+    default: ''
+  - name: WEBLOGIC_PASS
+    default: ''
+  - name: WEBLOGIC_ADMIN_SERVER_URL
+    default: ''
+  - name: WEBLOGIC_TIMEOUT
+    default: ''
+
+steps:
+  - task: Bash@3
+    displayName: Start Servers Weblogic
+    name: start_servers_weblogic
+    condition: succeeded()
+    inputs:
+      targetType: inline
+      workingDirectory: $(Pipeline.Workspace)
+      script: |
+
+        #set -x
+
+        CYAN='\033[96m'
+        RED='\033[91m'
+        RESET='\033[0m'
+
+        echo -e "${CYAN}==========================================="
+        echo -e "         Starting StartServers          "
+        echo -e "===========================================${RESET}"
+
+        wlsAdmin=${{ parameters.WEBLOGIC_USER }}
+        wlsPassword=${{ parameters.WEBLOGIC_PASS }}
+        wlsUrl=${{ parameters.WEBLOGIC_ADMIN_SERVER_URL }}
+        wlsTimeOut=${{ parameters.WEBLOGIC_TIMEOUT }}
+        echo -e "wlsAdmin: $wlsAdmin \nwlsPassword: $wlsPassword \nwlsUrl: $wlsUrl \nwlsTimeOut: $wlsTimeOut"
+        
+        if [ -z "$wlsAdmin" ] || [ -z "$wlsPassword" ] || [ -z "$wlsUrl" ] || [ -z "$wlsTimeOut" ]; then
+            echo -e "${RED} Um dos parametros wlsAdmin, wlsPassword, wlsUrl ou wlsTimeOut não estão definidos!${RESET}"
+                exit 1  # Sair com erro
+        fi
+
+        # Função para fazer chamadas REST (autenticação básica)
+        function call_rest_api() {
+            local url=$1
+            local method=$2
+            local data=$3
+            #local response=""
+
+            if [[ -n "$data" ]]; then
+                curl -s -u "$wlsAdmin:$wlsPassword" -X "$method" -H "X-Requested-By: curl" -H "Accept: application/json" -H "Content-Type: application/json" -d "$data" "$url" #2>&1
+            else
+                curl -s -u "$wlsAdmin:$wlsPassword" -X "$method" -H "X-Requested-By: curl" -H "Accept: application/json" "$url" #2>&1
+            fi
+
+            if [[ $? -ne 0 ]]; then
+                echo -e "${RED}Erro ao executar curl - Retorno código: $? ${RESET} \n Log de saida: $response " 
+            fi
+        }
+
+        # Função para iniciar o servidor usando a API REST
+        function start_server() {
+            local server_name=$1
+            echo -e "\033[96mStarting server...\033[0m $server_name"
+            response=$(call_rest_api "$wlsUrl/management/weblogic/latest/domainRuntime/serverLifeCycleRuntimes/$server_name/start" "POST")
+            taskStatus=$(echo "$response" | jq -r '.taskStatus')
+
+            # Verificando se o status é diferente de "TASK COMPLETED"
+            if [ "$taskStatus" != "TASK COMPLETED" ]; then
+                echo "Task Status: $taskStatus"
+                echo -e "${RED}Erro para subir a instancia $server_name !${RESET}"
+                echo "Response: $response"
+            fi
+        }
+
+        # Conectar e verificar a conexão com o AdminServer (simulado pela primeira requisição)
+        echo "Connecting to AdminServer at ${wlsUrl} ..."
+        response=$(call_rest_api "$wlsUrl/management/weblogic/latest/serverRuntime" "GET")
+        
+        if [[ $response == *"ServerRuntime"* ]]; then
+            echo "Connected!"
+        else
+            echo -e "${RED}Error while connecting to AdminServer!${RESET}"
+            echo "$response"
+            exit 1
+        fi
+
+        # Obter a lista de servidores
+        echo "Fetching list of servers..."
+        servers=$(call_rest_api "$wlsUrl/management/weblogic/latest/domainRuntime/serverLifeCycleRuntimes" "GET"| jq -r '.items[].name')
+
+        admServer=$(call_rest_api "$wlsUrl/management/weblogic/latest/domainConfig" "GET"| jq -r '.adminServerName')
+
+        start_server_pid=()
+        start_servers_array=()
+
+        echo "Starting servers..."
+
+        # Loop para iniciar servidores
+        for server in $servers; do
+            if [ "$server" != "$admServer" ]; then
+                server_state=$(call_rest_api "$wlsUrl/management/weblogic/latest/domainRuntime/serverLifeCycleRuntimes/${server}" "GET" | jq -r '.state')
+                    
+                if [ "$server_state" != "RUNNING" ]; then
+                    start_server "$server" &
+                    start_server_pid+=($!)
+                    start_servers_array+=($server)
+                fi
+            fi
+        done
+
+        # Espera pelos servidores iniciarem ou atingir o timeout
+        sleep 3
+        echo "Wait for the servers to start or timeout!"
+        timeout=0
+        running=1
+
+        while [ $timeout -le $wlsTimeOut ] && [ $running -ne 0 ]; do
+            running=0
+            for server in $servers; do
+                if [ "$server" != "$admServer" ]; then
+                    server_state=$(call_rest_api "$wlsUrl/management/weblogic/latest/domainRuntime/serverLifeCycleRuntimes/${server}" "GET"| jq -r '.state')
+                        
+                    if [ "$server_state" != "RUNNING" ]; then
+                        running=1
+                        timeout=$((timeout + 5))
+                        echo "$timeout seconds elapsed"
+                        sleep 5
+                        break
+                    fi
+                fi
+            done
+        done
+
+        echo "******** Status dos servidores: ********"
+        for server in $servers; do
+            if [ "$server" != "$admServer" ]; then
+                server_state=$(call_rest_api "$wlsUrl/management/weblogic/latest/domainRuntime/serverLifeCycleRuntimes/${server}" "GET"| jq -r '.state')
+                echo "Server: $server Status: $server_state"
+            fi
+        done
+        
+        ## Aguardando processos PID serem finalizados
+        if [ ${#start_server_pid[@]} -gt 0 ]; then
+            echo "Waiting for PID processes to finish."
+            count_time=0
+            wait=20
+            while [ ${#start_server_pid[@]} -gt 0 ]; do
+                for i in "${!start_server_pid[@]}"; do
+                    pid=${start_server_pid[$i]}
+                    # Verifica se o processo ainda está em execução
+                    if ! ps -p $pid > /dev/null; then
+                        echo -e "${CYAN}Server: ${start_servers_array[$i]}. Process with PID $pid finished!${RESET}"
+                        unset 'start_server_pid[$i]'
+                    else
+                        echo -e "${CYAN}Waiting! Server: ${start_servers_array[$i]}. Process with PID $pid don't finished!${RESET}"
+                        echo "Waiting more ${wait} seconds."
+                        sleep ${wait}
+                        count_time=$((count_time + wait))
+                        if [ ${count_time} -ge ${wlsTimeOut} ];then
+                            echo -e "${RED}WARNING TIMEOUT PROCESS! Killing Process with PID $pid for Server: ${start_servers_array[$i]}. ${RESET}"
+                            kill $pid
+                            unset 'start_server_pid[$i]'
+                        fi
+                    fi
+                done
+                sleep 1
+            done
+        else
+            echo "There are no processes to monitor."
+        fi
+
+        #Verifica se houve erro no start das JVM
+        if [ $timeout -ge $wlsTimeOut ]; then
+            echo -e "${RED}Timeout occurred while starting the servers!${RESET}"
+            echo -e "${RED}Due to a timeout, manual intervention is required to check servers startup. Please follow standard operating procedures for system checks.${RESET}"
+            exit 1   
+        else
+            exit 0
+        fi
+
+        
+
+        
+
+          

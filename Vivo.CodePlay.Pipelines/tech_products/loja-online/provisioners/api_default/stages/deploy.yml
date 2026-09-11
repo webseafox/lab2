@@ -1,0 +1,215 @@
+﻿stages:
+- ${{ if ne(parameters.skip_deploy, True)}}:
+  - stage: deploy
+    condition: or(
+                    eq('${{ parameters.runVersion }}', 'latest'),
+                    and(succeeded(), ne('${{ parameters.runVersion }}', ''), eq(contains('${{ parameters.runVersion }}', '.'), true), gt(length('${{ parameters.runVersion }}'), 4))
+                  )
+    # dependsOn:
+    # - validation
+    # - ${{ if eq(parameters.enableDevflowValidations, True) }}:
+    #   - repo_finalize_validations
+    pool: ${{ parameters.private_agent_pool }}
+    displayName: "Deploy ${{ parameters.environment }}"
+    jobs:
+    - job: "config_management_validation"
+      displayName: "Start config management"
+      workspace:
+        clean: all
+      steps:
+        - bash: |
+            if [ "${{ variables.CONFIG_MANAGEMENT }}" == "true" ]; then
+                echo "##[debug] Variável CONFIG_MANAGEMENT está com o valor = true"
+            else
+                echo "##[debug] Variável CONFIG_MANAGEMENT está com o valor = false"
+            fi
+          displayName: "About job - Config Management Enabled"
+
+        - script: |
+            # Lê a versão do package.json
+            package_version=$(cat package.json | jq -r '.version')
+
+            # Verifica se runVersion é 'latest'
+            if [ "${{ parameters.runVersion }}" == "latest" ]; then
+              echo "runVersion é 'latest'. Usando a versão do package.json: $package_version"
+              echo "##vso[task.setvariable variable=DEPLOY_VERSION;isOutput=true]$package_version"
+            else
+              echo "runVersion fornecido: ${{ parameters.runVersion }}"
+              echo "##vso[task.setvariable variable=DEPLOY_VERSION;isOutput=true]${{ parameters.runVersion }}"
+            fi
+          name: set_version
+          displayName: 'Getting app version'
+
+        - template: /tech_products/loja-online/tasks/catalog_info/extract_variables.yml
+
+        - bash: |
+            echo "##[debug] Executando script de configuração de gerenciamento"
+            cd $(Build.SourcesDirectory)/$(Build.Repository.Name)
+            namespaces=($ARGOCD_NAMESPACES)
+
+            echo "Gerando Config Map para $APP_NAME"
+
+            if [[ "${ARGOCD_ALLNAMESPACES_HML}" == "true" && ! ( "${ENVIRONMENT_CONFIG}" == "producao" || "${ENVIRONMENT_CONFIG}" == "prod" || "${ENVIRONMENT_CONFIG}" == "production" || "${ENVIRONMENT_CONFIG}" == "ms" ) ]]; then
+                echo "##[debug] Executando argocd em homologacao"
+                for env_config in "${namespaces[@]}"; do
+                    mkdir ${env_config}
+                    python $(Build.SourcesDirectory)/Vivo.Core.Pipelines.Scripts/app.py -cm -cmf env/env.yaml -cmn $APP_NAME -cms ${env_config} -cmda ./${env_config}
+                    if [[ $? != 0 ]]; then
+                      exit 1
+                    fi
+                    mv ./${env_config}/configmap${env_config}.yaml ./${env_config}/$APP_NAME-ConfigMap.yaml
+                    cd ../argocd/
+                    git config --global --replace-all user.name "Azure DevOps"
+                    git config --global --replace-all user.email "azuredevops@telefonicati.onmicrosoft.com"
+                    git fetch
+                    git checkout master
+                    git reset --hard origin/master
+                    cp -f $(Build.SourcesDirectory)/$(Build.Repository.Name)/${env_config}/$APP_NAME-ConfigMap.yaml ${env_config}
+                    git add ${env_config}/
+                    git commit -m "Nova versão de Configmap do $APP_NAME-ConfigMap no namespace ${env_config} "
+                    git push origin master
+                    cd $(Build.SourcesDirectory)/$(Build.Repository.Name)              
+                done
+            elif [[ "${ENVIRONMENT_CONFIG}" == "production" || "${ENVIRONMENT_CONFIG}" == "prod" || "${ENVIRONMENT_CONFIG}" == "producao" || "${ENVIRONMENT_CONFIG}" == "ms" ]]; then
+                echo "##[debug] Executando argocd em producao"
+                mkdir ${ENVIRONMENT_CONF}
+                python $(Build.SourcesDirectory)/Vivo.Core.Pipelines.Scripts/app.py -cm -cmf env/env.yaml -cmn $APP_NAME -cms ${ENVIRONMENT_CONF} -cmda ./${ENVIRONMENT_CONF}/
+                if [[ $? != 0 ]]; then
+                  exit 1
+                fi
+                mv ${ENVIRONMENT_CONF}/configmap${ENVIRONMENT_CONF}.yaml ./${ENVIRONMENT_CONF}/$APP_NAME-ConfigMap.yaml
+                ls -la ../
+                cp ./${ENVIRONMENT_CONF}/$APP_NAME-ConfigMap.yaml ../argocd-production/${ENVIRONMENT_CONF}
+                cd ../argocd-production/
+                git config --global --replace-all user.name "Azure DevOps"
+                git config --global --replace-all user.email "azuredevops@telefonicati.onmicrosoft.com"
+                git fetch
+                git checkout master
+                git reset --hard origin/master
+                cp -f $(Build.SourcesDirectory)/$(Build.Repository.Name)/${ENVIRONMENT_CONF}/$APP_NAME-ConfigMap.yaml ${ENVIRONMENT_CONF}
+                git add ${ENVIRONMENT_CONF}/
+                git commit -m "Nova versão de Configmap do $APP_NAME-ConfigMap no namespace ${ENVIRONMENT_CONF} "
+                git push origin master
+                cd $(Build.SourcesDirectory)/$(Build.Repository.Name) 
+            elif [[ "${CONFIG_MANAGEMENT_DEV}" == "true" ]]; then
+                echo "##[debug] Executando argocd em ambiente de desenvolvimento"
+                mkdir ${ENVIRONMENT_CONFIG}
+                python $(Build.SourcesDirectory)/Vivo.Core.Pipelines.Scripts/app.py -cm -cmf env/env.yaml -cmn $APP_NAME -cms dev -cmda ./${ENVIRONMENT_CONFIG}
+                if [[ $? != 0 ]]; then
+                  exit 1
+                fi
+                mv ./${ENVIRONMENT_CONFIG}/configmapdev.yaml ./${ENVIRONMENT_CONFIG}/configmap${ENVIRONMENT_CONFIG}.yaml
+                mv ${ENVIRONMENT_CONFIG}/configmap${ENVIRONMENT_CONFIG}.yaml ./${ENVIRONMENT_CONFIG}/$APP_NAME-ConfigMap.yaml
+                sed -i "s/namespace: dev/namespace: ${ENVIRONMENT_CONFIG}/g" ./${ENVIRONMENT_CONFIG}/$APP_NAME-ConfigMap.yaml
+                ls -la ../
+                cp ./${ENVIRONMENT_CONFIG}/$APP_NAME-ConfigMap.yaml ../argocd/${ENVIRONMENT_CONFIG}
+                cd ../argocd/
+                git config --global --replace-all user.name "Azure DevOps"
+                git config --global --replace-all user.email "azuredevops@telefonicati.onmicrosoft.com"
+                git fetch
+                git checkout master
+                git reset --hard origin/master
+                cp -f $(Build.SourcesDirectory)/$(Build.Repository.Name)/${ENVIRONMENT_CONFIG}/$APP_NAME-ConfigMap.yaml ${ENVIRONMENT_CONFIG}
+                git add ${ENVIRONMENT_CONFIG}/
+                git commit -m "Nova versão de Configmap do $APP_NAME-ConfigMap no namespace ${ENVIRONMENT_CONFIG} "
+                git push origin master
+                cd $(Build.SourcesDirectory)/$(Build.Repository.Name)
+            else
+                echo "##[debug] Executando argocd em homologacao"
+                mkdir ${ENVIRONMENT_CONFIG}
+                python $(Build.SourcesDirectory)/Vivo.Core.Pipelines.Scripts/app.py -cm -cmf env/env.yaml -cmn $APP_NAME -cms ${ENVIRONMENT_CONFIG} -cmda ./${ENVIRONMENT_CONFIG}/
+                if [[ $? != 0 ]]; then
+                  exit 1
+                fi
+                mv ${ENVIRONMENT_CONFIG}/configmap${ENVIRONMENT_CONFIG}.yaml ./${ENVIRONMENT_CONFIG}/$APP_NAME-ConfigMap.yaml
+                cd ../argocd/
+                git config --global --replace-all user.name "Azure DevOps"
+                git config --global --replace-all user.email "azuredevops@telefonicati.onmicrosoft.com"
+                git fetch
+                git checkout master
+                git reset --hard origin/master
+                cp -f $(Build.SourcesDirectory)/$(Build.Repository.Name)/${ENVIRONMENT_CONFIG}/$APP_NAME-ConfigMap.yaml ${ENVIRONMENT_CONFIG}
+                git add ${ENVIRONMENT_CONFIG}/
+                git commit -m "Nova versão de Configmap do $APP_NAME-ConfigMap no namespace ${ENVIRONMENT_CONF} "
+                git push origin master
+                cd $(Build.SourcesDirectory)/$(Build.Repository.Name) 
+            fi
+
+            echo $(Build.SourcesDirectory)
+            echo $(Build.Repository.Name)
+            echo $APP_NAME
+            echo ${ENVIRONMENT_CONFIG}
+            ls -la
+          condition: and(
+                      succeeded(),
+                      eq(variables.CONFIG_MANAGEMENT, true)
+                    )
+          displayName: "Config management validations"
+          env:
+            ENVIRONMENT_CONFIG: ${{ parameters.environment }}
+            HELM_RELEASE_NAMESPACE: ${{ parameters.helmReleaseNamespace }}
+            helm_release_name_prefix: ${{ parameters.helm_release_name_prefix }}
+
+    - deployment: ${{ parameters.environment }}
+      dependsOn: config_management_validation
+      variables:
+      - name: DEPLOY_VERSION
+        value: $[ dependencies.config_management_validation.outputs['set_version.DEPLOY_VERSION'] ]
+      condition: or (
+                  and(
+                    always(),
+                    eq(variables.flowIsTagging, false),
+                    eq(variables.flowIsMain, true)
+                  ),
+                  startsWith(variables['Build.SourceBranch'], 'refs/heads/')
+                ) 
+      workspace:
+        clean: all
+      displayName: "${{ parameters.runVersion }} - Deploy"
+      environment: "deploy-${{ parameters.environment }}"
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+            - template: /tech_products/loja-online/provisioners/api_default/steps/deploy/deploy.yml
+              parameters:
+                environment: ${{ parameters.environment }}
+                kubeconfig: ${{ parameters.kubeconfig }}
+                git_tag: ${{ parameters.git_tag }}
+                helm_release_name_prefix: ${{ parameters.helm_release_name_prefix }}
+                dev_namespace_to_deploy: ${{parameters.dev_namespace_to_deploy}}
+                argocd_enabled: ${{ parameters.argocd_enabled }}
+                project:  ${{ parameters.project }}
+                pipelineName:  ${{ parameters.pipelineName }}
+                runVersion: "$(DEPLOY_VERSION)"
+          on:
+            success:
+              steps:
+              - template: /tech_products/loja-online/provisioners/api_default/steps/deploy/success.yml
+                parameters:
+                  environment: ${{ parameters.environment }}
+                  kubeconfig: ${{ parameters.kubeconfig }}
+                  git_tag: ${{ parameters.git_tag }}
+                  helm_release_name_prefix: ${{ parameters.helm_release_name_prefix }}
+                  dev_namespace_to_deploy: ${{parameters.dev_namespace_to_deploy}}
+                  project:  ${{ parameters.project }}
+                  pipelineName:  ${{ parameters.pipelineName }}
+                  runVersion:  "$(DEPLOY_VERSION)"
+              - template: /tech_products/loja-online/task_groups/governance/check_govapp_policies.yml
+                parameters:
+                  govAppBreakglass: false
+                  govAppOperation: "deploy"
+                  continueOnError: false
+                  environment: ${{ parameters.environment }}
+                  stack: "NODEJS"
+                  dev_namespace_to_deploy: ${{parameters.dev_namespace_to_deploy}}
+                
+            failure:
+              steps:
+              - template: /tech_products/loja-online/provisioners/api_default/steps/deploy/failure.yml
+                parameters:
+                  environment: ${{ parameters.environment }}
+                  kubeconfig: ${{ parameters.kubeconfig }}
+                  git_tag: ${{ parameters.git_tag }}
+                  helm_release_name_prefix: ${{ parameters.helm_release_name_prefix }}
+                  dev_namespace_to_deploy: ${{parameters.dev_namespace_to_deploy}}

@@ -1,0 +1,302 @@
+trigger:
+  branches:
+    include:
+      - '*'
+  paths:
+    include:
+      - '*'
+    exclude:
+      - docs/*
+ 
+  
+parameters:
+- name: useMavenCache
+  displayName: Usar cache do maven
+  type: boolean
+  default: True
+
+#Incluir Variaveis da Library
+variables:
+  - name: ASDF_JDK_11
+    value: "openjdk-11.0.2"
+  - name: System.debug
+    value: "true"
+  - name: USE_MAVEN_CACHE
+    ${{ if not(not(parameters.useMavenCache)) }}:
+      value: ''
+    ${{ if not(parameters.useMavenCache) }}:
+      value: '-U'  
+
+  - name: SONARQUBE_CONNECTION_NAME
+    value: VIVO_SONARQUBE
+  - name: SONARQUBE_PROJECTKEY
+    value: br.com.vivo.gps4:app-gps-convergente
+  - name: SONARQUBE_URL
+    value: http://sonar.devops.redecorp.br
+  - name: SONARQUBE_PROJECT_NAME
+    value: $(System.TeamProject)-$(Build.Repository.Name)
+
+stages:
+- stage: build
+  displayName: Build
+  jobs:
+  - job: package
+    displayName: Build, Test and Pack
+    pool: GeneralPurposeLinuxAgentsCI
+    steps:
+    - checkout: self
+      fetchDepth: 1
+      persistCredentials: true
+
+    #- script: asdf versions maven
+      #env:
+       # HTTP_PROXY: http://10.240.58.39:3128
+        #HTTPS_PROXY: https://10.240.58.39:3128
+
+    - task: DownloadSecureFile@1
+      name: cachesettings
+      displayName: 'Build Cache Settings'
+      inputs:
+        secureFile: 'build-cache-settings.xml'
+        
+    - task: XmlParseFromVivo@4
+      displayName: Get pom.xml info
+      name: pom_info
+      inputs:
+        type: 'file'
+        origin: $(Build.SourcesDirectory)/pom.xml
+        jpaths: |
+          var POM_XML_VERSION = .project.version._text
+          var POM_FRONTEND_NAME = .project.properties['frontend-name']._text
+          var POM_FRONTEND_VERSION = .project.properties['frontend-version']._text
+
+    - task: SemverIncrementCustomFromVivo@5
+      displayName: Semver Increment 'patch'
+      name: new_version
+      continueOnError: false
+      inputs:
+        currentversion: $(POM_XML_VERSION)
+        outputVariableName: "NEW_VERSION"
+        releaseType: "patch"
+        template: "${NEW_COERCED_VERSION}"
+    
+    - task: Maven@3
+      displayName: "Maven versions:set"
+      env:
+        ASDF_JAVA_VERSION: $(ASDF_JDK_11)
+      inputs:
+          options: >
+            -Dmaven.test.skip=true 
+            -DnewVersion=$(new_version.NEW_VERSION)
+          mavenPomFile: $(Build.SourcesDirectory)/pom.xml
+          mavenOptions: '-Xmx3072m'
+          javaHomeOption: 'JDKVersion'
+          goals: 'versions:set'
+
+    - task: XmlParseFromVivo@4
+      displayName: Get New pom.xml info
+      name: pom_info_new
+      inputs:
+        type: 'file'
+        origin: $(Build.SourcesDirectory)/pom.xml
+        jpaths: |
+          var POM_XML_VERSION      =  .project.version._text
+
+    - task: AzureKeyVault@2
+      inputs:
+        azureSubscription: 'DevOpsSharedResources'
+        KeyVaultName: 'kv-azdevops-shared'
+        SecretsFilter: 'NEXUS-DEPS-USR, NEXUS-DEPS-PSW, SONARQUBE-TOKEN'
+        RunAsPreJob: true
+
+    - task: Bash@3
+      displayName: Copy files
+      continueOnError: false
+      inputs:
+        targetType: inline
+        script: |-
+            curl --user $(NEXUS-DEPS-USR):$(NEXUS-DEPS-PSW) https://nexus.telefonica.com.br/repository/novoportalgf-npm/$(POM_FRONTEND_NAME)/-/$(POM_FRONTEND_NAME)-$(POM_FRONTEND_VERSION).tgz -O
+            tar -zxvf $(POM_FRONTEND_NAME)-$(POM_FRONTEND_VERSION).tgz
+            tar -zxvf package/$(POM_FRONTEND_NAME)-$(POM_FRONTEND_VERSION).tgz
+            rm $(POM_FRONTEND_NAME)-$(POM_FRONTEND_VERSION).tgz
+            mkdir -p src/main/resources
+            cp -r package/dist/src/main/resources/static src/main/resources/
+            rm -rf package
+
+    - task: Maven@3
+      displayName: Maven Test and Pack
+      continueOnError: False
+      env:
+        ASDF_JAVA_VERSION: $(ASDF_JDK_11)
+      inputs:
+          options: >-
+            -Dmaven.test.skip=false
+            $(USE_MAVEN_CACHE)
+            -Dnpm.repositoryUrl="https://nexus.telefonica.com.br/repository/novoportalgf-npm"
+            -Dnpm.username="$(NEXUS-DEPS-USR)"
+            -Dnpm.password="$(NEXUS-DEPS-PSW)"
+
+          mavenPomFile: $(Build.SourcesDirectory)/pom.xml
+          mavenOptions: '-Xmx3072m'
+          javaHomeOption: 'JDKVersion'
+          publishJUnitResults: false
+          testResultsFiles: $(Build.SourcesDirectory)/**/surefire-reports/TEST-*.xml
+          goals: 'package'
+
+    #- task: Maven@2
+    #  displayName: Maven Test and Pack
+    #  continueOnError: False
+    #  env:
+    #    ASDF_JAVA_VERSION: $(ASDF_JDK_11)
+    #    #HTTP_PROXY: http://10.240.58.39:3128
+    #    #HTTPS_PROXY: http://10.240.58.39:3128
+    #    #NO_PROXY: localhost,0.0.0.0,127.0.0.1,10.244.0.0/16,192.168.0.0/16,10.129.178.173,nexus.telefonica.com.br,acrsharedservices01.azurecr.io,appcs-azdevops-shared.azconfig.io,scm.azurewebsites.net,gitlab.redecorp.br
+    #  inputs:
+    #      options: >-
+    #        -Dmaven.test.skip=false
+    #        -Dnpm.repositoryUrl="https://nexus.telefonica.com.br/repository/novoportalgf-npm"
+    #        -Dnpm.username="$(NEXUS-DEPS-USR)"
+    #        -Dnpm.password="$(NEXUS-DEPS-PSW)"
+    #        -X
+    #
+    #      mavenPomFile: $(Build.SourcesDirectory)/pom.xml
+    #      mavenOptions: '-Xmx3072m'
+    #      javaHomeOption: 'JDKVersion'
+    #      publishJUnitResults: True
+    #      testResultsFiles: $(Build.SourcesDirectory)/**/surefire-reports/TEST-*.xml
+    #      goals: 'clean install'
+
+    - script: find $(Build.SourcesDirectory)
+
+    ## -> Copy files for staging area
+    - task: CopyFiles@2
+      name: t_copy_file
+      displayName: 'Staging Artifacts'
+      condition: succeeded()
+      continueOnError: false
+      inputs:
+        SourceFolder: '$(build.sourcesdirectory)'
+        TargetFolder: '$(Build.ArtifactStagingDirectory)'
+        Contents: |
+          **/target/*.*ar
+          **/target/*.ejb
+          **/pom.xml
+          **/surefire-reports/TEST-*.xml
+          pom.xml
+        CleanTargetFolder: true
+        OverWrite: true
+        flattenFolders: false
+
+    ## -> Compress artifacts into tar. This allows to use less space and to be used in other stages, jobs or tasks.           
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Artifacts'
+      condition: succeeded()
+      continueOnError: false
+      inputs:
+        ArtifactName: bin
+    
+    - task: SonarQubePrepare@5
+      displayName: Overwrite Sonar Props
+      inputs:
+        SonarQube: $(SONARQUBE_CONNECTION_NAME)
+        scannerMode: 'CLI'
+        # configFile Não funciona no scannerMode Other, apenas CLI (https://learn.microsoft.com/pt-br/azure/devops/pipelines/tasks/reference/sonar-qube-prepare-v5?view=azure-pipelines)
+        configFile: $(Build.SourcesDirectory)/sonar-project.properties
+        extraProperties: |
+          sonar.scm.disabled=True
+          sonar.projectBaseDir=$(Build.SourcesDirectory)
+          sonar.projectKey=$(SONARQUBE_PROJECTKEY)
+          sonar.projectName=$(SONARQUBE_PROJECT_NAME)
+          sonar.projectVersion=$(build.new_version.NEW_VERSION)
+          sonar.analysis.repositoryName=$(Build.Repository.Name)
+          sonar.analysis.buildId=$(Build.BuildId)
+          sonar.analysis.repositoryId=$(Build.Repository.ID)
+          sonar.analysis.projectName=$(System.TeamProject)
+          sonar.analysis.projectId=$(System.TeamProjectId)
+          sonar.links.homepage=$(System.TeamFoundationCollectionUri)$(System.TeamProject)
+          sonar.links.ci=$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)&_a=summary
+          sonar.links.issue=$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_workitems
+          sonar.links.scm=$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_git/$(Build.Repository.Name)
+          sonar.scanner.metadataFilePath=$(Agent.TempDirectory)/sonar/$(Build.BuildId)/report-task.txt
+          sonar.qualitygate.wait=true
+          sonar.qualitygate.timeout=300
+
+    - task: SonarQubeAnalyze@5
+      displayName: 'Sonar Scan'
+      continueOnError: true
+      env:
+        ASDF_JAVA_VERSION: $(ASDF_JDK_11)
+
+
+    - task: Bash@3
+      displayName: Commit new version
+      name: commit_new_version
+      continueOnError: false
+      inputs:
+        targetType: inline
+        script: |-
+          git stash save pom.xml
+          git clean -fdX
+          
+          export TAG="${POM_XML_VERSION:4}+$(date -u +"%Y%m%d%H%M")-${BUILD_SOURCEBRANCHNAME}-${BUILD_BUILDID}"
+
+          echo "##[command] git checkout ${BUILD_SOURCEBRANCHNAME} --"
+          git fetch
+          git checkout ${BUILD_SOURCEBRANCHNAME} --
+          git pull --rebase origin ${BUILD_SOURCEBRANCHNAME}
+          git stash pop
+
+          echo "##[command] git commit"
+          git add pom.xml
+          git commit -m "[skip ci] CodePlay bump version ${TAG}"
+
+          echo "##[command]git tag ${TAG}"
+          git tag ${TAG} -m "Version has been updated to ${TAG}"
+
+          echo "##[command] git push origin ${BUILD_SOURCEBRANCHNAME}"
+          git push origin --tags ${BUILD_SOURCEBRANCHNAME}
+
+- stage: deploy
+  displayName: Deploy
+  condition: succeeded()
+  dependsOn:
+    - build
+    # - gates
+  jobs:
+  - job: deploy_on_nexus
+    continueOnError: False
+    condition: succeeded()
+    displayName: Deploy on Nexus
+    pool: GeneralPurposeLinuxAgentsCI
+    steps:
+    - task: DownloadBuildArtifacts@1
+      displayName: Get new pom.xml
+      inputs:
+        buildType: 'current'
+        downloadPath: '$(System.ArtifactsDirectory)'
+
+    - task: XmlParseFromVivo@4
+      displayName: Get Main Info
+      name: pom_info
+      inputs:
+        type: 'file'
+        origin: $(System.ArtifactsDirectory)/bin/pom.xml
+        jpaths: |
+          var POM_XML_VERSION = .project.version._text
+          var POM_XML_ARTIFACT_ID = .project.artifactId._text
+          var POM_XML_GROUP_ID = .project.groupId._text
+        
+    - task: NexusUploadMvnFromVivo@5
+      continueOnError: true
+      displayName: Upload POF
+      inputs:
+        nexusEndpoint: "Nexus Asis"
+        nexusRepoMaven: "novoportalgf-mvn"
+        groupId: $(POM_XML_GROUP_ID) # br.com.kyros
+        generatePom: false
+        artifactId: $(POM_XML_ARTIFACT_ID)
+        artifactVersion: $(POM_XML_VERSION)
+        artifactFile1: $(System.ArtifactsDirectory)/bin/target/pof.war
+        artifactExtension1: war
+        artifactFile2: $(System.ArtifactsDirectory)/bin/pom.xml
+        artifactExtension2: pom

@@ -1,0 +1,167 @@
+trigger:
+- main
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  VERSION: '1.0.0'  # Atualize para a versão necessária
+  NEXUS_USER: 'seu_usuario'
+  NEXUS_PASSWORD: 'sua_senha'
+  MODULE: 'seu_modulo'
+  IP: 'seu_ip'
+  REDIS_CLUSTER_NODES: 'nós_redis'
+  ENVIRONMENT: 'ambiente'
+
+jobs:
+- job: Deploy
+  displayName: 'Deploy to Remote Server'
+  steps:
+  - script: |
+      hosts_to_verify="oms sooms oms1 oms2"
+      missing_hosts=""
+
+      for host in $hosts_to_verify; do
+          if ! grep -q "\<$host\>" /etc/hosts; then
+              echo "Host $host not found in /etc/hosts"
+              if [ -n "$missing_hosts" ]; then
+                  missing_hosts+=" "
+              fi
+              missing_hosts+="$host"
+          fi
+      done
+
+      if [ -n "$missing_hosts" ]; then
+          echo "Os seguintes hosts não foram encontrados: $missing_hosts"
+          exit 1
+      else
+          echo "Todos os hosts necessários foram encontrados em /etc/hosts"
+      fi
+    displayName: 'Verify OMS Hosts'
+  
+  - script: |
+      file_uri="https://nexus.telefonica.com.br/repository/ngin-mvn/br/com/eisa/smarts/oms-tools/oms-package/${VERSION}/oms-package-${VERSION}-rpm.rpm"
+      check_uri="https://nexus.telefonica.com.br/repository/ngin-mvn/br/com/eisa/smarts/oms-tools/oms-package/${VERSION}/oms-package-${VERSION}-rpm.rpm.sha1"
+
+      file_download=$(wget -nv --http-user=${NEXUS_USER} --http-password=${NEXUS_PASSWORD} -O oms-package-${VERSION}-rpm.rpm $file_uri 2>&1)
+      exit_code=$?
+
+      if echo "$file_download" | grep -q "404"; then
+          echo "Erro 404 - Arquivo não encontrado no Nexus: $file_uri"
+          exit 1
+      elif [ $exit_code -ne 0 ]; then
+          echo "Falha no download. Código de saída: $exit_code"
+          exit 1
+      else
+          echo "Download concluído: ${file_uri}"
+      fi
+
+      check_file_download=$(wget -nv --http-user=${NEXUS_USER} --http-password=${NEXUS_PASSWORD} -O oms-package-${VERSION}-rpm.rpm.sha1 $check_uri  2>&1)
+      exit_code=$?
+
+      if echo "$check_file_download" | grep -q "404"; then
+          echo "Erro 404 - Arquivo não encontrado no Nexus: $check_uri"
+          exit 1
+      elif [ $exit_code -ne 0 ]; then
+          echo "Falha no download. Código de saída: $exit_code"
+          exit 1
+      else
+          echo "Download concluído: ${check_uri}"
+      fi
+
+      downloaded_sum=$(cat oms-package-${VERSION}-rpm.rpm.sha1)
+      calculated_sum=$(sha1sum oms-package-${VERSION}-rpm.rpm | awk '{print $1}')
+
+      echo -e "\nChecksum usando SHA-1 para garantir que o arquivo baixado está íntegro:\n"
+
+      echo "SHA-1 obtido do Nexus: $downloaded_sum"
+      echo "SHA-1 calculado do arquivo RPM: $calculated_sum"
+
+      if [ "$downloaded_sum" == "$calculated_sum" ]; then
+          echo "Verificação de SHA-1 bem sucedida."
+      else
+          echo "Erro: Verificação de SHA-1 falhou. Arquivo não parece ter sido baixado com sucesso. Impossível prosseguir."
+          exit 1
+      fi
+    displayName: 'Download and Verify OMS Package'
+  
+  - script: |
+      service_name="scgw-oms"
+      echo -e "Parando o serviço $service_name"
+      sudo systemctl stop $service_name
+      sleep 1
+
+      status_output=$(systemctl is-active "$service_name")
+      if [[ ! "$status_output" == "unknown" ]]; then
+          echo -e "Removendo versão instalada do serviço $service_name"
+          echo "y" | sudo -S yum erase "$service_name"
+          sleep 5
+          
+          status_output=$(systemctl is-active "$service_name")
+          if [[ "$status_output" == "unknown" ]]; then
+              echo "Remoção realizada com sucesso"
+          else
+              echo "Remoção não realizada com sucesso. Status do serviço é $status_output"
+          fi
+      fi
+
+      echo -e "Instalando nova versão do $service_name"
+      echo "y" | sudo -S yum localinstall "oms-package-${VERSION}-rpm.rpm"
+      sleep 5
+      status_output=$(systemctl is-active "$service_name")
+      if [[ "$status_output" == "unknown" ]]; then
+          echo -e "\nServiço não encontrado. Um problema ocorreu na etapa de instalação do módulo.\n"
+          exit 1
+      else
+          echo -e "\nMódulo instalado com sucesso\n"
+      fi
+    displayName: 'Install OMS Package'
+  
+  - script: |
+      service_name="scgw-oms"
+      echo -e "Verificando status do $service_name"
+      sleep 10
+      service_status=$(systemctl is-active "$service_name")
+      if [ "$service_status" == "active" ]; then
+          echo "Serviço $service_name está em estado Active"
+      else
+          echo "Serviço $service_name não está num estado ativo. Estado atual: $service_status."
+          
+          if [ -v JAVA_8_PATH ]; then
+              echo "JAVA_8_PATH está definido com o valor '$JAVA_8_PATH'. Não é possível realizar configuração do scgw-oms. Verifique o valor da variável."
+              exit 1
+          else
+              script_path="/opt/eisa/smartcgw/oms/scripts/start-oms-agent.sh"
+              echo "Variável de ambiente JAVA_8_PATH não está definida. Passo alternativo será realizado, com a inclusão no script $script_path"
+
+              java_path=$(find / -name 'java' -type f 2>/dev/null | grep "1.8" | head -n 1)
+
+              if [[ "$java_path" = "" ]]; then
+                  echo "Não foi possível encontrar o JDK 1.8 na máquina."
+                  exit 1
+              fi
+
+              line_to_add="export JAVA_8_PATH=\"$java_path\""
+
+              if grep -qF "export JAVA_8_PATH=" "$script_path"; then
+                  echo "JAVA_8_PATH já está presente no script. Verifique manualmente o caminho fornecido. Não é possível realizar configuração OMS."
+                  exit 1
+              else
+                  sed -i "1a\\
+                  $line_to_add" "$script_path"
+                  echo "JAVA_8_PATH adicionada ao script de start com sucesso."
+              fi
+
+              echo "Realizando restart do serviço..."
+              sudo systemctl restart scgw-oms
+              sleep 10
+              service_status=$(systemctl is-active "$service_name")
+              if [ "$service_status" == "active" ]; then
+                  echo "Sucesso na configuração do OMS. Serviço $service_name está em estado $service_status"
+              else
+                  echo "Configuração do OMS não foi bem sucedida: Serviço $service_name está em estado $service_status"
+                  exit 1
+              fi
+          fi
+      fi
+    displayName: 'Verify and Configure OMS Service'

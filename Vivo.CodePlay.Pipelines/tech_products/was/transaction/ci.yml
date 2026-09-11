@@ -1,0 +1,99 @@
+﻿stages:
+
+- stage: Validate
+  pool: GeneralPurposeLinuxAgentsCI
+  displayName: '✅ Validate'
+  jobs:
+  - job: Validate
+    displayName: '✅ Validate'
+    steps:
+      - checkout: self
+        displayName: '🔄 Checkout code'
+        fetchDepth: 0
+
+      - task: UniversalPackages@0
+        inputs:
+          command: 'download'
+          downloadDirectory: '$(System.ArtifactsDirectory)/transaction-config-validator'
+          feedsToUse: 'internal'
+          vstsFeed: '3d53bc62-8749-4931-ae46-a443b73bc87a'
+          vstsFeedPackage: 'transaction-config-validator'
+          vstsPackageVersion: '0.0.*'
+        displayName: '⬇️ Download Transaction Config Validator'
+  
+      - task: DownloadSecureFile@1
+        name: xsd
+        displayName: '🔐 Download secure file (xsd)'
+        inputs:
+          secureFile: 'transactionXSD8486.xsd'   
+      - script: |
+            java -jar $(System.ArtifactsDirectory)/transaction-config-validator/transaction-config-validator.jar '$(Build.SourcesDirectory)/$(ARQUIVO)' '$(xsd.secureFilePath)'
+        displayName: '✅ Execute Validation'
+
+- stage: Publish
+  pool: GeneralPurposeLinuxAgentsCI
+  displayName: '📦 Publish'
+  condition: or(and(eq(variables['Build.Reason'], 'PullRequest'), eq(variables['System.PullRequest.TargetBranch'], 'refs/heads/master')), and(eq(variables['Build.SourceBranch'], 'refs/heads/master'), eq(variables['Build.Reason'], 'Manual')))
+  jobs:
+    - job: Publish
+      displayName: '📦 Publish'
+      steps:
+        - checkout: self
+          displayName: '🔄 Checkout code'
+          persistCredentials: true
+          clean: false
+
+    # Script para gerar a versão 0.0.v considerando todas as versões do VERSION.md
+        - powershell: |
+            git fetch origin master
+            git checkout master
+            $versoes = Get-Content VERSION.md
+            # Extrai versões do formato 0.0.v (ex: 0.0.1, 0.0.2) mesmo dentro de tabela Markdown
+            $regex = "(?<=\| )0\.0\.(\d+)"
+            $versoesExistentes = $versoes | ForEach-Object {
+              if ($_ -match $regex) { [int]$matches[1] } else { $null }
+            } | Where-Object { $_ -ne $null }
+            if ($versoesExistentes) {
+              $ultimoV = ($versoesExistentes | Measure-Object -Maximum).Maximum
+              $novaVersao = "0.0." + ($ultimoV + 1)
+            } else {
+              $novaVersao = "0.0.1"
+            }
+            Write-Host "##vso[task.setvariable variable=PACKAGE_VERSION]$novaVersao"
+          displayName: '🏷️ Gerar versão 0.0.v'
+
+        - task: UniversalPackages@0
+          displayName: '📦 Publish to Azure Artifacts'
+          inputs:
+            command: 'publish'
+            publishDirectory: '$(Build.SourcesDirectory)/$(ARQUIVO)'
+            feedsToUsePublish: 'internal'
+            vstsFeedPublish: '3d53bc62-8749-4931-ae46-a443b73bc87a'
+            vstsFeedPackagePublish: '$(FEED_PACKAGE)'
+            versionOption: 'custom'
+            versionPublish: '$(PACKAGE_VERSION)'
+
+        - powershell: |
+            $versao = "$env:PACKAGE_VERSION"
+            $publishDate = Get-Date -Format 'dd/MM/yyyy'
+            $linhas = Get-Content VERSION.md
+            $linhaNova = "| $versao     | $publishDate   | -           |"
+            $headerIndex = ($linhas | Select-String -Pattern "^\| Version ").LineNumber
+            if ($headerIndex) {
+              $headerIndex = $headerIndex[0]
+              $linhas = $linhas[0..($headerIndex)] + $linhaNova + $linhas[($headerIndex+1)..($linhas.Length-1)]
+            } else {
+              $linhas += $linhaNova
+            }
+            Set-Content VERSION.md $linhas
+          displayName: '🏷️ Adicionar nova versão no topo da tabela do VERSION.md'
+
+        - script: |
+            git config user.email "devops@telefonicati.onmicrosoft.com"
+            git config user.name "DevOps Pipeline"
+            git fetch origin master
+            git checkout master
+            git add VERSION.md
+            git commit -m "chore: adiciona versão $env:PACKAGE_VERSION no topo da tabela do VERSION.md"
+            git push origin HEAD:master
+          displayName: '📝 Commitar e dar push nas alterações do VERSION.md sempre na master'

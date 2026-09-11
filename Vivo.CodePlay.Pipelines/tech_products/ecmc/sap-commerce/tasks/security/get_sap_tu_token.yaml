@@ -1,0 +1,86 @@
+parameters:
+- name: tokenVariableName
+  type: string
+  default: 'SAP_TU_ACCESS_TOKEN'
+- name: expirationVariableName
+  type: string
+  default: 'SAP_TU_TOKEN_EXPIRATION'
+- name: tokenLifetimeBufferSeconds
+  type: string
+  default: '60'
+- name: displayName
+  type: string
+  default: 'Get SAP Technical User token'
+- name: exportAsOutput
+  type: boolean
+  default: false
+- name: stepName
+  type: string
+  default: 'get_sap_tu_token'
+
+steps:
+  - bash: |
+      if [ -z "${SAP_TU_CLIENT_ID:-}" ] || [ -z "${SAP_TU_CLIENT_SECRET:-}" ] || \
+         [ -z "${SAP_TU_TOKEN_ENDPOINT:-}" ] || [ -z "${SAP_TU_RESOURCE:-}" ]; then
+        echo "##[error]Credenciais do Technical User não configuradas para este job"
+        exit 1
+      fi
+
+      echo "##[section]Solicitando access token (client credentials)"
+      TOKEN_PAYLOAD="grant_type=client_credentials&client_id=${SAP_TU_CLIENT_ID}&client_secret=${SAP_TU_CLIENT_SECRET}&resource=${SAP_TU_RESOURCE}"
+      SAP_TOKEN_RESPONSE=$(curl -s -X POST "$SAP_TU_TOKEN_ENDPOINT" \
+        -H "Content-Type: application/x-www-form-urlencoded" \
+        -d "$TOKEN_PAYLOAD")
+
+      ACCESS_TOKEN=$(echo "$SAP_TOKEN_RESPONSE" | jq -r '.access_token // empty')
+      EXPIRES_IN=$(echo "$SAP_TOKEN_RESPONSE" | jq -r '.expires_in // empty')
+
+      if [ -z "$ACCESS_TOKEN" ] || [ "$ACCESS_TOKEN" == "null" ]; then
+        echo "##[error]Falha ao obter access token do Technical User"
+        echo "##[debug]Resposta bruta do endpoint: $SAP_TOKEN_RESPONSE"
+        exit 1
+      fi
+
+      if [ -z "$EXPIRES_IN" ] || [ "$EXPIRES_IN" == "null" ]; then
+        EXPIRES_IN=3600
+      fi
+
+      if ! [[ $EXPIRES_IN =~ ^[0-9]+$ ]]; then
+        echo "##[warning]Valor de expires_in inesperado ($EXPIRES_IN). Aplicando 3600s por padrão"
+        EXPIRES_IN=3600
+      fi
+
+      TOKEN_BUFFER='${{ parameters.tokenLifetimeBufferSeconds }}'
+      if ! [[ $TOKEN_BUFFER =~ ^[0-9]+$ ]]; then
+        TOKEN_BUFFER=60
+      fi
+
+      NOW_TS=$(date +%s)
+      EXPIRATION_TS=$((NOW_TS + EXPIRES_IN - TOKEN_BUFFER))
+      if [ $EXPIRATION_TS -le $NOW_TS ]; then
+        EXPIRATION_TS=$((NOW_TS + EXPIRES_IN))
+      fi
+
+      echo "##[section]Token gerado com sucesso (valor oculto)"
+      echo "##[command]expires_in=${EXPIRES_IN}s (buffer ${TOKEN_BUFFER}s)"
+
+      TOKEN_VARIABLE_NAME='${{ parameters.tokenVariableName }}'
+      EXPIRATION_VARIABLE_NAME='${{ parameters.expirationVariableName }}'
+      EXPORT_AS_OUTPUT='${{ parameters.exportAsOutput }}'
+
+      # Sempre define variável para uso local (steps subsequentes no mesmo job)
+      echo "##vso[task.setvariable variable=$TOKEN_VARIABLE_NAME;issecret=true]$ACCESS_TOKEN"
+      echo "##vso[task.setvariable variable=$EXPIRATION_VARIABLE_NAME]$EXPIRATION_TS"
+
+      # Se exportAsOutput=true, também define com isOutput para jobs dependentes
+      if [ "$EXPORT_AS_OUTPUT" == "True" ]; then
+        echo "##vso[task.setvariable variable=$TOKEN_VARIABLE_NAME;issecret=true;isOutput=true]$ACCESS_TOKEN"
+        echo "##vso[task.setvariable variable=$EXPIRATION_VARIABLE_NAME;isOutput=true]$EXPIRATION_TS"
+      fi
+    displayName: ${{ parameters.displayName }}
+    name: ${{ parameters.stepName }}
+    env:
+      SAP_TU_CLIENT_ID: $(SAP_TU_CLIENT_ID)
+      SAP_TU_CLIENT_SECRET: $(SAP_TU_CLIENT_SECRET)
+      SAP_TU_TOKEN_ENDPOINT: $(SAP_TU_TOKEN_ENDPOINT)
+      SAP_TU_RESOURCE: $(SAP_TU_RESOURCE)

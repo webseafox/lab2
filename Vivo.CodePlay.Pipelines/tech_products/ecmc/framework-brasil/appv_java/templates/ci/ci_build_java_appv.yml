@@ -1,0 +1,297 @@
+parameters:
+- name: isMergeValidation
+  type: boolean
+  default: False
+- name: libOnly
+  type: boolean
+  default: False
+
+stages:
+
+- stage: ci_build
+  displayName: "CI - Build"
+  pool:
+    name: GeneralPurposeLinuxAgentsCI
+  dependsOn:
+  - environment_init
+
+  ## -> Loads variables from other stages.
+  variables:
+  - name: MAVEN_SETTINGS_LOCATION
+    value: $[ stageDependencies.environment_init.environment.outputs['settings_variables.MAVEN_SETTINGS_LOCATION'] ]
+  - name: MAVEN_CUSTOM_SETTINGS_CONTENT
+    value: $[ stageDependencies.environment_init.environment.outputs['custom_settings.MAVEN_CUSTOM_SETTINGS_CONTENT'] ]
+  - name: NEXUS_DEPS_USR
+    value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEPS_USR'] ]    
+  - name: NEXUS_DEPS_PSW
+    value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEPS_PSW'] ]
+  
+  jobs:      
+  - job: build
+    displayName: Build    
+    steps:
+
+    ## -> Clean the pipeline workspace and checkout the code.
+    ## -> 6d15af64-176c-496d-b583-fd2ae21d4df4 is the decorator for checkout.
+    - task: 6d15af64-176c-496d-b583-fd2ae21d4df4@1
+      displayName: Checkout Code
+      name: checkout_code 
+      inputs:
+        repository: self
+        persistCredentials: "true"
+        clean: true
+
+    ## -> Checkout the last commit that was pushed to the repository. 
+    ## -> Set last commit HASH to a variable. 
+    - task: Bash@3
+      displayName: Checkout Last Commit
+      name: checkout_last_commit     
+      condition: succeeded()
+      continueOnError: false
+      inputs:
+        targetType: inline
+        script: |
+          echo "##[debug] Checkout last commit from '$(Build.SourceBranchName)'"
+
+          git config pull.rebase true
+          git fetch -f --depth 1 origin $(Build.SourceBranchName):$(Build.SourceBranchName)
+          git checkout -f $(Build.SourceBranchName)
+          lastCommitHash=$(git rev-parse --short=6 HEAD)
+
+          echo "##[debug] Last commit short hash '$lastCommitHash'"          
+          echo "##vso[task.setvariable variable=SHORT_HASH]$lastCommitHash"
+
+    ## -> Start of Bump Version section
+    ## -> If branch is master, use numeric system. e.g: 0.0.1, 2.0.0;
+    ## -> If branch is NOT master, use branch name + last commit hash. e.g: dev-1a2b;
+
+    ## -> Get current version and set to variables. 
+    ## -> For master, set a variable to increment version further on.
+    - task: CmdLine@2
+      displayName: Get Current Version
+      name: current_version
+      condition: succeeded()
+      continueOnError: false
+      inputs:
+        script: |
+          setVariables(){
+            eval result=$2
+            echo "##vso[task.setvariable variable=$1]$result"
+          }                              
+
+          currentVersion=$(DOCKER_CMD_EXTRACT_POM_XML_VERSION)
+          setVariables "CURRENT_VERSION" $currentVersion
+          echo "##[debug] Source CURRENT_VERSION: '$currentVersion'"
+          incrementVersion=$(echo $currentVersion | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+          if [[ -n $incrementVersion ]]; then
+            setVariables "INCREMENT_VERSION" $incrementVersion
+          else
+            echo "##[error] Version in the pom.xml is not following semantic versioning."
+            echo "##[error] Verify if the version contains the pattern: <major>.<minor>.<patch>; e.g: 0.0.1, 1.0.0-branch, 1.1.0-branch+hash, 0.0.1-SNAPSHOT; "
+            exit 1
+          fi
+
+    ## -> Bump/Increment version and update increment variable. 
+    ## -> Only allows this for master branch and in CI steps. Do not allow manual pushes.
+    ## -> To disable set BUMP_VERSION_ENABLED in pipeline's library.
+    - task: semver-bump@1
+      displayName: Bump Version Master
+      name: bump_version
+      condition: and(
+        succeeded(),
+        or(
+        and(eq(variables.BUMP_VERSION_ENABLED, 'true'), eq(variables['Build.Reason'], 'IndividualCI')),
+        and(eq(variables.BUMP_VERSION_ENABLED, 'true'), eq(variables['Build.Reason'], 'BatchedCI')),
+        and(eq(False, true),eq(variables['Build.Reason'], 'Manual'))))
+      continueOnError: false
+      inputs:
+        VersionVariable: 'INCREMENT_VERSION'
+        IncrementLevel: 'patch'
+        targetType: inline  
+
+    ## -> Set the new version to a variable. This allows it to be used in other stages, jobs or tasks.
+    - task: Bash@3
+      displayName: 'Set New Version'
+      name: new_version
+      condition: succeeded()
+      continueOnError: false
+      inputs:
+        targetType: inline
+        script: |
+          echo "##[debug] Source CURRENT_VERSION: '$(CURRENT_VERSION)'"                    
+          if [ '$(Build.SourceBranchName)' == 'master' ]; then            
+            echo "##[debug] Source NEW_VERSION: '$(INCREMENT_VERSION)'"
+            echo "##vso[task.setvariable variable=NEW_VERSION;isOutput=true]$(INCREMENT_VERSION)"
+          else
+            newVersion=$(INCREMENT_VERSION)-$(Build.SourceBranchName).$(SHORT_HASH)
+            echo "##[debug] Source NEW_VERSION: $newVersion"
+            echo "##vso[task.setvariable variable=NEW_VERSION;isOutput=true]$newVersion"
+          fi
+
+    ## -> Load Custom Settings
+    - task: Bash@3
+      displayName: 'Load Custom Settings'
+      name: load_custom_settings
+      condition: and(
+        succeeded(),
+        ne(variables['MAVEN_CUSTOM_SETTINGS_CONTENT'], ''))
+      continueOnError: true
+      inputs:
+        targetType: inline
+        script: |
+          echo "##[debug] Loading custom settings: $(MAVEN_CUSTOM_SETTINGS_CONTENT)"
+          echo "##[debug] Location: $(MAVEN_SETTINGS_LOCATION)"
+          base64 -d <<< "$(MAVEN_CUSTOM_SETTINGS_CONTENT)" > $(MAVEN_SETTINGS_LOCATION)
+
+    # ==================================================================
+    # [Compliance] Verifica se o repositório está em conformidade com as políticas de configuração
+    # ==================================================================
+    - task: VivoDevOpsConfigCompliance@1
+      displayName: 'Check DevOps Config Compliance'
+      inputs:
+        policySets: |
+          image-definition-files
+
+    ## -> Build application and generate artifact.
+    - task: Bash@3
+      displayName: Build Version
+      name: build_version
+      condition: and(succeeded(), eq(variables.new_version.NEW_VERSION, ''))      
+      continueOnError: false
+      inputs:
+        targetType: inline
+        script: >
+          BUILDER_IMAGE_NAME="builder/java"
+
+          docker build -t $BUILDER_IMAGE_NAME -f .azuredevops/builder.Dockerfile .
+
+          run_docker() {
+            docker run --rm \
+              --user="$(DOCKER_CMD_USERNAME):$(DOCKER_CMD_GROUP)" \
+              --network host \
+              --log-driver none \
+              -e JAVA_OPTS_MEMORY_MAX="$(DEFAULT_MAX_MEMORY_BUILD)" \
+              -e TZ="America/Sao_Paulo" \
+              -e SYSTEM_ACCESSTOKEN="$(System.AccessToken)" \
+              -e NEXUS_DEPS_USR="$(NEXUS_DEPS_USR)" \
+              -e NEXUS_DEPS_PSW="$(NEXUS_DEPS_PSW)" \
+              -v $(pwd):/app \
+              -v $HOME/.m2:/.m2 \
+              -v $(MAVEN_SETTINGS_LOCATION):/.m2/settings.xml \
+              -w $(DOCKER_WORKDIR) \
+              "$BUILDER_IMAGE_NAME" sh -c "$1"
+          }
+
+          #run_docker "mvn --version"
+          echo "##[debug] Build with version: $(new_version.NEW_VERSION)"
+
+          if [[ "${BUMP_VERSION_ENABLED}" == 'true' ]]; then
+            run_docker "mvn -e -X $MAVEN_OPTS versions:set -DnewVersion=$(new_version.NEW_VERSION) -s /.m2/settings.xml -Dmaven.repo.local=/.m2/repository"
+          fi
+
+          command="install"
+
+          if [ "${{ parameters.libOnly }}" = "True" ]; then
+            echo "##[debug] libOnly - packing jar with dependencies."
+            command="package"
+          fi
+
+          echo "##[debug] mvn command: ${command}"
+
+          run_docker "mvn clean ${command} -Dmaven.test.failure.ignore=false -s /.m2/settings.xml -Dmaven.repo.local=/.m2/repository"
+          
+    ## -> Copy files for staging area
+    - task: CopyFiles@2
+      name: t_copy_file
+      displayName: 'Copy to Staging Directory'
+      condition: succeeded()
+      continueOnError: false
+      inputs:
+        TargetFolder: '$(Build.ArtifactStagingDirectory)'
+        OverWrite: true
+        CleanTargetFolder: true
+        Contents: >
+          **/*
+
+          !.git/**/*
+
+          !?/**/*
+
+          !**/*.log
+
+    ## -> Set artifact information to variables. This allows it to be used in other stages, jobs or tasks. 
+    - task: CmdLine@2
+      name: artifact_name   
+      displayName: 'Get Artifact Name'       
+      condition: succeeded()
+      continueOnError: false
+      inputs:
+        targetType: inline
+        script: |
+          setVariables(){
+            eval result=$2
+            echo "##vso[task.setvariable variable=$1;isOutput=true]$result"
+          }                              
+          
+          modules=$(DOCKER_CMD_EXTRACT_POM_XML_MODULES)
+          lastModule=$(echo $modules | tr -d '[]' | awk -F ',' '{print $NF}' | tr -d '""')
+        
+          if [[ -n $lastModule ]]; then
+            
+            echo "##[debug] Project is multi-module"
+            echo "##[debug] Looking for ear..."
+            artifactFile=$(find "$(Build.ArtifactStagingDirectory)" -type f -name "*.ear" -print -quit)
+
+            if [[ -z $artifactFile ]]; then
+              echo "##[debug] No ear file found. Looking for war...".
+              artifactFile=$(find "$(Build.ArtifactStagingDirectory)" -type f -name "*.war" -print -quit)
+
+              if [[ -z $artifactFile ]]; then
+                echo "##[debug] No war file found. Getting the jar for last module on pom.xml."
+                artifactFile=$(find "$(Build.ArtifactStagingDirectory)" -type f -name "*$lastModule*.jar" -print -quit)
+              fi                                    
+
+            fi
+          else
+            targetDirectory=$(echo "$(Build.ArtifactStagingDirectory)/target")          
+            echo "##[debug] Target Directory '$targetDirectory'"
+            artifactFile=$(ls "$targetDirectory" | grep -E "\.jar$|\.war$|\.ear$" | head -n 1)
+
+          fi
+          
+          echo "##[debug] Artifact File '$artifactFile'"
+          
+          # Artifact will not be generated with version name!
+          # if [[ $artifactFile != *"$(new_version.NEW_VERSION)"* ]]; then
+          #   echo "##[error] The artifact that was not generated with the correct name."
+          #   echo "##[error] Possible causes may include:"
+          #   echo "##[error] - A variable forcing the name in the pom.xml, e.g: <finalName> attribute inside the pom.xml"
+          #   exit 1
+          # fi          
+
+          artifactName=$(basename $artifactFile | sed 's/\.[^.]*$//')
+          echo "##[debug] Artifact Name '$artifactName'"
+
+          setVariables "ARTIFACT_FILE" $artifactFile          
+          setVariables "ARTIFACT_NAME" $artifactName
+
+    ## -> Compress artifacts into tar. This allows to use less space and to be used in other stages, jobs or tasks.           
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Artifact'
+      condition: succeeded()
+      continueOnError: false
+      inputs:
+        ArtifactName: app
+        StoreAsTar: true
+    
+    - task: PublishCodeCoverageResults@1
+      name: t_publish_code_coverage_result
+      displayName: 'Publish Code Coverage Result'
+      condition: ne(${{ parameters.isMergeValidation }}, True)
+      inputs:
+        codeCoverageTool: JaCoCo
+        summaryFileLocation: $(Build.SourcesDirectory)/$(COVERAGE_REPORT_SUMMARY_FILE_LOCATION)
+        reportDirectory: $(Build.SourcesDirectory)/$(COVERAGE_REPORT_REPORT_DIRECTORY)
+        failIfCoverageEmpty: false
+      timeoutInMinutes: 1
+      continueOnError: true

@@ -1,0 +1,127 @@
+parameters:
+- name: appConfigurationEnabled
+  type: boolean
+  default: true
+- name: azureSubscription
+  default: "$(APP_CONFIGURATION_AZURE_SUBSCRIPTION)"
+- name: appConfigurationEndpoint
+  default: "$(APP_CONFIGURATIN_ENDPOINT)"
+
+steps:
+  - bash: | 
+      echo "##[debug] APP CONFIG ENABLED...............: ${{ parameters.appConfigurationEnabled }}"
+      echo "##[debug] APP CONFIG SUBSCRIPTION..........: ${{ parameters.azureSubscription }}"
+      echo "##[debug] APP CONFIG ENDPOINT..............: ${{ parameters.appConfigurationEndpoint }}"
+
+      echo "##[debug] SONAR_SELF_HOSTED................: $(SONAR_SELF_HOSTED)"
+      echo "##[debug] SONARQUBE_SERVICE_CONNECTION_NAME: $(SONARQUBE_SERVICE_CONNECTION_NAME)"
+
+      echo "##vso[task.setvariable variable=SKIP_APPCONFIG_PUSH]true"
+    displayName: "App Configuration Info"
+
+  - bash: |
+      source ~/.bashrc
+
+      TEAM_PROJECT_NAME="$(System.TeamProject)"
+      TEAM_PROJECT_ID="`echo $(System.TeamProjectId) | tr '-' '_'`"
+      
+      KEY_SONAR_BREAK_ENABLED=$(echo "SONAR_ERROR_BREAK_ENABLED_${TEAM_PROJECT_ID}" | awk 'BEGIN { getline; print toupper($0) }')
+      LABEL_PROJECT="$TEAM_PROJECT_NAME"
+
+      echo "##vso[task.setvariable variable=OUT_LABEL_PROJECT]$LABEL_PROJECT"
+      echo "##vso[task.setvariable variable=OUT_KEY_SONAR_BREAK_ENABLED]$KEY_SONAR_BREAK_ENABLED"
+
+      echo "##[debug] LABEL_PROJECT.......................: $LABEL_PROJECT"
+      echo "##[debug] KEY SONAR BREAK ENABLED.............: $KEY_SONAR_BREAK_ENABLED"
+
+    condition: and( succeeded(), ${{ eq(parameters.appConfigurationEnabled, true) }}, or( eq(variables.SONARQUBE_SERVICE_CONNECTION_NAME, 'VIVO_SONARQUBE_VIP'), eq(variables.SONAR_SELF_HOSTED, 'true') ) )
+    displayName: 'Generate app configuration keys'
+
+  - task: AzureAppConfiguration@8
+    displayName: 'Download app configuration keys'
+    condition: and( succeeded(), ${{ eq(parameters.appConfigurationEnabled, true) }}, or( eq(variables.SONARQUBE_SERVICE_CONNECTION_NAME, 'VIVO_SONARQUBE_VIP'), eq(variables.SONAR_SELF_HOSTED, 'true') ) )
+    timeoutInMinutes: 1
+    retryCountOnTaskFailure: 5
+    inputs:
+      azureSubscription: ${{ parameters.azureSubscription }}
+      AppConfigurationEndpoint: ${{ parameters.appConfigurationEndpoint }}
+      Label: '$(OUT_LABEL_PROJECT)'
+    env:
+      HTTPS_PROXY: $(PROXY_AGENT_HTTPS)
+      HTTP_PROXY: $(PROXY_AGENT_HTTP)
+      NO_PROXY: $(PROXY_AGENT_NO_PROXY)
+
+  - bash: |
+      source ~/.bashrc
+
+      # Verificar se a variável OUT_KEY_SONAR_BREAK_ENABLED já possui valor definido
+      VAR_ORIGINAL_VALUE="${!OUT_KEY_SONAR_BREAK_ENABLED}";
+      if [ -n "$VAR_ORIGINAL_VALUE" ]; then
+        echo "##[debug] $OUT_KEY_SONAR_BREAK_ENABLED is already defined as '$VAR_ORIGINAL_VALUE'. Skipping App Configuration push..."
+        exit 0
+      fi
+
+      get_app_configuration_key() {
+          VAR_NAME="$1";
+          DEFAULT_VALUE="$2"
+          VAR_VALUE="${!VAR_NAME}"
+          [ -z "$VAR_VALUE" ] && echo "$DEFAULT_VALUE" || echo "$VAR_VALUE"
+      }
+
+      SONAR_BREAK_ENABLED_VALUE=`get_app_configuration_key $OUT_KEY_SONAR_BREAK_ENABLED "false"`
+
+      echo "##[debug] GLOBAL VARIABLES"
+      echo "##[debug] OUT_KEY_SONAR_BREAK_ENABLED............: $OUT_KEY_SONAR_BREAK_ENABLED"
+      echo "##[debug] SONAR_BREAK_ENABLED_VALUE..............: $SONAR_BREAK_ENABLED_VALUE"
+      echo ""
+
+      cat <<EOF > ${AGENT_TEMPDIRECTORY}/app_config_vars_sonar.json
+      {
+        "items": [
+        {"key": "$OUT_KEY_SONAR_BREAK_ENABLED","value": "$SONAR_BREAK_ENABLED_VALUE","label": "$OUT_LABEL_PROJECT","content_type": null,"tags": {}}
+        ]
+      }
+      EOF
+
+      echo "##vso[task.setvariable variable=SKIP_APPCONFIG_PUSH]false"
+    condition: and( succeeded(), ${{ eq(parameters.appConfigurationEnabled, true) }}, or( eq(variables.SONARQUBE_SERVICE_CONNECTION_NAME, 'VIVO_SONARQUBE_VIP'), eq(variables.SONAR_SELF_HOSTED, 'true') ) )
+    displayName: 'Validate app configuration keys'
+
+  - task: AzureAppConfigurationPush@7
+    displayName: 'Push app configuration keys'
+    condition: and( succeeded(), ${{ eq(parameters.appConfigurationEnabled, true) }}, eq(variables.SKIP_APPCONFIG_PUSH, 'false'), or( eq(variables.SONARQUBE_SERVICE_CONNECTION_NAME, 'VIVO_SONARQUBE_VIP'), eq(variables.SONAR_SELF_HOSTED, 'true') ) )
+    inputs:
+      azureSubscription: ${{ parameters.azureSubscription }}
+      AppConfigurationEndpoint: ${{ parameters.appConfigurationEndpoint }}
+      ConfigurationFile: '$(Agent.TempDirectory)/app_config_vars_sonar.json'
+      FileContentProfile: appconfig/kvset
+    env:
+      HTTPS_PROXY: $(PROXY_AGENT_HTTPS)
+      HTTP_PROXY: $(PROXY_AGENT_HTTP)
+      NO_PROXY: $(PROXY_AGENT_NO_PROXY)
+
+  - bash: |
+      source ~/.bashrc
+      
+      getvar() {
+        VAR_NAME="$1"; 
+        eval VAR_VALUE="\$$VAR_NAME";
+        [ -z "$VAR_VALUE" ] && echo "false" || echo "$VAR_VALUE"
+      }
+      
+      USE_APPCONFIG="${{ parameters.appConfigurationEnabled }}"
+
+      if [[ "$USE_APPCONFIG" =~ ^(T|t)rue$ ]]; then
+        
+        SONAR_BREAK_ENABLED="$(getvar $OUT_KEY_SONAR_BREAK_ENABLED)"
+        if [ "$SONAR_BREAK_ENABLED" != "true" ]; then
+            SONAR_BREAK_ENABLED=false
+        fi
+      fi
+
+      echo "##[debug] SONAR_BREAK_ENABLED...........: $SONAR_BREAK_ENABLED"
+      echo ""
+      echo "##vso[task.setvariable variable=SONAR_BREAK_ENABLED;isOutput=true;]$SONAR_BREAK_ENABLED"
+    condition: succeeded()
+    displayName: 'Evaluate quality gate flags'
+    name: evaluate_flags_sonar

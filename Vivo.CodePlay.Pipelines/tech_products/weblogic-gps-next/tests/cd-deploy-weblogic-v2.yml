@@ -1,0 +1,278 @@
+###
+### ISTO NAO E UM TEMPLATE 
+###
+### E UM TESTE PARA DEPLOY NO WEBLOGIC
+###
+
+resources:
+  repositories:
+    - repository: WeblogicScripts
+      name: MIGR-Gps2/gps-pipeline-resources
+      type: git
+      ref: refs/heads/master
+  
+parameters:  
+- name: deploymentName
+  displayName: Escolha o modulo para publicar no WebLogic
+  values:
+  - wizard
+  - admin
+
+- name: environment
+  displayName: Escolha a esteira de QA para para deploy
+  type: string
+  default: DEV
+  values:
+  - DEV
+  - ESTEIRA1
+  - ESTEIRA2
+  - PREPROD
+  - PRODLIKE
+  - PROD 
+
+#Incluir Variaveis da Library
+variables:
+  - group: GPS-NEXT.WeblogicCreds.${{ parameters.environment }}
+  - name: System.debug
+    value: "true"
+
+stages:
+- stage: deploy
+  displayName: Deploy
+  pool: DefaultDevOpsAgents
+
+  jobs:
+  - deployment: deploy_on_weblogic
+    displayName: Deploy on WebLogic
+    workspace:
+      clean: all
+    environment:
+      name: ${{ parameters.environment }}
+
+    strategy:
+      runOnce:
+
+        preDeploy:
+          steps:  
+          - task: Bash@3
+            inputs:
+              targetType: 'inline'
+              script: |
+                echo "##[debug] SERVICE CONNECTION=WL_GPS-NEXT-${{parameters.environment}}"
+                echo "##[debug] ARTIFACT_TARGETFOLDER=$(ARTIFACT_TARGETFOLDER)"
+                echo "##[debug] SCRIPTS_TARGETFOLDER=$(SCRIPTS_TARGETFOLDER)"
+                echo "##[debug] WEBLOGIC_USER=$(WEBLOGIC_USER)"
+                echo "##[debug] WEBLOGIC_PASS=$(WEBLOGIC_PASS) # Não deve ser exibido!"
+                echo "##[debug] WEBLOGIC_ADMIN_SERVER_URL=$(WEBLOGIC_ADMIN_SERVER_URL)"
+                echo "##[debug] WEBLOGIC_CLUSTER=$(WEBLOGIC_CLUSTER)"
+                echo "##[debug] WLST_SCRIPT=$(WLST_SCRIPT)"
+            displayName: Verify Variables
+          
+          - task: SSH@0
+            displayName: Check SSH connection
+            inputs:
+              sshEndpoint: 'WL_GPS-NEXT-${{parameters.environment}}'
+              runOptions: 'inline'
+              inline: >-
+                echo "Conectado com sucesso via Service Connection WL_GPS-NEXT-${{parameters.environment}}"
+                ls -lha $(SCRIPTS_TARGETFOLDER)
+              readyTimeout: '20000'
+          
+          ## -> Checkout no repositório que tem os scripts Weblogic
+          - checkout: WeblogicScripts
+            fetchDepth: 1
+          
+          ## -> Transfere os scripts pro servidor
+          - task: CopyFilesOverSSH@0
+            displayName: Transfering Weblogic Scripts
+            inputs:
+              sshEndpoint: 'WL_GPS-NEXT-${{parameters.environment}}'
+              sourceFolder: $(Build.SourcesDirectory)/scripts
+              contents: '*'
+              targetFolder: '$(SCRIPTS_TARGETFOLDER)'
+              readyTimeout: '20000'
+        
+        deploy:
+          steps:
+          - checkout: self
+            clean: true
+            fetchDepth: 1
+
+          - task: XmlParseFromVivo@4
+            displayName: Get pom.xml version
+            name: pom_info
+            inputs:
+              sourceType: 'file'
+              source: pom.xml
+              queries: |
+                var POM_XML_VERSION = .project.version._text
+
+          - task: AzureKeyVault@2
+            inputs:
+              azureSubscription: 'DevOpsSharedResources'
+              KeyVaultName: 'kv-azdevops-shared'
+              SecretsFilter: 'NEXUS-DEPS-USR, NEXUS-DEPS-PSW'
+              RunAsPreJob: true
+          
+          - task: Bash@3
+            name: download_wizard
+            condition: ${{ eq(parameters.deploymentName, 'wizard') }}
+            inputs:
+              targetType: 'inline'
+              script: >-
+                curl
+                -L
+                -u $(NEXUS-DEPS-USR):$(NEXUS-DEPS-PSW) 
+                'https://nexus.telefonica.com.br/service/rest/v1/search/assets/download?repository=gps2-mvn&maven.groupId=br.com.vivo.gps4&maven.artifactId=wizard-next-ear&maven.extension=ear&version=$(POM_XML_VERSION)'
+                -o $(System.ArtifactsDirectory)/wizard-next-ear-$(POM_XML_VERSION).ear
+            displayName: Download wizard-next-ear from Nexus
+
+          # - script: >-
+          #     curl
+          #     -u $(NEXUS-DEPS-USR):$(NEXUS-DEPS-PSW) 
+          #     https://nexus.telefonica.com.br/repository/gps2-mvn/br/com/vivo/gps4/wizard-next-ear/$(POM_XML_VERSION)/wizard-next-ear-$(POM_XML_VERSION).ear
+          #     -o $(System.ArtifactsDirectory)/wizard-next-ear-$(POM_XML_VERSION).ear
+          #   condition: ${{ eq(parameters.deploymentName, 'wizard') }}
+          #   displayName: Download wizard
+
+          - task: CopyFilesOverSSH@0
+            condition: ${{ eq(parameters.deploymentName, 'wizard') }}
+            displayName: Transfering wizard-next-ear
+            inputs:
+              sshEndpoint: 'WL_GPS-NEXT-${{parameters.environment}}'
+              sourceFolder: $(System.ArtifactsDirectory)
+              contents: wizard-next-ear*.ear
+              targetFolder: $(ARTIFACT_TARGETFOLDER)
+              readyTimeout: '20000'
+
+          - task: SSH@0
+            condition: ${{ eq(parameters.deploymentName, 'wizard') }}
+            displayName: Undeploy/Retiring wizard-next-ear
+            inputs:
+              sshEndpoint: 'WL_GPS-NEXT-${{parameters.environment}}'
+              runOptions: 'commands'
+              commands: >
+                $(WLST_SCRIPT)
+                $(SCRIPTS_TARGETFOLDER)/UndeployAppRetired.py
+                $(WEBLOGIC_USER)
+                $(WEBLOGIC_PASS)
+                $(WEBLOGIC_ADMIN_SERVER_URL)
+                wizard-next-ear
+              readyTimeout: '20000'
+
+          - task: SSH@0
+            condition: ${{ eq(parameters.deploymentName, 'wizard') }}
+            displayName: Update wizard-next-ear
+            inputs:
+              sshEndpoint: 'WL_GPS-NEXT-${{parameters.environment}}'
+              runOptions: 'commands'
+              commands: >
+                $(WLST_SCRIPT)
+                $(SCRIPTS_TARGETFOLDER)/HotDeployApp.py
+                $(WEBLOGIC_USER)
+                $(WEBLOGIC_PASS)
+                $(WEBLOGIC_ADMIN_SERVER_URL)
+                wizard-next-ear
+                $(ARTIFACT_TARGETFOLDER)/wizard-next-ear-$(POM_XML_VERSION).ear
+                $(WEBLOGIC_CLUSTER)
+              readyTimeout: '20000'
+          
+          - task: Bash@3
+            name: download_admin
+            condition: ${{ eq(parameters.deploymentName, 'admin') }}
+            inputs:
+              targetType: 'inline'
+              script: >-
+                curl
+                -L
+                -u $(NEXUS-DEPS-USR):$(NEXUS-DEPS-PSW) 
+                'https://nexus.telefonica.com.br/service/rest/v1/search/assets/download?repository=gps2-mvn&maven.groupId=br.com.vivo.gps4&maven.artifactId=admin-next-ear&maven.extension=ear&version=$(POM_XML_VERSION)'
+                -o $(System.ArtifactsDirectory)/admin-next-ear-$(POM_XML_VERSION).ear
+            displayName: Download admin-next-ear from Nexus
+
+            # - script: >-
+            #     curl
+            #     -u $(NEXUS-DEPS-USR):$(NEXUS-DEPS-PSW) 
+            #     https://nexus.telefonica.com.br/repository/gps2-mvn/br/com/vivo/gps4/admin-next-ear/$(POM_XML_VERSION)/admin-next-ear-$(POM_XML_VERSION).ear
+            #     -o $(System.ArtifactsDirectory)/admin-next-ear-$(POM_XML_VERSION).ear
+            #   condition: ${{ eq(parameters.deploymentName, 'admin') }}
+            #   displayName: Download admin
+
+          - task: CopyFilesOverSSH@0
+            condition: ${{ eq(parameters.deploymentName, 'admin') }}
+            displayName: Transfering admin-next-ear
+            inputs:
+              sshEndpoint: 'WL_GPS-NEXT-${{parameters.environment}}'
+              sourceFolder: $(System.ArtifactsDirectory)
+              contents: admin-next-ear*.ear
+              targetFolder: $(ARTIFACT_TARGETFOLDER)
+              readyTimeout: '20000'
+
+          - task: SSH@0
+            condition: ${{ eq(parameters.deploymentName, 'admin') }}
+            displayName: Undeploy/Retiring admin-next-ear
+            inputs:
+              sshEndpoint: 'WL_GPS-NEXT-${{parameters.environment}}'
+              runOptions: 'commands'
+              commands: >
+                $(WLST_SCRIPT)
+                $(SCRIPTS_TARGETFOLDER)/UndeployAppRetired.py
+                $(WEBLOGIC_USER)
+                $(WEBLOGIC_PASS)
+                $(WEBLOGIC_ADMIN_SERVER_URL)
+                admin-next-ear
+              readyTimeout: '20000'
+
+          - task: SSH@0
+            condition: ${{ eq(parameters.deploymentName, 'admin') }}
+            displayName: Update admin-next-ear
+            inputs:
+              sshEndpoint: 'WL_GPS-NEXT-${{parameters.environment}}'
+              runOptions: 'commands'
+              commands: >
+                $(WLST_SCRIPT)
+                $(SCRIPTS_TARGETFOLDER)/HotDeployApp.py
+                $(WEBLOGIC_USER)
+                $(WEBLOGIC_PASS)
+                $(WEBLOGIC_ADMIN_SERVER_URL)
+                admin-next-ear
+                $(ARTIFACT_TARGETFOLDER)/admin-next-ear-$(POM_XML_VERSION).ear
+                $(WEBLOGIC_CLUSTER)
+              readyTimeout: '20000'
+          
+        on:
+          success:
+            steps:
+            - task: Bash@3
+              displayName: Deploy on WebLogic Success
+              name: t_success_message
+              inputs:
+                targetType: inline
+                script: |
+                  echo "##[section]================================================================================================================================="
+                  echo "##[section]                                                 SUCCESS WEBLOGIC DEPLOY"
+                  echo "##[section]================================================================================================================================="
+                  echo "##[section]Parabéns o artefato '${{parameters.deploymentName}}-next-ear' foi publicado com sucesso no Weblogic"
+                  echo "##[section]"
+                  echo "##[section]================================================================================================================================="
+
+          failure:
+            steps:
+            - task: Bash@3
+              displayName: Deploy on WebLogic Failure
+              name: t_failure_message
+              inputs:
+                targetType: inline
+                script: |
+                  echo "##[error] ================================================================================================================================="
+                  echo "##[error]                                                  FAILURE WEBLOGIC DEPLOY"
+                  echo "##[error] ================================================================================================================================="
+                  echo "##[error] Se está vendo essa mensagem é porque aconteceu algo erro durante o deploy do artefato '${{parameters.deploymentName}}-next-ear'."
+                  echo "##[error] "
+                  echo "##[error] Segue abaixo umas dicas para o Troubleshooting:"
+                  echo "##[error] Consulte o log do estágio de publicação do artefato."
+                  echo "##[error] Verifique se a versão corrente da biblioteca já existe no repositório (sobrescrita não é permitido)."
+                  echo "##[error] Confira se as informações do repositório e credenciais de acesso estão corretas."
+                  echo "##[error] "
+                  echo "##[error] ================================================================================================================================="
+

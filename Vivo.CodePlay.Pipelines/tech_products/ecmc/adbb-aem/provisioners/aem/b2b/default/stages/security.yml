@@ -1,0 +1,71 @@
+parameters:
+- name: fortifyExclusionRepository
+- name: dependsOn
+  type: object
+  default: [maven_unit_test, node_unit_test]
+
+stages:
+- stage: security
+  displayName: "Security"
+  dependsOn: "${{ parameters.dependsOn }}"
+  condition: not(or(failed(), canceled()))
+  pool: $(PRIVATE_AGENT_DEFAULT)
+  jobs:
+  - job: app_config_keys
+    displayName: "Get AppSec Config Keys"
+    steps:
+    - template: /tech_products/ecmc/core-pipelines/tasks/bash/welcome.yml
+    - template: /security/get_appconfig_keys.yml
+
+  - job: sca_scan
+    dependsOn: app_config_keys
+    displayName: "SCA Scan"
+    variables:
+      USE_DEPENDENCY_TRACK: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_DEPENDENCY_TRACK'] ]
+      USE_DT_DOCKER: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_DT_DOCKER'] ]
+      USE_CONVISO: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_CONVISO'] ]
+      SKIP_SECURITY_GATE_SCA: $[ dependencies.app_config_keys.outputs['evaluate_flags.SKIP_SECURITY_GATE_SCA'] ]
+    condition: and(
+                  succeeded(),
+                  eq(variables.USE_DEPENDENCY_TRACK, true),
+                  eq(variables.USE_DT_DOCKER, false)
+                )
+    steps:
+    #Esta task é responsável por baixar o artefato Java, enquanto o artefato Node é baixado dentro do template.
+      - task: DownloadBuildArtifacts@1
+        displayName: 'Download Build Artifacts'
+        inputs:
+          artifactName: $(AEM_JAVA_BUNDLE_FOLDER_NAME)
+          cleanDestinationFolder: false
+          extractTars: true
+          parallelizationLimit: 8
+          downloadPath: $(Build.SourcesDirectory)
+      - template: /tech_products/ecmc/adbb-aem/provisioners/aem/tasks/define_app_version.yml
+      - template: /security/run_sca_scan.yml
+        parameters:
+          buildArtifactName: $(AEM_FRONTEND_FOLDER_NAME)
+          appVersion: "$(FORTIFY_APP_VERSION)"
+
+  - job: fortify_scan
+    dependsOn: app_config_keys
+    variables:
+      USE_FORTIFY: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_FORTIFY'] ]
+      USE_CONVISO: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_CONVISO'] ]
+      SKIP_SECURITY_GATE: $[ dependencies.app_config_keys.outputs['evaluate_flags.SKIP_SECURITY_GATE'] ]
+    condition: and(
+                    succeeded(),
+                    and(
+                      eq(variables.USE_FORTIFY, 'true'),
+                      eq(variables.flowIsToReview, true),
+                      not(startsWith(variables['Build.SourceBranch'], 'refs/tags/'))
+                    )
+                  )
+    displayName: "Fortify Scan"
+    steps:
+    - template: /tech_products/ecmc/adbb-aem/provisioners/aem/tasks/define_app_version.yml
+    - template: /security/run_fortify_scan.yml
+      parameters:
+        fortifyExclusionRepository: ${{ parameters.fortifyExclusionRepository }}
+        appVersion: $(FORTIFY_APP_VERSION)
+    - template: /tech_products/ecmc/core-pipelines/tasks/telemetry/telemetry.yml
+

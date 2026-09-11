@@ -1,0 +1,73 @@
+parameters:
+- name: namespaceToDeploy
+  type: string
+  default: 'dev1'
+
+stages:
+- stage: Helm
+  displayName: "Helm and push to argoCd"
+  pool:
+    name: $(PRIVATE_AGENT_DEFAULT)
+    # demands: Agent.Version -gtVersion 2.210.1
+
+  jobs:
+    - job: "start_helm"
+      workspace:
+        clean: all
+      displayName: "Download Helm and Push to ArgoCD"
+      steps:
+      - checkout: self
+        persistCredentials: true
+        fetchDepth: 1
+        displayName: "Checkout project"
+        clean: true
+
+      - checkout: ArgoCd
+        persistCredentials: true
+        fetchDepth: 0
+        displayName: "Checkout ArgoCD"
+        clean: true
+
+      - task: DownloadPipelineArtifact@2
+        displayName: Download version file temp
+        condition: succeeded()
+        inputs:
+          buildType: current
+          artifactName: version-temp
+          targetPath: $(Build.SourcesDirectory)/$(Build.Repository.Name)
+          itemPattern: '**'
+
+      - bash: |
+          cd $(Build.SourcesDirectory)/$(Build.Repository.Name)
+
+
+          echo "Download Helm Chart"
+          rm -rf infra-helm-vivo-hybris-1.0.26.tgz
+          wget --user=jenkins-ecom --password="${JKS_PASS}" '$(NEXUS_REPOSITORY_URL)/$(HELM_CHART_NAME)-$(CHART_VERSION).tgz'
+          tar -xvf "$(HELM_CHART_NAME)-$(CHART_VERSION).tgz"
+
+          pwd
+          ls -la
+          NEW_VERSION=$(cat VERSION-TEMP.txt)
+          echo "$environment"
+          echo "${{ parameters.namespaceToDeploy }}"
+          echo "passou do qa_environment"F
+          ls -la ../argocd/$environment
+          for scopes in backoffice cronjob hac webservices; do
+            if helm template $scopes infra-helm-vivo-hybris --namespace $environment --set namespace=$environment -f deploy/istio/$environment/$scopes-values.yaml --set image.tag=$SET_VERSION > $scopes.yaml --set image.tag=$NEW_VERSION > $scopes.yaml; then
+                echo "Template gerado com sucesso para $environment!!"
+                mv $scopes.yaml ../argocd/$environment
+                cd ../argocd/$environment
+                git checkout master
+                git add $scopes.yaml && git commit -m "Nova versão do $scopes no namespace $environment" && git push origin master --force
+                cd ../../src-lojaonline-vivo-hybris
+            else
+              echo "##[error]Falha ao gerar template para $scopes ou ao fazer commit no argocd"
+              exit 1
+            fi
+          done
+          rm -rf argocd
+        displayName: 'Download Helm Chart and push to ArgoCd'
+        env:
+          environment: ${{ parameters.namespaceToDeploy }}
+          JKS_PASS: $(JKS_PASS)

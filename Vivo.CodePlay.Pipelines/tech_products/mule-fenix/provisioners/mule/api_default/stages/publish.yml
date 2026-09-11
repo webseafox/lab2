@@ -1,0 +1,85 @@
+stages:
+- stage: publish
+  displayName: "Publish"
+  dependsOn: [ pipeline_init, build_test, quality_gates, security ]
+  condition: and(not(failed()), not(canceled()), eq(variables['isBumpingVersion'], true), eq(variables['SKIP_LEGACY_PIPELINE'], 'false'))
+  variables:
+    NEW_VERSION: $[ stageDependencies.pipeline_init.get_new_version.outputs['versioning.NEW_VERSION'] ]
+    ANYPOINT_ENVIRONMENT_IN_APPLICATION_NAME: $[ stageDependencies.pipeline_init.get_env_config.outputs['env_configuration.ANYPOINT_ENVIRONMENT_IN_APPLICATION_NAME'] ]
+    ARTIFACT_ID: $[ stageDependencies.pipeline_init.prepare_pipeline.outputs['pom_reference.ARTIFACT_ID'] ]
+  pool:
+    name: $(PRIVATE_AGENT_DEFAULT)
+  jobs:
+  - job: update_version
+    variables:
+      UPDATE_VERSION_BRANCH_NAME: $[ replace(variables['Build.SourceBranch'], 'refs/heads/', '') ]
+    displayName: "Update version and commit"
+    steps:
+    - template: /tech_products/mule-fenix/steps/version/update_repo_version.yml
+      parameters:
+        newVersion: $(NEW_VERSION)
+        tagRepo: True
+
+  - job: publish_to_artifacts
+    dependsOn: update_version
+    displayName: "Publishing to Artifacts"
+    steps:
+    - task: DownloadPipelineArtifact@2
+      displayName: 'Getting previous stage artifact'
+      inputs:
+        buildType: current
+        artifactName: app
+        targetPath: '$(Build.ArtifactStagingDirectory)'
+
+    - template: /tech_products/mule-fenix/steps/maven/extract_from_pom.yml
+      parameters:
+        pomProperty: "project.groupId"
+        outputVariable: "GROUP_ID"
+        workingDirectory: '$(Build.ArtifactStagingDirectory)'
+        name: 'extract_group_id'
+
+    - script: |
+        preffix=""
+        if [ "$BRANCH_NAME" != "master" ]; then
+          if [[ $BRANCH_REF_NAME == refs/heads/release/* ]]; then
+            preffix="release-"
+          else
+            preffix="${ANYPOINT_ENVIRONMENT_IN_APPLICATION_NAME}-"
+          fi
+        fi
+        echo "##vso[task.setvariable variable=PREFFIX_ARTIFACT_ID;]${preffix}"
+        echo "PREFFIX_ARTIFACT_ID: ${preffix}"
+      workingDirectory: '$(Build.ArtifactStagingDirectory)'
+      displayName: 'Getting artifact id preffix'
+      env:
+        BRANCH_NAME: $(Build.SourceBranchName)
+        BRANCH_REF_NAME: $(Build.SourceBranch)
+        ANYPOINT_ENVIRONMENT_IN_APPLICATION_NAME: $(ANYPOINT_ENVIRONMENT_IN_APPLICATION_NAME)
+
+    - template: /tech_products/mule-fenix/steps/maven/extract_from_pom.yml
+      parameters:
+        pomProperty: "project.packaging"
+        outputVariable: "PACKAGING"
+        workingDirectory: '$(Build.ArtifactStagingDirectory)'
+        name: 'extract_packaging'
+
+    - task: DownloadSecureFile@1
+      displayName: 'Getting settings file'
+      name: muleSettings
+      inputs:
+        secureFile: $(MULE_SETTINGS_FILE)
+
+    - task: Maven@4
+      displayName: 'Deploying file with maven'
+      inputs:
+        mavenPOMFile: '$(Build.ArtifactStagingDirectory)/pom.xml'
+        goals: 'deploy:deploy-file'
+        options: '-Durl=$(AZURE_ARTIFACTS_MAVEN_FEED_URL)
+          -DrepositoryId=$(AZURE_ARTIFACTS_ORGANIZATION)
+          -Dfile=$(Build.ArtifactStagingDirectory)/target/$(ARTIFACT_ID)-$(NEW_VERSION)-mule-application.jar
+          -DgroupId=$(extract_group_id.GROUP_ID)
+          -DartifactId=$(PREFFIX_ARTIFACT_ID)$(ARTIFACT_ID)
+          -Dversion=$(NEW_VERSION)
+          -Dpackaging=$(extract_packaging.PACKAGING).jar'
+      env:
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken)

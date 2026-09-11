@@ -1,0 +1,231 @@
+parameters:
+- name: agent_pool
+  type: object
+  default: GeneralPurposeLinuxAgentsCI
+- name: useMysql
+  type: boolean
+  default: false
+- name: envs
+  type: object
+  default: {}
+
+jobs:
+- job: tests
+  pool: ${{ parameters.agent_pool }}
+  ${{ if eq(parameters.useMysql, true) }}:
+    container:
+      image: acrsharedservices01.azurecr.io/base/dvps/node/22/runtime:jq
+      options: --user root
+      endpoint: ACR-DEVOPS
+  condition: and(succeeded(), or(eq(variables['EXECUTE_TESTS'], 'true'), eq(variables['EXECUTE_LINT'], 'true'), eq(variables['EXECUTE_E2E_TESTS'], 'true')))
+  workspace:
+    clean: all
+  variables:
+    CI: 'true'
+  ${{ if eq(parameters.useMysql, true) }}:
+    services:
+        mysql:
+          image: mysql:8.0
+          env:
+            MYSQL_ROOT_PASSWORD: secret
+            MYSQL_DATABASE: $(DB_NAME)
+            MYSQL_USER: default
+            MYSQL_PASSWORD: secret
+  steps:
+  # - task: DownloadBuildArtifacts@1
+  #   displayName: 'Download Build Artifacts'
+  #   inputs:
+  #     artifactName: node_modules
+  #     cleanDestinationFolder: false
+  #     extractTars: true
+  #     parallelizationLimit: 8
+  #     downloadPath: $(Build.SourcesDirectory)
+      
+  # - script: |
+  #     unzip -q 'extracted_tars/node_modules/node_modules.zip'
+  #     rm 'extracted_tars/node_modules/node_modules.zip'
+  #   displayName: 'Unzip with symlinks'
+  - task: 6d15af64-176c-496d-b583-fd2ae21d4df4@1
+    displayName: Checkout Code
+    name: checkout_code 
+    inputs:
+      repository: self
+      persistCredentials: "true"
+      clean: true
+
+  - ${{ if or(eq( parameters.envs.NPMRC_AUTH, 'true'), eq( parameters.envs.NPMRC_AUTH, 'True'), eq( parameters.envs.NPMRC_AUTH, true)) }}:
+    - task: DownloadSecureFile@1
+      name: CustomSettings
+      displayName: 'Download custom npmrc from secure file'
+      inputs:
+        secureFile: npmrc
+
+    - script: |
+        echo "##vso[task.setvariable variable=DEFAULT_NPMRC_TEMP_FILE_PATH]$(CustomSettings.secureFilePath)"
+        cp $(CustomSettings.secureFilePath) .npmrc
+      displayName: Set DEFAULT_NPMRC_TEMP_FILE_PATH Var
+
+  - task: Cache@2
+    continueOnError: true
+    condition: eq(variables['CACHE_APP_DEPENDENCIES'], 'true')
+    inputs:
+      key: "node | $(Agent.OS) | **/package-lock.json, **/npm-shrinkwrap.json, **/package.json"
+      path: "$(Build.SourcesDirectory)/node_modules"
+      restoreKeys: |
+        node | $(Agent.OS)
+        node
+
+  - ${{ if ne(parameters.useMysql, true) }}:
+    - template: /tech_products/azr4/templates/steps/set_nodejs_version.yaml
+      parameters:
+        NODE_VERSION: $(NODE_VERSION)
+
+  - task: EnsureFile@4
+    displayName: 'Ensure .npmrc'
+    inputs:
+      fileName: '.npmrc'
+      createIfNotExist: true
+      defaultContent: |
+        registry=https://pkgs.dev.azure.com/telefonica-vivo-brasil/_packaging/DevOps/npm/registry/
+        always-auth=true  
+
+  - task: npmAuthenticate@0
+    displayName: Npm Artifacts Authentication
+    inputs:
+      workingFile: ".npmrc"
+
+  - script: |
+      echo "##[command] npm install $(NPM_INSTALL_ARGS)"
+      npm install ${NPM_INSTALL_ARGS}
+    displayName: 'Install Dependencies'
+    env: 
+      NPM_INSTALL_ARGS: $(NPM_INSTALL_ARGS)
+
+  - script: |
+      BRANCH_NAME=$(echo ${BUILD_SOURCEBRANCH} | sed 's/refs\/heads\///')
+      npm run lint -- --fix
+      git config user.email "azuredevops@telefonica.com"
+      git config user.name "Azure DevOps"
+      git add .
+
+      git commit -m "[CI SKIP] style: Format lint"
+      
+      git push origin HEAD:${BRANCH_NAME}
+      echo "Branch Name: ${BRANCH_NAME}"
+
+    displayName: 'Run Linter'
+    condition: eq(variables['EXECUTE_LINT'], 'true')
+
+  - script: |
+      set -e  # Ensure the script exits immediately if any command fails
+      npm run test
+      if [ ! -d "coverage" ]; then
+        echo "[warning] No coverage folder found"
+        echo "[warning] Consider skipping this step: EXECUTE_TESTS: false"
+        echo "[warning] Mocking coverage report"
+        mkdir -p coverage
+      fi
+    displayName: 'Run Tests'
+    condition: eq(variables['EXECUTE_TESTS'], 'true')
+
+  # Publish Unit Test Coverage
+  - task: PublishCodeCoverageResults@1
+    inputs:
+      codeCoverageTool: 'Cobertura' # Compatible with lcov.info
+      summaryFileLocation: '$(System.DefaultWorkingDirectory)/reports/unit/lcov.info'
+      reportDirectory: '$(System.DefaultWorkingDirectory)/reports/unit'
+    condition: and(succeeded(), eq(variables['EXECUTE_TESTS'], 'true'))
+
+  - script: |
+      COVERAGE_FILE="$(System.DefaultWorkingDirectory)/reports/unit/coverage-summary.json"
+
+      echo "Coverage JSON file path: $COVERAGE_FILE"
+
+      # Check if jq is installed
+        echo $PATH
+        if ! command -v jq &> /dev/null; then
+          echo "##vso[task.logissue type=error;]jq command not found. Please install jq."
+          echo "##vso[task.complete result=SucceededWithIssues;]Task completed with warnings."
+          exit 0
+        fi
+
+      # Segue normal...
+      if [[ ! -f "$COVERAGE_FILE" ]]; then
+        echo "##vso[task.logissue type=warning;]Coverage summary file not found at $COVERAGE_FILE"
+        echo "##vso[task.complete result=SucceededWithIssues;]Task completed with warnings."
+        exit 0
+      fi
+
+      STATEMENTS=$(jq '.total.statements.pct' "$COVERAGE_FILE")
+      BRANCHES=$(jq '.total.branches.pct' "$COVERAGE_FILE")
+      FUNCTIONS=$(jq '.total.functions.pct' "$COVERAGE_FILE")
+      LINES=$(jq '.total.lines.pct' "$COVERAGE_FILE")
+
+      THRESHOLD=80
+
+      echo "Statements Coverage: ${STATEMENTS}%"
+      echo "Branches Coverage: ${BRANCHES}%"
+      echo "Functions Coverage: ${FUNCTIONS}%"
+      echo "Lines Coverage: ${LINES}%"
+
+      if [[ -z "$STATEMENTS" || -z "$BRANCHES" || -z "$FUNCTIONS" || -z "$LINES" ]]; then
+        echo "##vso[task.logissue type=error;]Failed to extract coverage metrics from the JSON report. Ensure the file exists and is valid JSON."
+        echo "##vso[task.complete result=SucceededWithIssues;]Task completed with warnings."
+        exit 0
+      fi
+
+      WARNING=0
+
+      if (( $(echo "$STATEMENTS < $THRESHOLD" | bc -l) )); then
+        echo "##vso[task.logissue type=warning;]Statements coverage ($STATEMENTS%) is below the threshold of $THRESHOLD%."
+        WARNING=1
+      fi
+
+      if (( $(echo "$BRANCHES < $THRESHOLD" | bc -l) )); then
+        echo "##vso[task.logissue type=warning;]Branches coverage ($BRANCHES%) is below the threshold of $THRESHOLD%."
+        WARNING=1
+      fi
+
+      if (( $(echo "$FUNCTIONS < $THRESHOLD" | bc -l) )); then
+        echo "##vso[task.logissue type=warning;]Functions coverage ($FUNCTIONS%) is below the threshold of $THRESHOLD%."
+        WARNING=1
+      fi
+
+      if (( $(echo "$LINES < $THRESHOLD" | bc -l) )); then
+        echo "##vso[task.logissue type=warning;]Lines coverage ($LINES%) is below the threshold of $THRESHOLD%."
+        WARNING=1
+      fi
+
+      if [[ "$WARNING" == "1" ]]; then
+        echo "##vso[task.complete result=SucceededWithIssues;]Task completed with warnings."
+      else
+        echo "Task completed successfully with no warnings."
+      fi
+
+      exit 0
+    displayName: 'Check Code Coverage Threshold'
+
+
+
+  # Ensure Cypress binary is installed if E2E tests are running
+  - script: npx cypress install
+    displayName: "Ensure Cypress is Installed"
+    condition: eq(variables['EXECUTE_E2E_TESTS'], 'true')
+
+  - script: npm run e2e:headless
+    displayName: "Run Cypress E2E Tests"
+    condition: and(succeeded(), eq(variables['EXECUTE_E2E_TESTS'], 'true'))
+
+  - task: PublishTestResults@2
+    inputs:
+      testResultsFiles: '**/test-*.xml'
+      searchFolder: '$(System.DefaultWorkingDirectory)'
+      mergeTestResults: true
+      testRunTitle: 'Cypress Test Results'
+    condition: and(succeeded(), eq(variables['EXECUTE_E2E_TESTS'], 'true'))
+    displayName: 'Publish Cypress Test Results'
+
+  - task: PublishBuildArtifacts@1
+    inputs:
+      pathToPublish: '$(Build.SourcesDirectory)/$(DROP_SUBPATH)'
+      artifactName: drop

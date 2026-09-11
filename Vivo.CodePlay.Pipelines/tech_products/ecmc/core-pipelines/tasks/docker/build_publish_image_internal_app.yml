@@ -1,0 +1,62 @@
+parameters:
+- name: appName
+  type: string
+- name: dockerImageName
+  type: string
+- name: dockerImageTag
+  type: string
+- name: appVersion
+  type: string
+
+steps:
+# ==================================================================
+# [Compliance] Verifica se o repositório está em conformidade com as políticas de configuração
+# ==================================================================
+- task: VivoDevOpsConfigCompliance@1
+  displayName: 'Check DevOps Config Compliance'
+  inputs:
+    workDir: $(DEFAULT_WORKDIR_ARTIFACTS)
+    policySets: |
+      image-definition-files
+
+- task: Docker@2
+  displayName: Docker Build
+  inputs:
+    containerRegistry: $(DOCKER_DEFAULT_REGISTRY_SERVICE_CONNECTION_NAME)
+    command: build
+    repository: '${{ parameters.dockerImageName}}'
+    Dockerfile: "$(DEFAULT_WORKDIR_ARTIFACTS)/.azuredevops/runtime.Dockerfile"
+    buildContext: "$(DEFAULT_WORKDIR_ARTIFACTS)"
+    arguments: '--no-cache --build-arg APPLICATION_NAME=${{ parameters.appName }} --build-arg APPLICATION_PATH=target --build-arg APP_VERSION=${{ parameters.appVersion }} --build-arg ARTIFACT_EXTENSION_FILE=jar --build-arg HTTP_PROXY="$(PROXY_AGENT_HTTP)" --build-arg HTTPS_PROXY="$(PROXY_AGENT_HTTPS)" --build-arg NO_PROXY="$(PROXY_AGENT_NO_PROXY)"'
+    tags: |
+      ${{ parameters.dockerImageTag }}
+
+- task: Docker@2
+  displayName: Docker Push
+  name: dockerPushImage
+  condition: and(succeeded(), eq(variables.flowIsPullRequest, false))
+  inputs:
+    containerRegistry: $(DOCKER_DEFAULT_REGISTRY_SERVICE_CONNECTION_NAME)
+    command: push
+    repository: "${{ parameters.dockerImageName }}"
+    addPipelineData: true
+    addBaseImageData: true
+    tags: |
+      ${{ parameters.dockerImageTag }}
+  continueOnError: false
+
+- bash: |
+    DOCKER_DIGEST="$(cat ${DOCKER_OUTPUT} | grep "digest" | awk -F ' ' '{print $3}')"
+    echo "##[debug] DOCKER_DIGEST..........: ${DOCKER_DIGEST}"
+    echo "##vso[task.setvariable variable=DOCKER_DIGEST;isOutput=true]${DOCKER_DIGEST}"
+    if [ -z "${DOCKER_DIGEST}" ]; then
+      echo "##[error]Erro ao obter o digest da imagem Docker. Verifique os logs acima."
+      exit 1
+    fi
+  condition: and(succeeded(), eq(variables.flowIsPullRequest, false))
+  displayName: Export Image Digest
+  name: docker_digest
+  env:
+    DOCKER_OUTPUT: $(dockerPushImage.DockerOutput)
+  continueOnError: false
+

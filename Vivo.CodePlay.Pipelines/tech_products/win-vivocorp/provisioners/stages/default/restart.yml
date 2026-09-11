@@ -1,0 +1,60 @@
+parameters:
+- name: environment 
+  type: string
+
+stages:
+- stage: restart
+  dependsOn: 
+  - upload_files
+  - import_files
+  condition: succeeded()
+  displayName: "Restart Server"
+  pool: $(PollVivoCorpSiebelAgents)
+  jobs:
+  - job: put_files
+    displayName: "Restart server"
+    condition: and(eq(stageDependencies.import_files.import_files.outputs['checkSifFiles.sif_found'], 'true'), eq(stageDependencies.import_files.import_files.outputs['checkNonWorkflowSif.non_workflow_sif_found'], 'true'))
+    steps:
+      - checkout: none  
+      - task: CmdLine@2
+        displayName: "Run Stop Script"
+        inputs:
+          script: |
+            ssh -o StrictHostKeyChecking=no -i "$(SIEBEL_PRIVATE_KEY)" $(host) $(devopsStopScriptName)
+            exit
+
+      - ${{ if eq(parameters.environment, 'dev1') }}:
+        - task: CmdLine@2
+          displayName: Run Rename Script for $(environmentNameUpperCase)
+          inputs:
+            script: |
+              ssh -o StrictHostKeyChecking=no -i "$(SIEBEL_PRIVATE_KEY)" $(host) $(renameScriptName)
+              exit
+
+      - ${{ if or(eq(parameters.environment, 'qa1'), eq(parameters.environment, 'qa2'), eq(parameters.environment, 'pp'), eq(parameters.environment, 'ppl'), eq(parameters.environment, 'prod_new')) }}:
+
+        - task: CmdLine@2
+          displayName: Run Rename Script for $(environmentNameUpperCase)
+          inputs:
+            script: |
+              ssh -o StrictHostKeyChecking=no -i "$(SIEBEL_PRIVATE_KEY)" $(host) $(renameScriptName)
+              ssh -o StrictHostKeyChecking=no -i "$(SIEBEL_PRIVATE_KEY)" $(host) "chmod 755 /opt/web/siebel/siebel811/siebsrvr/objects/ptb/siebel_sia.srf"
+              exit
+
+      - task: CmdLine@2
+        displayName: Run Start Script for $(environmentNameUpperCase)
+        inputs:
+          script: |
+            ssh -o StrictHostKeyChecking=no -i "$(SIEBEL_PRIVATE_KEY)"  $(host) "$(devopsStartScriptName)"
+            exit
+  - job: SkipRestart
+    displayName: "Skip Restart - No New Objects Found"
+    condition: ne(stageDependencies.import_files.import_files.outputs['checkNonWorkflowSif.non_workflow_sif_found'], 'true')
+    steps:
+    - checkout: none
+    - task: CmdLine@2
+      displayName: "Skip Restart"
+      inputs:
+        script: |
+          echo No new objects found. Skipping restart.
+          echo No new objects found. Skipping restart. > C:\Siebel_Devops\log\Restart_$(environmentNameUpperCase)_Skip.log

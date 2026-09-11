@@ -1,0 +1,96 @@
+parameters:
+  - name: fortifyExclusionRepository 
+
+stages:
+  - stage: stage_security_analysis
+    displayName: "Security Analysis"
+    pool: $(POOL)
+    dependsOn: 
+    - stage_prep
+    - stage_download
+    - stage_process
+    condition: |
+      and(
+        in(dependencies.stage_prep.result, 'Succeeded', 'SucceededWithIssues'), 
+        in(dependencies.stage_download.result, 'Succeeded', 'Skipped'),
+        eq(dependencies.stage_process.result, 'Succeeded')
+      )
+    jobs:
+      - job: app_config_keys
+        displayName: "Get AppSec Config Keys"
+        steps:
+        - checkout: none
+        - template: /tasks/bash/welcome.yml@CorePipelines
+        - template: /task_groups/security/get_appconfig_keys.yml@CorePipelines
+
+      - job: get_tar_files
+        displayName: "Get .tar Files"
+        steps:
+          - checkout: none
+          - template: ../../../task_groups/artifact/download.yml
+            parameters:
+              displayName: Download Pipeline Artifact [$(TAR_IMAGES_FOLDER)]
+              artifactName: "$(TAR_IMAGES_FOLDER)"
+              targetPath: "$(TAR_IMAGES_FOLDER_PATH)"
+          - script: |
+              echo "##[debug] Getting TAR files from previous stage..."
+              
+              ATF=""
+              MATRIX_JSON="{"
+              first=1
+              while IFS= read -r tar_file || [[ -n "$tar_file" ]]; do
+                tar_file_name=$(basename "$tar_file")
+                tar_key="${tar_file_name%%.*}"
+                
+                echo ">>>>> $tar_file_name"
+                
+                if [ $first -eq 0 ]; then
+                  MATRIX_JSON+=","  # separador
+                fi
+                MATRIX_JSON+="\"$tar_key\": { \"tarFile\": \"$tar_file_name\" }"
+                first=0
+                if [ "${#ATF}" -gt 0 ]; then
+                  ATF+=",$tar_file_name"
+                else
+                  ATF+="$tar_file_name"
+                fi
+              done <<< "$(ALL_TAR_FILES=$(find $(TAR_IMAGES_FOLDER_PATH) -name "*.tar" -o -name "*.tar.gz" 2>/dev/null) && echo "$ALL_TAR_FILES")"
+              MATRIX_JSON+="}"
+              
+              echo "##[debug] ALL TAR FILES: $ATF"
+
+              echo "##vso[task.setvariable variable=TAR_IMAGES_LIST]$ATF"
+              echo "##vso[task.setvariable variable=tarMatrix;isOutput=true]$MATRIX_JSON"
+            name: get_tar_list
+            displayName: "Get .tar/.tar.gz Files List"
+
+      - job: sca_scan
+        displayName: "SCA Scan"
+        dependsOn: 
+          - app_config_keys
+          - get_tar_files
+        variables:
+          USE_DEPENDENCY_TRACK: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_DEPENDENCY_TRACK'] ]
+          USE_DT_DOCKER: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_DT_DOCKER'] ]
+          USE_CONVISO: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_CONVISO'] ]
+          SKIP_SECURITY_GATE_SCA: $[ dependencies.app_config_keys.outputs['evaluate_flags.SKIP_SECURITY_GATE_SCA'] ]
+        condition: |
+          and(
+            succeeded(),
+            eq(variables.USE_DEPENDENCY_TRACK, true),
+            eq(variables.USE_DT_DOCKER, true)
+          )
+        strategy:
+          maxParallel: 10
+          matrix: $[ dependencies.get_tar_files.outputs['get_tar_list.tarMatrix'] ]
+        steps:
+          - checkout: none
+          - template: ../../../task_groups/artifact/download.yml
+            parameters:
+              displayName: Download Pipeline Artifact [$(TAR_IMAGES_FOLDER)]
+              artifactName: "$(TAR_IMAGES_FOLDER)"
+              targetPath: "$(TAR_IMAGES_FOLDER_PATH)"
+              itemPattern: "$(tarFile)"
+          - template: ../../../task_groups/security/sca_scan_docker.yml
+            parameters:
+              tarFile: "$(TAR_IMAGES_FOLDER_PATH)/$(tarFile)"

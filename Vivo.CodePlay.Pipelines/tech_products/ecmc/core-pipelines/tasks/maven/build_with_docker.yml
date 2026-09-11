@@ -1,0 +1,147 @@
+parameters:
+  - name: mavenSettingsLocation
+    type: string
+    default: $(DEFAULT_MAVEN_SETTINGS)
+  - name: mavenMaxMemoryBuild
+    type: string
+    default: $(DEFAULT_MAX_MEMORY_BUILD)
+  - name: dockerWorkDir
+    type: string
+    default: $(DOCKER_WORKDIR)
+  - name: appDependenciesCachePath
+    type: string
+    default: ""
+  - name: appDependenciesCacheFolder
+    type: string
+    default: ""
+
+steps:
+- task: AzureKeyVault@2  
+  displayName: 'Getting AKV credentials'
+  timeoutInMinutes: 1
+  retryCountOnTaskFailure: 5  
+  inputs:    
+    azureSubscription: DevOpsSharedResources    
+    KeyVaultName: $(AKV_DEVOPS_NAME)
+    SecretsFilter: 'NEXUS-DEPS-USR, NEXUS-DEPS-PSW'
+
+- bash: |
+    echo "Debug: Diretorio atual: $(pwd)"
+    echo "Debug: MAVEN_SETTINGS_LOCATION: ${{ parameters.mavenSettingsLocation }}"
+    echo "Debug: MAVEN_CACHE_FOLDER: $(MAVEN_CACHE_FOLDER)"
+
+    echo
+    echo "Debug: HOME/.m2"
+    ls -lah $HOME/.m2 || true
+
+    echo
+    echo "Debug: settings externo"
+    cat ${{ parameters.mavenSettingsLocation }} || true
+
+    echo
+    echo "##[debug] mavenSettingsLocation..................: ${{ parameters.mavenSettingsLocation }}"
+    echo "##[debug] MAVEN_CACHE_FOLDER.....................: $(MAVEN_CACHE_FOLDER)"
+
+    echo "Setando Java: $(JAVA_VERSION_PUBLISH_MVN)"
+
+    asdf local java $(JAVA_VERSION_PUBLISH_MVN)
+
+    . ~/.asdf/asdf.sh || true
+
+    export JAVA_HOME="$(asdf where java $(JAVA_VERSION_PUBLISH_MVN))"
+    export PATH="$JAVA_HOME/bin:$PATH"
+
+    echo "JAVA_HOME=$JAVA_HOME"
+    which java
+    which javac
+    java -version
+    javac -version
+    mvn -version
+
+    echo
+    echo "########################################################"
+    echo "#### DEBUG - JAVA / MAVEN"
+    echo "########################################################"
+    echo "JAVA_VERSION_PUBLISH_MVN: $(JAVA_VERSION_PUBLISH_MVN)"
+    java -version || true
+    mvn -version || true
+
+    echo
+    echo "########################################################"
+    echo "#### DEBUG - SETTINGS.XML"
+    echo "########################################################"
+    ls -lah $(dirname "${{ parameters.mavenSettingsLocation }}") || true
+    cat ${{ parameters.mavenSettingsLocation }}
+
+    echo
+    echo "########################################################"
+    echo "#### VALIDACAO SETTINGS.XML"
+    echo "########################################################"
+    head -5 ${{ parameters.mavenSettingsLocation }}
+
+    if ! grep -q "<settings" "${{ parameters.mavenSettingsLocation }}"; then
+      echo "ERRO: settings.xml não contém tag <settings>"
+      exit 1
+    fi
+
+    echo
+    echo "########################################################"
+    echo "#### DEBUG - REPOSITORIES NO SETTINGS"
+    echo "########################################################"
+    grep -i -A 5 -B 5 repository ${{ parameters.mavenSettingsLocation }} || true
+    grep -i -A 5 -B 5 mirror ${{ parameters.mavenSettingsLocation }} || true
+    grep -i -A 5 -B 5 profile ${{ parameters.mavenSettingsLocation }} || true
+
+    echo
+    echo "########################################################"
+    echo "#### DEBUG - ACTIVE PROFILES"
+    echo "########################################################"
+    mvn help:active-profiles \
+      -s ${{ parameters.mavenSettingsLocation }}
+
+    echo
+    echo "########################################################"
+    echo "#### DEBUG - EFFECTIVE SETTINGS"
+    echo "########################################################"
+    mvn help:effective-settings \
+      -s ${{ parameters.mavenSettingsLocation }} \
+      -DshowPasswords=false
+
+    echo
+    echo "########################################################"
+    echo "#### DEBUG - EFFECTIVE POM"
+    echo "########################################################"
+    mvn help:effective-pom \
+      -s ${{ parameters.mavenSettingsLocation }} \
+      -Doutput=/tmp/effective-pom.xml || true
+
+    head -200 /tmp/effective-pom.xml || true
+
+    echo
+    echo "########################################################"
+    echo "#### DEBUG - TESTE RESOLUCAO DEPENDENCIAS"
+    echo "########################################################"
+    mvn dependency:tree \
+      -U \
+      -X \
+      -s ${{ parameters.mavenSettingsLocation }} \
+      -Dmaven.repo.local=$(MAVEN_CACHE_FOLDER) || true
+
+
+    echo
+    echo "########################################################"
+    echo "#### BUILD"
+    echo "########################################################"
+    mvn clean install test \
+      -U \
+      -X \
+      -Dmaven.test.failure.ignore=false \
+      -s ${{ parameters.mavenSettingsLocation }} \
+      -Dmaven.repo.local=$(MAVEN_CACHE_FOLDER)
+  displayName: Build & Test & Coverage
+  env:
+    SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+    NEXUS_DEPS_USR: $(NEXUS-DEPS-USR)
+    NEXUS_DEPS_PSW: $(NEXUS-DEPS-PSW)
+    MAVEN_CACHE_FOLDER: $HOME/.m2/repository
+    JAVA_VERSION_PUBLISH_MVN: $(JAVA_VERSION_PUBLISH_MVN)

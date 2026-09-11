@@ -1,0 +1,331 @@
+stages:
+- stage: ci_publish
+  displayName: "CI - Publish"
+  pool:
+    name: $(AGENT_POOL_CI)
+  dependsOn:
+  - environment_init
+  - ci_build
+  - ci_security
+  condition: and(
+    succeeded(),
+    or(
+      eq(variables['Build.SourceBranchName'],'master'),
+      eq(variables['Build.SourceBranchName'],'main'),
+      eq(variables['Build.SourceBranchName'],'dev'),      
+      startsWith(variables['Build.SourceBranchName'],'hotfix'),
+      and(
+        eq(dependencies.environment_init.outputs['environment.multibranch_exclusions.ALLOW_MULTIBRANCH'], 'true'),
+        or(
+          eq(variables['Build.SourceBranchName'],'prodlike'),
+          eq(variables['Build.SourceBranchName'],'preprod'),
+          eq(variables['Build.SourceBranchName'],'esteira1'),
+          eq(variables['Build.SourceBranchName'],'esteira2')
+        )
+      )
+    ))
+
+  ## -> Loads variables from other stages.
+  variables:
+  - name: NEXUS_DEPS_USR
+    value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEPS_USR'] ]
+  - name: NEXUS_DEPS_PSW
+    value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEPS_PSW'] ]
+  - name: NEXUS_DEFAULT_USR
+    value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEFAULT_USR'] ]
+  - name: NEXUS_DEFAULT_PSW
+    value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEFAULT_PSW'] ]
+  - name: SAST_STATUS
+    value: $[ stageDependencies.ci_security.sast_scan.outputs['job_status.SAST_STATUS'] ]
+  - name: SCA_STATUS
+    value: $[ stageDependencies.ci_security.sca_scan.outputs['job_status.SCA_STATUS'] ]
+  - name: SONARQUBE_STATUS
+    value: $[ stageDependencies.ci_quality_gate.sonarqube.outputs['job_status.SONARQUBE_STATUS'] ]
+  - name: GOVERNANCE_STATUS
+    value: $[ stageDependencies.ci_quality_gate.governance.outputs['job_status.GOVERNANCE_STATUS'] ]
+
+  - template: /tech_products/oss/initialize/variables_source_data.yml
+
+  jobs:
+
+  - job: publish
+    displayName: "Publish"
+
+    steps:
+
+    ## -> Download Artifacts
+    - download: none
+
+    ## -> Check if previous Gates stages were not failed as there is bug in AzDo that bypasses the condition
+    ## -> and the pipeline continues to the next stage.
+    ## -> This is a workaround to avoid the pipeline to continue if the gates failed.
+    - task: Bash@3
+      displayName: Gates Verification
+      condition: and(succeeded(),
+        or(
+          eq(variables.SAST_STATUS, 'Failed'),
+          eq(variables.SCA_STATUS, 'Failed'),
+          eq(variables.SONARQUBE_STATUS, 'Failed'),
+          eq(variables.GOVERNANCE_STATUS, 'Failed')))
+      inputs:
+        targetType: inline
+        script: |
+
+          echo "##[debug] SAST_STATUS       : ${SAST_STATUS:-Skipped}"
+          echo "##[debug] SCA_STATUS        : ${SCA_STATUS:-Skipped}"
+          echo "##[debug] SONARQUBE_STATUS  : ${SONARQUBE_STATUS:-Skipped}"
+          echo "##[debug] GOVERNANCE_STATUS : ${GOVERNANCE_STATUS:-Skipped}"
+
+          echo "##[error] Security or quality gate check(s) failed."
+          echo "##[error] Publication cannot proceed until all gates checks pass. Please address the issues reported in the respective scan results."
+          exit 1
+
+    ## -> Download and uncompress the downloaded artifact.
+    ## -> 30f35852-3f7e-4c0c-9a88-e127b4f97211 is the decorator for download artifact.
+    - task: DownloadBuildArtifacts@1
+      displayName: 'Download Build Artifacts'
+      inputs:
+        artifactName: $(ARTIFACT_NAME)
+        cleanDestinationFolder: false
+        extractTars: true
+        parallelizationLimit: 8
+        downloadPath: $(System.ArtifactsDirectory)
+
+    ## -> Publish Artifact to NEXUS.
+    ## -> Only allowed for the specified branches below. Other branches must skip this task.
+    ## -> Using npm to push to nexus.
+    - task: Bash@3
+      displayName: Publish to Nexus
+      condition: succeeded()
+      inputs:
+        workingDirectory: $(DEFAULT_WORKDIR_ARTIFACTS)/$(ARTIFACT_NAME)
+        targetType: inline
+        script: |
+
+          #registry=$(jq -r '.publishConfig.registry' package.json)
+          nexusRepositoryURL=$(NEXUS_REPOSITORY_URL)
+
+          echo "##[debug] Getting the publishing repository from .npmrc file..."
+
+          ## -> Extract the repository from .npmrc and remove the last slash and the repository name.
+          repository=$(grep ":registry=" .npmrc | sed -n "s|.*$nexusRepositoryURL/\([^/]*\)/.*|\1|p")
+          echo "##vso[task.setvariable variable=REPOSITORY]$repository"
+
+          echo "##[debug] Publishing to Repository: $repository"
+          echo "##[debug] Default URL: $nexusRepositoryURL"
+
+          if command -v tree >/dev/null 2>&1; then
+            echo "##[group] Path tree"
+            echo "$(tree)"
+            echo "##[endgroup]"
+          fi
+
+          echo "##[debug] Extracted tar path: $(pwd)"
+          echo "##[group] Extracted tar content"
+          echo "$(ls -lh)"
+          echo "##[endgroup]"
+
+          targetDirectory="$(DEFAULT_WORKDIR_ARTIFACTS)/$(ARTIFACT_NAME)"
+          echo "##[debug] Target directory path: $targetDirectory"
+          echo "##[group] Target directory content"
+          echo "$(ls -lh $targetDirectory)"
+          echo "##[endgroup]"
+          echo "##vso[task.setvariable variable=TARGET_DIRECTORY]$targetDirectory"
+
+          run_npm_publish() {
+
+            echo "##[section]Publishing to Nexus $(ARTIFACT_NAME)..."
+
+            if [ -f .npmrc ]; then
+              echo "##[debug] Configuring credentials..."
+              auth_opt="email=vivo.devops.br@telefonica.com\nalways-auth=true"
+              auth=$(echo -n $(NEXUS_DEFAULT_USR):$(NEXUS_DEFAULT_PSW) | openssl base64)
+
+              # Normalize CRLF from artifact files before generating auth entries.
+              sed -i 's/\r$//' .npmrc
+              repos=$(grep -o "registry=.*" .npmrc | cut -d':' -f2 | awk -v auth="$auth" '{print $0 ":_auth=" auth}')
+              echo -e "\n$repos\n$auth_opt" >> .npmrc
+              echo "##[debug] Credentials configured!"
+
+              output=$(npm publish --verbose --access=restricted 2>&1)
+              publish_status=$?
+
+              if [ $publish_status -ne 0 ] ; then
+                echo "##[error] Error while executing curl command to push artifact to nexus."
+                echo "##[debug] $output"
+
+                ## -> Check if artifact and version is already published by error *"does not allow updating"*
+                if [[ "$output" == *"does not allow updating"*  ]]; then
+                  echo '##[error] ARTIFACT VERSION ALREADY EXISTS ON NEXUS...'
+                  echo '##vso[task.logissue type=error] The version of the artifact you are trying to publish has already been published and cannot be updated.'
+                  echo '##[error] If you want to publish a new version of the artifact, please update the package version and try again.'
+                  exit 1
+                fi
+
+                ## -> check for general errors while publishing
+                if [[ "$output" == *"npm ERR! code"*  ]]; then
+                  echo '##vso[task.logissue type=error] A problem has occured while trying to publish to nexus.'
+                  echo '##[error] Please verify the curl output for more information. Search for the error in the 'npm ERR!' lines.'
+                  exit 1
+                fi
+
+                ## -> if it doesnt find any type of the if erros exit 1
+                exit 1
+              fi
+
+              ## -> Log the result of the publish
+              echo "##[group] Npm publish output"
+              echo "$output"
+              echo "##[endgroup]"
+
+              ## -> Log the artifact URL
+              nexusRepoPath=$(echo $nexusRepositoryURL | sed 's|/repository|/#browse/browse:|' |  sed 's|/$||')
+              packageJsonName=$(DOCKER_CMD_EXTRACT_PACKAGE_JSON_NAME)
+              artPath="${packageJsonName//\//%2F}"
+
+              artifactUrl="$nexusRepoPath$repository:${artPath}"
+              echo "##vso[task.setvariable variable=ARTIFACT_URL]$artifactUrl"
+
+              echo "##[debug] See Artifact on Nexus: $artifactUrl"
+              echo "##[section]Successfully published $(ARTIFACT_NAME)"
+
+            else
+              echo '##vso[task.logissue type=error] Error while executing npm publish. The file .npmrc was not found.'
+              exit 1
+            fi
+          }
+
+          run_npm_publish
+
+    - task: Bash@3
+      displayName: Upload Publish Summary
+      continueOnError: true
+      inputs:
+        targetType: inline
+        script: |
+          upload_publish_summary() {
+            ver="$NEW_VERSION"
+            artifactUrl="$(ARTIFACT_URL)"
+            repository=$(echo "$artifactUrl" | sed -n 's|https://nexus.telefonica.com.br/#browse/browse:\(.*\):.*|\1|p')
+
+            ## -> Write the publish summary to a file
+            echo "**Published Artifact $(ARTIFACT_NAME) info:**" >> $(Build.SourcesDirectory)/publishInfo.md
+            echo "Artifact: $(ARTIFACT_NAME)" >> $(Build.SourcesDirectory)/publishInfo.md
+            echo "Version: $ver" >> $(Build.SourcesDirectory)/publishInfo.md
+            echo "Packaging: npm" >> $(Build.SourcesDirectory)/publishInfo.md
+            echo "Repository: $(REPOSITORY)" >> $(Build.SourcesDirectory)/publishInfo.md
+            echo "[See Published Artifact on Nexus]($artifactUrl)" >> $(Build.SourcesDirectory)/publishInfo.md
+            echo "" >> $(Build.SourcesDirectory)/publishInfo.md
+          }
+
+          upload_publish_summary
+
+          ## -> Upload the sumary to the pipeline dashboard
+          echo "##vso[task.addattachment type=Distributedtask.Core.Summary;name="Nexus Publish Summary";]$(Build.SourcesDirectory)/publishInfo.md"
+
+  - job: commit_version_bump
+    displayName: "Commit Version Bump"
+    dependsOn: publish
+    steps:
+
+    ## -> Clean the pipeline workspace and checkout the code.
+    ## -> 6d15af64-176c-496d-b583-fd2ae21d4df4 is the decorator for checkout.
+    - task: 6d15af64-176c-496d-b583-fd2ae21d4df4@1
+      condition: and(
+        succeeded(),
+        eq(variables.BUMP_VERSION_ENABLED, 'true'))
+      inputs:
+        repository: self
+        persistCredentials: "true"
+        clean: true
+
+    ## -> Checkout the last commit that was pushed to the repository.
+    - task: Bash@3
+      displayName: Checkout Last Commit
+      name: checkout_last_commit
+      condition: and(
+        succeeded(),
+        eq(variables.BUMP_VERSION_ENABLED, 'true'))
+      inputs:
+        targetType: inline
+        script: |
+          echo "##[debug] Checkout last commit from '$(Build.SourceBranchName)'"
+
+          git config pull.rebase true
+          git fetch -f --depth 1 origin $(Build.SourceBranchName):$(Build.SourceBranchName)
+          git checkout -f $(Build.SourceBranchName)
+
+    ## -> Bump version in code
+    - task: Bash@3
+      displayName: Update Source Version
+      condition: and(
+        succeeded(),
+        eq(variables.BUMP_VERSION_ENABLED, 'true'))
+      inputs:
+        targetType: inline
+        script: |
+
+          echo "##[debug] Pushing NEW_VERSION: $(NEW_VERSION)"
+          jq '.version="$(NEW_VERSION)"' package.json > /tmp/package.json
+          mv /tmp/package.json package.json
+
+    ## -> Push new version to git
+    - task: Bash@3
+      displayName: 'Commit Updated Version'
+      condition: and(
+        succeeded(),
+        eq(variables.BUMP_VERSION_ENABLED, 'true'))
+      inputs:
+        targetType: inline
+        script: |
+
+          ## -> Define variables
+          branchName=$(Build.SourceBranchName)
+          tagRepo=true
+
+          ## -> Set tagPushParam if tagRepo is true
+          tagPushParam=""
+          echo "##[debug] tagRepo.....: $tagRepo"
+
+          ## -> Add changes and commit
+          git add .
+          git commit -am "[CI SKIP] Project version has been updated. Released version '$(NEW_VERSION)'" --author="$BUILD_REQUESTEDFOR <$BUILD_REQUESTEDFOREMAIL>"
+
+          ## -> Tag the commit if tagRepo is true
+          if [[ "$tagRepo" == "true" ]]; then
+
+            if git rev-parse "$(NEW_VERSION)" >/dev/null 2>&1; then
+              echo "##vso[task.logissue type=warning;]Tag $(NEW_VERSION) already exists. Skipping tag creation and commit."
+            else
+              if [[ "$tagRepo" == "true" ]]; then
+                tagPushParam="--tags"
+                git tag $(NEW_VERSION)
+              fi
+            fi
+
+          fi
+
+          ## -> Show git status for debug purposes
+          git status
+
+          ## -> Attempt to push changes and tags
+          echo "##[command] git push origin $tagPushParam $branchName"
+          git push origin $tagPushParam $branchName
+
+          ## -> Check if git push succeeded
+          if [ $? -ne 0 ]; then
+            echo "##vso[task.logissue type=error;] Git push failed. Permission denied."
+            echo "##vso[task.complete result=Failed;]"
+            exit 1
+          fi
+
+          echo "##[debug] Version updated to $(NEW_VERSION)"
+
+    - task: Bash@3
+      displayName: 'Tag Pipeline with Package Version'
+      condition: succeeded()
+      inputs:
+        targetType: inline
+        script: |
+          echo "##[debug] Adding pipeline tag with new version: $(NEW_VERSION)"
+          echo "##vso[build.addbuildtag]version=$(NEW_VERSION)"

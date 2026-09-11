@@ -1,0 +1,201 @@
+## -> Parameters:
+parameters:
+  - name: environment
+  - name: skipDeploy
+  - name: proxy
+  - name: packageVersion
+  - name: kubernetesServiceConnectionEnabled
+    default: false
+
+## -> CI
+stages:
+  ## -> Initialize Enviroment
+  - template: /tech_products/hrcl/templates/common/stages/initialize/environment.yml
+    parameters:
+      packageVersion: ${{ parameters.packageVersion }}
+
+  ## PREPARE
+  - stage: prepare
+    dependsOn:
+      - environment_init
+    displayName: "Prepare"
+    jobs:
+      - job: extract
+        displayName: "Preparing Pipeline"
+        pool:
+          name: GeneralPurposeLinuxAgentsCI
+        steps:
+          - checkout: self
+            persistCredentials: true
+            fetchTags: true
+            clean: true
+          - template: /tech_products/hrcl/templates/python/ci/ci_prepare.yml
+            parameters:
+              proxy: ${{ parameters.proxy }}
+
+  ## PACKAGE
+  - stage: build_package
+    displayName: "Build & Test & Package"
+    dependsOn:
+      - prepare
+      - environment_init
+    variables:
+      # -> Catalog Info Variables
+      - name: pip_cache_dir
+        value: $(Pipeline.Workspace)/.pip
+      - name: CURRENT_VERSION
+        value: $[ stageDependencies.prepare.extract.outputs['extract_version_and_sha.CURRENT_VERSION'] ]
+      - name: NEXT_VERSION
+        value: $[ stageDependencies.prepare.extract.outputs['extract_version_and_sha.NEXT_VERSION'] ]
+      - name: TAG_VERSION
+        value: $[ stageDependencies.prepare.extract.outputs['extract_version_and_sha.TAG_VERSION'] ]
+      - name: COMMIT_SHA
+        value: $[ stageDependencies.prepare.extract.outputs['extract_version_and_sha.COMMIT_SHA'] ]
+      - template: /tech_products/hrcl/templates/common/initialize/variables_catalog_info.yml
+    jobs:
+      - job: Build
+        displayName: "Build & Test & Package"
+        pool:
+          name: GeneralPurposeLinuxAgentsCI
+        steps:
+          - checkout: self
+            persistCredentials: true
+            fetchTags: true
+          - template: /tech_products/hrcl/templates/python/ci/ci_build_package.yml
+            parameters:
+              jobName: $(APP_NAME)
+              nextVersion: $(NEXT_VERSION)
+              commitSHA: $(COMMIT_SHA)
+
+  ## GOVAPP
+  - stage: gov_app_quality_gate
+    displayName: "Gov App Gate"
+    pool:
+      name: GeneralPurposeLinuxAgentsCI
+    dependsOn:
+      - environment_init
+      - prepare
+      - build_package
+    condition: succeeded()
+    ## -> Loads variables from other stages.
+    variables:
+    - name: NEXT_VERSION
+      value: $[ stageDependencies.prepare.extract.outputs['extract_version_and_sha.NEXT_VERSION'] ]
+    - template: /tech_products/hrcl/templates/common/initialize/variables_catalog_info.yml
+    jobs:
+    - job: governance
+      displayName: Governance Policies Check
+      condition: succeeded()
+      steps:
+      ## -> Validate the application on Governance App
+      - template: /tech_products/hrcl/templates/common/gates/gov_app/gov_app.yml
+        parameters:
+          environment: "${{ parameters.environment }}"
+          operation: "validate"
+          version: "$(NEXT_VERSION)"
+
+  ## SONARQUBE
+  - stage: sonarqube_quality_gate
+    displayName: "SonarQube Gate"
+    pool:
+      name: GeneralPurposeLinuxAgentsCI
+    dependsOn:
+      - environment_init
+      - prepare
+      - build_package
+    condition: succeeded()
+    ## -> Loads variables from other stages.
+    variables:
+    - name: NEXT_VERSION
+      value: $[ stageDependencies.prepare.extract.outputs['extract_version_and_sha.NEXT_VERSION'] ]
+    - template: /tech_products/hrcl/templates/common/initialize/variables_catalog_info.yml
+    jobs:
+    - job: sonarqube
+      displayName: Code Analysis
+      condition: succeeded()
+      steps:
+      ## -> Quality Gates (SonarQube)
+      - template: /tech_products/hrcl/templates/python/ci/ci_sonarqube.yml
+        parameters:
+          environment: "${{ parameters.environment }}"
+
+  ## SECURITY
+  - template: /tech_products/hrcl/templates/common/stages/security/security.yml
+    parameters:
+      fortifyExclusionRepository: FortifyExclusion
+
+  - stage: bump
+    dependsOn:
+      - prepare
+      - security_quality_gate
+      - sonarqube_quality_gate
+      - gov_app_quality_gate
+    displayName: "Bump"
+    variables:
+      # -> Catalog Info Variables
+      - template: /tech_products/hrcl/templates/common/initialize/variables_catalog_info.yml
+      # -> variables are automatically exported as environment variables so this will override pip's default cache dir
+      - name: pip_cache_dir
+        value: $(Pipeline.Workspace)/.pip
+    jobs:
+      - job: Push
+        displayName: "Bump"
+        pool:
+          name: GeneralPurposeLinuxAgentsCI
+        steps:
+          - checkout: self
+            persistCredentials: true
+            fetchTags: true
+          - template: /tech_products/hrcl/templates/python/ci/ci_bump.yml
+
+    ## -> CD
+  - ${{ if ne(parameters.skipDeploy, True) }}:
+      - stage: Deploy
+        dependsOn:
+          - prepare
+          - environment_init
+          - bump
+        pool:
+          name: GeneralPurposeLinuxAgentsCD
+        variables:
+          - template: /tech_products/hrcl/templates/common/initialize/variables_catalog_info.yml
+          - template: /tech_products/hrcl/templates/common/initialize/variables_helm.yml
+          - name: NEXT_VERSION
+            value: $[ stageDependencies.prepare.extract.outputs['extract_version_and_sha.NEXT_VERSION'] ]
+        jobs:
+          - deployment: deploy_${{ parameters.environment }}
+            displayName: "Deploy"
+            environment: deploy-${{ parameters.environment }}
+            strategy:
+              runOnce:
+                deploy:
+                  steps:
+                    - template: /tech_products/hrcl/templates/common/initialize/deploy_environment.yml
+                      parameters:
+                        environment: "${{ parameters.environment }}"
+                    ## -> Use HELM to deploy
+                    - template: /tech_products/hrcl/templates/common/cd/cd_deploy.yml
+                      parameters:
+                        environment: "${{ parameters.environment }}"
+                        packageVersion: $(NEXT_VERSION)
+                        kubernetesServiceConnectionEnabled: ${{ parameters.kubernetesServiceConnectionEnabled }}
+                on:
+                  success:
+                    steps:
+                      ## -> Validate the application on Governance App
+                      - template: /tech_products/hrcl/templates/common/gates/gov_app/gov_app.yml
+                        parameters:
+                          environment: "${{ parameters.environment }}"
+                          operation: "deploy"
+                          version: "$(NEXT_VERSION)"
+                  failure:
+                    steps:
+                      - task: CatchLogsToLocalDirectoryFromVivo@4
+                        displayName: Dump logs and metas
+                        inputs:
+                          dumpDir: $(Build.ArtifactStagingDirectory)/audit
+                      - task: PublishBuildArtifacts@1
+                        displayName: "Push Logs to Artifacts"
+                        inputs:
+                          ArtifactName: audit
+                          PathtoPublish: $(Build.ArtifactStagingDirectory)/audit

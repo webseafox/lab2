@@ -1,0 +1,199 @@
+parameters:
+- name: blue_green
+  type: string
+  default: 'Não'
+  values:
+  - 'Não'
+  - 'Sim'
+- name: build_name
+  type: string
+  default: ''
+- name: database_update_mode
+  type: string
+  default: NONE
+  values:
+  - NONE
+  - UPDATE
+- name: deploy_strategy
+  type: string
+  default: RECREATE
+  values:
+  - RECREATE
+  - ROLLING_UPDATE
+- name: environment_for_deploy
+  type: string
+  default: d15
+  values:
+  - p1
+  - s1
+  - s2
+  - s3
+  - d1
+  - d2
+  - d3
+  - d4
+  - d5
+  - d6
+  - d7
+  - d8
+  - d9
+  - d10
+  - d11
+  - d12
+  - d13
+  - d14
+  - d15
+
+jobs:
+- job: deploy_blue_green_success
+  displayName: "${{ parameters.environment_for_deploy }} - Executar Deploy Blue/Green"
+  dependsOn:
+  - task_manual
+  - acompanhar_deploy_job
+  condition: and(eq('${{ parameters.blue_green }}', 'Sim'), eq(dependencies.task_manual.result,'Succeeded'))
+  pool:
+    name: $(PRIVATE_AGENT_DEFAULT)
+  variables:
+  - name: DEPLOY_CODE
+    value: $[ dependencies.acompanhar_deploy_job.outputs['acompanhar_deploy_bash.DEPLOY_CODE'] ]
+  - name: SAP_TU_ACCESS_TOKEN
+    value: $[ dependencies.acompanhar_deploy_job.outputs['reexport_token.SAP_TU_ACCESS_TOKEN'] ]
+  - name: SAP_TU_TOKEN_EXPIRATION
+    value: $[ dependencies.acompanhar_deploy_job.outputs['reexport_token.SAP_TU_TOKEN_EXPIRATION'] ]
+  timeoutInMinutes: 120
+  steps:
+  - checkout: none
+  - bash: |
+      ACCESS_TOKEN="${SAP_TU_ACCESS_TOKEN}"
+      if [ -z "$ACCESS_TOKEN" ] || [ "$ACCESS_TOKEN" == "null" ]; then
+        echo "##[error]Access token do Technical User indisponível"
+        exit 1
+      fi
+      echo "[section]Access token reutilizado (valor oculto)"
+      TZ='America/Sao_Paulo'
+      DATE_SAP=$(date +"%d-%m-%Y %H:%M:%S")
+      echo "[section] O manual Validation foi aceito"
+      echo "[section] 🚀 Deploy code: ......... $DEPLOY_CODE"
+
+      DEPLOY_CAPT_ACCEPT=$(curl --compressed -s -X POST $URL_SAP_DEPLOY$DEPLOY_CODE/decisions \
+        --max-time $CURL_HTTP_TIMEOUT \
+        -o deploy_accept.json -H "x-approuter-authorization: Bearer ${ACCESS_TOKEN}" \
+        -H "Content-Type: application/json" \
+        -d "{\"decision\": \"ACCEPT\", \"reason\": \"Deploy Green aceito via pipeline com sucesso.\"}"
+      )
+      DEPLOY_CODE_ACCEPT=$(cat deploy_accept.json | jq -r '.newDeploymentCode')
+
+      echo "[section]           ♻️  DEPLOY GREEN FOI ACEITO, SUBSTITUINDO VERSÃO BLUE PELA GREEN.... ♻️"
+      echo "[section]                    ⚠️⚠️ Parâmetros da implantação ⚠️⚠️"
+      echo "[section]                    Database update mode....: $DATABASE_UPDATE_MODE"
+      echo "[section]                    URL.....................: $(URL_SAP_DEPLOY)$DEPLOY_CODE_ACCEPT"
+      echo "[section]                    Build name..............: $BUILD_NAME"
+      echo "[section]                    Ambiente................: $ENVIRONMENT_FOR_DEPLOY"
+      echo "[section]                    Estrategia de deploy....: $DEPLOY_STRATEGY"
+      echo "[section]                    Deploy code.............: $DEPLOY_CODE"
+      echo "[section]                    Código de deploy Green..: $DEPLOY_CODE_ACCEPT"
+      echo "[section] --------------------------------------------------------------------------------"
+
+      function progress_bar {
+      percent_total=${2}
+      echo "##vso[task.setprogress value=$percent_total;]Progress"
+      let _progress=(${2}*100/100)
+      let _done=(${_progress}*5)/10
+      let _left=50-$_done
+      _fill=$(printf "%${_done}s")
+      _empty=$(printf "%${_left}s")
+
+      printf "\r##[command]Status:$1 - Progresso : [${_fill// /#}${_empty// /-}] ${_progress}%%"
+      echo -e "\n"
+      }
+      echo "[section]⌛ Aguardando Deploy... ⌛"
+      API_URL_DEPLOYMENTS_PROGRESS="$(echo $URL_SAP_DEPLOY)$DEPLOY_CODE_ACCEPT/progress"
+      echo "##[command]Requisição para $API_URL_DEPLOYMENTS_PROGRESS"
+
+      COUNT_FAILS=0
+      LAST_PERCENT=0
+      while (true)
+      do
+      HTTP_CODE_RESPONSE=$(curl --compressed -s -w "%{http_code}" \
+        --max-time $CURL_HTTP_TIMEOUT \
+        -o SAP_API_RESPONSE_FILE.json -X GET $API_URL_DEPLOYMENTS_PROGRESS \
+        -H "x-approuter-authorization: Bearer ${ACCESS_TOKEN}" \
+        -H "Content-Type: application/json"
+      )
+
+      if [[ "$HTTP_CODE_RESPONSE" != "200" ]]; then
+          ((COUNT_FAILS++))
+          if [[ $COUNT_FAILS == 10 ]]; then
+              echo "##vso[task.setvariable variable=BUILD_ERROR]TRUE"
+              echo "##vso[task.setvariable variable=SAP_ERROR_TYPE]HTTP_ERROR"
+              echo "##vso[task.setvariable variable=BUILD_ERROR_NUMBER_OR_MESSAGE]$HTTP_CODE_RESPONSE"
+              echo "##[error]❌ Não foi possível retornar os dados do deploy ❌"
+              exit 1
+          fi
+          echo "##[warning]Não foi possível retornar os dados do deploy (tentativa $COUNT_FAILS). Será realizada uma nova tentativa em alguns instantes"
+          sleep 60
+          continue
+      fi
+
+      if [[ "$HTTP_CODE_RESPONSE" == "200" ]]; then
+          RESPONSE_BODY=$(cat SAP_API_RESPONSE_FILE.json && rm SAP_API_RESPONSE_FILE.json)
+
+          DEPLOYMENT_STATUS=$(echo $RESPONSE_BODY | jq -r '.deploymentStatus')
+          DEPLOYMENT_PERCENTAGE=$(echo $RESPONSE_BODY | jq -r '.percentage')
+
+          if [[ "$DEPLOYMENT_STATUS" == "UNKNOWN" ]]; then
+              echo -e "##[command]Status ainda não definido, aguarde ...\n"
+              sleep 180
+          fi
+
+          if [[ "$DEPLOYMENT_STATUS" == "UNDEPLOYED" ]]; then
+              echo -e "##[command]Deployment não foi realizado...\n"
+              exit 1
+          fi
+
+          if [[ "$DEPLOYMENT_STATUS" == "DEPLOYING" ]]; then
+              if [ "$DEPLOYMENT_PERCENTAGE" == "100" ]; then
+                echo "[section] Deploy Green finalizado com sucesso, Build $BUILD_CODE implantado no ambiente $ENVIRONMENT_FOR_DEPLOY 😊"
+                sleep 60
+                continue
+              fi
+              if [ "$LAST_PERCENT" != "$DEPLOYMENT_PERCENTAGE" ]; then
+                progress_bar $DEPLOYMENT_STATUS $DEPLOYMENT_PERCENTAGE
+                echo "[section] 🚀 Deploy em andamento, aguarde..."
+              fi
+          fi
+
+          if [[ "$DEPLOYMENT_STATUS" == "DEPLOYED" ]];then
+              progress_bar $DEPLOYMENT_STATUS $DEPLOYMENT_PERCENTAGE
+              echo "##vso[task.setvariable variable=DEPLOY_CODE;isoutput=true]$DEPLOY_CODE"
+              break
+          fi
+
+          if [[ "$DEPLOYMENT_STATUS" == "FAIL" ]];then
+              DEPLOYMENT_ERROR_MESSAGE=$(echo $RESPONSE_BODY | jq -r '.errorMessage')
+              echo "##[error]$DEPLOYMENT_ERROR_MESSAGE"
+              STEP_FAIL=$(echo $RESPONSE_BODY | jq -r  '.stages[] | select(.status == "FAIL" )')
+              STEP_FAIL_DETAILS=$(echo $STEP_FAIL | jq -r '.steps[].children[] | select(.status == "FAIL" )')
+              STEP_FAIL_DETAIL_NAME=$(echo $STEP_FAIL_DETAILS | jq -r '.name')
+              STEP_FAIL_DETAILS_JSON=$(echo $STEP_FAIL_DETAILS | jq -r '.')
+              echo "##[error]$STEP_FAIL_DETAILS_JSON"
+              echo "##[error]O deploy não foi concluído"
+              echo "##vso[task.setvariable variable=SAP_ERROR_TYPE]SAP_ERROR"
+              echo "##vso[task.setvariable variable=BUILD_ERROR_NUMBER_OR_MESSAGE]$DEPLOYMENT_ERROR_MESSAGE<br>$STEP_FAIL_DETAILS_JSON"
+              echo "##vso[task.setvariable variable=BUILD_ERROR]TRUE"
+              exit 1
+          fi
+        LAST_PERCENT=$DEPLOYMENT_PERCENTAGE
+        sleep 60
+      fi
+        sleep 60
+      done
+      echo "##vso[task.setvariable variable=DEPLOY_CODE;isoutput=true]$DEPLOY_CODE"
+    displayName: "Deploy Blue/Green accepted"
+    env:
+      DATABASE_UPDATE_MODE: ${{ parameters.database_update_mode }}
+      BUILD_NAME: ${{ replace(parameters.build_name, ' ', '') }}
+      ENVIRONMENT_FOR_DEPLOY: ${{ parameters.environment_for_deploy }}
+      DEPLOY_STRATEGY: ${{ parameters.deploy_strategy }}
+      SAP_TU_ACCESS_TOKEN: $(SAP_TU_ACCESS_TOKEN)
+

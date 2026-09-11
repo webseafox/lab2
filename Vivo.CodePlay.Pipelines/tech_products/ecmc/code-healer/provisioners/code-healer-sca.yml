@@ -1,0 +1,148 @@
+parameters:
+  - name: projectPrefix
+    type: string
+    default: "ECMC - Ecomm Cloud B2C-"
+  - name: maxParallelScans
+    type: number
+    default: 5
+  - name: minNodeVersion
+    type: number
+    default: 16
+  - name: repository
+    type: string
+    default: ""
+  - name: branch
+    displayName: "Branch a ser corrigida (ex: 'feat/xpto')"
+    type: string
+    default: "master"
+  - name: runSync
+    displayName: "Executar sincronização de repositórios"
+    type: boolean
+    default: true
+  - name: generateSbom
+    displayName: "Gerar SBOM e realizar sync na conviso antes de rodar o agente (Single Repo)"
+    type: boolean
+    default: false
+
+stages:
+  - stage: code_healer_sca
+    displayName: "Code-Healer SCA"
+    pool: $(PRIVATE_AGENT_DEFAULT)
+    jobs:
+      # ─────────────────────────────────────────────────────────────────────────
+      # Job 1: Consulta a Conviso e gera a matrix de repos a escanear
+      # ─────────────────────────────────────────────────────────────────────────
+      - job: GetRepositories
+        displayName: "Fetch Repositories from Conviso"
+        condition: eq('${{ parameters.repository }}', '')
+        steps:
+          - template: /tech_products/ecmc/code-healer/stages/fetch-conviso-matrix.yml
+            parameters:
+              projectPrefix: ${{ parameters.projectPrefix }}
+
+      # ─────────────────────────────────────────────────────────────────────────
+      # Job 2: Executa o scan SCA e agente em paralelo para cada repo da matrix
+      # ─────────────────────────────────────────────────────────────────────────
+      - job: RunScaScans
+        displayName: "Executar SCA (Matriz)"
+        dependsOn: GetRepositories
+        condition: and(succeeded(), eq('${{ parameters.repository }}', ''), ne(dependencies.GetRepositories.outputs['fetchMatrix.SCA_TARGETS'], '{}'))
+        workspace:
+          clean: all
+        strategy:
+          matrix: $[ dependencies.GetRepositories.outputs['fetchMatrix.SCA_TARGETS'] ]
+          maxParallel: ${{ parameters.maxParallelScans }}
+        variables:
+          DT_APP_DEFAULT_VERSION: "DevSecOps"
+        steps:
+          - checkout: CodeHealerSCA
+            persistCredentials: true
+            fetchDepth: 1
+            displayName: "Checkout SCA Agent"
+
+          - template: /tech_products/ecmc/code-healer/stages/setup-python-version.yml
+
+          - template: /tech_products/ecmc/code-healer/stages/clone-and-validate.yml
+            parameters:
+              minNodeVersion: ${{ parameters.minNodeVersion }}
+
+          - template: /tech_products/ecmc/code-healer/stages/setup-credentials.yml
+            parameters:
+              runSync: ${{ parameters.runSync }}
+
+          - template: /tech_products/ecmc/code-healer/stages/build-and-sbom.yml
+            parameters:
+              runSync: ${{ parameters.runSync }}
+
+          - template: /tech_products/ecmc/code-healer/stages/sync-vulnerabilities.yml
+            parameters:
+              runSync: ${{ parameters.runSync }}
+
+          - task: Bash@3
+            displayName: "Cleanup Docker Images & Workspace"
+            condition: always()
+            inputs:
+              targetType: inline
+              script: |
+                echo "##[section]#################### CLEANUP ####################"
+                echo "##[debug] Removendo imagens Docker geradas nesta execução..."
+                docker rmi "builder/node" -f || true
+                docker rmi "$(REPO_NAME)-sca:latest" -f || true
+                echo "Cleanup completed"
+
+          - template: /tech_products/ecmc/code-healer/stages/agent-sca.yml
+            parameters:
+              branch: ${{ parameters.branch }}
+              repoName: $(REPO_NAME)
+
+      # ─────────────────────────────────────────────────────────────────────────
+      # Job de Execução manual para um repositório específico (Single Repo) - Roda apenas se 'repository' estiver preenchido
+      # ─────────────────────────────────────────────────────────────────────────
+      - job: RunSingleRepoSca
+        displayName: "Executar SCA (Single Repo)"
+        condition: ne('${{ parameters.repository }}', '')
+        workspace:
+          clean: all
+        variables:
+          REPO_NAME: ${{ parameters.repository }}
+          DT_APP_DEFAULT_VERSION: "DevSecOps"
+        steps:
+          - checkout: CodeHealerSCA
+            persistCredentials: true
+            fetchDepth: 1
+            displayName: "Checkout SCA Agent"
+
+          - template: /tech_products/ecmc/code-healer/stages/setup-python-version.yml
+
+          - template: /tech_products/ecmc/code-healer/stages/clone-and-validate.yml
+            parameters:
+              minNodeVersion: ${{ parameters.minNodeVersion }}
+
+          - template: /tech_products/ecmc/code-healer/stages/setup-credentials.yml
+            parameters:
+              runSync: ${{ parameters.generateSbom }}
+
+          - template: /tech_products/ecmc/code-healer/stages/build-and-sbom.yml
+            parameters:
+              runSync: ${{ parameters.generateSbom }}
+
+          - template: /tech_products/ecmc/code-healer/stages/sync-vulnerabilities.yml
+            parameters:
+              runSync: ${{ parameters.generateSbom }}
+
+          - task: Bash@3
+            displayName: "Cleanup Docker Images & Workspace"
+            condition: always()
+            inputs:
+              targetType: inline
+              script: |
+                echo "##[section]#################### CLEANUP ####################"
+                echo "##[debug] Removendo imagens Docker geradas nesta execução..."
+                docker rmi "builder/node" -f || true
+                docker rmi "$(REPO_NAME)-sca:latest" -f || true
+                echo "Cleanup completed"
+
+          - template: /tech_products/ecmc/code-healer/stages/agent-sca.yml
+            parameters:
+              branch: ${{ parameters.branch }}
+              repoName: $(REPO_NAME)

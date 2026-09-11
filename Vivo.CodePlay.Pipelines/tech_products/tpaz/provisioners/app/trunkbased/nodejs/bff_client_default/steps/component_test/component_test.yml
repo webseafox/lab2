@@ -1,0 +1,130 @@
+steps:
+- task: AzureKeyVault@2  
+  displayName: 'Getting AKV credentials'
+  timeoutInMinutes: 1
+  retryCountOnTaskFailure: 5  
+  inputs:    
+    azureSubscription: DevOpsSharedResources    
+    KeyVaultName: $(AKV_DEVOPS_NAME)
+    SecretsFilter: 'NEXUS-DEPS-USR, NEXUS-DEPS-PSW'
+
+- task: Docker@2
+  displayName: "Docker login ACR"
+  inputs:
+    containerRegistry: "$(DOCKER_ACR_REGISTRY_SERVICE_CONNECTION_NAME)"
+    command: login
+
+- bash: |
+    source ~/.bashrc
+    echo "COMPONENT_TESTS_WORKING_DIRECTORY=$(COMPONENT_TESTS_WORKING_DIRECTORY)"
+    echo "COMPONENT_TESTS_COMPOSE_PROJECT_NAME=$(COMPONENT_TESTS_COMPOSE_PROJECT_NAME)"
+    echo "COMPONENT_TESTS_COMPOSE_MAIN_SERVICE=$(COMPONENT_TESTS_COMPOSE_MAIN_SERVICE)"
+    echo "COMPONENT_TESTS_COMPOSE_FILE_PATH=$(COMPONENT_TESTS_COMPOSE_FILE_PATH)"
+    echo "COMPONENT_TESTS_RESULT_DIRECTORY=$(COMPONENT_TESTS_RESULT_DIRECTORY)"
+    echo "COMPONENT_TESTS_TIMEOUT_MINUTES=$(COMPONENT_TESTS_TIMEOUT_MINUTES)"
+  displayName: "Component tests Variables Info"
+
+- template: /tasks/catalog_info/extract_variables.yml
+
+- task: DownloadPipelineArtifact@2
+  inputs:
+    downloadPath: '$(System.ArtifactsDirectory)/myArtifact'
+
+- task: ExtractFiles@1
+  displayName: Extract App Files
+  inputs:
+    archiveFilePatterns: '$(System.ArtifactsDirectory)/myArtifact/app/app.tar'
+    destinationFolder: '$(COMPONENT_TESTS_WORKING_DIRECTORY)'
+
+- bash: |
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    NC='\033[0m'
+
+    if [ -d "$RESULT_DIRECTORY" ]; then
+      rm -rf $RESULT_DIRECTORY
+    fi
+    mkdir -p $RESULT_DIRECTORY
+    
+    docker compose -p $PROJECT_NAME -f $COMPOSE_FILE_PATH build && \
+    docker compose -p $PROJECT_NAME -f $COMPOSE_FILE_PATH up --attach $COMPOSE_MAIN_SERVICE --exit-code-from $COMPOSE_MAIN_SERVICE
+    TEST_EXIT_CODE=`echo $?`
+    
+    if [ $TEST_EXIT_CODE -eq 0 ] ; then
+      printf "${GREEN}Tests Passed${NC}\n"
+    else
+      printf "${RED}Tests Failed${NC} - Exit Code: $TEST_EXIT_CODE\n"
+    fi
+
+    exit $TEST_EXIT_CODE
+  displayName: Run component test
+  workingDirectory: "$(COMPONENT_TESTS_WORKING_DIRECTORY)"
+  timeoutInMinutes: 120
+  env:
+    PROJECT_NAME: $(COMPONENT_TESTS_COMPOSE_PROJECT_NAME)
+    COMPOSE_FILE_PATH: $(COMPONENT_TESTS_COMPOSE_FILE_PATH)
+    COMPOSE_MAIN_SERVICE: $(COMPONENT_TESTS_COMPOSE_MAIN_SERVICE)
+    RESULT_DIRECTORY: $(COMPONENT_TESTS_RESULT_DIRECTORY)
+    DEPS_CREDENTIAL_USR: $(NEXUS-DEPS-USR)
+    DEPS_CREDENTIAL_PSW: $(NEXUS-DEPS-PSW)
+    HTTPS_PROXY: $(PROXY_AGENT_HTTPS)
+    HTTP_PROXY: $(PROXY_AGENT_HTTP)
+    NO_PROXY: $(PROXY_AGENT_NO_PROXY)
+
+- bash: |
+    save_logs() {
+      mkdir -p $RESULT_DIRECTORY/logs
+      SERVICES=$(docker compose -p $PROJECT_NAME ps -a --services | awk '{if(NR>0) print $NF}')
+      for i in $SERVICES
+      do
+        docker compose -p $PROJECT_NAME logs ${i} > "$RESULT_DIRECTORY/logs/${i}.log"
+        echo "Log from service ${i} saved in $RESULT_DIRECTORY/logs/${i}.log"
+      done
+    }
+    
+    cleanup () {
+      docker compose -p $PROJECT_NAME kill
+      docker compose -p $PROJECT_NAME down
+    }
+    
+    save_logs
+    cleanup
+  displayName: Save logs and clean up containers
+  workingDirectory: "$(COMPONENT_TESTS_WORKING_DIRECTORY)"
+  timeoutInMinutes: 30
+  condition: always()
+  env:
+    PROJECT_NAME: $(COMPONENT_TESTS_COMPOSE_PROJECT_NAME)
+    COMPOSE_FILE_PATH: $(COMPONENT_TESTS_COMPOSE_FILE_PATH)
+    COMPOSE_MAIN_SERVICE: $(COMPONENT_TESTS_COMPOSE_MAIN_SERVICE)
+    RESULT_DIRECTORY: $(COMPONENT_TESTS_RESULT_DIRECTORY)
+    DEPS_CREDENTIAL_USR: $(NEXUS-DEPS-USR)
+    DEPS_CREDENTIAL_PSW: $(NEXUS-DEPS-PSW)
+
+- task: DeleteFiles@1
+  condition: always()
+  inputs:
+    SourceFolder: '$(Build.ArtifactStagingDirectory)'
+    Contents: |
+      **/*
+
+- task: CopyFiles@2
+  condition: always()
+  displayName: 'Copy log files'
+  inputs:
+    SourceFolder: '$(COMPONENT_TESTS_WORKING_DIRECTORY)/$(COMPONENT_TESTS_RESULT_DIRECTORY)'
+    TargetFolder: '$(Build.ArtifactStagingDirectory)'
+    OverWrite: true
+    Contents: |
+      **
+
+- task: PublishBuildArtifacts@1
+  condition: always()
+  displayName: 'Publish Test Artifact'
+  inputs:
+    ArtifactName: 'component-test-result'
+
+- template: /tasks/grafeas/component_test_occurrence.yml
+  parameters:
+    dockerAppName: $(APP_NAME)
+    dockerAppVersion: $(APP_VERSION)

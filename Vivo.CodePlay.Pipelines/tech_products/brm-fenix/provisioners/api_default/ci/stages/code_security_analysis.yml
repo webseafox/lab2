@@ -1,0 +1,75 @@
+# This YAML file defines the stages and jobs for code security analysis in a pipeline.
+
+parameters:
+  - name: fortifyExclusionRepository # The name of the parameter used to specify the Fortify exclusion repository.
+  - name: stageSecurityOnly
+  - name: flow # The name of the parameter used to specify the flow of the pipeline.
+    type: object
+
+stages:
+  - stage: stage_code_security_analysis
+    displayName: "Security"
+    pool: $(POOL)
+    dependsOn:
+      - stage_prep
+    condition: |
+      or(
+        eq(variables['STAGE_SECURITY_ONLY'], True),
+        and(
+          ne(variables['TECHNOLOGY'], 'onlyHelmUpdate'),
+          eq(variables['DISABLE_STAGE_CODE_SECURITY_ANALYSIS'], 'false'),
+          in(dependencies.stage_prep.result, 'Succeeded', 'SucceededWithIssues'),
+          notIn(variables['Build.SourceBranchName'], 'qa01_15', 'qa02_15')
+        )
+      )
+    variables:
+      - name: USE_FORTIFY
+        value: $[ stageDependencies.stage_prep.app_config_keys.outputs['evaluate_flags.USE_FORTIFY'] ]
+      - name: USE_CONVISO
+        value: $[ stageDependencies.stage_prep.app_config_keys.outputs['evaluate_flags.USE_CONVISO'] ]
+      - name: SKIP_SECURITY_GATE
+        value: $[ stageDependencies.stage_prep.app_config_keys.outputs['evaluate_flags.SKIP_SECURITY_GATE'] ]
+      - name: USE_CHECKMARX
+        value: $[ stageDependencies.stage_prep.app_config_keys.outputs['evaluate_flags.USE_CHECKMARX'] ]
+      - name: USE_DEPENDENCY_TRACK
+        value: $[ stageDependencies.stage_prep.app_config_keys.outputs['evaluate_flags.USE_DEPENDENCY_TRACK'] ]
+      - name: USE_DT_DOCKER
+        value: $[ stageDependencies.stage_prep.app_config_keys.outputs['evaluate_flags.USE_DT_DOCKER'] ]
+      - name: USE_CONVISO
+        value: $[ stageDependencies.stage_prep.app_config_keys.outputs['evaluate_flags.USE_CONVISO'] ]
+      - name: SKIP_SECURITY_GATE_SCA
+        value: $[ stageDependencies.stage_prep.app_config_keys.outputs['evaluate_flags.SKIP_SECURITY_GATE_SCA'] ]
+    jobs:
+      # The job that performs the Fortify scan.
+      - job: fortify_scan
+        condition: and(
+          succeeded(),
+          eq(variables.USE_FORTIFY, 'true'),
+          eq(variables.flowIsToReview, true),
+          not(startsWith(variables['Build.SourceBranch'], 'refs/tags/'))
+          )
+        displayName: "Fortify Scan"
+        steps:
+
+          - template: /security/define_appsec_app_version.yml@CodePlay
+
+          - template: /security/run_fortify_scan.yml@CodePlay
+            parameters:
+              fortifyExclusionRepository: ${{ parameters.fortifyExclusionRepository }}
+              appVersion: "$(FORTIFY_APP_VERSION)"
+              vivoFlow: "dev01_15,dev02_15,dev03_15,preprod_15,prodlike_15,master_15"
+          - template: /tasks/telemetry/telemetry.yml@CorePipelines
+
+      # The job that performs the Checkmarx scan.
+      - job: checkmarx_scan
+        condition: and(
+          succeeded(),
+          eq(variables.USE_CHECKMARX, 'true'),
+          eq(variables.flowIsToReview, true),
+          not(startsWith(variables['Build.SourceBranch'], 'refs/tags/'))
+          )
+        displayName: "Checkmarx Scan"
+        steps:
+          - template: /task_groups/security/run_checkmarx_scan.yml@CorePipelines
+            parameters:
+              skipSecurityGate: $(SKIP_SECURITY_GATE)

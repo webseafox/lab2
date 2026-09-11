@@ -1,0 +1,4 @@
+#!/bin/bash
+
+echo "NEXUS_DEPS_USR: ${NEXUS_DEPS_USR}"
+echo "DOCKER_WORKDIR: ${DOCKER_WORKDIR}"

@@ -1,0 +1,702 @@
+﻿parameters:
+- name: workingDirectory
+  type: string
+- name: bump_version
+  type: string
+  default: ''
+- name: bump_message
+  type: string
+  default: ''
+
+stages:
+  - stage: Init
+    displayName: "Pipeline initialization"
+    pool: $(PRIVATE_AGENT_DEFAULT)
+    jobs:
+    - job: prepare_pipeline
+      displayName: "Prepare"
+      steps:
+
+      - script: |
+          echo "##[debug] BREAK_WHEN_NOT_FOUND.....: ${BREAK_WHEN_NOT_FOUND}"
+          if [ ! -f "catalog-info.yaml" ]; then
+            if [ "$BREAK_WHEN_NOT_FOUND" = 'True' ]; then
+              echo "##vso[task.logissue type=error] Unable to find catalog-info.yaml file (path=$(pwd))."
+              exit 1
+            fi
+          fi
+        displayName: "Check for catalog-info.yml"
+        env:
+          BREAK_WHEN_NOT_FOUND: true
+
+      - task: CopyFiles@2
+        displayName: "Copy catalog-info.yaml to Staging Directory"
+        inputs:
+          TargetFolder: "$(Build.ArtifactStagingDirectory)"
+          OverWrite: true
+          CleanTargetFolder: true
+          Contents: |
+            catalog-info.yaml
+
+      - task: PublishPipelineArtifact@1
+        displayName: "Publish catalog-info.yaml"
+        inputs:
+          artifactName: "catalog-info"
+          targetPath: "$(Build.ArtifactStagingDirectory)"
+
+  - stage: Build
+    displayName: 'Build and Test'
+    jobs:
+      - job: BuildAndTest
+        displayName: 'Build and Test MFE'
+        pool: GeneralPurposeLinuxAgentsCI
+        steps:
+        - checkout: self
+          fetchDepth: 1
+          persistCredentials: true
+
+        - task: NodeTool@0
+          inputs:
+            versionSource: 'spec'
+            versionSpec: '18.x'
+          env:
+            HTTPS_PROXY: http://10.240.58.39:3128 # SQUID PROXY
+            HTTP_PROXY: http://10.240.58.39:3128 # SQUID PROXY
+            NO_PROXY: localhost,0.0.0.0,127.0.0.1,10.244.0.0/16,192.168.0.0/16,10.129.178.173,nexus.telefonica.com.br,acrsharedservices01.azurecr.io,appcs-azdevops-shared.azconfig.io,scm.azurewebsites.net
+
+        - task: AzureKeyVault@2
+          displayName: 'Getting AKV Credentials'
+          timeoutInMinutes: 1
+          retryCountOnTaskFailure: 5
+          inputs:
+            azureSubscription: 'DevOpsSharedResources'
+            KeyVaultName: 'kv-azdevops-shared'
+            SecretsFilter: 'NEXUS-DEPS-USR, NEXUS-DEPS-PSW, NEXUS-DEFAULT-USR, NEXUS-DEFAULT-PSW'
+        
+        - task: npmAuthenticate@0
+          inputs:
+            workingFile: .npmrc
+          displayName: Set dependencies credentials (Azure Artifacts)
+          env:
+            HTTPS_PROXY: $(PROXY_AGENT_HTTPS)
+            HTTP_PROXY: $(PROXY_AGENT_HTTP)
+            NO_PROXY: $(PROXY_AGENT_NO_PROXY)
+          
+        - task: Cache@2
+          displayName: 'Cache node_modules'
+          inputs:
+            key: 'npm | "$(Agent.OS)" | package-lock.json'
+            path: node_modules
+            restoreKeys: |
+              npm | "$(Agent.OS)"
+          
+        - script: npm ci
+          displayName: Install dependencies
+
+        - script: npm run build:webpack
+          displayName: Build
+
+        - script: npm test -- -u
+                  #npm test -- -u
+                  #npm run test
+          displayName: Test
+          continueOnError: true # BYPASS
+
+        - bash: |
+            # Lista de extensões permitidas
+            allowed_extensions=(
+              # Fontes
+              ".ttf" ".otf" ".woff" ".woff2" ".eot"
+              # Imagens
+              ".png" ".jpg" ".jpeg" ".gif" ".svg" ".webp" ".ico"
+              # Outros
+              ".html" ".css" ".js" ".map" ".txt"
+            )
+
+            # Função para verificar se a extensão é permitida
+            is_allowed_extension() {
+              local file_ext="${1,,}"  # Converte para minúsculo
+              for allowed in "${allowed_extensions[@]}"; do
+                if [[ "${file_ext}" == "${allowed}" ]]; then
+                  return 0
+                fi
+              done
+              return 1
+            }
+
+            # Encontra todos os arquivos no diretório dist
+            echo "Verificando arquivos no diretório dist..."
+            invalid_files=()
+            
+            while IFS= read -r -d '' file; do
+              # Pega a extensão do arquivo
+              extension=$(echo "${file}" | grep -o '\.[^/.]*$' | tr '[:upper:]' '[:lower:]')
+              
+              # Se o arquivo tem extensão e não está na lista de permitidos
+              if [[ ! -z "${extension}" ]] && ! is_allowed_extension "${extension}"; then
+                invalid_files+=("${file}")
+              fi
+            done < <(find "dist" -type f -print0)
+
+            # Se encontrou arquivos inválidos
+            if [ ${#invalid_files[@]} -gt 0 ]; then
+              echo "##[error]Arquivos com extensões não permitidas encontrados:"
+              printf '%s\n' "${invalid_files[@]}"
+              echo "Extensões permitidas são:"
+              echo "Fontes: ${allowed_extensions[@]:0:5}"
+              echo "Imagens: ${allowed_extensions[@]:5:6}"
+              echo "Outros: ${allowed_extensions[@]:11}"
+              exit 1
+            else
+              echo "##[section]Todos os arquivos no diretório dist têm extensões permitidas."
+              echo "##[section]Lista de arquivos encontrados:"
+              find "dist" -type f -exec ls -lh {} \;
+            fi
+          displayName: 'Check dist files'
+
+        # Criar pacote NPM
+        - bash: |
+            if [ -d "dist" ]; then
+              # Extrair nome do pacote do catalog-info.yaml
+              PACKAGE_NAME=$(yq -r '.metadata.name' catalog-info.yaml)
+              PACKAGE_SCOPE=$(yq -r '.metadata.annotations."techarch.governance-app.acronym"' catalog-info.yaml)
+              
+              # Atualizar package.json
+              echo "##[debug]Atualizando package.json..."
+              node -e '
+                const fs = require("fs");
+                const pkg = JSON.parse(fs.readFileSync("package.json"));
+                pkg.name = `@'"$PACKAGE_SCOPE"'/'"$PACKAGE_NAME"'`;
+                fs.writeFileSync("package.json", JSON.stringify(pkg, null, 2));
+              '
+              
+              # Criar pacote NPM
+              npm pack
+              
+              # Renomear para nome padrão
+              mv *.tgz app.tar.gz
+              
+              echo "##[debug]Pacote NPM criado com sucesso:"
+              ls -lh app.tar.gz
+            else
+              echo "##[error]Diretório dist não encontrado"
+              exit 1
+            fi
+          displayName: 'Create NPM Package'
+          workingDirectory: $(System.DefaultWorkingDirectory)
+
+        # Publicar artefato para uso posterior
+        - task: PublishPipelineArtifact@1
+          displayName: 'Publish NPM Package'
+          inputs:
+            targetPath: '$(System.DefaultWorkingDirectory)/app.tar.gz'
+            artifact: 'app-package'
+
+  - stage: Security
+    displayName: 'Security Scan'
+    dependsOn: Init
+    condition: |
+      and(
+        succeeded(),
+        in(variables['Build.SourceBranch'], 'refs/heads/master', 'refs/heads/release'),
+        ne(variables.skip_sonarqube, true)
+      )
+    jobs:
+      - job: sonarqube
+        displayName: 'Code Analysis'
+        pool:
+          name: $(PRIVATE_AGENT_DEFAULT)
+        steps:
+          # Get Sonar Project Key from catalog-info.yaml
+          - task: Bash@3
+            displayName: "Get Sonar Project Key - catalog-info.yaml"
+            inputs:
+              targetType: inline
+              script: |
+                if [ ! -f "catalog-info.yaml" ]; then
+                  echo "##vso[task.logissue type=error] Unable to find catalog-info.yaml file (path=$(pwd))."
+                  echo "##vso[task.complete result=Failed;]"
+                  exit 1
+                fi
+
+                SONAR_PROJECT_KEY="$(yq -r 'select(documentIndex == 0) | .metadata.annotations."sonarqube.org/project-key" | select (.!=null)' catalog-info.yaml)"
+                echo "##[debug]SONAR_PROJECT_KEY..........: ${SONAR_PROJECT_KEY}"
+                echo "##vso[task.setvariable variable=SONAR_PROJECT_KEY]${SONAR_PROJECT_KEY}"
+
+          # Get SonarQube Token from Azure Key Vault
+          - task: AzureKeyVault@2
+            displayName: 'Getting AKV credentials'
+            timeoutInMinutes: 1
+            retryCountOnTaskFailure: 5
+            inputs:
+              azureSubscription: DevOpsSharedResources
+              KeyVaultName: 'kv-azdevops-shared'
+              SecretsFilter: 'SONARQUBE-TOKEN'
+
+          # Setup Project and Quality Gate
+          - task: Bash@3
+            displayName: 'Setup Project and Quality Gate'
+            name: setup_quality_gate
+            condition: succeeded()
+            inputs:
+              targetType: inline
+              script: |
+                url="$(SONARQUBE_URL)"
+                token="$(SONARQUBE-TOKEN)"
+                project_key="$(echo $(SONAR_PROJECT_KEY) | sed 's/ /+/g')"
+                project_name="$(echo $(System.TeamProject)-$(Build.Repository.Name) | sed 's/ /+/g')"
+                project_quality_gate="$(SONARQUBE_PROJECT_QUALITYGATE)"
+                default_quality_gate="$(SONARQUBE_DEFAULT_QUALITYGATE)"
+
+                # If no custom quality gate was provided, use default
+                if [[ -z $project_quality_gate ]]; then
+                    echo "##[debug]Quality Gate not found, using default."
+                    project_quality_gate="$default_quality_gate"
+                fi
+
+                # Check if project exists
+                project_exists=$(curl -s -X GET -u $token: "$url/api/projects/search?projects=$project_key" | jq '.paging.total' | sed 's/null/0/g')
+
+                if [ "$project_exists" -ne 1 ]; then
+                    echo "##[debug]Project does not exist, creating..."
+                    project_status=$(curl -s -X POST -o ./.tmp.sonar.out -w "%{http_code}" -u $token: "$url/api/projects/create?name=$project_name&project=$project_key&visibility=public")
+
+                    if [ "$project_status" -eq 200 ]; then
+                        echo "##[debug]SonarQube project created"
+                    else
+                        echo "##[error]Error creating SonarQube project"
+                        echo "##[error]$(cat ./.tmp.sonar.out | jq '.errors[0].msg')"
+                    fi
+                fi
+
+                # Link project to Quality Gate
+                status=$(curl -s -X POST -o /dev/null -w "%{http_code}" -u $token: "$url/api/qualitygates/select?gateName=$project_quality_gate&projectKey=$project_key")
+
+                if [ "$status" -ne 204 ]; then
+                  echo "##[error]Error while linking application to Quality Gate!"
+                  exit 1
+                fi
+
+          # Prepare analysis on SonarQube
+          - task: SonarQubePrepare@5
+            displayName: 'Prepare analysis on SonarQube'
+            inputs:
+              SonarQube: 'VIVO_SONARQUBE'
+              scannerMode: CLI
+              configMode: manual
+              cliProjectKey: $(SONAR_PROJECT_KEY)
+              cliProjectName: $(System.TeamProject)-$(Build.Repository.Name)
+              cliSources: .
+              extraProperties: |
+                sonar.javascript.lcov.reportPaths=coverage/lcov.info
+                sonar.typescript.lcov.reportPaths=coverage/lcov.info
+                sonar.coverage.exclusions=**/*.test.ts,**/*.test.tsx,**/*.spec.ts,**/*.spec.tsx
+                sonar.test.inclusions=**/*.test.ts,**/*.test.tsx,**/*.spec.ts,**/*.spec.tsx
+                sonar.cpd.exclusions=**/*.test.ts,**/*.test.tsx,**/*.spec.ts,**/*.spec.tsx
+                sonar.qualitygate.wait=true
+                sonar.qualitygate.timeout=300
+
+          # Run Code Analysis
+          - task: SonarQubeAnalyze@5
+            displayName: 'Run Code Analysis'
+            continueOnError: true
+
+          # Get Sonarqube taskId
+          - task: Bash@3
+            displayName: 'Get Sonar TaskId'
+            name: sonar_task_id
+            # condition: succeeded()
+            continueOnError: true
+            inputs:
+              workingDirectory: $(workingDirectory)
+              targetType: inline
+              script: |
+                REPORT_TASK_FILE=".scannerwork/report-task.txt"
+                if [ -f "$REPORT_TASK_FILE" ]; then
+                  echo "##[debug]Report task file found at: $REPORT_TASK_FILE"
+                  TASK_ID=$(grep 'ceTaskId=' "$REPORT_TASK_FILE" | cut -d'=' -f2)
+                  if [ -n "$TASK_ID" ]; then
+                    echo "##[debug]Found Sonar task id: $TASK_ID"
+                    echo "##vso[task.setvariable variable=SONAR_TASK_ID;isOutput=true]$TASK_ID"
+                  else
+                    echo "##[error]Could not find ceTaskId in report file"
+                    exit 1
+                  fi
+                else
+                  echo "##[error]Report task file not found at: $REPORT_TASK_FILE"
+                  echo "##[debug]Current directory: $(pwd)"
+                  echo "##[debug]Directory contents:"
+                  ls -la
+                  exit 1
+                fi
+
+          # Publish Quality Gate Result
+          - task: SonarQubePublish@5
+            displayName: 'Publish Quality Gate Result'
+            continueOnError: true
+
+          # Verify QualityGate Status
+          - task: Bash@3
+            displayName: 'Analyze Quality Gate status'
+            name: quality_gate_status
+            condition: succeeded()
+            continueOnError: true
+            inputs:
+              workingDirectory: $(Agent.TempDirectory)/sonar/$(Build.BuildId)
+              targetType: inline
+              script: |
+                sonarTaskUrl="$(SONARQUBE_URL)/api/ce/task?id=$(sonar_task_id.SONAR_TASK_ID)"
+                echo "##[debug] SONAR_TASK_URL..............: $sonarTaskUrl"
+                
+                analysisId="$(curl -s -u "$(SONARQUBE-TOKEN):" "$sonarTaskUrl" | jq -r '.task.analysisId')"
+                echo "##[debug] ANALYSIS_ID.................: $analysisId"
+
+                sonarProjectStatusUrl="$(SONARQUBE_URL)/api/qualitygates/project_status?analysisId=$analysisId"
+                echo "##[debug] SONAR_PROJECT_STATUS_URL....: $sonarProjectStatusUrl"
+                
+                analysisStatus="$(curl -s -u "$(SONARQUBE-TOKEN):" "$sonarProjectStatusUrl" | jq -r '.projectStatus.status')"
+                echo "##[debug] ANALYSIS_STATUS.............: $analysisStatus"
+
+                sonarProjectDashboard="$(SONARQUBE_URL)/dashboard?id=$(SONAR_PROJECT_KEY)"
+                echo "##[debug] SONAR_PROJECT_DASHBOARD.....: $sonarProjectDashboard"
+                
+                if [[ "$analysisStatus" == "ERROR" ]]; then
+                  echo "##vso[task.logissue type=error;] Sonar Quality Gate status is ERROR - View details on step Run Code Analysis."
+                  echo "##vso[task.complete result=Failed;]"
+                fi
+
+  - stage: Version
+    displayName: 'Version & TAG'
+    dependsOn: [Build, Security]
+    condition: and(succeeded(), in(variables['Build.SourceBranch'], 'refs/heads/main', 'refs/heads/master'))
+    pool:
+      name: $(PRIVATE_AGENT_DEFAULT)
+    jobs:
+      - job: Tag
+        displayName: 'Version & TAG'
+        steps:
+          - checkout: self
+            persistCredentials: true
+            fetchDepth: 0
+            fetchTags: true
+            clean: true
+
+          # Setup NPM Authentication
+          - task: npmAuthenticate@0
+            inputs:
+              workingFile: .npmrc
+            displayName: Set dependencies credentials (Azure Artifacts)
+            env:
+              HTTPS_PROXY: $(PROXY_AGENT_HTTPS)
+              HTTP_PROXY: $(PROXY_AGENT_HTTP)
+              NO_PROXY: $(PROXY_AGENT_NO_PROXY)
+
+          # Setup NPM and Install Dependencies
+          - task: Bash@3
+            displayName: 'Setup NPM'
+            inputs:
+              targetType: inline
+              script: |
+                # Configurar npm para usar o registro interno
+                npm config set registry https://pkgs.dev.azure.com/telefonica-vivo-brasil/_packaging/DevOps/npm/registry/
+                
+                # Instalar standard-version globalmente
+                npm install -g standard-version
+                
+                # Verificar a configuração
+                echo "##[debug]NPM Registry: $(npm config get registry)"
+
+          # Set Git Config
+          - task: Bash@3
+            displayName: 'Set Git Config'
+            name: git_config
+            inputs:
+              targetType: inline
+              script: |
+                git config --global user.email "azuredevops@telefonicati.onmicrosoft.com"
+                git config --global user.name "Azure DevOps"
+
+
+          # Get Pull Request Number
+          - task: Bash@3
+            displayName: 'Pull Request Number'
+            name: pull_request_number
+            inputs:
+              targetType: inline
+              script: |
+                source_version_message=$BUILD_SOURCEVERSIONMESSAGE
+                echo "##[debug]BUILD_SOURCEVERSIONMESSAGE: $source_version_message"
+
+                pattern_pr="Merged\ PR\ ([0-9]+):"
+
+                if [[ $source_version_message =~ $pattern_pr ]]; then
+                    pr_number=${BASH_REMATCH[1]}
+                    echo "##[debug]PULL REQUEST NUMBER: $pr_number"
+                    echo "##vso[task.setvariable variable=PULL_REQUEST_NUMBER;]$pr_number"
+                    echo "##vso[task.setvariable variable=HAS_PULL_REQUEST;]true"
+                else
+                    echo "##vso[task.setvariable variable=HAS_PULL_REQUEST;]false"
+                fi
+
+          # Get Pull Request Info
+          - task: PullRequestGetInfo@1
+            displayName: 'Get Pull Request Info'
+            condition: eq(variables.HAS_PULL_REQUEST, true)
+            inputs:
+              pullRequestNumber: $(PULL_REQUEST_NUMBER)
+              pullRequestTitleVariable: 'PULL_REQUEST_TITLE'
+              pullRequestDescriptionVariable: 'PULL_REQUEST_DESCRIPTION'
+
+          # Tag
+          - task: Bash@3
+            displayName: 'Updating Version & Tag'
+            name: tag
+            inputs:
+              targetType: inline
+              script: |
+                build_reason="$BUILD_REASON"
+                echo "##[debug]Build reason is: $build_reason"
+                NEW_VERSION=""
+
+                if [[ "$build_reason" == "Manual" ]]; then
+                  bump_version="${{ parameters.bump_version }}"
+                  bump_message="${{ parameters.bump_message }}"
+
+                  echo "##[debug]Bump version: $bump_version"
+                  echo "##[debug]Bump message: $bump_message"
+
+                  if [[ $bump_message =~ (feat!:|chore!:|fix!:|feat:|fix:) ]]; then
+                    npx standard-version --release-as "$bump_version" --releaseCommitMessageFormat "$bump_message [skip ci]"
+                    NEW_VERSION=$(jq -r '.version' package.json)
+                    echo "##[debug]New version: $NEW_VERSION"
+                    echo "##vso[task.setvariable variable=NEW_VERSION;isOutput=true]$NEW_VERSION"
+                    git push --follow-tags origin HEAD:$(Build.SourceBranchName)
+                  else
+                    echo "##[error]Message type error"
+                    echo "##[debug]Esta pipeline espera um tipo no parâmetro de mensagem. [feat/fix]"
+                    echo "##vso[task.complete result=Failed;]"
+                    exit 1
+                  fi
+                else
+                  commit_description=$BUILD_SOURCEVERSIONMESSAGE
+                  echo "##[debug]Commit description is: $commit_description"
+
+                  if [[ $(HAS_PULL_REQUEST) == true ]]; then
+                    echo "##[debug]Pull request"
+
+                    pr_description="${PULL_REQUEST_DESCRIPTION}"
+                    if [[ -n "$pr_description" ]]; then
+                      echo "##[debug]Pull request description OK"
+                    else
+                      echo "##[error]Pull request description is empty"
+                      echo "##vso[task.complete result=Failed;]"
+                      exit 1
+                    fi
+
+                    if [[ $commit_description =~ (BREAKING CHANGE|feat!:|chore!:|fix!:) ]]; then
+                      echo "##[debug]Bump major version"
+                      keyword=$(echo "$commit_description" | grep -oE 'feat!:|chore!:|fix!:')
+                      description_after_keyword="${pr_description#*$keyword}"
+                      commit_message=$keyword$description_after_keyword
+                      npx standard-version --release-as major --releaseCommitMessageFormat "$commit_message [skip ci]"
+
+                    elif [[ $commit_description =~ (feat:) ]]; then
+                      echo "##[debug]Feat"
+                      keyword=$(echo "$commit_description" | grep -oE 'feat:')
+                      description_after_keyword="${pr_description#*$keyword}"
+                      commit_message=$keyword$description_after_keyword
+                      npx standard-version --release-as minor --releaseCommitMessageFormat "$commit_message [skip ci]"
+
+                    elif [[ $commit_description =~ (fix:) ]]; then
+                      echo "##[debug]Patch"
+                      keyword=$(echo "$commit_description" | grep -oE 'fix:')
+                      description_after_keyword="${pr_description#*$keyword}"
+                      commit_message=$keyword$description_after_keyword
+                      npx standard-version --release-as patch --releaseCommitMessageFormat "$commit_message [skip ci]"
+
+                    else
+                      echo "##[error]Commit type error"
+                      echo "##[debug]Esta pipeline espera um tipo na descrição do commit ou titulo do PR. [feat/fix]"
+                      echo "##vso[task.complete result=Failed;]"
+                      exit 1
+                    fi
+
+                    # Get the new version after bumping
+                    NEW_VERSION=$(jq -r '.version' package.json)
+                    echo "##[debug]New version: $NEW_VERSION"
+                    echo "##vso[task.setvariable variable=NEW_VERSION;isOutput=true]$NEW_VERSION"
+                    
+                    git push --follow-tags origin HEAD:$(Build.SourceBranchName)
+                  else
+                    echo "##[debug]Pull request does not exist"
+                    echo "##[debug]Skipping TAG."
+                  fi
+                fi
+
+          # Clear Git Config
+          - task: Bash@3
+            displayName: 'Clear Git Config'
+            name: clear_git_config
+            condition: always()
+            continueOnError: true
+            inputs:
+              targetType: inline
+              script: |
+                git config --global --unset-all user.email
+                git config --global --unset-all user.name
+                
+  - stage: Publish
+    displayName: 'Publish Package'
+    dependsOn: Version
+    variables:
+      NEW_VERSION: $[ dependencies.Version.outputs['Tag.tag.NEW_VERSION'] ]
+    jobs:
+      - job: PublishPackage
+        displayName: 'Publish to NPM Registry'
+        pool:
+          name: $(PRIVATE_AGENT_DEFAULT)
+        steps:
+          # Download dos artefatos
+          - task: DownloadPipelineArtifact@2
+            displayName: 'Download Artifacts'
+            inputs:
+              buildType: 'current'
+              artifactName: 'app-package'
+              targetPath: '$(Pipeline.Workspace)/package'
+
+          - task: DownloadPipelineArtifact@2
+            displayName: 'Download catalog-info'
+            inputs:
+              buildType: 'current'
+              artifactName: 'catalog-info'
+              targetPath: '$(Pipeline.Workspace)'
+
+          # Configurar NPM
+          - bash: |
+              cd $(Pipeline.Workspace)
+              
+              # Extrair nome do pacote do catalog-info.yaml
+              PACKAGE_NAME=$(yq -r '.metadata.name' catalog-info.yaml)
+              PACKAGE_SCOPE=$(yq -r '.metadata.annotations."techarch.governance-app.acronym"' catalog-info.yaml)
+              
+              echo "##[debug]Package info: @${PACKAGE_SCOPE}/${PACKAGE_NAME}"
+              
+              # Criar .npmrc com configuração do feed
+              echo "registry=https://pkgs.dev.azure.com/telefonica-vivo-brasil/_packaging/DevOps/npm/registry/ 
+              @${PACKAGE_SCOPE}:registry=https://pkgs.dev.azure.com/telefonica-vivo-brasil/_packaging/DevOps/npm/registry/" > $(Agent.TempDirectory)/.npmrc
+              
+              echo "##[debug]Generated .npmrc:"
+              cat $(Agent.TempDirectory)/.npmrc
+              
+              echo "##[debug]Setting NPM_CONFIG_USERCONFIG"
+              echo "##vso[task.setvariable variable=NPM_CONFIG_USERCONFIG]$(Agent.TempDirectory)/.npmrc"
+            displayName: 'Configure NPM'
+
+          - task: AzureKeyVault@2
+            displayName: 'Getting AKV Credentials'
+            timeoutInMinutes: 1
+            retryCountOnTaskFailure: 5
+            inputs:
+              azureSubscription: 'DevOpsSharedResources'
+              KeyVaultName: 'kv-azdevops-shared'
+              SecretsFilter: 'NEXUS-DEFAULT-USR, NEXUS-DEFAULT-PSW'
+
+          - task: npmAuthenticate@0
+            inputs:
+              workingFile: $(Agent.TempDirectory)/.npmrc
+            displayName: Set dependencies credentials (Azure Artifacts)
+            env:
+              HTTPS_PROXY: $(PROXY_AGENT_HTTPS)
+              HTTP_PROXY: $(PROXY_AGENT_HTTP)
+              NO_PROXY: $(PROXY_AGENT_NO_PROXY)
+
+          - bash: |
+              if [ -f $(Agent.TempDirectory)/.npmrc ]; then
+                auth_opt="email=vivo.devops.br@telefonica.com\nalways-auth=true"
+                auth=$(echo -n ${NEXUS_DEFAULT_USR}:${NEXUS_DEFAULT_PSW} | openssl base64)
+                repos=$(grep -o "registry=.*" "$(Agent.TempDirectory)/.npmrc" | cut -d':' -f2 | awk -v auth="$auth" '{print $0 ":_auth="auth""}')
+                { printf '\n'; echo -e "$repos\n$auth_opt"; } | tee -a >(cat >> "$(Agent.TempDirectory)/.npmrc") > /dev/null
+                echo "##[debug]Credenciais configuradas!"
+              else
+                echo "##vso[task.logissue type=error]O arquivo .npmrc não foi encontrado!"
+                echo "##[error]O arquivo .npmrc não foi encontrado!"
+                exit 1;
+              fi
+            displayName: "Set dependencies credentials (Nexus)"
+            env:    
+              NEXUS_DEFAULT_USR: $(NEXUS-DEFAULT-USR)
+              NEXUS_DEFAULT_PSW: $(NEXUS-DEFAULT-PSW)
+          
+          # Checkout do código
+          - checkout: self
+            persistCredentials: true
+            fetchDepth: 1
+
+          # Download do artefato
+          - task: DownloadPipelineArtifact@2
+            displayName: 'Download Artifacts'
+            inputs:
+              buildType: 'current'
+              artifactName: 'app-package'
+              targetPath: '$(System.DefaultWorkingDirectory)/dist'
+
+          # Publicar pacote
+          - bash: |
+              echo "##[debug]Publishing to npm registry..."
+              
+              # Extrair nome do pacote do catalog-info.yaml
+              PACKAGE_NAME=$(yq -r '.metadata.name' catalog-info.yaml)
+              PACKAGE_SCOPE=$(yq -r '.metadata.annotations."techarch.governance-app.acronym"' catalog-info.yaml)
+              
+              # Usar a versão do stage Version
+              TAGGED_VERSION="$(NEW_VERSION)"
+              if [ -z "$TAGGED_VERSION" ]; then
+                echo "##[debug]No version from Version stage, using package.json version"
+                TAGGED_VERSION=$(jq -r '.version' package.json)
+              fi
+              echo "##[debug]Using version from Version stage: ${TAGGED_VERSION}"
+              
+              # Extrair o app.tar.gz para atualizar a versão
+              mkdir -p dist/temp
+              tar -xzf dist/app.tar.gz -C dist/temp
+              
+              # Verificar a versão dentro do pacote
+              if [ -f dist/temp/package.json ]; then
+                PACKAGE_INSIDE_VERSION=$(jq -r '.version' dist/temp/package.json)
+                echo "##[debug]Version inside package: ${PACKAGE_INSIDE_VERSION}"
+                
+                # Sempre atualizar a versão no pacote para garantir que esteja sincronizada
+                echo "##[debug]Updating package version from ${PACKAGE_INSIDE_VERSION} to ${TAGGED_VERSION}"
+                
+                # Atualizar a versão no package.json dentro do pacote
+                FULL_PACKAGE_NAME="@${PACKAGE_SCOPE}/${PACKAGE_NAME}"
+                jq --arg name "${FULL_PACKAGE_NAME}" --arg version "${TAGGED_VERSION}" '.name = $name | .version = $version' dist/temp/package.json > dist/temp/package.json.new
+                mv dist/temp/package.json.new dist/temp/package.json
+                
+                # Atualizar também o package-lock.json se existir
+                if [ -f dist/temp/package-lock.json ]; then
+                  echo "##[debug]Updating version in package-lock.json"
+                  jq --arg version "${TAGGED_VERSION}" '.version = $version' dist/temp/package-lock.json > dist/temp/package-lock.json.new
+                  mv dist/temp/package-lock.json.new dist/temp/package-lock.json
+                fi
+                
+                # Recriar o pacote com a versão atualizada
+                cd dist/temp
+                npm pack
+                mv *.tgz ../app.tar.gz
+                cd ../..
+                echo "##[section]Successfully updated package to version ${TAGGED_VERSION}"
+              else
+                echo "##[warning]No package.json found inside the package, using version: ${TAGGED_VERSION}"
+                FULL_PACKAGE_NAME="@${PACKAGE_SCOPE}/${PACKAGE_NAME}"
+              fi
+              
+              # Publicar o pacote
+              FULL_PACKAGE_NAME="@${PACKAGE_SCOPE}/${PACKAGE_NAME}"
+              echo "##[debug]Publishing ${FULL_PACKAGE_NAME}@${TAGGED_VERSION}..."
+              cd dist
+              npm publish app.tar.gz --verbose
+            displayName: "Publish to npm registry"
+            workingDirectory: "$(System.DefaultWorkingDirectory)"
+            env:
+              NPM_CONFIG_USERCONFIG: $(Agent.TempDirectory)/.npmrc

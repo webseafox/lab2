@@ -1,0 +1,499 @@
+parameters:
+#############################################################################
+# INFRAESTRUTURA E AMBIENTE
+#############################################################################
+- name: agentPool
+  type: string
+  default: GeneralPurposeLinuxAgentsCI
+  displayName: 'Agent Pool para execução'
+
+#############################################################################
+# CONFIGURAÇÕES DO PROJETO
+#############################################################################
+- name: sigla
+  type: string
+  default: $(SIGLA)
+  displayName: 'Sigla do projeto (obrigatório)'
+
+- name: version
+  type: string
+  default: ''
+  displayName: 'Versão da imagem (opcional se versionFile configurado)'
+
+- name: versionFile
+  type: string
+  default: 'version.txt'
+  displayName: 'Arquivo onde será salva/lida a versão (usado quando version não informado)'
+
+#############################################################################
+# CONFIGURAÇÕES DE DOCKER
+#############################################################################
+- name: imageName
+  type: string
+  default: ''
+  displayName: 'Nome da imagem Docker (opcional, padrão: $(sigla)/$(Build.Repository.Name))'
+
+- name: registryServiceConnection
+  type: string
+  default: 'ACR-DEVOPS'
+  displayName: 'Service Connection do Registry'
+
+- name: registryUrl
+  type: string
+  default: 'acrsharedservices01.azurecr.io'
+  displayName: 'URL do Container Registry (ex: myacr.azurecr.io)'
+
+#############################################################################
+# CONFIGURAÇÕES DO ARQUIVO .TAR
+#############################################################################
+- name: tarSource
+  type: string
+  default: 'manualUpload'
+  displayName: 'Origem do arquivo .tar'
+  values:
+    - manualUpload    # Upload manual via Azure CLI durante execução do pipeline
+    - repository      # Arquivo commitado no repositório
+    - secureFile      # Upload via Secure Files (Library)
+
+- name: tarFilePath
+  type: string
+  default: ''
+  displayName: 'Caminho do arquivo .tar no repositório (quando tarSource=repository)'
+
+- name: secureFileName
+  type: string
+  default: ''
+  displayName: 'Nome do Secure File no Library (quando tarSource=secureFile)'
+
+- name: artifactName
+  type: string
+  default: 'docker-tar'
+  displayName: 'Nome do artefato para upload manual (quando tarSource=manualUpload)'
+
+variables:
+  # Sigla do projeto (extraída do nome do projeto ou do parâmetro)
+  SIGLA: $[ lower(split(variables['System.TeamProject'],' ')[0]) ]
+  
+  # Variável de versão (será sobrescrita pelo VersionManagerVivo se version não informado)
+  IMAGE_VERSION: ${{ parameters.version }}
+
+  # Configurações de segurança
+  DOCKER_BUILDKIT: 1
+  BUILDKIT_PROGRESS: plain
+
+  # Variáveis utilizadas por templates de Segurança (SCA)
+  CACORP_LOCATION: $(Agent.HomeDirectory)/../../certs/CACORP.pem
+  FORTIFY_APP_DEFAULT_VERSION: DevSecOps
+  APP_LANGUAGE: 'other'
+  DOCKER_SERVICE_CONNECTION: ${{ parameters.registryServiceConnection }}
+
+  # Configurações de KeyVault para Segurança
+  AKV_DEVOPS_NAME: 'kv-azdevops-shared'
+
+  # Variables for Proxy
+  PROXY_SQUID_SERVER: "10.240.58.39:3128"
+  PROXY_AGENT_HTTP: "http://$(PROXY_SQUID_SERVER)"
+  PROXY_AGENT_HTTPS: "http://$(PROXY_SQUID_SERVER)"
+  PROXY_AGENT_NO_PROXY: "localhost,0.0.0.0,127.0.0.1,10.244.0.0/16,192.168.0.0/16,10.129.178.173,nexus.telefonica.com.br,acrsharedservices01.azurecr.io,appcs-azdevops-shared.azconfig.io,scm.azurewebsites.net"
+
+stages:
+
+# ==================================================================
+# Stage 1: SecurityAnalysis - Obter Configurações de Segurança
+# Descrição: Obtém as flags de configuração de segurança do AppConfig
+#            para habilitar/desabilitar SCA scan
+# ==================================================================
+- stage: SecurityAnalysis
+  displayName: 'Security Analysis'
+  condition: succeeded()
+  jobs:
+
+  - job: AppSecConfigKeys
+    displayName: 'Get AppSec Config Keys'
+    pool: ${{ parameters.agentPool }}
+    steps:
+    - template: /security/get_appconfig_keys_framework.yml
+      parameters:
+        azureSubscription: DevOpsSharedResources
+        appConfigurationEndpoint: https://appcs-azdevops-shared.azconfig.io
+
+# ==================================================================
+# Stage 2: Upload - Aguarda Upload Manual do Arquivo .tar
+# Descrição: Exibe instruções para upload via Azure CLI e aguarda
+#            confirmação do usuário (apenas quando tarSource=manualUpload)
+# ==================================================================
+- ${{ if eq(parameters.tarSource, 'manualUpload') }}:
+  - stage: Upload
+    displayName: 'Aguardar Upload do Arquivo'
+    dependsOn: SecurityAnalysis
+    condition: succeeded()
+    jobs:
+    - job: WaitForUpload
+      displayName: 'Aguardando Upload Manual'
+      pool: server
+      steps:
+      - task: ManualValidation@1
+        displayName: 'Aguardar Upload do Arquivo .tar'
+        inputs:
+          notifyUsers: ''
+          instructions: |
+            ╔══════════════════════════════════════════════════════════════════════╗
+            ║                    📦 UPLOAD DO ARQUIVO .TAR                         ║
+            ╚══════════════════════════════════════════════════════════════════════╝
+            
+            O pipeline está aguardando o upload do arquivo Docker (.tar ou .tar.gz).
+            
+            ══════════════════════════════════════════════════════════════════════
+            📋 PRÉ-REQUISITOS
+            ══════════════════════════════════════════════════════════════════════
+            
+            1. Instale o Azure CLI:
+               https://learn.microsoft.com/pt-br/cli/azure/install-azure-cli
+            
+            2. Instale a extensão Azure DevOps:
+               az extension add --name azure-devops
+            
+            ══════════════════════════════════════════════════════════════════════
+            🚀 COMANDO PARA UPLOAD
+            ══════════════════════════════════════════════════════════════════════
+            
+            ▸ Windows (CMD):
+              set ARTEFATO=C:\caminho\para\imagem.tar
+              az login
+              az pipelines runs artifact upload --artifact-name ${{ parameters.artifactName }} --path %ARTEFATO% --run-id $(Build.BuildId) --organization $(System.CollectionUri) --project "$(System.TeamProject)"
+            
+            ▸ Windows (PowerShell):
+              $ARTEFATO = "C:\caminho\para\imagem.tar"
+              az login
+              az pipelines runs artifact upload --artifact-name ${{ parameters.artifactName }} --path $ARTEFATO --run-id $(Build.BuildId) --organization $(System.CollectionUri) --project "$(System.TeamProject)"
+            
+            ▸ Linux/macOS:
+              ARTEFATO="/caminho/para/imagem.tar"
+              az login
+              az pipelines runs artifact upload --artifact-name ${{ parameters.artifactName }} --path "$ARTEFATO" --run-id $(Build.BuildId) --organization $(System.CollectionUri) --project "$(System.TeamProject)"
+            
+            ══════════════════════════════════════════════════════════════════════
+            ℹ️  INFORMAÇÕES DO PIPELINE
+            ══════════════════════════════════════════════════════════════════════
+            
+              • Build ID:        $(Build.BuildId)
+              • Projeto:         $(System.TeamProject)
+              • Nome Artefato:   ${{ parameters.artifactName }}
+              • Sigla:           ${{ parameters.sigla }}
+              • Versão:          ${{ parameters.version }}
+            
+            ══════════════════════════════════════════════════════════════════════
+            ⚠️  IMPORTANTE
+            ══════════════════════════════════════════════════════════════════════
+            
+              • O arquivo deve ser .tar ou .tar.gz gerado com "docker save"
+              • Após o upload, clique em "Resume" para continuar o pipeline
+            
+            ══════════════════════════════════════════════════════════════════════
+          onTimeout: 'reject'
+
+# ==================================================================
+# Stage 3: DockerLoad - Carrega e Publica a Imagem Docker
+# Descrição: Baixa o artefato .tar, executa docker load para carregar 
+#            a imagem, executa SCA e publica no Azure Container Registry
+# ==================================================================
+- stage: DockerLoad
+  displayName: 'Docker Load and Push'
+  ${{ if eq(parameters.tarSource, 'manualUpload') }}:
+    dependsOn: 
+    - SecurityAnalysis
+    - Upload
+  ${{ else }}:
+    dependsOn: SecurityAnalysis
+  condition: succeeded()
+  jobs:
+  
+  - job: LoadAndPush
+    displayName: 'Load and Push Docker Image'
+    pool: ${{ parameters.agentPool }}
+    variables:
+      USE_DT_DOCKER: $[ stageDependencies.SecurityAnalysis.AppSecConfigKeys.outputs['evaluate_flags.USE_DT_DOCKER'] ]
+      USE_CONVISO: $[ stageDependencies.SecurityAnalysis.AppSecConfigKeys.outputs['evaluate_flags.USE_CONVISO'] ]
+      SKIP_SECURITY_GATE_SCA: $[ stageDependencies.SecurityAnalysis.AppSecConfigKeys.outputs['evaluate_flags.SKIP_SECURITY_GATE_SCA'] ]
+    steps:
+    
+    # Checkout do código-fonte (inclui o arquivo .tar commitado)
+    - checkout: self
+      displayName: 'Checkout Repository'
+
+    # ==================================================================
+    # VERSIONAMENTO AUTOMÁTICO (quando version não informado)
+    # Descrição: Lê versão do arquivo version.txt se parâmetro version estiver vazio
+    # ==================================================================
+    - ${{ if eq(parameters.version, '') }}:
+      - task: VersionManagerVivo@8
+        displayName: 'Read version from file'
+        inputs:
+          command: 'nextVersion'
+          versionFile: $(Build.SourcesDirectory)/${{ parameters.versionFile }}
+          bumpMethod: 'patch'
+
+      - task: CmdLine@2
+        displayName: 'Set IMAGE_VERSION from VersionManager'
+        inputs:
+          script: |
+            echo "##[section] Versão obtida do arquivo ${{ parameters.versionFile }}"
+            echo "##[debug] VERSION: $(VersionManagerVivo.VERSION)"
+            echo "##vso[task.setvariable variable=IMAGE_VERSION]$(VersionManagerVivo.VERSION)"
+
+    # ==================================================================
+    # OPÇÃO 1: Upload Manual via Azure CLI
+    # ==================================================================
+    - ${{ if eq(parameters.tarSource, 'manualUpload') }}:
+      - task: DownloadPipelineArtifact@2
+        displayName: 'Download Uploaded Artifact'
+        inputs:
+          buildType: 'current'
+          artifactName: '${{ parameters.artifactName }}'
+          targetPath: '$(Pipeline.Workspace)/docker-artifact'
+
+      - task: CmdLine@2
+        displayName: 'Validate TAR File (Manual Upload)'
+        inputs:
+          script: |
+            echo "##[section] Validating TAR file from manual upload..."
+            
+            ARTIFACT_DIR="$(Pipeline.Workspace)/docker-artifact"
+            
+            # Encontra o arquivo .tar ou .tar.gz no artefato
+            TAR_FILE=$(find "$ARTIFACT_DIR" -type f \( -name "*.tar" -o -name "*.tar.gz" \) | head -1)
+            
+            if [ -z "$TAR_FILE" ]; then
+              echo "##[error] Nenhum arquivo .tar ou .tar.gz encontrado no artefato."
+              echo "##[section] Conteúdo do artefato:"
+              ls -la "$ARTIFACT_DIR"
+              exit 1
+            fi
+            
+            echo "##[debug] Arquivo .tar encontrado: $TAR_FILE"
+            echo "##[debug] Tamanho do arquivo: $(du -h $TAR_FILE | cut -f1)"
+            
+            # Exporta o caminho para uso posterior
+            echo "##vso[task.setvariable variable=TAR_FILE_PATH]$TAR_FILE"
+
+    # ==================================================================
+    # OPÇÃO 2: Arquivo .tar do Repositório
+    # ==================================================================
+    - ${{ if eq(parameters.tarSource, 'repository') }}:
+      - task: CmdLine@2
+        displayName: 'Validate TAR File (Repository)'
+        inputs:
+          script: |
+            echo "##[section] Validating TAR file from repository..."
+            
+            TAR_PATH="${{ parameters.tarFilePath }}"
+            
+            if [ -z "$TAR_PATH" ]; then
+              echo "##[error] Parâmetro 'tarFilePath' é obrigatório quando tarSource=repository."
+              exit 1
+            fi
+            
+            FULL_TAR_PATH="$(Build.SourcesDirectory)/$TAR_PATH"
+            
+            if [ ! -f "$FULL_TAR_PATH" ]; then
+              echo "##[error] Arquivo .tar não encontrado: $FULL_TAR_PATH"
+              echo "##[section] Conteúdo do diretório $(Build.SourcesDirectory):"
+              find $(Build.SourcesDirectory) -name "*.tar" -o -name "*.tar.gz" 2>/dev/null || true
+              echo ""
+              echo "##[section] Certifique-se de que o arquivo .tar foi commitado no repositório."
+              echo "##[section] Use 'git lfs track \"*.tar\"' para arquivos grandes."
+              exit 1
+            fi
+            
+            echo "##[debug] Arquivo .tar encontrado: $FULL_TAR_PATH"
+            echo "##[debug] Tamanho do arquivo: $(du -h $FULL_TAR_PATH | cut -f1)"
+            
+            # Exporta o caminho para uso posterior
+            echo "##vso[task.setvariable variable=TAR_FILE_PATH]$FULL_TAR_PATH"
+
+    # ==================================================================
+    # OPÇÃO 3: Arquivo .tar via Secure File
+    # ==================================================================
+    - ${{ if eq(parameters.tarSource, 'secureFile') }}:
+      - task: DownloadSecureFile@1
+        displayName: 'Download Secure File'
+        name: dockerTarFile
+        inputs:
+          secureFile: '${{ parameters.secureFileName }}'
+
+      - task: CmdLine@2
+        displayName: 'Validate TAR File (Secure File)'
+        inputs:
+          script: |
+            echo "##[section] Validating TAR file from Secure Files..."
+            
+            SECURE_FILE_NAME="${{ parameters.secureFileName }}"
+            
+            if [ -z "$SECURE_FILE_NAME" ]; then
+              echo "##[error] Parâmetro 'secureFileName' é obrigatório quando tarSource=secureFile."
+              exit 1
+            fi
+            
+            FULL_TAR_PATH="$(dockerTarFile.secureFilePath)"
+            
+            if [ ! -f "$FULL_TAR_PATH" ]; then
+              echo "##[error] Secure File não encontrado: $FULL_TAR_PATH"
+              exit 1
+            fi
+            
+            echo "##[debug] Arquivo .tar encontrado: $FULL_TAR_PATH"
+            echo "##[debug] Tamanho do arquivo: $(du -h $FULL_TAR_PATH | cut -f1)"
+            
+            # Exporta o caminho para uso posterior
+            echo "##vso[task.setvariable variable=TAR_FILE_PATH]$FULL_TAR_PATH"
+
+    # Login no Container Registry
+    - task: Docker@2
+      displayName: 'Login to Registry - ${{ parameters.registryServiceConnection }}'
+      inputs:
+        command: 'login'
+        containerRegistry: '${{ parameters.registryServiceConnection }}'
+
+    # Carrega a imagem Docker do arquivo .tar e faz retag
+    - task: CmdLine@2
+      displayName: 'Docker Load from TAR'
+      name: dockerLoad
+      inputs:
+        script: |
+          echo "##[section] Loading Docker image from TAR file..."
+          
+          TAR_PATH="$(TAR_FILE_PATH)"
+          
+          echo "##[debug] TAR file: $TAR_PATH"
+          echo "##[debug] TAR file size: $(du -h $TAR_PATH | cut -f1)"
+          
+          # Detecta se o arquivo está compactado com gzip e captura o output
+          if file "$TAR_PATH" | grep -q "gzip"; then
+            echo "##[debug] Arquivo compactado com gzip detectado. Descompactando..."
+            LOAD_OUTPUT=$(gunzip -c "$TAR_PATH" | docker load 2>&1)
+          else
+            LOAD_OUTPUT=$(docker load -i "$TAR_PATH" 2>&1)
+          fi
+          
+          echo "##[debug] Docker load output:"
+          echo "$LOAD_OUTPUT"
+          
+          # Extrai o nome da imagem carregada do output
+          # Formato esperado: "Loaded image: nome:tag" ou "Loaded image ID: sha256:..."
+          if echo "$LOAD_OUTPUT" | grep -q "Loaded image:"; then
+            LOADED_IMAGE=$(echo "$LOAD_OUTPUT" | grep "Loaded image:" | sed 's/Loaded image: //' | tail -1)
+          elif echo "$LOAD_OUTPUT" | grep -q "Loaded image ID:"; then
+            LOADED_IMAGE=$(echo "$LOAD_OUTPUT" | grep "Loaded image ID:" | sed 's/Loaded image ID: //' | tail -1)
+          else
+            # Fallback: pega a imagem mais recente
+            LOADED_IMAGE=$(docker images --format '{{.Repository}}:{{.Tag}}' | head -1)
+            if [ "$LOADED_IMAGE" == "<none>:<none>" ]; then
+              LOADED_IMAGE=$(docker images --format '{{.ID}}' | head -1)
+            fi
+          fi
+          
+          if [ -z "$LOADED_IMAGE" ]; then
+            echo "##[error] Nenhuma imagem encontrada após docker load"
+            exit 1
+          fi
+          
+          echo "##[debug] Imagem carregada: $LOADED_IMAGE"
+          
+          # Exporta a imagem carregada para a próxima task
+          echo "##vso[task.setvariable variable=LOADED_IMAGE;isOutput=true]${LOADED_IMAGE}"
+          
+          echo "##[section] Docker images after load:"
+          docker images
+
+    # Faz tag da imagem com o nome correto para o registry
+    - task: CmdLine@2
+      displayName: 'Tag Docker Image'
+      name: tagImage
+      inputs:
+        script: |
+          echo "##[section] Tagging Docker image..."
+          
+          LOADED_IMAGE="$(dockerLoad.LOADED_IMAGE)"
+          
+          echo "##[debug] Imagem a ser retagueada: $LOADED_IMAGE"
+          
+          # Obtém o nome do registry a partir do parâmetro
+          REGISTRY="${{ parameters.registryUrl }}"
+          
+          # Calcula o IMAGE_NAME em runtime
+          # Se o parâmetro imageName foi informado, usa ele; senão, usa SIGLA/repo
+          PARAM_IMAGE_NAME="${{ parameters.imageName }}"
+          if [ -n "$PARAM_IMAGE_NAME" ]; then
+            IMAGE_NAME="$PARAM_IMAGE_NAME"
+          else
+            # Usa SIGLA (variável runtime) + nome do repositório
+            IMAGE_NAME="$(SIGLA)/$(Build.Repository.Name)"
+          fi
+          
+          VERSION="$(IMAGE_VERSION)"
+          FULL_IMAGE_NAME="${REGISTRY}/${IMAGE_NAME}:${VERSION}"
+          
+          echo "##[debug] SIGLA: $(SIGLA)"
+          echo "##[debug] IMAGE_NAME: $IMAGE_NAME"
+          echo "##[debug] VERSION: $VERSION"
+          echo "##[debug] Nome final da imagem: $FULL_IMAGE_NAME"
+          
+          # Faz o tag da imagem
+          docker tag "$LOADED_IMAGE" "$FULL_IMAGE_NAME"
+          
+          echo "##vso[task.setvariable variable=FULL_IMAGE_NAME;isOutput=true]${FULL_IMAGE_NAME}"
+          echo "##vso[task.setvariable variable=LOADED_IMAGE;isOutput=true]${LOADED_IMAGE}"
+          echo "##vso[task.setvariable variable=IMAGE_NAME;isOutput=true]${IMAGE_NAME}"
+          
+          echo "##[section] Docker images after tagging:"
+          docker images
+
+    # Inspeciona a imagem
+    - task: CmdLine@2
+      displayName: 'Inspect Docker Image'
+      name: inspect
+      inputs:
+        script: |
+          echo "##[section] Inspecting Docker image..."
+          docker inspect $(tagImage.FULL_IMAGE_NAME)
+          
+          # Exporta variável para uso nos templates de SCA
+          echo "##vso[task.setvariable variable=FULL_IMAGE_NAME]$(tagImage.FULL_IMAGE_NAME)"
+
+    # ==================================================================
+    # CAPACIDADE: SCA SCAN (SCA)
+    # ==================================================================
+    # Descrição: Análise de composição de software (SCA) usando Dependency Track,
+    #            com integração à Conviso e publicação de artefatos.
+    # Documentação: https://dvps.redecorp.azr/portal/codeplay/capacidades/catalog
+    # Observações: Exporta variáveis e publica artefatos para uso no Security Gate.
+    # ==================================================================
+
+    # Define a versão da aplicação para segurança
+    - template: /security/define_appsec_app_version.yml
+
+    # Executa SCA Scan na imagem Docker
+    - template: /security/run_sca_scan_docker.yml
+      parameters:
+        imageSource: $(tagImage.FULL_IMAGE_NAME)
+        appVersion: "$(FORTIFY_APP_VERSION)"
+
+    # Push da imagem para o registry
+    - task: Docker@2
+      displayName: 'Push Docker Image'
+      inputs:
+        command: 'push'
+        repository: '$(tagImage.IMAGE_NAME)'
+        containerRegistry: '${{ parameters.registryServiceConnection }}'
+        tags: $(IMAGE_VERSION)
+
+    # Limpeza das imagens locais
+    - task: CmdLine@2
+      displayName: 'Cleanup Docker Images'
+      condition: always()
+      inputs:
+        script: |
+          echo "##[section] Cleaning up Docker images..."
+          docker rmi $(tagImage.FULL_IMAGE_NAME) || true
+          docker rmi $(tagImage.LOADED_IMAGE) || true
+          echo "##[section] Cleanup completed"

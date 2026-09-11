@@ -1,0 +1,601 @@
+###
+### ISTO NAO E UM TEMPLATE 
+###
+### E UM TESTE DE SCAN DO FORTIFY
+###
+
+variables:
+- name: System.debug
+  value: "true"
+
+stages:
+- stage:
+  displayName: 'Fortify Gate'
+  pool: 
+    name: GeneralPurposeLinuxAgentsCI
+    # demands:
+    # - Agent.Name -equals BRTAZLTS0105CO.azagent.gp_linux_ci.005
+    
+  variables:
+  - name: CACORP_LOCATION
+    value: "$(Agent.HomeDirectory)/../../certs/CACORP.pem"
+
+  - name: ASDF_JDK_17
+    value: "openjdk-11.0.2"
+  - name: ASDF_JDK_17
+    value: "openjdk-17.0.2"
+
+  - name: FORTIFY_PROJECT_NAME
+    value: "$(System.TeamProject)-$(Build.Repository.Name)"
+
+  - name: FORTIFY_EXCLUSIONS_RAW
+    value: |-
+      **/*test*
+      **/*spec*/**/*
+      **/*xsd*/**/*
+      **/*xsd*
+      **/*groovy*
+      **/*groovy*/**/*
+      **/*stryker*
+      **/*stryker*/**/*
+      **/*html*
+      **/*html*/**/*
+      **/*json*
+      **/*json*/**/*
+      **/*Dockerfile*
+      **/*Dockerfile*/**/*
+      **/*config*
+      **/*config*/**/*
+      **/*platform*
+      **/*platform*/**/*
+      **/*pipeline*
+      **/*pipeline*/**/*
+      **/*router*
+      **/*router*/**/*
+      **/*lib*
+      **/*lib*/**/*
+      **/*certs*
+      **/*certs*/**/*
+      **/*dist*
+      **/*dist*/**/*
+      **/*yaml*
+      **/*yaml*/**/*
+      **/*docker*
+      **/*docker*/**/*
+      **/*.yml*
+      **/*.yml*/**/*
+
+  - name: FORTIFY_EXCLUSIONS
+    value: >-
+      -targs "-exclude '**/*test*'"
+      -targs "-exclude '**/*spec*/**/*'"
+      -targs "-exclude '**/*xsd*/**/*'"
+      -targs "-exclude '**/*xsd*'"
+      -targs "-exclude '**/*groovy*'"
+      -targs "-exclude '**/*groovy*/**/*'"
+      -targs "-exclude '**/*stryker*'"
+      -targs "-exclude '**/*stryker*/**/*'"
+      -targs "-exclude '**/*html*'"
+      -targs "-exclude '**/*html*/**/*'"
+      -targs "-exclude '**/*json*'"
+      -targs "-exclude '**/*json*/**/*'"
+      -targs "-exclude '**/*Dockerfile*'"
+      -targs "-exclude '**/*Dockerfile*/**/*'"
+      -targs "-exclude '**/*config*'"
+      -targs "-exclude '**/*config*/**/*'"
+      -targs "-exclude '**/*platform*'"
+      -targs "-exclude '**/*platform*/**/*'"
+      -targs "-exclude '**/*pipeline*'"
+      -targs "-exclude '**/*pipeline*/**/*'"
+      -targs "-exclude '**/*router*'"
+      -targs "-exclude '**/*router*/**/*'"
+      -targs "-exclude '**/*lib*'"
+      -targs "-exclude '**/*lib*/**/*'"
+      -targs "-exclude '**/*certs*'"
+      -targs "-exclude '**/*certs*/**/*'"
+      -targs "-exclude '**/*dist*'"
+      -targs "-exclude '**/*dist*/**/*'"
+      -targs "-exclude '**/*yaml*'"
+      -targs "-exclude '**/*yaml*/**/*'"
+      -targs "-exclude '**/*docker*'"
+      -targs "-exclude '**/*docker*/**/*'"
+      -targs "-exclude '**/*.yml*'"
+      -targs "-exclude '**/*.yml*/**/*'"
+
+  jobs:
+  - job:
+    displayName: 'Fortify Scan'
+    steps:
+    - checkout: self
+      fetchDepth: 1
+
+    - task: AzureKeyVault@2
+      displayName: 'Getting AKV credentials'
+      timeoutInMinutes: 1
+      retryCountOnTaskFailure: 5
+      inputs:
+        azureSubscription: 'DevOpsSharedResources'
+        KeyVaultName: 'kv-azdevops-shared'
+        SecretsFilter: 
+          FORTIFY-SSC-CLI-TOKEN, FORTIFY-SCANCENTRAL-CLIENT-TOKEN
+
+    - task: TemplateInline@4
+      displayName: 'Bind Fortify Variables'
+      inputs:
+        autoSurround: false
+        sourceType: 'text'
+        source: |-
+          var FORTIFY_PROJECT_NAME = {{ (SYSTEM_TEAMPROJECT + '-' + BUILD_REPOSITORY_NAME) | replace(r/ +/igm, '_') | lower }}-codeplay
+          # var FORTIFY_PROJECT_NAME = {{ SYSTEM_TEAMPROJECT }}-{{ BUILD_REPOSITORY_NAME }}-codeplay
+          var FORTIFY_VERSION_NAME = {{ 'DevSecOps' }}
+
+    - task: Base64FromVivo@4
+      displayName: Encode Token
+      inputs:
+        content: $(FORTIFY-SSC-CLI-TOKEN)
+        outputVariable: FORTIFY_SSC_CLI_TOKEN_64
+        isSecret: true
+
+    # Busca o ID do projeto/versão no FORTIFY
+    - task: AxiosFromVivo@4
+      displayName: 'Check Project Exists'
+      inputs:
+        sourceType: 'text'
+        source: |
+          var options = {
+            method: 'GET',
+            url: 'https://ssc-fortify.redecorp.br/ssc/api/v1/projectVersions',
+            params: {fields: 'id,name,project', q: 'project.name:$(FORTIFY_PROJECT_NAME)'},
+            headers: {Authorization: 'FortifyToken $(FORTIFY_SSC_CLI_TOKEN_64)'}
+          };
+        variablePrefix: 'FORTIFY_EXISTS_'
+      env:
+        NODE_EXTRA_CA_CERTS: $(CACORP_LOCATION)
+
+    - task: JsonParseFromVivo@4
+      displayName: 'Get existing info'
+      inputs:
+        source: $(FORTIFY_EXISTS_BODY)
+        sourceType: 'text'
+        queries: |
+          var FORTIFY_PROJECT_ID = $.data[?(@.project.name === '$(FORTIFY_PROJECT_NAME)')].project.id
+          var FORTIFY_PROJECT_VERSION_ID = $.data[?(@.project.name === '$(FORTIFY_PROJECT_NAME)')].id
+
+    - task: AxiosFromVivo@4
+      displayName: "Create Fortify Project/Project Version"
+      condition: not(variables['FORTIFY_PROJECT_VERSION_ID'])
+      inputs:
+        type: 'text'
+        origin: |
+          var options = {
+            method: 'POST',
+            url: 'https://ssc-fortify.redecorp.br/ssc/api/v1/projectVersions',
+            headers: {Authorization: 'FortifyToken $(FORTIFY_SSC_CLI_TOKEN_64)'},
+            data: {
+              "name": "$(FORTIFY_VERSION_NAME)",
+              "issueTemplateId": "Prioritized-HighRisk-Project-Template",
+              "project": {
+                "name": "$(FORTIFY_PROJECT_NAME)",
+                "issueTemplateId": "Prioritized-HighRisk-Project-Template"
+              }
+            },
+          };
+        variablePrefix: 'FORTIFY_CREATE_'
+      env:
+        NODE_EXTRA_CA_CERTS: $(CACORP_LOCATION)
+
+    - task: JsonParseFromVivo@4
+      displayName: 'Get created info'
+      condition: not(variables['FORTIFY_PROJECT_VERSION_ID'])
+      inputs:
+        sourceType: 'text'
+        source: $(FORTIFY_CREATE_BODY)
+        queries: |
+          var FORTIFY_PROJECT_ID = $.data.project.id
+          var FORTIFY_PROJECT_VERSION_ID = $.data.id
+
+    - task: TypeScriptRunner@4
+      displayName: 'Prevent acive scan'
+      inputs:
+        script: | # typescript
+          const res = await fetch(
+            'https://ssc-fortify.redecorp.br/ssc/api/v1/projectVersions/$(FORTIFY_PROJECT_VERSION_ID)/artifacts?limit=5',
+            {
+              method: 'GET',
+              headers: {
+                'Authorization': 'FortifyToken $(FORTIFY_SSC_CLI_TOKEN_64)',
+                'Accept': 'application/json',
+                'Content-Type': 'application/json',
+              },
+              }
+            );
+          const results = await res.json();
+          console.log(JSON.stringify(results, null, 2));
+          
+          if(!results.data || !results.data.length) return;
+
+          if(results.data[0].status != 'PROCESS_COMPLETE') {
+            task_failed(`This project have active scan running (${results.data[0].status}).`)
+          }
+      env:
+        NODE_EXTRA_CA_CERTS: $(CACORP_LOCATION)
+
+    - task: AxiosFromVivo@4
+      displayName: 'Updating project metadata'
+      inputs:
+        type: 'text'
+        origin: |
+          var options = {
+            method: 'PUT',
+            url: 'https://ssc-fortify.redecorp.br/ssc/api/v1/projectVersions/$(FORTIFY_PROJECT_VERSION_ID)/attributes',
+            headers: {Authorization: 'FortifyToken $(FORTIFY_SSC_CLI_TOKEN_64)'},
+            data: [
+              {
+                "attributeDefinitionId":"1",
+                "values":[ { "guid": "High", "name": "High", "description": "High Business Risk. This application is critical to the primary business goals of the organization.", "inUse": true } ],
+                "guid": "BusinessRisk"
+              },
+              {
+                "attributeDefinitionId": 2,
+                "values": [ { "guid": "NONE", "name": "None", "description": "There are no known legal compliance obligations", "inUse": true } ],
+                "guid": "Compliance"
+              },
+              {
+                "attributeDefinitionId": 3,
+                "values": [ { "guid": "Unknown", "name": "Unknown Data", "description": "Interacts with data of an unknown classification type. Data of this type should be assumed to at least be Restricted. ", "inUse": true } ],
+                "guid": "InfoClassification"
+              },
+              {
+                "attributeDefinitionId": 4,
+                "values": [
+                  { "guid": "Pro", "name": "Product", "description": "Product delivery and confirmation", "inUse": true },
+                  { "guid": "Sales", "name": "Sales", "description": "Customer relationship management and transaction processing", "inUse": true },
+                  { "guid": "Services", "name": "Services", "description": "Customer support and service delivery improvement systems", "inUse": true }
+                ],
+                "guid": "ProjectClassification"
+              },
+              {
+                "attributeDefinitionId": 5,
+                "values": [ { "guid": "New", "name": "New", "description": "This application has just begun development and has not had a production release.", "inUse": true } ],
+                "guid": "DevPhase"
+              },
+              {
+                "attributeDefinitionId": 6,
+                "values": [ { "guid": "Partial", "name": "Partially Outsourced", "description": "Development duties partially outsourced. Design, management, development, and support duties are split between internal employees and an outsourced resource.", "inUse": true } ],
+                "guid": "DevStrategy"
+              },
+              {
+                "attributeDefinitionId": 7,
+                "values": [ { "guid": "externalpublicnetwork", "name": "External Public Network Access Required", "description": "Interaction can occur from an untrusted public network (e.g. the public internet).", "inUse": true } ],
+                "guid": "Accessibility"
+              },
+              {
+                "attributeDefinitionId": 8,
+                "values": [ { "guid": "ApplicationComponent", "name": "Application Component", "description": "A module which performs a business function that is not a self contained application", "inUse": true } ],
+                "guid": "ProjectType"
+              },
+              {
+                "attributeDefinitionId": 9,
+                "values": [ { "guid": "NA", "name": "Platform Neutral", "description": "Application does not rely on any operating system", "inUse": true } ],
+                "guid": "TargetPlatform"
+              },
+              {
+                "attributeDefinitionId": 10,
+                "values": [ { "guid": "API", "name": "Programmatic API", "description": "Logic is only available through programmatic API access.", "inUse": true } ],
+                "guid": "Interfaces"
+              },
+              {
+                "attributeDefinitionId": 12,
+                "values": [ { "guid": "Custom", "name": "Custom", "description": "", "inUse": true } ],
+                "guid": "AuthenticationSystem"
+              },
+              {
+                "attributeDefinitionId": 14,
+                "values": [ { "guid": "Operations", "name": "Operations", "description": "Operations business unit", "inUse": true } ],
+                "guid": "BusinessUnit"
+              },
+              {
+                "attributeDefinitionId": 15,
+                "values": [ { "guid": "Retail", "name": "Retail", "description": "Retail industry", "inUse": true } ],
+                "guid": "Industry"
+              },
+              {
+                "attributeDefinitionId": 16,
+                "values": [ { "guid": "Americas", "name": "Americas", "description": "The Americas region", "inUse": true } ],
+                "guid": "Region"
+              }
+            ]
+          };
+        variablePrefix: 'FORTIFY_ATTR_'
+      env:
+        NODE_EXTRA_CA_CERTS: $(CACORP_LOCATION)
+
+    - task: AxiosFromVivo@4
+      displayName: 'Commiting project version'
+      inputs:
+        type: 'text'
+        origin: |
+          var options = {
+            method: 'PUT',
+            url: 'https://ssc-fortify.redecorp.br/ssc/api/v1/projectVersions/$(FORTIFY_PROJECT_VERSION_ID)',
+            headers: {Authorization: 'FortifyToken $(FORTIFY_SSC_CLI_TOKEN_64)'},
+            data: {"committed": true},
+          };
+        variablePrefix: 'FORTIFY_COMMIT_'
+      env:
+        NODE_EXTRA_CA_CERTS: $(CACORP_LOCATION)
+
+    - script: |-
+        asdf install java $(ASDF_JDK_17)
+        echo "##vso[task.setvariable variable=ASDF_JDK_17_PATH]$(asdf where java $(ASDF_JDK_17))"
+      displayName: 'Ensure Fortify Java Version'
+
+    - task: TypeScriptRunner@4
+      displayName: 'Ensure Fortify ScanCentral'
+      inputs:
+        script: | # typescript
+          let toolpath = '$(Agent.ToolsDirectory)/scancentral/24.4.0/x64/bin/scancentral';
+          if(!fs.existsSync(toolpath)) toolpath = '/devops/fortify/scancentral/24.4.0/bin/scancentral';
+          if(!fs.existsSync(toolpath)) {
+            const versions = toollib.findLocalToolVersions('scancentral');
+            console.log(versions);
+            if(!versions || versions.length == 0){
+              task_failed(`scancentral not found!`);
+              return;
+            }
+            toolpath = toollib.findLocalTool('scancentral', versions[versions.length - 1]);
+          }
+          set_variable('SCANCENTRAL_BIN', toolpath);
+    
+      # usage: scancentral [global options] command [command options]
+
+
+    - script: | # shell
+        asdf local java $(ASDF_JDK_17)
+        $(SCANCENTRAL_BIN) --help start        # Start a remote scan job
+        # $(SCANCENTRAL_BIN) --help status       # Get the status of a remote scan job
+        # $(SCANCENTRAL_BIN) --help retrieve     # Download the result of a remote scan job
+        # $(SCANCENTRAL_BIN) --help cancel       # Cancel a remote scan job
+        # $(SCANCENTRAL_BIN) --help worker       # Start or test a ScanCentral Sensor
+        # $(SCANCENTRAL_BIN) --help package      # Create a zip package of the specified project
+        # $(SCANCENTRAL_BIN) --help arguments    # * Deprecated: Use the start or package command with either the -targs or -sargs option. * Generate a settings file for additional SCA command-line arguments
+        # $(SCANCENTRAL_BIN) --help progress     # Get the progress of the SCA scan
+        # $(SCANCENTRAL_BIN) --help update       # Update ScanCentral clients/sensors if a newer version is available on the Controller.
+        # $(SCANCENTRAL_BIN) --help upload       # Request FPR upload
+
+      displayName: "SCANCENTRAL HELP"
+      # Global options:
+      # ----------------------------------------
+      #   -debug                Enable debug output in the log
+      #   -h,--help <command>   Get help for the selected <command>.
+      #                         Type 'all' to see all command help
+      #   -ssctoken <token>     Specify the encoded SSC authentication token.
+      #                         Acceptance of the decoded token is deprecated.
+      #   -sscurl <url>         Specify the SSC URL
+      #   -url <url>            Specify the controller URL
+      #   -v,--version          Get the product version
+      #   -version              * Deprecated: Use -v (--version) to get the
+      #                         product version *
+
+      # Commands:
+      # status       Get the status of a remote scan job
+      # start        Start a remote scan job
+      # retrieve     Download the result of a remote scan job
+      # cancel       Cancel a remote scan job
+      # worker       Start or test a ScanCentral Sensor
+      # package      Create a zip package of the specified project
+      # arguments    * Deprecated: Use the start or package command with either the -targs or -sargs option. * Generate a settings file for additional SCA command-line arguments
+      # progress     Get the progress of the SCA scan
+      # update       Update ScanCentral clients/sensors if a newer version is available on the Controller.
+      # upload       Request FPR upload
+
+    - task: TypeScriptRunner@4
+      displayName: 'Run Fortify SAST'
+      continueOnError: true
+      env:
+        NODE_EXTRA_CA_CERTS: $(CACORP_LOCATION)
+        ASDF_JAVA_VERSION: "openjdk-17.0.2"
+        SCANCENTRAL_JAVA_HOME: $(ASDF_JDK_17_PATH)
+        JAVA_HOME_17_X64: $(ASDF_JDK_17_PATH)
+        JAVA_HOME: $(ASDF_JDK_17_PATH)
+      inputs:
+        script: | # typescript
+          const {SCANCENTRAL_BIN} = process.env;
+          const cwd = process.cwd();
+          const scancmd = [
+            `${SCANCENTRAL_BIN}`,
+            `-url 'https://scancentral-sast.redecorp.br/scancentral-ctrl'`,
+            `-sscurl 'https://ssc-fortify.redecorp.br/ssc/'`,
+            `-ssctoken '$(FORTIFY-SSC-CLI-TOKEN)'`,
+            `start`,
+            `-sargs "-sc 'devops'"`,
+            `-skipBuild`,
+            `-upload`,
+            `-uptoken '$(FORTIFY-SSC-CLI-TOKEN)'`,
+            `-bt none`,
+            `-diag debug-fortify.zip`,
+            // `-block`,
+            `--overwrite`,
+            `--log-file "$(FORTIFY_PROJECT_NAME)-$(System.JobAttempt)-fortify.log"`,
+            `--application "$(FORTIFY_PROJECT_NAME)"`,
+            // `--application-version "$(FORTIFY_VERSION_NAME)"`,
+            `--application-version-id "$(FORTIFY_PROJECT_VERSION_ID)"`,
+            `-exclude catalog`,
+            `-exclude .mvn`,
+            `-exclude docs`,
+            `-exclude script_pipeline`,
+            `-exclude .gitignore`,
+            `-exclude catalog-info.yaml`,
+            `-exclude code_review.yml`,
+            `-exclude mkdocs.yml`,
+            `-exclude mvnw`,
+            `-exclude mvnw.cmd`,
+            `-exclude pom.xml`,
+            `-exclude pom.xml.versionsBackup`,
+            `-exclude README.md`,
+          ].join(' ')
+
+          sh.exec(scancmd, {cwd}, (code, stdout, stderr) => {
+            const m = /Submitted job and received token: {0,}([^ ]+)/i.exec(stdout);
+            if(!m){
+              task_failed('Scan job has not scheduled!');
+              return;
+            }
+            const token = m[1];
+            log_debug(token);
+            set_variable('SCAN_JOB_TOKEN', token)
+            process.exit(code);
+          });
+
+    - task: TypeScriptRunner@4
+      displayName: 'Fetch scan status'
+      continueOnError: true
+      env:
+        NODE_EXTRA_CA_CERTS: $(CACORP_LOCATION)
+        ASDF_JAVA_VERSION: "openjdk-17.0.2"
+        SCANCENTRAL_JAVA_HOME: $(ASDF_JDK_17_PATH)
+        JAVA_HOME_17_X64: $(ASDF_JDK_17_PATH)
+        JAVA_HOME: $(ASDF_JDK_17_PATH)
+      inputs:
+        script: | # typescript
+          const {
+            SCANCENTRAL_BIN,
+            SCAN_JOB_TOKEN
+          } = process.env;
+          const cwd = process.cwd();
+          const scancmd = [
+            `${SCANCENTRAL_BIN}`,
+            `-url 'https://scancentral-sast.redecorp.br/scancentral-ctrl'`,
+            `-sscurl 'https://ssc-fortify.redecorp.br/ssc/'`,
+            `-ssctoken '$(FORTIFY-SSC-CLI-TOKEN)'`,
+            `status -token '${SCAN_JOB_TOKEN}'`,
+          ].join(' ')
+
+
+          while (true) {
+            let jobstatus = '';
+            let upstatus = '';
+            try {
+              await new Promise((resolve, reject) => {
+                sh.exec(scancmd, {cwd}, (code, stdout, stderr) => {
+                  try {
+                    let m = /Job status: {0,}([^ \n]+)/i.exec(stdout + '\n' + stderr);
+                    jobstatus = m?m[1]: '';
+                    
+                    m = /SSC upload status: {0,}([^ \n]+)/i.exec(stdout + '\n' + stderr);
+                    upstatus = m?m[1]: '';
+                    resolve()
+                  } catch (error) {
+                    console.error(error);
+                    reject()
+                  }
+                })
+              })
+
+              console.log({jobstatus, upstatus});
+              if(
+                [ jobstatus ,upstatus ].includes('CANCELED')||
+                [ jobstatus ,upstatus ].includes('UPLOAD_CANCELED')||
+                [ jobstatus ,upstatus ].includes('FAULTED')||
+                [ jobstatus ,upstatus ].includes('FAILED')
+              ) {
+                task_failed(`Process '${jobstatus}' and '${upstatus}'!`)
+                return;
+              }
+              if(
+                [ jobstatus ,upstatus ].includes('COMPLETED')
+              ) {
+                task_succeeded(`Process '${jobstatus}' and '${upstatus}'!`)
+                return;
+              }
+
+            } catch (error) {
+              console.error(error);
+            }
+            await sleep(2000);
+          }
+
+    # - script: |
+    #     asdf local java $(ASDF_JDK_17)
+    #     # $(SCANCENTRAL_BIN) --help start
+
+    #     $(SCANCENTRAL_BIN) \
+    #     -url 'https://scancentral-sast.redecorp.br/scancentral-ctrl' \
+    #     -sscurl 'https://ssc-fortify.redecorp.br/ssc/' \
+    #     -ssctoken '$(FORTIFY-SSC-CLI-TOKEN)' \
+    #     start \
+    #     -upload \
+    #     -uptoken '$(FORTIFY-SSC-CLI-TOKEN)' \
+    #     -bt none \
+    #     --overwrite \
+    #     --log-file "$(FORTIFY_PROJECT_NAME)-$(System.JobAttempt)-fortify.log" \
+    #     --application "$(FORTIFY_PROJECT_NAME)" \
+    #     --application-version "$(FORTIFY_VERSION_NAME)" \
+    #     -exclude catalog \
+    #     -exclude .mvn \
+    #     -exclude docs \
+    #     -exclude script_pipeline \
+    #     -exclude .gitignore \
+    #     -exclude catalog-info.yaml \
+    #     -exclude code_review.yml \
+    #     -exclude mkdocs.yml \
+    #     -exclude mvnw \
+    #     -exclude mvnw.cmd \
+    #     -exclude pom.xml \
+    #     -exclude pom.xml.versionsBackup \
+    #     -exclude README.md
+    #   continueOnError: true
+
+    # - task: FortifyScanCentralSAST@7
+    #   displayName: "Run Fortify SAST"
+    #   continueOnError: true
+    #   inputs:
+    #     scanCentralCtrlUrl: "https://scancentral-sast.redecorp.br/scancentral-ctrl"
+    #     scanCentralClientToken: $(FORTIFY-SCANCENTRAL-CLIENT-TOKEN)
+    #     sscUrl: "https://ssc-fortify.redecorp.br/ssc/"
+    #     sscCiToken: $(FORTIFY-SSC-CLI-TOKEN)
+    #     uploadToSSC: true
+    #     buildFailureCriteria: "[fortify priority order]:critical"
+    #     applicationName: $(FORTIFY_PROJECT_NAME)
+    #     applicationVersion: $(FORTIFY_VERSION_NAME)
+    #     buildTool: "none" # must be 'none' for skipBuild
+    #     # excludeArgs: $(FORTIFY_EXCLUSIONS_RAW)
+    #     # buildCommand: "$(FORTIFY_EXCLUSIONS)"
+    #     block: true
+    #     outputFile: $(FORTIFY_PROJECT_NAME)-fortify.fpr
+    #     logFile: $(FORTIFY_PROJECT_NAME)-$(System.JobAttempt)-fortify.log
+    #     overwrite: true
+    #   env:
+    #     NODE_EXTRA_CA_CERTS: $(CACORP_LOCATION)
+    #     ASDF_JAVA_VERSION: "openjdk-17.0.2"
+    #     FORTIFY_SSC_CLI_TOKEN: "$(FORTIFY-SSC-CLI-TOKEN)"
+    #     # SCANCENTRAL_JAVA_HOME: $(ASDF_JDK_17_PATH)
+    #     # # JAVA_HOME_17_X64: $(ASDF_JDK_17_PATH)
+    #     # JAVA_HOME: $(ASDF_JDK_17_PATH)
+
+    - task: CopyFiles@2
+      displayName: 'Staging Results'
+      inputs:
+        SourceFolder: "/home/svc_devopscorp/.fortify/scancentral-24.4.0/log"
+        TargetFolder: $(Build.ArtifactStagingDirectory)
+        CleanTargetFolder: true
+        OverWrite: true
+        flattenFolders: false
+
+    - task: CopyFiles@2
+      displayName: 'Staging Results 2'
+      inputs:
+        SourceFolder: $(Build.SourcesDirectory)
+        TargetFolder: $(Build.ArtifactStagingDirectory)
+        CleanTargetFolder: true
+        OverWrite: true
+        flattenFolders: false
+        Contents: |
+          **/*-fortify.*
+          *-fortify.*
+
+    - task: PublishPipelineArtifact@1
+      displayName: "Push Results"
+      inputs:
+        targetPath: $(Build.ArtifactStagingDirectory)
+        artifactName: "fortify"

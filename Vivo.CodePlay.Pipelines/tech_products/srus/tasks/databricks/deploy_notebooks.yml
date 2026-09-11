@@ -1,0 +1,315 @@
+parameters:
+- name: pythonVersion
+  type: string
+
+- name: databricksHost
+  type: string
+
+- name: databricksTenantId
+  type: string
+
+- name: databricksClientId
+  type: string
+
+- name: databricksClientSecret
+  type: string
+
+- name: diretorio
+  type: string
+
+- name: proxyAddl
+  type: string
+
+
+steps:
+- bash: |
+    echo "##[debug]Creating deployNotebooks.py script..."
+    cat << 'EOF' > deployNotebooks.py
+    # deployNotebooks.py
+
+    import getopt
+    import json
+    import sys
+    import requests
+    import os
+    import base64
+    from multiprocessing import Pool, cpu_count
+    import time
+
+
+    # =====================================================
+    # Azure AD – Service Principal Token
+    # =====================================================
+    def get_aad_token():
+        tenant_id = os.environ["DATABRICKS_TENANT_ID"]
+        client_id = os.environ["DATABRICKS_CLIENT_ID"]
+        client_secret = os.environ["DATABRICKS_CLIENT_SECRET"]
+
+        url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
+
+        payload = {
+            "grant_type": "client_credentials",
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "scope": "2ff814a6-3304-4ab8-85cb-cd0e6f879c1d/.default",
+        }
+
+        resp = requests.post(url, data=payload)
+        resp.raise_for_status()
+        return resp.json()["access_token"]
+
+
+    def get_headers(token):
+        return {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        }
+
+
+    # =====================================================
+    # Main
+    # =====================================================
+    def main():
+        helpMessage = """Usage: deployNotebooks.py
+            -s <shard>
+            -n <notebooksPath>
+            -d <workspacePath>"""
+
+        databricksHost = ""
+        notebooksPath = ""
+        workspacePath = ""
+
+        try:
+            opts, _ = getopt.getopt(
+                sys.argv[1:],
+                "hsnd",
+                [
+                    "shard=",
+                    "notebooksPath=",
+                    "workspacePath="
+                ],
+            )
+        except getopt.GetoptError:
+            print(helpMessage)
+            sys.exit(2)
+
+        if not opts:
+            print(helpMessage)
+            sys.exit(2)
+
+        for opt, arg in opts:
+            if opt == "-h":
+                print(helpMessage)
+                sys.exit()
+            elif opt in ("-s", "--shard"):
+                databricksHost = arg
+            elif opt in ("-n", "--notebooksPath"):
+                notebooksPath = arg
+            elif opt in ("-d", "--workspacePath"):
+                workspacePath = arg
+
+        print("========================================")
+        print("Databricks Notebook Deployment Started")
+        print("========================================")
+        print(f"- shard: {databricksHost}")
+        print(f"- notebooksPath: {notebooksPath}")
+        print(f"- workspacePath: {workspacePath}")
+        print("----------------------------------------")
+
+        print("Obtaining Azure AD token using Service Principal...")
+        token = get_aad_token()
+        print("Token obtained successfully.")
+        print("----------------------------------------")
+
+        deployNotebooks(databricksHost, token, notebooksPath, workspacePath)
+
+
+    # =====================================================
+    # Deployment Logic (Fail Fast + Notebook Name in Error)
+    # =====================================================
+    def deployNotebooks(shard, token, notebooksPath, workspacePath):
+        print("Deploying Notebooks to databricks...")
+        print("Getting List of Notebooks to deploy...")
+
+        notebooksList = listNotebooks(notebooksPath)
+
+        print(f"Processing '{len(notebooksList)}' notebooks")
+        print(f"Using '{cpu_count()}' CPU(s) to process the notebooks deployment.")
+        print("----------------------------------------")
+
+        argList = [
+            (shard, token, notebooksPath, workspacePath, path, notebookFile)
+            for path, notebookFile in notebooksList
+        ]
+
+        pool = Pool(cpu_count())
+
+        try:
+            pool.map(deployNotebookWrapper, argList)
+            pool.close()
+            pool.join()
+
+        except Exception as e:
+            print("\n========================================", flush=True)
+            print("❌ DEPLOYMENT FAILED", flush=True)
+            print(f"Reason: {e}", flush=True)
+            print("========================================\n", flush=True)
+
+            pool.terminate()
+            pool.join()
+            sys.exit(1)
+
+        print("----------------------------------------")
+        print("Deployment finished successfully.")
+
+
+    def deployNotebookWrapper(args):
+        return deployNotebook(*args)
+
+
+    def deployNotebook(shard, token, notebooksPath, workspacePath, path, notebookFile):
+        notebookDirPath = path.replace(notebooksPath, workspacePath)
+        notebookSource = os.path.join(path, notebookFile)
+        notebookTarget = os.path.join(notebookDirPath, notebookFile)
+
+        print(f"Checking if directory exists: {notebookDirPath}", flush=True)
+
+        if not workspaceDirExists(shard, token, notebookDirPath):
+            print(f"Directory '{notebookDirPath}' does not exist. Creating...", flush=True)
+            createWorkspaceDir(shard, token, notebookDirPath)
+        else:
+            print(f"Directory '{notebookDirPath}' already exists", flush=True)
+
+        importNotebook(shard, token, notebookSource, notebookTarget)
+
+
+    def importNotebook(shard, token, notebookFile, workspacePath):
+        print(f"Importing Notebook '{notebookFile}' to databricks...", flush=True)
+
+        with open(notebookFile, "rb") as file:
+            content = base64.b64encode(file.read()).decode()
+
+        postData = {
+            "path": workspacePath,
+            "format": "AUTO",
+            "content": content,
+            "overwrite": True,
+        }
+
+        headers = get_headers(token)
+
+        for attempt in range(1, 6):
+            resp = requests.post(
+                shard + "/api/2.0/workspace/import",
+                headers=headers,
+                json=postData
+            )
+
+            if resp.status_code in (200, 201):
+                print(f"Notebook '{notebookFile}' imported successfully", flush=True)
+                return
+
+            if resp.status_code == 429:
+                sleep_time = 2 ** attempt
+                print(
+                    f"Rate limit exceeded for '{notebookFile}'. Retrying in {sleep_time} seconds...",
+                    flush=True
+                )
+                time.sleep(sleep_time)
+                continue
+
+            error_msg = getApiErrorMessage(resp)
+            raise Exception(f"Notebook '{notebookFile}' failed: {error_msg}")
+
+
+    def createWorkspaceDir(shard, token, dirPath):
+        headers = get_headers(token)
+
+        for attempt in range(1, 6):
+            resp = requests.post(
+                shard + "/api/2.0/workspace/mkdirs",
+                headers=headers,
+                json={"path": dirPath}
+            )
+
+            if resp.status_code in (200, 201):
+                print(f"Directory '{dirPath}' created successfully", flush=True)
+                return
+
+            if resp.status_code == 429:
+                sleep_time = 2 ** attempt
+                print(
+                    f"Rate limit exceeded creating '{dirPath}'. Retrying in {sleep_time} seconds...",
+                    flush=True
+                )
+                time.sleep(sleep_time)
+                continue
+
+            raise Exception(getApiErrorMessage(resp))
+
+
+    def workspaceDirExists(shard, token, dirPath):
+        headers = get_headers(token)
+
+        resp = requests.get(
+            shard + "/api/2.0/workspace/list",
+            params={"path": dirPath},
+            headers=headers
+        )
+
+        if resp.status_code == 200:
+            return True
+
+        if resp.status_code == 404:
+            return False
+
+        raise Exception(getApiErrorMessage(resp))
+
+
+    def listNotebooks(notebooksPath):
+        return [
+            (root, file)
+            for root, _, files in os.walk(notebooksPath)
+            for file in files
+        ]
+
+
+    def getApiErrorMessage(resp: requests.Response):
+        try:
+            err = resp.json()
+            return f"{resp.status_code} - {err.get('message', resp.text)}"
+        except Exception:
+            return f"{resp.status_code} - {resp.text}"
+
+
+    if __name__ == "__main__":
+        main()
+    EOF
+  displayName: Creating Deploy Notebooks script
+
+
+- template: /tech_products/srus/tasks/python/run_bash_on_docker_proxy.yml
+  parameters:
+    pythonVersion: "${{ parameters.pythonVersion }}"
+    proxyAddl: "${{ parameters.proxyAddl }}"
+    scriptNameOrCmd: |
+        echo "##[debug]Criando ambiente virtual python..."
+        python -m venv .venv
+
+        echo "##[debug]Ativando ambiente virtual python..."
+        source .venv/bin/activate
+
+        echo "##[debug]Instalando biblioteca requests..."
+        pip install requests
+
+        echo "##[debug]Exportando variáveis de ambiente Databricks..."
+        export DATABRICKS_TENANT_ID='${{ parameters.databricksTenantId }}'
+        export DATABRICKS_CLIENT_ID='${{ parameters.databricksClientId }}'
+        export DATABRICKS_CLIENT_SECRET='${{ parameters.databricksClientSecret }}'
+
+        echo "##[debug]Executando deploy dos Notebooks no databricks..."
+        python deployNotebooks.py \
+          --shard=${{ parameters.databricksHost }} \
+          --notebooksPath=notebooks \
+          --workspacePath=/Shared/${{ parameters.diretorio }}
+    displayName: Deploying Notebooks

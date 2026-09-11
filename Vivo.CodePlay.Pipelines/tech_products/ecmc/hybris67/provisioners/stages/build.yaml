@@ -1,0 +1,107 @@
+﻿stages:
+- stage: build_test
+  displayName: "Build"
+  pool:
+    name: $(PRIVATE_AGENT_DEFAULT)
+  jobs:
+    - job: "start_build"
+      displayName: "Start build"
+      workspace:
+        clean: all
+      timeoutInMinutes: 120
+      pool:
+        name: $(PRIVATE_AGENT_DEFAULT)
+      steps:
+
+      - checkout: self
+        persistCredentials: true
+        fetchDepth: 1
+        displayName: "Checkout project"
+
+      - bash: |
+          cd $(Build.SourcesDirectory)/$(Build.Repository.Name)
+          pwd
+          ls -la
+          cat VERSION
+          CURRENT_VERSION=$(cat VERSION)
+          echo "VERSION"
+          IFS='.' read -ra VERSION_PARTS <<< "$CURRENT_VERSION"
+          PATCH_VERSION=$((${VERSION_PARTS[2]} + 1))
+          SET_VERSION="${VERSION_PARTS[0]}.${VERSION_PARTS[1]}.${PATCH_VERSION}"
+
+          echo -n $SET_VERSION > VERSION
+          echo "Nova versão: $SET_VERSION"
+          echo "##vso[task.setvariable variable=NEW_VERSION;]$SET_VERSION"
+          git config user.email "azure-pipelines@telefonicati.onmicrosoft.com"
+          git config user.name "Azure Pipelines"
+          git add VERSION && git commit -m "[CI SKIP] Change refs/tags/$SET_VERSION" && git push origin HEAD:master
+          git tag $SET_VERSION
+          git push origin refs/tags/$SET_VERSION --force
+        displayName: 'Bump Version'
+        condition: and(in(variables['Build.Reason'], 'IndividualCI', 'BatchedCI'), ne(variables['Build.Reason'], 'PullRequest'), eq(variables['Build.SourceBranch'], 'refs/heads/master'))
+
+      # ==================================================================
+      # [Compliance] Verifica se o repositório está em conformidade com as políticas de configuração
+      # ==================================================================
+      - task: VivoDevOpsConfigCompliance@1
+        displayName: 'Check DevOps Config Compliance'
+        inputs:
+          policySets: |
+            image-definition-files
+
+      - bash: |
+          AGENT_UID=$(id -u $(whoami))
+          AGENT_GID=$(id -g $(whoami))
+          echo "UID do agente: $AGENT_UID"
+          echo "GID do agente: $AGENT_GID"
+
+          echo "##[debug]ALLOW_PUSH_DOCKER_IMAGE ...  : $ALLOW_PUSH_DOCKER_IMAGE"
+          echo "##[debug]IS_PULL_REQUEST ............ : $IS_PULL_REQUEST
+          echo "##[debug]FLOW_IS_MAIN ............... : $FLOW_IS_MAIN
+
+          echo "Build Reason -> ${{ variables['Build.Reason'] }}"
+          if [[ "${{ variables['Build.Reason'] }}" == "PullRequest" ]]; then
+            BRANCH=$(echo "$(System.PullRequest.SourceBranch)" | sed 's/refs\/heads\///g')
+            git fetch origin $BRANCH
+            git checkout $BRANCH
+            git pull
+            git status
+          fi
+
+          docker rmi devops-framework-docker.nexus.telefonica.com.br/vivohybris:latest
+          docker rmi lojaonline-dkr.nexus.telefonica.com.br/ybase_jdk:latest
+          docker rm -f devops-framework-docker.nexus.telefonica.com.br/vivohybris:latest
+          docker rm -f lojaonline-dkr.nexus.telefonica.com.br/ybase_jdk:latest
+          docker run --rm --entrypoint "/bin/sh" --network host -v $(pwd):/home/aztemp -w /home/aztemp devops-framework-docker.nexus.telefonica.com.br/vivohybris:latest -c "$(HYBRIS_INSTALL)"
+          if [ $? -ne 0 ]; then
+            echo "Erro na execução do HYBRIS_INSTALL"
+            exit 1
+          fi
+
+          if [ "$ALLOW_PUSH_DOCKER_IMAGE" == "True" ] && [ "$IS_PULL_REQUEST" != "True" ] && [ "$FLOW_IS_MAIN" == "True" ]; then
+            docker build -t lojaonline-dkr.nexus.telefonica.com.br/ecmc/lojaonline-vivo-hybris:$(NEW_VERSION) -f .azuredevops/runtime.Dockerfile .
+          else
+            CUSTOM_VERSION=$(date '+%Y%m%d%H%M%S')
+            echo $CUSTOM_VERSION
+            docker build -t lojaonline-dkr.nexus.telefonica.com.br/ecmc/lojaonline-vivo-hybris:$CUSTOM_VERSION -f .azuredevops/runtime.Dockerfile .
+          fi
+          rm -rf installer/
+          if [ "$ALLOW_PUSH_DOCKER_IMAGE" == "True" ] && [ "$IS_PULL_REQUEST" != "True" ] && [ "$FLOW_IS_MAIN" == "True" ]; then
+            docker login lojaonline-dkr.nexus.telefonica.com.br -u="${DOCKER_USERNAME}" -p="${JKS_PASS}"
+            docker push lojaonline-dkr.nexus.telefonica.com.br/ecmc/lojaonline-vivo-hybris:$(NEW_VERSION)
+          else
+             echo "##[debug] Skipando docker login/push"
+          fi
+        displayName: 'BUILD Vivo-Hybris'
+        env:
+          ALLOW_PUSH_DOCKER_IMAGE: ${{ in(variables['Build.Reason'], 'IndividualCI', 'BatchedCI') }}
+          IS_PULL_REQUEST: ${{ eq(variables['Build.Reason'], 'PullRequest') }}
+          FLOW_IS_MAIN: ${{ eq(variables['Build.SourceBranch'], 'refs/heads/master') }}
+          JKS_PASS: $(JKS_PASS)
+
+      - task: PublishPipelineArtifact@1
+        inputs:
+          targetPath: '$(System.DefaultWorkingDirectory)/hybris.tar.gz'
+          artifact: app
+          publishLocation: 'pipeline'
+        displayName: 'Publish Artifact: app'

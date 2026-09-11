@@ -1,0 +1,82 @@
+parameters:
+- name: environment
+- name: dev_namespace_to_deploy
+  default: ''
+- name: project
+- name: pipelineName
+- name: runVersion
+  type: string
+  default: ''
+- name: microserviceName
+  default: $(MICROSERVICE_NAME)
+  type: string
+- name: nexusGroup
+  default: $(NEXUS_GROUP_LOJAONLINE)
+  type: string
+
+steps:
+- task: AzureKeyVault@2  
+  displayName: 'Getting AKV credentials'
+  timeoutInMinutes: 1
+  retryCountOnTaskFailure: 5  
+  inputs:    
+    azureSubscription: DevOpsSharedResources    
+    KeyVaultName: $(AKV_DEVOPS_NAME)
+    SecretsFilter: 'NEXUS-DEFAULT-USR, NEXUS-DEFAULT-PSW'
+
+- task: Bash@3
+  displayName: Getting binary files from Nexus (${{ parameters.microserviceName }})
+  condition: succeeded()
+  inputs:
+    targetType: inline
+    script: |
+
+      echo "##[debug] Retrieving from Repository: $(NEXUS_REPO_LOJAONLINE_NPM)."
+      nexusURL='$(NEXUS_ENDPOINT_API_REPOSITORY)/search/assets?repository=$(NEXUS_REPO_LOJAONLINE_NPM)&group=${{ parameters.nexusGroup }}&name=${{ parameters.microserviceName }}&version=${{ parameters.runVersion }}'
+      echo "##[debug] Search NEXUS URL: $nexusURL"
+
+      downloadUrl=($(curl -u $(NEXUS-DEFAULT-USR):$(NEXUS-DEFAULT-PSW) $nexusURL | \
+      jq -r '.items[] | select(.downloadUrl | test("\\.(tgz)$")) | .downloadUrl'))
+      
+      if [ -z "$downloadUrl" ]; then
+        echo "##[error] Failed to retrieve download URL from Nexus."
+        exit 1
+      fi
+
+      echo "##[debug] Download NEXUS URL: $downloadUrl"
+
+      echo "##vso[task.setvariable variable=DOWNLOAD_NEXUS_URL]$downloadUrl"
+
+      artifactFile=$(basename $downloadUrl)
+      artifactPath=$(Pipeline.Workspace)/$artifactFile
+
+      echo "##[debug] Artifact file: $artifactFile"
+      echo "##[debug] Artifact path: $artifactPath"
+
+      echo "##vso[task.setvariable variable=ARTIFACT_FILE]$artifactFile"
+      echo "##vso[task.setvariable variable=ARTIFACT_PATH]$artifactPath"
+
+      echo "##[debug] Downloading artifact from Nexus..."
+      curl -u $(NEXUS-DEFAULT-USR):$(NEXUS-DEFAULT-PSW) -o $artifactPath $downloadUrl
+
+      if [ $? -ne 0 ]; then
+        echo "##[error] Failed to download artifact from Nexus."
+        exit 1
+      fi
+
+      echo "##[debug] Artifact downloaded successfully: $artifactPath"
+
+- script: |
+    mkdir -p $(Build.ArtifactStagingDirectory)/extracted_tars/app
+    tar -xvf ${ARTIFACT_PATH} -C $(Build.ArtifactStagingDirectory)/extracted_tars/app --strip-components=1
+  displayName: Extracting binary files from Nexus (${{ parameters.microserviceName }})
+
+- template: /tech_products/loja-online/tasks/artifacts/download_docker.yml
+  parameters:
+    microserviceName:  ${{ parameters.microserviceName }}
+    appVersion:  ${{ parameters.runVersion }}
+
+- template: /tech_products/loja-online/tasks/helm/utils.yml
+  parameters:
+    environment: ${{parameters.environment}}
+    dev_namespace_to_deploy: ${{parameters.dev_namespace_to_deploy}}

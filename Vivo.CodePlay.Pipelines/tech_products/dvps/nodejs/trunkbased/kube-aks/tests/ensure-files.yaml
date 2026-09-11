@@ -1,0 +1,143 @@
+parameters:
+- name: environment
+  displayName: 'Ambiente padrao para implantacao.'
+  type: string
+  default: dev
+  # values:
+  # - dev
+  # - esteira1
+  # - esteira2
+  # - esteira3
+  # - preprod
+  # - production
+  # - prodlike
+
+variables:
+- name: System.debug
+  value: 'true'
+- ${{ each group_name in parameters.variable_groups }}:
+  - group: ${{ group_name }}
+
+stages:
+- stage:
+  displayName: Ensure config files
+  pool: GeneralPurposeLinuxAgentsCI
+  jobs:
+  - job: 
+    displayName: Ensure files
+    steps:
+    - checkout: self
+      fetchDepth: 1
+
+    - task: EnsureFile@4
+      displayName: 'Ensure .nvmrc'
+      inputs:
+        fileName: '.nvmrc'
+        createIfNotExist: true
+        defaultContent: 'v18.15.0'
+
+    - task: EnsureFile@4
+      displayName: 'Ensure .npmrc'
+      inputs:
+        fileName: '.npmrc'
+        createIfNotExist: true
+        defaultContent: |
+          registry=https://pkgs.dev.azure.com/telefonica-vivo-brasil/_packaging/DevOps/npm/registry/
+          always-auth=true
+
+    - task: EnsureFile@4
+      displayName: 'Ensure ${{ parameters.environment }}/values.yml'
+      inputs:
+        fileName: .azuredevops/config/${{ parameters.environment }}/values.yml
+        createIfNotExist: true
+        defaultContent: | 
+          replicaCount: 1
+          liveness:
+            enabled: true
+            failureThreshold: 3
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            successThreshold: 1
+            timeoutSeconds: 120
+            healthCheck: /
+          readiness:
+            enabled: true
+            failureThreshold: 3
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            successThreshold: 1
+            timeoutSeconds: 120
+            healthCheck: /
+
+    - task: EnsureFile@4
+      displayName: 'Ensure ${{ parameters.environment }}/environments_variables.yml'
+      inputs:
+        fileName: .azuredevops/config/${{ parameters.environment }}/environments_variables.yml
+        createIfNotExist: true
+        defaultContent: | 
+          replicaCount: 1
+
+    - task: EnsureFile@4
+      displayName: 'Ensure ${{ parameters.environment }}/secrets.yaml'
+      inputs:
+        fileName: .azuredevops/config/${{ parameters.environment }}/secrets.yaml
+        createIfNotExist: true
+        defaultContent: | 
+          secrets: []
+          secretFiles: []
+
+    - task: JsonParseFromVivo@4
+      displayName: 'Get package.json info'
+      inputs:
+        type: 'file'
+        origin: $(Build.SourcesDirectory)/package.json
+        jpaths: |
+          var PACKAGE_JSON_VERSION = .version
+
+    - task: SemverIncrementCustomFromVivo@5
+      displayName: 'Semver Increment "patch"'
+      name: new_version
+      inputs:
+        currentversion: $(PACKAGE_JSON_VERSION)
+        outputVariableName: "NEW_VERSION"
+        releaseType: "patch"
+        template: "${NEW_COERCED_VERSION}"
+
+    # Alternative
+    # - script: npm version patch --no-git-tag-version
+    #   displayName: Bump version
+
+    - task: NodeTool@0
+      displayName: Ensure Node 
+      inputs:
+        versionSource: 'fromFile'
+        versionFilePath: '.nvmrc'
+
+    - task: Npm@1
+      displayName: "npm version"
+      inputs:
+        command: 'custom'
+        customCommand: >- 
+          --no-git-tag-version
+          version $(new_version.NEW_VERSION)
+
+    - task: CopyFiles@2
+      displayName: 'Staging Artifacts'
+      inputs:
+        SourceFolder: "$(build.sourcesdirectory)"
+        TargetFolder: "$(Build.ArtifactStagingDirectory)"
+        Contents: |
+          .nvmrc
+          .npmrc
+          .azuredevops/config/${{ parameters.environment }}/values.yml
+          .azuredevops/config/${{ parameters.environment }}/environments_variables.yml
+          .azuredevops/config/${{ parameters.environment }}/secrets.yaml
+          package.json
+        CleanTargetFolder: true
+        OverWrite: true
+        flattenFolders: false
+
+    - task: PublishBuildArtifacts@1
+      displayName: "Push Artifacts"
+      inputs:
+        ArtifactName: generated-sources

@@ -1,0 +1,58 @@
+# This YAML file defines the stages and jobs for static code analysis in a pipeline.
+
+parameters:
+  # The 'config' parameter is an object that holds configuration information for the pipeline.
+  - name: config
+    type: object
+
+stages:
+  - stage: stage_static_code_analysis
+    displayName: "Quality Gates"
+    pool: $(POOL)
+    dependsOn:
+      - stage_prep
+      - stage_build_test
+    condition: |
+      and(
+        eq(variables['STAGE_SECURITY_ONLY'], False),
+        eq(variables['DISABLE_STAGE_STATIC_CODE_ANALYSIS'], false),
+        in(variables['TECHNOLOGY'], 'java', 'C'),
+        in(dependencies.stage_prep.result, 'Succeeded', 'SucceededWithIssues'),
+        in(dependencies.stage_build_test.result, 'Succeeded', 'SucceededWithIssues', 'Skipped')
+      )
+    variables:
+      - name: VERSION
+        value: $[ stageDependencies.stage_prep.version_bump.outputs['bump.VERSION'] ]
+    jobs:
+      - job: analysis
+        displayName: "Analysis"
+        steps:
+          - checkout: none
+          - template: ../../../../task_groups/artifact/download.yml
+            parameters:
+              displayName: Download Pipeline Artifact [catalog-info]
+              artifactName: catalog-info
+              targetPath: $(Agent.BuildDirectory)/catalog-info
+
+          # Extract variables from the downloaded artifact
+          - template: /tasks/catalog_info/extract_variables.yml@CorePipelines
+            parameters:
+              skipDownload: true
+              workingDirectory: $(Agent.BuildDirectory)/catalog-info
+
+          # Run SonarQube scan for Java or C code
+          - template: /task_groups/gates/run_sonarqube_scan.yml@CorePipelines
+            parameters:
+              ${{ if eq(parameters.config.technology, 'java') }}:
+                stack: "JAVA"
+              ${{ elseif eq(parameters.config.technology, 'C') }}:
+                stack: "C"
+              ${{ else }}:
+                stack: "JAVA"
+              projectKey: $(Build.Repository.Name)
+              configFile: "$(Agent.BuildDirectory)/source_code/.azuredevops/sonar-project.properties"
+              version: $(VERSION)
+              artifactType: pipeline
+              artifactName: source_with_shared_files
+              workdirArtifacts: $(Agent.BuildDirectory)/source_code
+              continuePipelineOnQualityGateError: true # FALSE PARA ATIVAR O QUALITY GATE

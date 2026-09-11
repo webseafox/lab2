@@ -1,0 +1,1135 @@
+parameters:
+- name: helm_chart_name
+  displayName: Nome do Heml Chart dentro do repositorio 'devops-helm' default 'generic-microservice'
+  default: generic-microservice
+
+- name: helm_chart_version
+  default: 1.0.8
+
+- name: variable_groups
+  displayName: Lista de Variables Groups para complementar variaveis e segredos.
+  default: []
+  type: object
+
+- name: environment
+  displayName: 'Ambiente padrao para implantacao.'
+  type: string
+  default: dev
+  # values:
+  # - dev
+  # - esteira1
+  # - esteira2
+  # - esteira3
+  # - preprod
+  # - production
+  # - prodlike
+
+- name: vivonow_chg
+  displayName: 'Numero CHG do VivoNow, somente para "production"'
+  default: CHG0000001
+
+variables:
+- name: System.debug
+  value: 'true'
+- name: SONARQUBE_PROJECT_NAME
+  value: "$(System.TeamProject)-$(Build.Repository.Name)"
+- name: DOCKER_TAG_SUFIX
+  ${{ if eq('${{ parameters.environment }}', 'production') }}:
+    value: 'RELEASE'
+  ${{ else }}:
+    value: 'SNAPSHOT'
+- ${{ each group_name in parameters.variable_groups }}:
+  - group: ${{ group_name }}
+
+stages:
+- stage:
+  displayName: "Ensure config files"
+  pool: GeneralPurposeLinuxAgentsCI
+  jobs:
+  - job: 
+    displayName: "Ensure files"
+    steps:
+    - checkout: self
+      fetchDepth: 1
+
+    - task: YamlParseFromVivo@4
+      displayName: 'Get Metadata Info'
+      inputs:
+        type: 'file'
+        origin: "catalog-info.yaml"
+        jpaths: |-
+          var CATALOG_YAML_NAME = .metadata.name
+          var CATALOG_YAML_ACRONYM = .metadata.annotations['techarch.governance-app.acronym']
+          var CATALOG_YAML_K8S_NS = .metadata.annotations['vivo.io/kubernetes-k8s-namespace-${{ parameters.environment }}']
+          
+    - task: JsonParseFromVivo@4
+      displayName: 'Get composer.json info'
+      inputs:
+        type: 'file'
+        origin: $(Build.SourcesDirectory)/composer.json
+        jpaths: |
+          var COMPOSER_JSON_VERSION = .version
+
+    - task: SemverIncrementCustomFromVivo@5
+      displayName: 'Semver Increment "patch"'
+      name: new_version
+      inputs:
+        currentversion: $(COMPOSER_JSON_VERSION)
+        outputVariableName: "NEW_VERSION"
+        releaseType: "patch"
+        template: "${NEW_COERCED_VERSION}"
+
+
+    - task: Replace@4
+      displayName: "Bump composer.json version"
+      inputs:
+        source: 'file://./composer.json'
+        destination: 'file://./composer.json'
+        regex: '"version": "([^"]+)"'
+        substitution: '"version": "$(new_version.NEW_VERSION)"'
+
+    - task: EnsureFile@4
+      displayName: 'Ensure ${{ parameters.environment }}/values.yml'
+      inputs:
+        fileName: .azuredevops/config/${{ parameters.environment }}/values.yml
+        createIfNotExist: true
+        defaultContent: |-
+          applicationName: "$(CATALOG_YAML_NAME)"
+          applicationVersion: "$(COMPOSER_JSON_VERSION)-$(DOCKER_TAG_SUFIX)"
+          applicationPrefix: "/"
+
+          replicaCount: 1
+          serviceAccount:
+            create: false
+            annotations: {}
+            name: ""
+          podAnnotations: {}
+          podSecurityContext: {}
+          securityContext: {}
+          service:
+            type: ClusterIP
+            port: 8080
+          container:
+            port: 80
+            schema: HTTP
+          # istio:
+          #   enabled: true
+          #   canaryEnabled: false
+          #   circuitBreak:
+          #     connectionPool:
+          #       enabled: false
+          #       maxConnections: 10
+          #       http1MaxPendingRequests: 50
+          #       maxRequestsPerConnection: 10
+          #   virtualService:
+          #     hosts:
+          #       - "$(CATALOG_YAML_K8S_NS).redecorp.azr"
+          #     gateways:
+          #       - "$(CATALOG_YAML_ACRONYM)-gateway.$(CATALOG_YAML_ACRONYM)-common.svc.cluster.local"
+          #     rewriteUri: /
+          resources: {}
+          autoscaling:
+            enabled: false
+            istioEnabled: false
+            minReplicas: 1
+            maxReplicas: 1
+            targetCPUUtilizationPercentage:
+
+          nodeSelector: {}
+          tolerations: []
+          affinity: {}
+          liveness:
+            enabled: false
+            failureThreshold: 3
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            successThreshold: 1
+            timeoutSeconds: 120
+            healthCheck: /health.php
+
+          readiness:
+            enabled: false
+            failureThreshold: 3
+            periodSeconds: 10
+            successThreshold: 1
+            timeoutSeconds: 120
+            healthCheck: /health.php
+
+          timezone: "America/Sao_Paulo"
+          configMapKeys: {}
+          applicationVariables: []
+          volumes: []
+          volumeMounts: []
+
+    - task: EnsureFile@4
+      displayName: 'Ensure ${{ parameters.environment }}/environments_variables.yml'
+      inputs:
+        fileName: .azuredevops/config/${{ parameters.environment }}/environments_variables.yml
+        createIfNotExist: true
+        defaultContent: |-
+          env: []
+
+    - task: EnsureFile@4
+      displayName: 'Ensure ${{ parameters.environment }}/secrets.yaml'
+      inputs:
+        fileName: .azuredevops/config/${{ parameters.environment }}/secrets.yaml
+        createIfNotExist: true
+        defaultContent: |-
+          secrets: []
+          secretFiles: []
+
+    - task: CopyFiles@2
+      displayName: 'Staging Artifacts'
+      inputs:
+        SourceFolder: $(Build.SourcesDirectory)
+        TargetFolder: $(Build.ArtifactStagingDirectory)
+        Contents: |
+          .azuredevops/config/${{ parameters.environment }}/values.yml
+          .azuredevops/config/${{ parameters.environment }}/environments_variables.yml
+          .azuredevops/config/${{ parameters.environment }}/secrets.yaml
+          composer.json
+        CleanTargetFolder: true
+        OverWrite: true
+        flattenFolders: false
+
+    - task: PublishBuildArtifacts@1
+      displayName: "Push Artifacts"
+      inputs:
+        ArtifactName: 'generated-sources'
+        PathtoPublish: $(Build.ArtifactStagingDirectory)
+
+- stage: vivonow
+  displayName: 'VivoNow Gate'
+  pool: GeneralPurposeLinuxAgentsCD
+  jobs:
+  - job:
+    displayName: 'Check on (VivoNow)'
+    condition: eq('${{ parameters.environment }}', 'production')
+    steps:
+
+    - task: AxiosFromVivo@4
+      displayName: 'Fetch CHG'
+      inputs:
+        type: 'text'
+        origin: |
+          var options = {
+            method: 'GET',
+            url: 'http://10.41.252.111:9010/vivonow/viewer/${{ parameters.vivonow_chg }}'
+          };
+        variablePrefix: 'VIVO_NOW_CHG_'
+      env:
+        NODE_EXTRA_CA_CERTS: $(CACORP_LOCATION)
+
+    - task: RegexMatch@4
+      displayName: 'Query CHG'
+      inputs:
+        source: $(VIVO_NOW_CHG_BODY)
+        regex: '/(<title>)(.*)(<\/title>)/ig'
+        outVarPrefix: 'CHG_FOUND_'
+
+    - script: exit 1
+      displayName: 'Check CHG'
+      condition: not(variables['CHG_FOUND_HAS_MATCH'])
+
+- stage: govapp
+  displayName: 'GovApp Gate'
+  pool: GeneralPurposeLinuxAgentsCD
+  jobs:
+  - job:
+    displayName: 'Governance Policies Check'
+    steps:
+    - checkout: self
+
+    - task: JsonParseFromVivo@4
+      displayName: 'Get composer.json info'
+      inputs:
+        type: 'file'
+        origin: $(Build.SourcesDirectory)/composer.json
+        jpaths: |
+          var COMPOSER_JSON_VERSION = .version
+
+    - task: LoadFile@4
+      inputs:
+        script: |
+          CATALOG_YAML_CONTENT = $(Build.SourcesDirectory)/catalog-info.yaml
+
+    - task: YamlParseFromVivo@4
+      displayName: 'Get Metadata Info'
+      inputs:
+        type: 'file'
+        origin: $(Build.SourcesDirectory)/catalog-info.yaml
+        jpaths: |
+          var CATALOG_YAML_NAME = .metadata.name
+          var CATALOG_YAML_ACRONYM = .metadata.annotations['techarch.governance-app.acronym']
+          var CATALOG_YAML_K8S_NS = .metadata.annotations['vivo.io/kubernetes-k8s-namespace-${{ parameters.environment }}']
+
+    - task: VivoGovernance@1
+      continueOnError: true
+      displayName: 'Governance Validate'
+      inputs:
+        breakglass: false
+        serverEndpoint: 'governanceapi'
+        operation: 'validate'
+        component: $(CATALOG_YAML_NAME)
+        version: $(COMPOSER_JSON_VERSION)
+        cluster: aks-$(CATALOG_YAML_ACRONYM)-${{ parameters.environment }}
+        namespace: $(CATALOG_YAML_K8S_NS)
+        deployment: $(CATALOG_YAML_NAME)
+        environment: ${{ parameters.environment }}
+        catalogInfo: $(CATALOG_YAML_CONTENT)
+
+- stage:
+  displayName: 'Build'
+  pool: GeneralPurposeLinuxAgentsCI
+  condition: succeeded()
+  jobs:
+  - job:
+    displayName: 'Jira Commit Integration'
+    steps:
+    - checkout: self
+      fetchDepth: 1
+
+    - task: Regex@4
+      displayName: 'Filter Commit Message'
+      inputs:
+        source: $(Build.SourceVersionMessage)
+        regex: '/^[^:]+ {0,}: {0,}(([^| ]+) {0,}\| {0,}([^| ]+) {0,}\| {0,}(.+) {0,})/gm'
+
+
+    - task: TypeScriptRunner@4
+      displayName: 'Get Commit Info'
+      condition: eq(variables['REGEX_HAS_MATCH'], 'true')
+      inputs:
+        azureDevOpsEndpoint: 'Azure DevOps Api Generic'
+        script: |- # typescript
+          const { BUILD_REPOSITORY_ID } = process.env;
+          const commits = await (await connection.getGitApi()).getCommits(BUILD_REPOSITORY_ID, {$top: 1});
+          
+          set_variable('COMMITTER_NAME)', commits[0].committer.name);
+          set_variable('COMMIT_DATE)', commits[0].committer.date);
+
+    # - task: KafkaProducer@0.0.16
+    #   displayName: 'Publicar informações no tópico'
+    #   condition: eq(variables['REGEX_HAS_MATCH'], 'true')
+    #   inputs:
+    #     kafkaOamEndpoint: 'KafkaEsteiraDigitalProd'
+    #     kafkaProducerClientId: 'esteira-digital-group'
+    #     kafkaServer: 'oauth.bootstrap.apps.ocp-kafka-prd.redecorp.br:443'
+    #     commitDate: $(COMMIT_DATE)
+    #     commitId: $(Build.SourceVersion)
+    #     commitMessage: $(Build.SourceVersionMessage)
+    #     committerName: $(COMMITTER_NAME)
+    #     repoName: $(Build.Repository.Name)
+    #     kafkaTopic: "integracao-azure-jira-branch-master"
+    #     debug: true
+
+  - job: build
+    displayName: 'Build, Unit Test and Pack'
+    steps:
+    - checkout: self
+      fetchDepth: 1
+      persistCredentials: true
+
+    - task: DownloadBuildArtifacts@1
+      displayName: 'Download Artifact'
+      inputs:
+        buildType: 'current'
+        artifactName: 'generated-sources'
+        downloadPath: $(System.ArtifactsDirectory)
+
+    - task: CopyFiles@2
+      displayName: Overwrite generated sources
+      inputs:
+        SourceFolder: $(System.ArtifactsDirectory)/generated-sources
+        Contents: '**'
+        TargetFolder: './'
+        OverWrite: true
+
+    - task: JsonParseFromVivo@4
+      displayName: 'Get composer.json info'
+      inputs:
+        type: 'file'
+        origin: $(Build.SourcesDirectory)/composer.json
+        jpaths: |
+          var COMPOSER_JSON_VERSION = .version
+
+    - task: YamlParseFromVivo@4
+      displayName: 'Get Metadata Info'
+      inputs:
+        type: 'file'
+        origin: $(Build.SourcesDirectory)/catalog-info.yaml
+        jpaths: |
+          var CATALOG_YAML_NAME = .metadata.name
+          var CATALOG_YAML_MODULE = .metadata.annotations['techarch.governance-app.module']
+          var CATALOG_YAML_ACRONYM = .metadata.annotations['techarch.governance-app.acronym']
+
+    - script: |- # shell
+        echo "##vso[build.addbuildtag]helm"
+        echo "##vso[build.addbuildtag]kubernetes"
+        echo "##vso[build.addbuildtag]acr"
+        echo "##vso[build.addbuildtag]kube-config"
+        echo "##vso[build.addbuildtag]php"
+        echo "##vso[build.addbuildtag]maven"
+        echo "##vso[build.addbuildtag]nexus"
+        echo "##vso[build.addbuildtag]ci-gold"
+        echo "##vso[build.addbuildtag]sonar-scan"
+        echo "##vso[build.addbuildtag]fortify"
+        echo "##vso[build.addbuildtag]$(CATALOG_YAML_ACRONYM)"
+        echo "##vso[build.addbuildtag]$(CATALOG_YAML_MODULE)"
+      displayName: 'Set tags'
+
+
+    - task: ListFilesAndFolders@4
+      displayName: 'Find Dockerfile'
+      inputs:
+        script: 'var://DOCKERFILES = **/*ockerfile'
+        dot: true
+
+    - task: PythonRunner@4
+      displayName: 'Ensure Dockerfile'
+      inputs:
+        script: | # py
+          import os
+          set_variable('DOCKERFILE',
+            (os.getenv('DOCKERFILES') or '.azuredevops/runtime.Dockerfile')
+            .split(',')[0]
+          )
+
+    # ==================================================================
+    # [Compliance] Verifica se o repositório está em conformidade com as políticas de configuração
+    # ==================================================================
+    - task: VivoDevOpsConfigCompliance@1
+      displayName: 'Check DevOps Config Compliance'
+      inputs:
+        policySets: |
+          image-definition-files
+
+    - task: Docker@2
+      displayName: 'Docker Build'
+      inputs:
+        containerRegistry: 'ACR-DEVOPS'
+        command: build
+        repository: $(CATALOG_YAML_ACRONYM)/$(CATALOG_YAML_NAME)
+        Dockerfile: $(DOCKERFILE)
+        buildContext: ./
+        addPipelineData: true
+        addBaseImageData: true
+        arguments: >-
+          --no-cache 
+          --build-arg APPLICATION_NAME=$(CATALOG_YAML_NAME)
+          --build-arg APP_VERSION=$(COMPOSER_JSON_VERSION) 
+          --build-arg APPLICATION_PATH=target 
+          --build-arg HTTP_PROXY="http://10.240.58.39:3128"
+          --build-arg HTTPS_PROXY="http://10.240.58.39:3128"
+          --build-arg NO_PROXY="localhost, 0.0.0.0, 127.0.0.1, 10.244.0.0/16, 192.168.0.0/16, 10.129.178.173, nexus.telefonica.com.br, acrsharedservices01.azurecr.io, appcs-azdevops-shared.azconfig.io, scm.azurewebsites.net"
+
+        tags: >
+          $(COMPOSER_JSON_VERSION)-SNAPSHOT
+
+    - task: Docker@2
+      displayName: 'Push to Docker (SNAPSHOT)'
+      inputs:
+        containerRegistry: 'ACR-DEVOPS'
+        command: push
+        repository: $(CATALOG_YAML_ACRONYM)/$(CATALOG_YAML_NAME)
+        addPipelineData: true
+        addBaseImageData: true
+        tags: >
+          $(COMPOSER_JSON_VERSION)-SNAPSHOT
+
+  - job:
+    dependsOn: build
+    displayName: 'Push to Git (TAG)'
+    steps:
+    - checkout: self
+      persistCredentials: true
+
+    - task: DownloadBuildArtifacts@1
+      displayName: 'Download Artifact'
+      inputs:
+        buildType: 'current'
+        downloadType: 'single'
+        artifactName: 'generated-sources'
+        downloadPath: $(Build.ArtifactStagingDirectory)
+
+    - task: JsonParseFromVivo@4
+      displayName: 'Get composer.json info'
+      inputs:
+        type: 'file'
+        origin: $(Build.ArtifactStagingDirectory)/generated-sources/composer.json
+        jpaths: |
+          var COMPOSER_JSON_VERSION = .version
+
+    - task: Bash@3
+      displayName: 'Commit new version'
+      continueOnError: false
+      inputs:
+        targetType: inline
+        script: |- # shell
+          git switch -c $(Build.SourceBranch)
+          yes | cp -r -f $(Build.ArtifactStagingDirectory)/generated-sources/composer.json ./
+
+          git add .
+          git commit -m "[skip ci] CodePlay bump version $(COMPOSER_JSON_VERSION)"
+          git tag $(COMPOSER_JSON_VERSION) -m "Version has been updated to $(COMPOSER_JSON_VERSION)"
+          git push origin --tags HEAD:$(Build.SourceBranch)
+
+          echo "##[command] yes | cp -r -f $(Build.ArtifactStagingDirectory)/generated-sources/composer.json ./"
+          echo "##[command] git add ."
+          echo "##[command] git commit -m \"[skip ci] CodePlay bump version $(COMPOSER_JSON_VERSION)\""
+          echo "##[command] git tag $(COMPOSER_JSON_VERSION) -m \"Version has been updated to $(COMPOSER_JSON_VERSION)\""
+          echo "##[command] git push origin --tags HEAD:$(Build.SourceBranch)"
+
+- stage:
+  displayName: 'Fortify Gate'
+  pool: GeneralPurposeLinuxAgentsCI
+  variables:
+  - name: CACORP_LOCATION
+    value: "$(Agent.HomeDirectory)/../../certs/CACORP.pem"
+
+  - name: ASDF_JDK_11
+    value: "openjdk-11.0.2"
+
+  - name: FORTIFY_VERSION_NAME
+    value: DevSecOps-${{ split(variables['Build.SourceBranch'], 'refs/heads/')[1] }}
+
+  - name: FORTIFY_PROJECT_NAME
+    value: "$(System.TeamProject)-$(Build.Repository.Name)"
+
+  - name: FORTIFY_EXCLUSIONS
+    value: >-
+      -targs "-exclude '**/*test*'"
+      -targs "-exclude '**/*spec*/**/*'"
+      -targs "-exclude '**/*xsd*/**/*'"
+      -targs "-exclude '**/*xsd*'"
+      -targs "-exclude '**/*groovy*'"
+      -targs "-exclude '**/*groovy*/**/*'"
+      -targs "-exclude '**/*stryker*'"
+      -targs "-exclude '**/*stryker*/**/*'"
+      -targs "-exclude '**/*html*'"
+      -targs "-exclude '**/*html*/**/*'"
+      -targs "-exclude '**/*json*'"
+      -targs "-exclude '**/*json*/**/*'"
+      -targs "-exclude '**/*Dockerfile*'"
+      -targs "-exclude '**/*Dockerfile*/**/*'"
+      -targs "-exclude '**/*config*'"
+      -targs "-exclude '**/*config*/**/*'"
+      -targs "-exclude '**/*platform*'"
+      -targs "-exclude '**/*platform*/**/*'"
+      -targs "-exclude '**/*pipeline*'"
+      -targs "-exclude '**/*pipeline*/**/*'"
+      -targs "-exclude '**/*router*'"
+      -targs "-exclude '**/*router*/**/*'"
+      -targs "-exclude '**/*lib*'"
+      -targs "-exclude '**/*lib*/**/*'"
+      -targs "-exclude '**/*certs*'"
+      -targs "-exclude '**/*certs*/**/*'"
+      -targs "-exclude '**/*dist*'"
+      -targs "-exclude '**/*dist*/**/*'"
+      -targs "-exclude '**/*yaml*'"
+      -targs "-exclude '**/*yaml*/**/*'"
+      -targs "-exclude '**/*docker*'"
+      -targs "-exclude '**/*docker*/**/*'"
+      -targs "-exclude '**/*.yml*'"
+      -targs "-exclude '**/*.yml*/**/*'"
+
+  jobs:
+  - job:
+    displayName: 'Fortify Scan'
+    steps:
+    - checkout: self
+      fetchDepth: 1
+
+    - task: AzureKeyVault@2
+      displayName: 'Getting AKV credentials'
+      timeoutInMinutes: 1
+      retryCountOnTaskFailure: 5
+      inputs:
+        azureSubscription: 'DevOpsSharedResources'
+        KeyVaultName: 'kv-azdevops-shared'
+        SecretsFilter: 
+          FORTIFY-SSC-CLI-TOKEN, FORTIFY-SCANCENTRAL-CLIENT-TOKEN
+
+    - task: TemplateInline@4
+      displayName: 'Bind Fortify Variables'
+      inputs:
+        source: |
+          var FORTIFY_PROJECT_NAME = {{ (SYSTEM_TEAMPROJECT + '-' + BUILD_REPOSITORY_NAME) | replace(r/ +/igm, '_') | lower }}
+
+    - task: Base64FromVivo@4
+      displayName: Encode Token
+      inputs:
+        content: $(FORTIFY-SSC-CLI-TOKEN)
+        outputVariable: FORTIFY_SSC_CLI_TOKEN_64
+        isSecret: true
+
+    # Busca o ID do projeto/versão no FORTIFY
+    - task: AxiosFromVivo@4
+      displayName: 'Check Project Exists'
+      inputs:
+        sourceType: 'text'
+        source: |
+          var options = {
+            method: 'GET',
+            url: 'https://ssc-fortify.redecorp.br/ssc/api/v1/projectVersions',
+            params: {fields: 'id,name,project', q: 'project.name:$(FORTIFY_PROJECT_NAME)'},
+            headers: {Authorization: 'FortifyToken $(FORTIFY_SSC_CLI_TOKEN_64)'}
+          };
+        variablePrefix: 'FORTIFY_EXISTS_'
+      env:
+        NODE_EXTRA_CA_CERTS: $(CACORP_LOCATION)
+
+    - task: JsonParseFromVivo@4
+      displayName: 'Get existing info'
+      inputs:
+        source: $(FORTIFY_EXISTS_BODY)
+        sourceType: 'text'
+        queries: |
+          var FORTIFY_PROJECT_ID = $.data[?(@.project.name.match(/$(FORTIFY_PROJECT_NAME)/i))].project.id
+          var FORTIFY_PROJECT_VERSION_ID = $.data[?(@.project.name.match(/$(FORTIFY_PROJECT_NAME)/i))].id
+
+    - task: AxiosFromVivo@4
+      displayName: "Create Fortify Project/Project Version"
+      condition: not(variables['FORTIFY_PROJECT_VERSION_ID'])
+      inputs:
+        type: 'text'
+        origin: |
+          var options = {
+            method: 'POST',
+            url: 'https://ssc-fortify.redecorp.br/ssc/api/v1/projectVersions',
+            headers: {Authorization: 'FortifyToken $(FORTIFY_SSC_CLI_TOKEN_64)'},
+            data: {
+              "name": "$(FORTIFY_VERSION_NAME)",
+              "issueTemplateId": "Prioritized-HighRisk-Project-Template",
+              "project": {
+                "name": "$(FORTIFY_PROJECT_NAME)",
+                "issueTemplateId": "Prioritized-HighRisk-Project-Template"
+              }
+            },
+          };
+        variablePrefix: 'FORTIFY_CREATE_'
+      env:
+        NODE_EXTRA_CA_CERTS: $(CACORP_LOCATION)
+
+    - task: JsonParseFromVivo@4
+      displayName: 'Get created info'
+      condition: not(variables['FORTIFY_PROJECT_VERSION_ID'])
+      inputs:
+        sourceType: 'text'
+        source: $(FORTIFY_CREATE_BODY)
+        queries: |
+          var FORTIFY_PROJECT_ID = $.data.project.id
+          var FORTIFY_PROJECT_VERSION_ID = $.data.id
+
+    - task: AxiosFromVivo@4
+      displayName: 'Updating project metadata'
+      inputs:
+        type: 'text'
+        origin: |
+          var options = {
+            method: 'PUT',
+            url: 'https://ssc-fortify.redecorp.br/ssc/api/v1/projectVersions/$(FORTIFY_PROJECT_VERSION_ID)/attributes',
+            headers: {Authorization: 'FortifyToken $(FORTIFY_SSC_CLI_TOKEN_64)'},
+            data: [
+              {
+                "attributeDefinitionId":"1",
+                "values":[ { "guid": "High", "name": "High", "description": "High Business Risk. This application is critical to the primary business goals of the organization.", "inUse": true } ],
+                "guid": "BusinessRisk"
+              },
+              {
+                "attributeDefinitionId": 2,
+                "values": [ { "guid": "NONE", "name": "None", "description": "There are no known legal compliance obligations", "inUse": true } ],
+                "guid": "Compliance"
+              },
+              {
+                "attributeDefinitionId": 3,
+                "values": [ { "guid": "Unknown", "name": "Unknown Data", "description": "Interacts with data of an unknown classification type. Data of this type should be assumed to at least be Restricted. ", "inUse": true } ],
+                "guid": "InfoClassification"
+              },
+              {
+                "attributeDefinitionId": 4,
+                "values": [
+                  { "guid": "Pro", "name": "Product", "description": "Product delivery and confirmation", "inUse": true },
+                  { "guid": "Sales", "name": "Sales", "description": "Customer relationship management and transaction processing", "inUse": true },
+                  { "guid": "Services", "name": "Services", "description": "Customer support and service delivery improvement systems", "inUse": true }
+                ],
+                "guid": "ProjectClassification"
+              },
+              {
+                "attributeDefinitionId": 5,
+                "values": [ { "guid": "New", "name": "New", "description": "This application has just begun development and has not had a production release.", "inUse": true } ],
+                "guid": "DevPhase"
+              },
+              {
+                "attributeDefinitionId": 6,
+                "values": [ { "guid": "Partial", "name": "Partially Outsourced", "description": "Development duties partially outsourced. Design, management, development, and support duties are split between internal employees and an outsourced resource.", "inUse": true } ],
+                "guid": "DevStrategy"
+              },
+              {
+                "attributeDefinitionId": 7,
+                "values": [ { "guid": "externalpublicnetwork", "name": "External Public Network Access Required", "description": "Interaction can occur from an untrusted public network (e.g. the public internet).", "inUse": true } ],
+                "guid": "Accessibility"
+              },
+              {
+                "attributeDefinitionId": 8,
+                "values": [ { "guid": "ApplicationComponent", "name": "Application Component", "description": "A module which performs a business function that is not a self contained application", "inUse": true } ],
+                "guid": "ProjectType"
+              },
+              {
+                "attributeDefinitionId": 9,
+                "values": [ { "guid": "NA", "name": "Platform Neutral", "description": "Application does not rely on any operating system", "inUse": true } ],
+                "guid": "TargetPlatform"
+              },
+              {
+                "attributeDefinitionId": 10,
+                "values": [ { "guid": "API", "name": "Programmatic API", "description": "Logic is only available through programmatic API access.", "inUse": true } ],
+                "guid": "Interfaces"
+              },
+              {
+                "attributeDefinitionId": 12,
+                "values": [ { "guid": "Custom", "name": "Custom", "description": "", "inUse": true } ],
+                "guid": "AuthenticationSystem"
+              },
+              {
+                "attributeDefinitionId": 14,
+                "values": [ { "guid": "Operations", "name": "Operations", "description": "Operations business unit", "inUse": true } ],
+                "guid": "BusinessUnit"
+              },
+              {
+                "attributeDefinitionId": 15,
+                "values": [ { "guid": "Retail", "name": "Retail", "description": "Retail industry", "inUse": true } ],
+                "guid": "Industry"
+              },
+              {
+                "attributeDefinitionId": 16,
+                "values": [ { "guid": "Americas", "name": "Americas", "description": "The Americas region", "inUse": true } ],
+                "guid": "Region"
+              }
+            ]
+          };
+        variablePrefix: 'FORTIFY_ATTR_'
+      env:
+        NODE_EXTRA_CA_CERTS: $(CACORP_LOCATION)
+
+    - task: AxiosFromVivo@4
+      displayName: 'Commiting project version'
+      inputs:
+        type: 'text'
+        origin: |
+          var options = {
+            method: 'PUT',
+            url: 'https://ssc-fortify.redecorp.br/ssc/api/v1/projectVersions/$(FORTIFY_PROJECT_VERSION_ID)',
+            headers: {Authorization: 'FortifyToken $(FORTIFY_SSC_CLI_TOKEN_64)'},
+            data: {"committed": true},
+          };
+        variablePrefix: 'FORTIFY_COMMIT_'
+      env:
+        NODE_EXTRA_CA_CERTS: $(CACORP_LOCATION)
+
+    - task: FortifyScanCentralSAST@7
+      displayName: "Fortify SAST Scan"
+      inputs:
+        scanCentralCtrlUrl: https://scancentral-sast.redecorp.br/scancentral-ctrl
+        scanCentralClientToken: $(FORTIFY-SCANCENTRAL-CLIENT-TOKEN)
+        sscUrl: https://ssc-fortify.redecorp.br/ssc/
+        sscCiToken: $(FORTIFY-SSC-CLI-TOKEN)
+        uploadToSSC: true
+        buildFailureCriteria: "[fortify priority order]:critical"
+        applicationName: $(FORTIFY_PROJECT_NAME)
+        applicationVersion: $(FORTIFY_VERSION_NAME)
+        buildTool: none # must be 'none' for skipBuild
+        buildCommand: "$(FORTIFY_EXCLUSIONS)"
+        block: true
+        skipBuild: true # this param doesn't matter
+        outputFile: $(FORTIFY_PROJECT_NAME)-fortify.fpr
+        logFile: $(FORTIFY_PROJECT_NAME)-fortify.log
+        overwrite: true
+      env:
+        NODE_EXTRA_CA_CERTS: $(CACORP_LOCATION)
+        ASDF_JAVA_VERSION: $(ASDF_JDK_11)
+
+    - task: CopyFiles@2
+      displayName: 'Staging Results'
+      inputs:
+        SourceFolder: $(build.sourcesdirectory)
+        TargetFolder: $(Build.ArtifactStagingDirectory)
+        Contents: |
+          *-fortify.*
+        CleanTargetFolder: true
+        OverWrite: true
+        flattenFolders: false
+
+    - task: PublishPipelineArtifact@1
+      displayName: "Push Results"
+      inputs:
+        targetPath: $(Build.ArtifactStagingDirectory)
+        artifactName: "fortify"
+
+- stage:
+  displayName: 'Deploy on (${{ parameters.environment }})'
+  pool: GeneralPurposeLinuxAgentsCD
+  variables:
+  - name: System.debug
+    value: "true"
+  jobs:
+  - deployment:
+    displayName: 'Deploy on (${{ parameters.environment }})'
+    # creates an environment if it doesn't exist
+    environment:
+      name: 'deploy-${{ parameters.environment }}'
+    variables:
+      - name: HELM_EXPERIMENTAL_OCI
+        value: 1
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+            persistCredentials: true
+            fetchDepth: 1
+
+          - task: DownloadBuildArtifacts@1
+            displayName: 'Download Artifact'
+            inputs:
+              buildType: 'current'
+              artifactName: 'generated-sources'
+              downloadPath: $(System.ArtifactsDirectory)
+          
+          - task: CopyFiles@2
+            displayName: Overwrite generated sources
+            inputs:
+              SourceFolder: $(System.ArtifactsDirectory)/generated-sources
+              Contents: '**'
+              TargetFolder: './'
+              OverWrite: true
+
+          # - script: |
+          #     ls -lha .azuredevops/config/**/*
+          #     cat .azuredevops/config/${{parameters.environment}}/values.yml
+
+          - task: JsonParseFromVivo@4
+            displayName: 'Get composer.json info'
+            inputs:
+              type: 'file'
+              origin: $(Build.SourcesDirectory)/composer.json
+              jpaths: |
+                var COMPOSER_JSON_VERSION = .version
+
+          - task: YamlParseFromVivo@4
+            displayName: 'Get Metadata Info'
+            inputs:
+              type: 'file'
+              origin: catalog-info.yaml
+              jpaths: |-
+                var CATALOG_YAML_NAME = .metadata.name
+                var CATALOG_YAML_ACRONYM = .metadata.annotations['techarch.governance-app.acronym']
+                var CATALOG_YAML_K8S_NS = .metadata.annotations['vivo.io/kubernetes-k8s-namespace-${{ parameters.environment }}']
+                var CATALOG_YAML_KUBE_ID = .metadata.annotations['backstage.io/kubernetes-id']
+
+          - task: AzureKeyVault@2
+            displayName: 'Getting AKV credentials'
+            timeoutInMinutes: 1
+            retryCountOnTaskFailure: 5
+            inputs:
+              azureSubscription: DevOpsSharedResources
+              KeyVaultName: kv-azdevops-shared
+              SecretsFilter: >-
+                DOCKER-REGISTRY-ACR-USERNAME, DOCKER-REGISTRY-ACR-PASSWORD
+
+          - task: DownloadSecureFile@1
+            name: kubeconfig
+            displayName: 'Download config from (kube-${{parameters.environment}})'
+            inputs:
+              secureFile: 'kube-${{ parameters.environment }}'
+
+          - task: PlaceInFiles@4
+            displayName: "Apply config variables"
+            inputs:
+              globPattern: ".azuredevops/config/${{ parameters.environment }}/*.y*ml"
+              regex: '/\$\(([^\)]+)\)/gmi'
+
+          # - script: |-
+          #     kubectl get ns \
+          #     -o json \
+          #     --kubeconfig="$(kubeconfig.secureFilePath)" \
+          #     --insecure-skip-tls-verify \
+          #     > existing-namespaces.json
+          #   displayName: Fetch namespaces
+
+          # - task: JsonParseFromVivo@4
+          #   displayName: Query for Namespace
+          #   inputs:
+          #     type: file
+          #     origin: existing-namespaces.json
+          #     jpaths: |-
+          #       var EXISTING_NAMESPACES = $.items[?(@.metadata.name.match(/$(CATALOG_YAML_K8S_NS)/i))].metadata.name
+
+          # - script: >-
+          #     kubectl create ns "$(CATALOG_YAML_K8S_NS)"
+          #     --kubeconfig="$(kubeconfig.secureFilePath)"
+          #     --insecure-skip-tls-verify
+          #   displayName: Create Namespace
+          #   condition: not(variables['EXISTING_NAMESPACES'])
+
+          # - script: >-
+          #     kubectl delete secret acr-devops
+          #     --namespace $(CATALOG_YAML_K8S_NS)
+          #     --kubeconfig="$(kubeconfig.secureFilePath)"
+          #     --insecure-skip-tls-verify
+          #   displayName: DELETE Docker Secret
+
+          - script: |- # shell
+              kubectl get secrets acr-devops \
+              --namespace $(CATALOG_YAML_K8S_NS) \
+              --kubeconfig="$(kubeconfig.secureFilePath)" \
+              --insecure-skip-tls-verify
+
+              echo "##vso[task.setvariable variable=EXISTING_SECRETS]$?"
+            displayName: Fetch Docker Secret
+
+          - script: >- # shell
+              kubectl create secret docker-registry acr-devops
+              --docker-server="acrsharedservices01.azurecr.io" 
+              --docker-username="$(DOCKER-REGISTRY-ACR-USERNAME)" 
+              --docker-password="$(DOCKER-REGISTRY-ACR-PASSWORD)" 
+              --docker-email='arquiteturati@telefonica.com.br'
+              --namespace $(CATALOG_YAML_K8S_NS)
+              --kubeconfig="$(kubeconfig.secureFilePath)"
+              --insecure-skip-tls-verify
+            condition: eq(variables['EXISTING_SECRETS'], '1')
+            displayName: Create Docker Secret
+
+          - task: Bash@3
+            displayName: 'Helm login (ACR)'
+            inputs:
+              targetType: inline
+              script: >- # shell
+                helm registry login
+                acrsharedservices01.azurecr.io
+                --username $(DOCKER-REGISTRY-ACR-USERNAME)
+                --password "$(DOCKER-REGISTRY-ACR-PASSWORD)"
+
+          - task: Bash@3
+            displayName: 'Helm status on (${{ parameters.environment }})'
+            inputs:
+              targetType: inline
+              script: |- # shell
+                HELM_STATUS=$(helm history "$(CATALOG_YAML_NAME)"  \
+                --namespace "$(CATALOG_YAML_K8S_NS)" \
+                --kubeconfig $(kubeconfig.secureFilePath) \
+                -o json)
+
+                echo "##vso[task.setvariable variable=HELM_STATUS;]$HELM_STATUS";
+
+          - task: JsonParseFromVivo@4
+            displayName: 'Helm revision info'
+            condition: not(eq(variables['HELM_STATUS'], ''))
+            inputs:
+              sourceType: 'var'
+              source: 'HELM_STATUS'
+              queries: |-
+                # last deployed revision
+                var LAST_DEPLOYED_REV = $[?(@.status=='deployed')].revision
+                # last deployed
+                var LAST_STATUS = $[-1:].status
+                # last failed
+                var LAST_REV = $[-1:].revision
+                # last deployed revision
+
+          - task: Bash@3
+            displayName: 'Helm rollback last failure on (${{ parameters.environment }})'
+            condition:
+              and(
+                not(eq(variables['LAST_STATUS'], 'deployed')),
+                not(eq(variables['LAST_REV'], ''))
+              )
+            inputs:
+              targetType: inline
+              script: >- # shell
+                
+                helm rollback "$(CATALOG_YAML_NAME)" $(LAST_DEPLOYED_REV)
+                --namespace "$(CATALOG_YAML_K8S_NS)"
+                --kubeconfig $(kubeconfig.secureFilePath) | true
+
+          - task: Bash@3
+            displayName: 'Helm force uninstall (${{ parameters.environment }})'
+            condition: in(variables['Agent.JobStatus'], 'Failed', 'SucceededWithIssues')
+            inputs:
+              targetType: inline
+              script: >- # shell
+                
+                helm uninstall "$(CATALOG_YAML_NAME)"
+                --namespace "$(CATALOG_YAML_K8S_NS)" 
+                --kubeconfig $(kubeconfig.secureFilePath)
+                --description "[codeplay-nodejs-aks] Failed to rollback, forcing uninstall"
+                --wait
+
+          - task: Bash@3
+            displayName: Debug Kube resources
+            inputs:
+              targetType: inline
+              script: |- # shell
+                #
+                kubectl get all "$(CATALOG_YAML_K8S_NS)" \
+                --kubeconfig="$(kubeconfig.secureFilePath)" \
+                --insecure-skip-tls-verify
+
+                kubectl api-resources --verbs=list \
+                --kubeconfig="$(kubeconfig.secureFilePath)" \
+                --insecure-skip-tls-verify
+
+          - task: Bash@3
+            displayName: Check namespace
+            inputs:
+              targetType: inline
+              script: |- # shell
+                #
+                kubectl get deployment "$(CATALOG_YAML_NAME)" \
+                --namespace "$(CATALOG_YAML_K8S_NS)" \
+                --kubeconfig="$(kubeconfig.secureFilePath)" \
+                --insecure-skip-tls-verify
+
+                echo "##vso[task.setvariable variable=EXISTING_DEPLOYMENT]$?"
+
+          - task: TypeScriptRunner@4
+            displayName: 'Helm upgrade on (${{ parameters.environment }})'
+            inputs:
+              script: | # typescript
+                const existDeployment = !process.env.EXISTING_DEPLOYMENT
+
+                const helmUpgradeCommand = [
+                  `helm upgrade ${existDeployment ? '' : '--install'} $(CATALOG_YAML_NAME)`,
+                  'oci://acrsharedservices01.azurecr.io/helm/devops/${{ parameters.helm_chart_name }}',
+                  '--version "${{ parameters.helm_chart_version }}"',
+                  '--set "nameOverride=$(CATALOG_YAML_NAME)"',
+                  '--set "fullnameOverride=$(CATALOG_YAML_NAME)"',
+                  '--set "containerName=$(CATALOG_YAML_NAME)"',
+                  '--set "image.repository=acrsharedservices01.azurecr.io/$(CATALOG_YAML_ACRONYM)/$(CATALOG_YAML_NAME)"',
+                  '--set "image.tag=$(COMPOSER_JSON_VERSION)-$(DOCKER_TAG_SUFIX)"',
+                  '--set "imagePullSecrets[0].name=acr-devops"',
+                  '-f .azuredevops/config/${{ parameters.environment }}/values.yml',
+                  '-f .azuredevops/config/${{ parameters.environment }}/environments_variables.yml',
+                  '-f .azuredevops/config/${{ parameters.environment }}/secrets.yaml',
+                  '--kubeconfig $(kubeconfig.secureFilePath)',
+                  '--namespace "$(CATALOG_YAML_K8S_NS)"',
+                  '--install',
+                  '--insecure-skip-tls-verify',
+                  '--output table',
+                  '--history-max 5',
+                  '--debug',
+                  '--atomic',
+                  '--wait',
+                  '--timeout 300s',
+                ].join(' ');
+
+                const kubelogs = [
+                  'kubectl logs',
+                  'deployment/$(CATALOG_YAML_NAME)',
+                  '-f',
+                  '--all-containers=true',
+                  '--namespace "$(CATALOG_YAML_K8S_NS)"',
+                  '--kubeconfig $(kubeconfig.secureFilePath)',
+                  '--insecure-skip-tls-verify',
+                ].join(' ')
+
+                const kubeevents = [
+                  'kubectl events',
+                  'deployment/$(CATALOG_YAML_NAME)',
+                  '-w',
+                  '--namespace "$(CATALOG_YAML_K8S_NS)"',
+                  '--kubeconfig $(kubeconfig.secureFilePath)',
+                  '--insecure-skip-tls-verify',
+                ].join(' ')
+
+                const cwd = process.cwd();
+                const pid1out = [];
+                const pid2out = [];
+
+                const pid1 = sh.exec(kubeevents, { cwd, async: true, silent: true });
+                pid1.stdout.on('data', (chunk) => pid1out.push(chunk))
+                pid1.stderr.on('data', (chunk) => pid1out.push(chunk))
+
+                const pid2 = sh.exec(kubelogs, { cwd, async: true, silent: true });
+                pid2.stdout.on('data', (chunk) => pid2out.push(chunk))
+                pid2.stderr.on('data', (chunk) => pid2out.push(chunk))
+
+                const pid = sh.exec(helmUpgradeCommand, { cwd }, (code, stdout, stderr) => {
+                  console.info('kube events!')
+                  console.log(pid1out.join('') || 'No events!');
+
+                  console.info('kube logs!')
+                  console.log(pid2out.join('') || 'No logs');
+
+                  process.exit(code);
+                });
+
+        on:
+          success:
+            steps:
+            - checkout: self
+              fetchDepth: 1
+
+            - task: JsonParseFromVivo@4
+              displayName: 'Get composer.json info'
+              inputs:
+                type: 'file'
+                origin: $(Build.SourcesDirectory)/composer.json
+                jpaths: |
+                  var COMPOSER_JSON_VERSION = .version
+
+            - task: LoadFile@4
+              displayName: 'Load catalog-info.yaml'
+              inputs:
+                script: |
+                  CATALOG_YAML_CONTENT = $(Build.SourcesDirectory)/catalog-info.yaml
+
+            - task: YamlParseFromVivo@4
+              displayName: 'Get Metadata Info'
+              inputs:
+                type: 'file'
+                origin: $(Build.SourcesDirectory)/catalog-info.yaml
+                jpaths: |
+                  var CATALOG_YAML_NAME = .metadata.name
+                  var CATALOG_YAML_ACRONYM = .metadata.annotations['techarch.governance-app.acronym']
+                  var CATALOG_YAML_K8S_NS = .metadata.annotations['vivo.io/kubernetes-k8s-namespace-${{ parameters.environment }}']
+
+            - task: CatchLogsToLocalDirectoryFromVivo@4
+              displayName: 'Dump logs and metas'
+              inputs:
+                dumpDir: $(Build.ArtifactStagingDirectory)/audit
+
+            - task: PublishBuildArtifacts@1
+              displayName: 'Push Logs to Artifacts'
+              inputs:
+                ArtifactName: audit
+                PathtoPublish: $(Build.ArtifactStagingDirectory)/audit
+
+            - task: VivoGovernance@1
+              displayName: 'Gov Notify "deploy"'
+              inputs:
+                breakglass: false
+                serverEndpoint: 'governanceapi'
+                operation: 'deploy'
+                component: $(CATALOG_YAML_NAME)
+                version: $(COMPOSER_JSON_VERSION)
+                cluster: aks-$(CATALOG_YAML_ACRONYM)-${{ parameters.environment }}
+                namespace: $(CATALOG_YAML_K8S_NS)
+                deployment: $(CATALOG_YAML_NAME)
+                environment: ${{ parameters.environment }}
+                catalogInfo: $(CATALOG_YAML_CONTENT)
+
+          failure:
+            steps:
+            - checkout: none
+
+            - task: CatchLogsToLocalDirectoryFromVivo@4
+              displayName: 'Dump logs and metas'
+              inputs:
+                dumpDir: $(Build.ArtifactStagingDirectory)/audit
+
+            - task: PublishBuildArtifacts@1
+              displayName: 'Push Logs to Artifacts'
+              inputs:
+                ArtifactName: audit
+                PathtoPublish: $(Build.ArtifactStagingDirectory)/audit
+

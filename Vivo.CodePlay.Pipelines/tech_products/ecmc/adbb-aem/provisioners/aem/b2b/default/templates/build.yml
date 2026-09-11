@@ -1,0 +1,115 @@
+parameters:
+  - name: mavenSettingsLocation
+    type: string
+    default: $(DEFAULT_MAVEN_SETTINGS)
+  - name: mavenCommand
+    type: string
+    default: "mvn clean package"
+
+steps:
+- task: AzureKeyVault@2  
+  displayName: 'Getting AKV credentials'
+  timeoutInMinutes: 1
+  retryCountOnTaskFailure: 5  
+  inputs:    
+    azureSubscription: DevOpsSharedResources    
+    KeyVaultName: $(AKV_DEVOPS_NAME)
+    SecretsFilter: 'NEXUS-DEPS-USR, NEXUS-DEPS-PSW'
+
+- bash: |
+    echo "🔑 Injetando credenciais Azure Artifacts no settings.xml..."
+
+    SETTINGS_FILE="$HOME/.m2/settings.xml"
+
+    if [ ! -f "$SETTINGS_FILE" ]; then
+      echo "❌ ERRO: settings.xml não encontrado em $SETTINGS_FILE"
+      exit 1
+    fi
+
+    # Remove bloco <servers>...</servers> existente (tolerante a indentação)
+    # e injeta novo bloco antes de </settings>
+    awk -v token="$SYSTEM_ACCESSTOKEN" '
+      /<[[:space:]]*servers[[:space:]]*>/ { skip=1 }
+      skip && /<\/[[:space:]]*servers[[:space:]]*>/ { skip=0; next }
+      skip { next }
+      /<\/[[:space:]]*settings[[:space:]]*>/ {
+        print "  <servers>"
+        print "    <server>"
+        print "      <id>telefonica-vivo-brasil</id>"
+        print "      <username>vsts</username>"
+        print "      <password>" token "</password>"
+        print "    </server>"
+        print "  </servers>"
+      }
+      { print }
+    ' "$SETTINGS_FILE" > "${SETTINGS_FILE}.tmp" && mv "${SETTINGS_FILE}.tmp" "$SETTINGS_FILE"
+
+    echo "✓ Credenciais injetadas no settings.xml"
+    echo ""
+    echo "📄 Settings.xml atualizado (mascarado):"
+    sed 's/\(<password>\).*\(<\/password>\)/\1***MASKED***\2/' "$SETTINGS_FILE"
+  displayName: 'Inject Azure Artifacts Credentials'
+  env:
+    SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+
+- bash: |
+    echo "🔧 Configurando Maven com SSL/TLS workarounds..."
+    
+    # Detectar localização do settings.xml
+    if [ -f "${{ parameters.mavenSettingsLocation }}" ]; then
+      SETTINGS_FILE="${{ parameters.mavenSettingsLocation }}"
+    elif [ -f "$HOME/.m2/settings.xml" ]; then
+      SETTINGS_FILE="$HOME/.m2/settings.xml"
+    elif [ -f ".m2/settings.xml" ]; then
+      SETTINGS_FILE="$BUILD_SOURCESDIRECTORY/.m2/settings.xml"
+    else
+      SETTINGS_FILE="$HOME/.m2/settings.xml"
+    fi
+    
+    echo "✓ Settings.xml: $SETTINGS_FILE"
+    
+    # Limpar cache corrompido
+    echo ""
+    echo "🧹 Limpando cache Maven corrompido..."
+    rm -rf $(MAVEN_CACHE_FOLDER)/br/com/vivo/telefonica-vivo* 2>/dev/null || true
+    rm -rf $(MAVEN_CACHE_FOLDER)/br/com/vivo/*aem* 2>/dev/null || true
+    rm -rf $(MAVEN_CACHE_FOLDER)/org/apache/maven/maven-repository-metadata 2>/dev/null || true
+    rm -rf $(MAVEN_CACHE_FOLDER)/org/apache/sling 2>/dev/null || true
+    rm -rf $(MAVEN_CACHE_FOLDER)/com/adobe 2>/dev/null || true
+    echo "✓ Cache limpo"
+    
+    # Configurar MAVEN_OPTS com propriedades JVM de SSL + Maven Wagon + Aether
+    echo ""
+    echo "🔐 Configurando MAVEN_OPTS com SSL bypass completo..."
+    export MAVEN_OPTS="-Xmx2048m -XX:MaxPermSize=512m \
+      -Dmaven.wagon.http.ssl.insecure=true \
+      -Dmaven.wagon.http.ssl.allowall=true \
+      -Dmaven.wagon.http.ssl.ignore.validity.dates=true \
+      -Daether.connector.https.securityMode=insecure \
+      -Daether.connector.http.retryHandler.count=3 \
+      -Dhttps.protocols=TLSv1.2,TLSv1.3"
+    
+    echo "✓ MAVEN_OPTS configurado:"
+    echo "$MAVEN_OPTS"
+    
+    # Executar build Maven com TODAS as flags SSL inline
+    echo ""
+    echo "🚀 Executando Maven Build..."
+    ${{ parameters.mavenCommand }} \
+      -s "$SETTINGS_FILE" \
+      -Dmaven.repo.local=$(MAVEN_CACHE_FOLDER) \
+      -Dmaven.wagon.http.ssl.insecure=true \
+      -Dmaven.wagon.http.ssl.allowall=true \
+      -Dmaven.wagon.http.ssl.ignore.validity.dates=true \
+      -Daether.connector.https.securityMode=insecure \
+      -Daether.connector.http.retryHandler.count=3 \
+      -Dmaven.wagon.http.retryHandler.count=3 \
+      -Dmaven.wagon.httpconnectionManager.ttlSeconds=120 \
+      -Dhttps.protocols=TLSv1.2,TLSv1.3 \
+      -U
+      
+  displayName: 'Maven Build (AEM - SSL/TLS Workaround)'
+  env:
+    SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+    NEXUS_DEPS_USR: $(NEXUS-DEPS-USR)
+    NEXUS_DEPS_PSW: $(NEXUS-DEPS-PSW)

@@ -1,0 +1,255 @@
+parameters:
+- name: environment
+
+stages:
+- stage: ci_build
+  displayName: "CI - Build"
+  pool:
+    name: $(AGENT_POOL_CI)
+  dependsOn:
+  - environment_init
+
+  ## -> Loads variables from other stages.
+  variables:
+  - name: NEXUS_DEPS_USR
+    value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEPS_USR'] ]
+  - name: NEXUS_DEPS_PSW
+    value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEPS_PSW'] ]
+  - name: NEXUS_DEFAULT_USR
+    value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEFAULT_USR'] ]
+  - name: NEXUS_DEFAULT_PSW
+    value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEFAULT_PSW'] ]
+
+  jobs:
+
+  - job: build
+    displayName: Build
+    timeoutInMinutes: $[ variables['BUILD_JOB_TIMEOUT'] ]
+    steps:
+
+    ## -> Checkout the code
+    - checkout: self
+      displayName: Checkout Code
+      name: checkout_code
+      submodules: true
+      persistCredentials: true
+
+    ## -> Checkout the last commit that was pushed to the repository.
+    ## -> Set last commit HASH to a variable.
+    - task: Bash@3
+      displayName: Checkout Last Commit
+      name: checkout_last_commit
+      condition: succeeded()
+      continueOnError: false
+      inputs:
+        targetType: inline
+        script: |
+          echo "##[debug] Checkout last commit from '$(Build.SourceBranchName)'"
+
+          git config pull.rebase true
+          git fetch -f --depth 50 origin $(Build.SourceBranchName):$(Build.SourceBranchName)
+          git checkout -f $(Build.SourceBranchName)
+
+          ## -> Ignore commits that only change .azuredevops/ content
+          lastCommit=$(git log --format=%H -- . ':!'".azuredevops/" | head -n 1)
+          lastCommitHash=$(git rev-parse --short=6 $lastCommit)
+
+          echo "##[debug] Last commit short hash '$lastCommitHash'"
+          echo "##vso[task.setvariable variable=SHORT_HASH]$lastCommitHash"
+
+    ## -> Start of Bump Version section
+    ## -> If branch is master, use numeric system. e.g: 0.0.1, 2.0.0;
+    ## -> If branch is NOT master, use branch name + last commit hash. e.g: dev-1a2b;
+
+    ## -> Get current version and set to variables.
+    ## -> For master, set a variable to increment version further on.
+    - task: CmdLine@2
+      displayName: Get Current Version
+      name: current_version
+      condition: succeeded()
+      continueOnError: false
+      inputs:
+        targetType: inline
+        script: |
+
+          currentVersion=$(DOCKER_CMD_EXTRACT_PACKAGE_JSON_VERSION)
+          echo "##[debug] Source CURRENT_VERSION: '$currentVersion' "
+          echo "##vso[task.setvariable variable=CURRENT_VERSION;]$currentVersion"
+
+          incrementVersion=$(echo $currentVersion | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+          if [[ -n $incrementVersion ]]; then
+            echo "##vso[task.setvariable variable=INCREMENT_VERSION;]$incrementVersion"
+          else
+            echo "##[error] Version in the pom.xml is not following semantic versioning."
+            echo "##[error] Verify if the version contains the pattern: <major>.<minor>.<patch>; e.g: 0.0.1, 1.0.0-branch, 1.1.0-branch+hash, 0.0.1-SNAPSHOT; "
+            exit 1
+          fi
+
+    ## -> Bump/Increment version and update increment variable.
+    ## -> Only allows this for master branch and in CI steps. Do not allow manual pushes.
+    ## -> To disable set BUMP_VERSION_ENABLED in pipeline's library.
+    - task: semver-bump@1
+      displayName: Bump Version Master
+      name: bump_version
+      condition: and(
+        succeeded(),
+        and(eq(variables.BUMP_VERSION_ENABLED, 'true'), ne(variables['Build.Reason'], 'Manual')))
+      continueOnError: false
+      inputs:
+        VersionVariable: 'INCREMENT_VERSION'
+        IncrementLevel: 'patch'
+        targetType: inline
+
+    ## -> Set the new version to a variable. This allows it to be used in other stages, jobs or tasks.
+    - task: Bash@3
+      displayName: 'Set New Version'
+      name: new_version
+      condition: succeeded()
+      continueOnError: false
+      inputs:
+        targetType: inline
+        script: |
+          echo "##[debug] Source CURRENT_VERSION: '$(CURRENT_VERSION)'"
+          if [ '$(Build.SourceBranchName)' == 'master' ]; then
+            echo "##[debug] Source NEW_VERSION: '$(INCREMENT_VERSION)'"
+            echo "##vso[task.setvariable variable=NEW_VERSION;isOutput=true]$(INCREMENT_VERSION)"
+          else
+            newVersion=$(INCREMENT_VERSION)-$(Build.SourceBranchName).$(SHORT_HASH)
+            echo "##[debug] Source NEW_VERSION: $newVersion"
+            echo "##vso[task.setvariable variable=NEW_VERSION;isOutput=true]$newVersion"
+          fi
+
+    ## -> Bump version in code and build code.
+    - task: Bash@3
+      displayName: Build Version
+      name: build_version
+      condition: succeeded()
+      continueOnError: false
+      inputs:
+        targetType: inline
+        script: |
+
+          echo "##[debug] Environment: ${{ parameters.environment }}"
+
+          BUILDER_IMAGE_NAME="builder/$(Build.BuildId)"
+
+          ## -> Grant execute permissions to all .sh files in the root directory
+          for FILE in *.sh; do
+            chmod +x "$FILE"
+          done
+
+          docker build --no-cache --build-arg USER_ID=$(DOCKER_CMD_USERNAME) --build-arg GROUP_ID=$(DOCKER_CMD_GROUP) --build-arg NODE_ENV=${{parameters.environment}} -t $BUILDER_IMAGE_NAME -f .azuredevops/builder.Dockerfile .
+
+          run_docker() {
+            docker run --rm \
+              --user="$(DOCKER_CMD_USERNAME):$(DOCKER_CMD_GROUP)" \
+              --network host \
+              --log-driver none \
+              -e NPM_CONFIG_USERCONFIG="/tmp/.npmrc" \
+              -e NO_PROXY=$(PROXY_AGENT_NO_PROXY) \
+              -e TZ="America/Sao_Paulo" \
+              -e SYSTEM_ACCESSTOKEN="$(System.AccessToken)" \
+              -e NEXUS_DEPS_USR="$(NEXUS_DEPS_USR)" \
+              -e NEXUS_DEPS_PSW="$(NEXUS_DEPS_PSW)" \
+              -e NEXUS-DEFAULT-USR="$(NEXUS_DEFAULT_USR)" \
+              -e NEXUS-DEFAULT-PSW="$(NEXUS_DEFAULT_PSW)" \
+              -e NODE_ENV="${{parameters.environment}}" \
+              -v $(pwd):/app \
+              -v $(DEFAULT_NPMRC_TEMP_FILE_PATH):/tmp/.npmrc \
+              -w $(DOCKER_WORKDIR) \
+              "$BUILDER_IMAGE_NAME" sh -c "$1"
+          }
+
+          if [[ "${BUMP_VERSION_ENABLED}" == 'true' ]]; then
+            echo "##[debug] Bump version to NEW_VERSION: $(new_version.NEW_VERSION)"
+            jq '.version="$(new_version.NEW_VERSION)"' package.json > /tmp/package.json
+            mv /tmp/package.json package.json
+          fi
+
+          echo "##[debug] Build with version: $(new_version.NEW_VERSION)"
+          echo "##[debug] NODEJS_CMD_BUILD: $(NODEJS_CMD_BUILD)"
+          echo "##[debug] NODEJS_CMD_BUILD_TEST: $(NODEJS_CMD_BUILD_TEST)"
+          echo "##[debug] NODEJS_CMD_OPTIONAL: $(NODEJS_CMD_OPTIONAL)"
+
+          run_docker "$(NODEJS_CMD_BUILD) $( [[ -n "$(NODEJS_CMD_BUILD_TEST)" ]] && echo "&& $(NODEJS_CMD_BUILD_TEST)" ) $( [[ -n "$(NODEJS_CMD_OPTIONAL)" ]] && echo "&& $(NODEJS_CMD_OPTIONAL)" )"
+
+
+    ## -> Copy files for staging area
+    - task: CopyFiles@2
+      name: t_copy_file
+      displayName: 'Copy to Staging Directory'
+      condition: succeeded()
+      continueOnError: false
+      inputs:
+        TargetFolder: '$(Build.ArtifactStagingDirectory)'
+        OverWrite: true
+        CleanTargetFolder: true
+        Contents: >
+          **/*
+
+          !.git/**/*
+
+          !?/**/*
+
+          !**/*.log
+
+          !**/node_modules/**
+
+    ## -> Set artifact information to variables. This allows it to be used in other stages, jobs or tasks.
+    - task: CmdLine@2
+      name: artifact_name
+      displayName: 'Set Artifact Name'
+
+      condition: succeeded()
+      continueOnError: false
+      inputs:
+        targetType: inline
+        script: |
+
+          echo "$(pwd)"
+          echo "$(ls -lah)"
+
+          packageJsonName=$(DOCKER_CMD_EXTRACT_PACKAGE_JSON_NAME)
+          echo "##[debug] package.json .name: '$packageJsonName'"
+
+          echo "##[debug] Set Artifact Name + New Version"
+          artifactName="$(echo $packageJsonName | awk -F '/' '{print$NF}')-$(new_version.NEW_VERSION)"
+          echo "##[debug] Artifact Name: '$artifactName'"
+
+          echo "##vso[task.setvariable variable=PACKAGE_JSON_NAME;isOutput=true]$packageJsonName"
+          echo "##vso[task.setvariable variable=ARTIFACT_NAME;isOutput=true]$artifactName"
+
+    ## -> Compress artifacts into tar. This allows to use less space and to be used in other stages, jobs or tasks.
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Artifact'
+      condition: succeeded()
+      continueOnError: false
+      inputs:
+        ArtifactName: $(artifact_name.ARTIFACT_NAME)
+        StoreAsTar: true
+
+    ## -> Publish results for JUnit tests
+    - task: PublishTestResults@2
+      name: t_publish_test_result
+      displayName: Publish Test Results
+      inputs:
+        mergeTestResults: true
+        searchFolder: $(Build.SourcesDirectory)
+        testResultsFiles: '**/TEST-*.xml'
+        testResultsFormat: JUnit
+        testRunTitle: Test Results
+        failTaskOnFailedTests: true
+        publishRunAttachments: false
+      continueOnError: true
+
+    ## -> Publish results for Code Coverage
+    - task: PublishCodeCoverageResults@1
+      name: t_publish_code_coverage_result
+      displayName: 'Publish Code Coverage Result'
+      inputs:
+        codeCoverageTool: Cobertura
+        summaryFileLocation: $(Build.SourcesDirectory)/$(COVERAGE_REPORT_SUMMARY_FILE_LOCATION)/lcov.info
+        pathToSources: $(Build.SourcesDirectory)/$(COVERAGE_REPORT_PATH_TO_SOURCE)
+        reportDirectory: $(Build.SourcesDirectory)/$(COVERAGE_REPORT_REPORT_DIRECTORY)/lcov-report
+        additionalCodeCoverageFiles: $(Build.SourcesDirectory)/$(COVERAGE_REPORT_REPORT_DIRECTORY)/**/*.xml
+      continueOnError: true

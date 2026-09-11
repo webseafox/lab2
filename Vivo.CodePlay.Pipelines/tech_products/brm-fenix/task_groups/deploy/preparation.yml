@@ -1,0 +1,150 @@
+# This YAML file defines a pipeline preparation task group for deploying Helm charts and executing deploy commands.
+
+parameters:
+  - name: applicationName
+  - name: helmCharts
+  - name: deployCommandsSourceFile
+  - name: deployCommandsTargetFile
+  - name: commandsFilesTargetFolder
+  - name: pricingConfigComponentsToDeploy
+  # JCR UPGRADE BRM 15: permitir que o CD ignore os artefatos de Files e use checkout local.
+  - name: useSourceCodeArtifact
+    default: true
+  - name: downloadHelmArtifacts
+    default: true
+  - name: sshEndpoint
+  - name: targetFolder
+
+steps:
+  - script: |
+      echo "##[debug] applicationName.........................................: ${{ parameters.applicationName }}"
+      echo "##[debug] helmCharts..............................................: ${{ parameters.helmCharts }}"
+      echo "##[debug] deployCommandsSourceFile................................: ${{ parameters.deployCommandsSourceFile }}"
+      echo "##[debug] deployCommandsTargetFile................................: ${{ parameters.deployCommandsTargetFile }}"
+      echo "##[debug] commandsFilesTargetFolder...............................: ${{ parameters.commandsFilesTargetFolder }}"
+      echo "##[debug] pricingConfigComponentsToDeploy.........................: ${{ parameters.pricingConfigComponentsToDeploy }}"
+      echo "##[debug] sshEndpoint.............................................: ${{ parameters.sshEndpoint }}"
+      echo "##[debug] targetFolder............................................: ${{ parameters.targetFolder }}"
+    displayName: "Preparation Show Parameters"
+
+  # JCR UPGRADE BRM 15: manter o download de artefato para CI e fluxos legados.
+  - ${{ if eq(parameters.useSourceCodeArtifact, true) }}:
+      - template: ../../task_groups/artifact/download.yml
+        parameters:
+          displayName: Download Pipeline Artifact [source_with_shared_files]
+          artifactName: source_with_shared_files
+          targetPath: $(Agent.BuildDirectory)/source_code
+
+  # JCR UPGRADE BRM 15: o CD resolve source_code diretamente, sem baixar o artefato de Files.
+  # - template: ../../task_groups/artifact/download.yml
+  #   parameters:
+  #     displayName: Download Pipeline Artifact [source_with_shared_files]
+  #     artifactName: source_with_shared_files
+  #     targetPath: $(Agent.BuildDirectory)/source_code
+  - ${{ if eq(parameters.useSourceCodeArtifact, false) }}:
+      - template: ../../task_groups/checkout/checkout.yml
+        parameters:
+          repository: self
+          path: source_code
+
+  # JCR UPGRADE BRM 15: o CD ignora o download dos artefatos helm antes produzidos em Files.
+  - ${{ if and(eq(parameters.downloadHelmArtifacts, true), ne(parameters.helmCharts, '')) }}:
+      # Download each Helm chart artifact to the Agent's build directory.
+      - ${{ each helm_chart in split(parameters.helmCharts, ',')}}:
+          - template: ../../task_groups/artifact/download.yml
+            parameters:
+              displayName: Download Pipeline Artifact [${{ replace(helm_chart, 'package-', '') }}]
+              artifactName: ${{ replace(helm_chart, 'package-', '') }}
+              targetPath: $(Agent.BuildDirectory)/${{ replace(helm_chart, 'package-', '') }}
+
+          # Download the secure file for the Helm chart.
+          - template: /tasks/artifacts/download_secure_files.yml@CorePipelines
+            parameters:
+              name: ${{ replace(helm_chart,'-','_') }}
+              secureFile: "brm_${{ replace(helm_chart,'-','_') }}_$(ENVIRONMENT).yml"
+
+          # Move the secrets-values file to the secret-values folder for the Helm chart.
+          - task: CmdLine@2
+            displayName: "Move secrets-values file to $(Agent.BuildDirectory)/${{ replace(helm_chart, 'package-', '') }}/secret-values folder"
+            inputs:
+              script: |
+                echo "##[debug] SECRET_VALUES_FILE................: ${_SECRET_VALUES_FILE}"
+                echo "##[debug] SECRET_VALUES_FILE_NAME...........: ${_SECRET_VALUES_FILE_NAME}"
+                echo "##[debug] SECRET_VALUES_FILE_PATH...........: ${_SECRET_VALUES_FILE_PATH}"
+
+                echo "Create secret-values folder"
+                echo "##[command]mkdir -p ${_SECRET_VALUES_FILE_PATH}"
+                mkdir -p ${_SECRET_VALUES_FILE_PATH}
+
+                echo "Move ${_SECRET_VALUES_FILE} to ${_SECRET_VALUES_FILE_PATH}/${_SECRET_VALUES_FILE_NAME}"
+                echo "##[command]mv ${_SECRET_VALUES_FILE} ${_SECRET_VALUES_FILE_PATH}/${_SECRET_VALUES_FILE_NAME}"
+                mv ${_SECRET_VALUES_FILE} ${_SECRET_VALUES_FILE_PATH}/${_SECRET_VALUES_FILE_NAME}
+            env:
+              _SECRET_VALUES_FILE: $(${{ replace(helm_chart,'-','_') }}.secureFilePath)
+              _SECRET_VALUES_FILE_NAME: $(ENVIRONMENT)-secret.yaml
+              _SECRET_VALUES_FILE_PATH: $(Agent.BuildDirectory)/${{ replace(helm_chart, 'package-', '') }}/secret-values
+
+          - ${{ if and(eq(helm_chart, 'package-oc-cn-helm-chart'), in(parameters.applicationName, 'billingcare', 'billingcare-extension')) }}:
+              - template: ../../tasks/bash/replace_variables.yml
+                parameters:
+                  sourceFile: $(Agent.BuildDirectory)/${{ replace(helm_chart, 'package-', '') }}/pipeline/$(BC_BCWS_DEPLOY_SCRIPT)
+                  transpiledFileTargetFolder: $(Agent.BuildDirectory)/${{ replace(helm_chart, 'package-', '') }}/pipeline
+                  transpiledFileName: $(BC_BCWS_DEPLOY_SCRIPT_TRANSPILED)
+                  extraVars: "OPERATION_HOST_HELM_PATH=$(OPERATION_HOST_HELM_PATH);HELM_CHART_FILE=$(HELM_CHART_FILE);ENVIRONMENT=$(ENVIRONMENT);SCRIPT_MODE=$(SCRIPT_MODE);BRM_CORE_RELEASE_VERSION=$(BRM_CORE_RELEASE_VERSION)"
+
+          # Generate a build information file for the Helm chart.
+          - template: ../../tasks/bash/build_information_file.yml
+            parameters:
+              filePath: $(Agent.BuildDirectory)/${{ replace(helm_chart, 'package-', '') }}
+
+          # Transfer the Helm chart files to the target environment using SSH.
+          #- template: ../../task_groups/ssh/file_transfer.yml
+          #  parameters:
+          #    sshEndpoint: ${{ parameters.sshEndpoint }}
+          #    sourceFolder: $(Agent.BuildDirectory)/${{ replace(helm_chart, 'package-', '') }}
+          #    targetFolder: $(OPERATION_HOST_HELM_PATH)/${{ helm_chart }}/
+          #    targetEnvironment: $(OPERATION_HOST_ENVIRONMENT)
+          #    fileName: ${{ replace(helm_chart, 'package-', '') }}
+          #    backupTargetFolder: true
+          #    cleanTargetFolder: true
+
+          # Remove the secrets-values file from the secret-values folder.
+          - task: CmdLine@2
+            displayName: "Remove secrets-values file $(ENVIRONMENT)-secret.yaml in $(Agent.BuildDirectory)/${{ replace(helm_chart, 'package-', '') }}/secret-values folder"
+            inputs:
+              script: |
+                echo "##[debug] SECRET VALUES FILE NAME......................: ${_SECRET_VALUES_FILE_NAME}"
+                echo "##[debug] SECRET VALUES FILE PATH......................: ${_SECRET_VALUES_FILE_PATH}"
+
+                echo "##[command]rm -Rfv ${_SECRET_VALUES_FILE_PATH}/${_SECRET_VALUES_FILE_NAME}"
+                rm -Rfv ${_SECRET_VALUES_FILE_PATH}/${_SECRET_VALUES_FILE_NAME}
+            env:
+              _SECRET_VALUES_FILE_NAME: $(ENVIRONMENT)-secret.yaml
+              _SECRET_VALUES_FILE_PATH: $(Agent.BuildDirectory)/${{ replace(helm_chart, 'package-', '') }}/secret-values
+
+  - ${{ if eq(parameters.applicationName, 'bi-publisher-reports') }}:
+      - template: ../../task_groups/ssh/file_transfer.yml
+        parameters:
+          sshEndpoint: ${{ parameters.sshEndpoint }}
+          targetFolder: $(BIP_MIGRATION_FILES_PATH)
+          sourceFolder: $(Agent.BuildDirectory)/source_code/BRM_Reports
+          targetEnvironment: $(OPERATION_HOST_ENVIRONMENT)
+          fileName: BRM_Reports
+
+  - template: ../../tasks/bash/replace_variables.yml
+    parameters:
+      sourceFile: $(DEPLOY_COMMANDS_FILE)
+      transpiledFileTargetFolder: ${{ parameters.commandsFilesTargetFolder }}
+      transpiledFileName: ${{ parameters.deployCommandsTargetFile }}
+      ${{ if eq(parameters.applicationName, 'pricing-design-center') }}:
+        extraVars: "PRICING_CONFIG_COMPONENTS_TO_DEPLOY=$(PRICING_CONFIG_COMPONENTS_TO_DEPLOY);APP_EXECUTION_MODE=$(_APP_EXECUTION_MODE);OPERATION_HOST_COMMANDS_PATH=$(OPERATION_HOST_COMMANDS_PATH);ENVIRONMENT=$(ENVIRONMENT);OPERATION_HOST_HELM_PATH=$(OPERATION_HOST_HELM_PATH);HELM_CHART_FILE=$(HELM_CHART_FILE);BRM_CORE_RELEASE_VERSION=$(BRM_CORE_RELEASE_VERSION)"
+      ${{ if eq(parameters.applicationName, 'bi-publisher-reports') }}:
+        extraVars: "ENVIRONMENT=$(ENVIRONMENT);BIP_COMMANDS_PATH=$(BIP_COMMANDS_PATH);BIP_MIGRATION_FILES_PATH=$(BIP_MIGRATION_FILES_PATH);BRM_CORE_RELEASE_VERSION=$(BRM_CORE_RELEASE_VERSION);_APP_EXECUTION_MODE=$(_APP_EXECUTION_MODE);BIP_SCRIPT_SERVER_PATH=$(BIP_SCRIPT_SERVER_PATH);BIP_MIGRATION_FILES_TARGET_PATH=$(BIP_MIGRATION_FILES_TARGET_PATH);BIP_TMP_MIGRATIONS_FILES=$(BIP_TMP_MIGRATIONS_FILES);BIP_BRM_REPORTS_BACKUP_FOLDER=$(BIP_BRM_REPORTS_BACKUP_FOLDER);BIP_BRM_REPORTS_BACKUP_FOLDER_PATH=$(BIP_BRM_REPORTS_BACKUP_FOLDER_PATH);BUILD_NUMBER=$(Build.BuildNumber)"
+
+  - template: ../../task_groups/ssh/file_transfer.yml
+    parameters:
+      sshEndpoint: ${{ parameters.sshEndpoint }}
+      targetFolder: ${{ parameters.targetFolder }}
+      sourceFolder: ${{ parameters.commandsFilesTargetFolder }}
+      targetEnvironment: $(OPERATION_HOST_ENVIRONMENT)
+      fileName: ${{ parameters.deployCommandsTargetFile }}

@@ -1,0 +1,145 @@
+
+## -> CI
+trigger:
+  branches:
+    include:
+      - 'master'
+      - 'main'
+      - 'codeplay'
+  paths:
+    exclude:
+      - .azuredevops/*cd.*
+      - .azuredevops/*pr.*
+
+variables:
+- group: "azdo-team-project-variables"
+- group: "${{ variables['Build.Repository.Name'] }}"
+- name: HTTP_PROXY
+  value: 'http://10.240.58.39:3128'
+- name: HTTPS_PROXY
+  value: 'http://10.240.58.39:3128'
+- name: NO_PROXY
+  value: 
+    localhost,
+    0.0.0.0,
+    127.0.0.1,
+    10.244.0.0/16,
+    192.168.0.0/16,
+    10.129.178.173,
+    nexus.telefonica.com.br,
+    acrsharedservices01.azurecr.io,
+    appcs-azdevops-shared.azconfig.io,
+    scm.azurewebsites.net
+
+stages:
+- stage: Build_and_Push
+  jobs:
+  - job: Docker
+    pool:
+      name: GeneralPurposeLinuxAgentsCI
+    steps:
+
+    - checkout: self
+      fetchDepth: 1
+      persistCredentials: true
+    
+    - task: YamlParseFromVivo@4
+      displayName: 'Get Metadata Info'
+      inputs:
+        type: 'file'
+        origin: $(Build.SourcesDirectory)/catalog-info.yaml
+        jpaths: |
+          var CATALOG_YAML_NAME = .metadata.name
+          var CATALOG_YAML_ACRONYM = .metadata.annotations['techarch.governance-app.acronym']
+    
+    - task: Bash@3
+      displayName: 'Get Version'
+      inputs:
+        targetType: 'inline'
+        script: |
+          INCREMENT_VERSION=$(jq .version package.json -r)
+          echo "##vso[task.setvariable variable=INCREMENT_VERSION]$INCREMENT_VERSION"
+          echo "Version extracted: $INCREMENT_VERSION"
+
+    - task: semver-bump@1
+      inputs:
+        VersionVariable: 'INCREMENT_VERSION'
+        IncrementLevel: 'patch'
+    
+    ## -> Set the new version to a variable.
+    - task: Bash@3
+      displayName: 'Set New Version'
+      name: new_version
+      inputs:
+        targetType: inline
+        script: |
+          echo "##[debug] Source NEW_VERSION: '$(INCREMENT_VERSION)'"
+          echo "##vso[task.setvariable variable=NEW_VERSION;isOutput=true]$INCREMENT_VERSION"
+
+    # ==================================================================
+    # [Compliance] Verifica se o repositório está em conformidade com as políticas de configuração
+    # ==================================================================
+    - task: VivoDevOpsConfigCompliance@1
+      displayName: 'Check DevOps Config Compliance'
+      inputs:
+        policySets: |
+          image-definition-files
+
+    - task: Docker@2
+      displayName: 'Docker Build'
+      inputs:
+        containerRegistry: '$(DOCKER_DEFAULT_REGISTRY_SERVICE_CONNECTION_NAME)'
+        command: build
+        repository: $(CATALOG_YAML_ACRONYM)/$(CATALOG_YAML_NAME)
+        Dockerfile: '**/Dockerfile'
+        arguments: >-
+          --no-cache 
+          --build-arg APPLICATION_NAME=$(CATALOG_YAML_NAME)
+          --build-arg HTTP_PROXY="$(HTTP_PROXY)"
+          --build-arg HTTPS_PROXY="$(HTTPS_PROXY)"
+          --build-arg NO_PROXY="$(NO_PROXY)"
+        tags: >
+          $(new_version.NEW_VERSION)-SNAPSHOT
+
+    - task: Docker@2
+      displayName: 'Push to Docker (SNAPSHOT)'
+      inputs:
+        containerRegistry: $(DOCKER_DEFAULT_REGISTRY_SERVICE_CONNECTION_NAME)
+        command: push
+        repository: $(CATALOG_YAML_ACRONYM)/$(CATALOG_YAML_NAME)
+        addPipelineData: true
+        addBaseImageData: true
+        tags: >
+          $(new_version.NEW_VERSION)-SNAPSHOT
+
+    ## -> Push new version to git
+    - task: Bash@3
+      displayName: 'Commit Updated Version'
+      inputs:
+        targetType: inline
+        script: |
+          export TAG="$(new_version.NEW_VERSION)"
+
+          ## -> Add changes
+          jq --arg newVersion "$TAG" '.version = $newVersion' $(Build.SourcesDirectory)/package.json > tmp.json && mv tmp.json $(Build.SourcesDirectory)/package.json
+
+          
+          git stash save $(Build.SourcesDirectory)/package.json
+          git clean -fdX
+
+          echo "##[command] git checkout ${BUILD_SOURCEBRANCHNAME} --"
+          git fetch
+          git checkout ${BUILD_SOURCEBRANCHNAME} --
+          git pull --rebase origin ${BUILD_SOURCEBRANCHNAME}
+          git stash pop
+
+          echo "##[command] git commit"
+          git add $(Build.SourcesDirectory)/package.json
+
+          git commit -am "[CI SKIP] Project version has been updated. Released version '${TAG}'" --author="$(Build.RequestedFor) <$(Build.RequestedForEmail)>"
+
+          echo "##[command]git tag ${TAG}"
+          git tag ${TAG} -m "Version has been updated to ${TAG}"
+
+          echo "##[command] git push origin ${BUILD_SOURCEBRANCHNAME}"
+          git push origin --tags ${BUILD_SOURCEBRANCHNAME}

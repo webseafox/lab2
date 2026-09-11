@@ -1,0 +1,106 @@
+parameters:
+  - name: BUNDLE_NAME
+    type: string
+  - name: MANUAL_BUNDLE_VERSION
+    type: string
+  - name: BUNDLE_NEXUS_REPOSITORY
+    type: string
+  - name: BUNDLE_NEXUS_COMPONENT_GROUP
+    type: string
+  - name: AZURE_STORAGE_CONTAINER_NAME
+    type: string
+  - name: AZURE_STORAGE_CONTAINER_PREFIX_PATH
+    type: string
+  - name: skipReleaseCreation
+    type: boolean
+  - name: AZURE_STORAGE_ACCOUNT_NAME
+    type: string
+  - name: AZURE_STORAGE_ACCOUNT_KEY
+    type: string
+
+stages:
+  - stage: PublishRelease
+    displayName: Publish Release
+    pool:
+      name: GeneralPurposeLinuxAgentsCI
+    dependsOn:
+      - environment_init
+      - ci_build
+      - ci_publish
+    condition: succeeded()
+    variables:
+      - name: BUNDLE_VERSION
+        ${{ if ne(parameters.MANUAL_BUNDLE_VERSION, '') }}:
+          value: ${{ trim(parameters.MANUAL_BUNDLE_VERSION) }}
+        ${{ else }}:
+          value: $[ stageDependencies.ci_build.build.outputs['new_version.NEW_VERSION'] ]
+      
+      - name: NEXUS_DEPS_USR
+        value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEPS_USR'] ]
+      - name: NEXUS_DEPS_PSW
+        value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEPS_PSW'] ]
+
+    jobs:
+      - job: DownloadFromNexus
+        displayName: "Download and Publish"
+        condition: succeeded()
+        variables:
+          BUNDLE_NEXUS_URL: https://nexus.telefonica.com.br/repository/${{parameters.BUNDLE_NEXUS_REPOSITORY}}/@${{parameters.BUNDLE_NEXUS_COMPONENT_GROUP}}/${{parameters.BUNDLE_NAME}}/-/${{parameters.BUNDLE_NAME}}-$(BUNDLE_VERSION).tgz
+        steps:
+          - bash: |
+              curl --request GET --url $(BUNDLE_NEXUS_URL) -O -u $(NEXUS_DEPS_USR):$(NEXUS_DEPS_PSW)
+            displayName: "Download Package From Nexus"
+
+          - bash: |
+              tar -zxvf ${{parameters.BUNDLE_NAME}}-$(BUNDLE_VERSION).tgz && \
+              mv package/dist/$(BUNDLE_VERSION) ${{parameters.BUNDLE_NAME}}-$(BUNDLE_VERSION)
+            displayName: "Unpack File"
+
+          - task: Bash@3
+            condition: and( succeeded(), eq('${{ parameters.skipReleaseCreation }}', false ))
+            displayName: "Upload to Blob Storage"
+            #env:
+            #  HTTPS_PROXY: $(PROXY_AGENT_HTTPS)
+            #  HTTP_PROXY: $(PROXY_AGENT_HTTP)
+            #  NO_PROXY: $(PROXY_AGENT_NO_PROXY)
+            inputs:
+              targetType: inline
+              script: |
+                echo "##[debug] Target directory path: './${{parameters.AZURE_STORAGE_CONTAINER_NAME}}/${{parameters.AZURE_STORAGE_CONTAINER_PREFIX_PATH}}/${{parameters.BUNDLE_NAME}}'"
+                echo "##[debug] Source directory path: './${{parameters.BUNDLE_NAME}}-$(BUNDLE_VERSION)'"
+                # Instala o Azure CLI extension para o Azure DevOps
+                #az extension add --name storage-preview
+
+                # Copia a pasta e seu conteúdo para o Blob Storage
+
+                az storage blob upload-batch \
+                --verbose \
+                --account-name ${{parameters.AZURE_STORAGE_ACCOUNT_NAME}} \
+                --account-key ${{parameters.AZURE_STORAGE_ACCOUNT_KEY}} \
+                --overwrite \
+                -d ${{parameters.AZURE_STORAGE_CONTAINER_NAME}}/${{parameters.AZURE_STORAGE_CONTAINER_PREFIX_PATH}}/${{parameters.BUNDLE_NAME}}/$(BUNDLE_VERSION) \
+                -s ./${{parameters.BUNDLE_NAME}}-$(BUNDLE_VERSION)
+
+          - bash: |
+              if [ -d "package/dist/metadata" ]; then
+                mv package/dist/metadata ${{parameters.BUNDLE_NAME}}-$(BUNDLE_VERSION)/metadata
+                echo "##[section] Metadata folder moved"
+              else
+                echo "##[warning] No metadata folder found in package"
+              fi
+            displayName: "Move Metadata to Artifact"
+            continueOnError: true
+
+          - task: CopyFiles@2
+            displayName: "Copy to Staging Directory"
+            inputs:
+              SourceFolder: ${{parameters.BUNDLE_NAME}}-$(BUNDLE_VERSION)
+              TargetFolder: $(Build.ArtifactStagingDirectory)/${{parameters.BUNDLE_NAME}}-$(BUNDLE_VERSION)
+              Contents: "**"
+              CleanTargetFolder: false
+
+          - task: PublishBuildArtifacts@1
+            displayName: "Publish Artifact"
+            inputs:
+              PathtoPublish: $(Build.ArtifactStagingDirectory)/${{parameters.BUNDLE_NAME}}-$(BUNDLE_VERSION)
+              ArtifactName: ${{parameters.BUNDLE_NAME}}-$(BUNDLE_VERSION)

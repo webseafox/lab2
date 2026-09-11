@@ -1,0 +1,149 @@
+stages:
+- stage: deploy
+  displayName: "CD - Deploy ${{parameters.environment}}"
+  dependsOn:
+    - ci_build
+    - ci_quality_gate
+    - ci_security
+  pool: $(AGENT_POOL_CD)
+
+  ## -> Loads variables from other stages.
+  variables:
+  - name: ARTIFACT_NAME
+    value: $[ stageDependencies.ci_build.build.outputs['artifact_name.ARTIFACT_NAME'] ]
+  - name: WORK_DIR
+    value: '$(System.ArtifactsDirectory)/extracted_tars/$(ARTIFACT_NAME)'
+
+  jobs:
+    - deployment: deploy
+      workspace:
+        clean: all
+      displayName: Deploy
+      environment: "deploy-db-${{parameters.environment}}"
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+                ## -> Skip Download
+                - download: none
+
+                ## -> Download DB Arifact
+                - task: DownloadBuildArtifacts@1
+                  displayName: 'Download Build Artifacts'
+                  inputs:
+                    artifactName: $(ARTIFACT_NAME)
+                    parallelizationLimit: 20
+                    extractTars: true
+
+                ## -> Login to docker registry
+                - task: Docker@2
+                  displayName: "Docker login VCR"
+                  inputs:
+                    containerRegistry: "VCR-DOCKER"
+                    command: login
+
+                ## -> Build Liquibase docker image
+                - task: Bash@3
+                  displayName: 'Build Liquibase Image'
+                  inputs:
+                    workingDirectory: $(WORK_DIR)
+                    targetType: inline
+                    script: |
+                      echo "##[group] Show Dockerfile"
+                      cat .azuredevops/builder.Dockerfile
+                      echo "##[endgroup]"
+
+                      echo "##[debug] Building the docker image from .azuredevops/builder.Dockerfile"
+                      docker build -t "builder/java" -f .azuredevops/builder.Dockerfile .
+
+                ## -> Tag the data base with pre-deploy pre-$(Build.BuildNumber)
+                ## -> The tag is used to manage the changes and to do the rollback
+                - task: LiquibaseMvnVivoLiquibase@4
+                  displayName: 'Tag Database'
+                  inputs:
+                    goal: 'tag'
+                    extraAttributes: '-Dliquibase.tag=pre-$(Build.BuildNumber)'
+                    cwd: $(WORK_DIR)
+
+                ## -> List changesets candidate to deploy
+                - task: LiquibaseMvnVivoLiquibase@4
+                  displayName: 'List Undeployed Changesets Before Deployment'
+                  condition: succeededOrFailed()
+                  continueOnError: 'true'
+                  inputs:
+                    goal: 'status'
+                    cwd: $(WORK_DIR)
+                    extraAttributes: '-Dliquibase.logLevel=WARNING'
+
+                ## -> Deploy changes to data base
+                - task: LiquibaseMvnVivoLiquibase@4
+                  displayName: 'Deploy Database Changes'
+                  inputs:
+                    goal: 'update'
+                    cwd: $(WORK_DIR)
+                    extraAttributes: >-
+                      -Dliquibase.contexts=$(environment)
+                      -Dliquibase.labels=$(LIQUIBASE_LABELS)
+                      -Dliquibase.logLevel=WARNING
+
+                ## -> List changesets that ware not deployed, wether there is any
+                - task: LiquibaseMvnVivoLiquibase@4
+                  displayName: 'List Undeployed Changesets After Deployment'
+                  condition: succeededOrFailed()
+                  continueOnError: 'true'
+                  inputs:
+                    goal: 'listUndeployedChangesets'
+                    cwd: $(WORK_DIR)
+                    extraAttributes: '-Dliquibase.logLevel=WARNING'
+
+                ## -> Diff the data base with the snapshot previously taken
+                - task: LiquibaseMvnVivoLiquibase@4
+                  displayName: 'Diff Database Changes'
+                  condition: and(succeededOrFailed(), eq(variables.ENABLE_SNAPSHOT_COMPARE, true) )
+                  continueOnError: 'true'
+                  inputs:
+                    goal: 'diff'
+                    cwd: $(WORK_DIR)
+                    extraAttributes: >-
+                      -Dliquibase.referenceUrl=offline:$(DB_TYPE)?snapshot=snapshot_db_$(environment).json
+
+          on:
+            success:
+              steps:
+                - task: Bash@3
+                  displayName: Publish Success
+                  inputs:
+                    targetType: inline
+                    script: |
+                        echo "##[section] ================================================================================================================================="
+                        echo "##[section]                                                      DEPLOY WAS SUCCESSFUL! "
+                        echo "##[section] ================================================================================================================================="
+                        echo "##[section] Congratulations, your script has been successfully deployed to the database."
+                        echo "##[section] Access your database and validate if your new version has been successfully delivered."
+                        echo "##[section] If you have any questions about this phase of the pipeline, please refer to our documentation: $(CORPORATE_WIKI_DOC_URL)"
+                        echo "##[section]================================================================================================================================="
+
+                        ## -> Set Pipeline Tag on success
+                        echo "##vso[build.addbuildtag]deploy-${{ parameters.environment }}=succeeded"
+
+            failure:
+              steps:
+                - task: Bash@3
+                  displayName: Publish Failure
+                  inputs:
+                    targetType: inline
+                    script: |
+                        echo "##[error] ================================================================================================================================="
+                        echo "##[error]                                                    DEPLOY WAS NOT SUCCESSFUL! "
+                        echo "##[error] ================================================================================================================================="
+                        echo "##[error] If you are seeing this message, it means that an error occurred during the deployment of your application."
+                        echo "##[error] "
+                        echo "##[error] Here are some tips for troubleshooting:"
+                        echo "##[error] $(ALERT_MESSAGE_ARROW) Check the deploy stage log."
+                        echo "##[error] $(ALERT_MESSAGE_ARROW) Consult with the technical responsible on how to proceed in case of environment failure."
+                        echo "##[error] "
+                        echo "##[error] If you have any questions about this phase of the pipeline, please refer to our documentation: $(CORPORATE_WIKI_DOC_URL)"
+                        echo "##[error] ================================================================================================================================="
+
+                        ## -> Set Pipeline Tag on failure
+                        echo "##vso[build.addbuildtag]deploy-${{ parameters.environment }}=failed"

@@ -1,0 +1,84 @@
+parameters:
+- name: fortifyExclusionRepository
+
+stages:
+- stage: ci_security
+  displayName: "CI - Security Gates"
+  pool:
+    name: GeneralPurposeLinuxAgentsCI
+  dependsOn:
+  - environment_init
+  - gates_environment_init
+  - ci_build
+  condition: and(
+    succeeded(),
+    or(
+      eq(variables.gatesEnabled, 'True'),
+      in(variables['Build.SourceBranch'], 'refs/heads/master', 'refs/heads/main')
+    )
+  )
+
+  variables:
+  - name: FORTIFY_SSC_CLI_TOKEN
+    value: $[ stageDependencies.gates_environment_init.environment.outputs['fortify_credentials.FORTIFY_SSC_CLI_TOKEN'] ]
+  - name: FORTIFY_SCANCENTRAL_CLIENT_TOKEN
+    value: $[ stageDependencies.gates_environment_init.environment.outputs['fortify_credentials.FORTIFY_SCANCENTRAL_CLIENT_TOKEN'] ]
+  - name: USE_FORTIFY
+    value: $[ stageDependencies.gates_environment_init.environment.outputs['evaluate_flags.USE_FORTIFY'] ]    
+  - name: USE_CONVISO
+    value: $[ stageDependencies.gates_environment_init.environment.outputs['evaluate_flags.USE_CONVISO'] ] 
+  - name: USE_CHECKMARX
+    value: $[ stageDependencies.gates_environment_init.environment.outputs['evaluate_flags.USE_CHECKMARX'] ] 
+  - name: SKIP_SECURITY_GATE
+    value: $[ stageDependencies.gates_environment_init.environment.outputs['evaluate_flags.SKIP_SECURITY_GATE'] ] 
+
+  jobs:
+  - job: app_config_keys
+    displayName: "Get AppSec Config Keys"
+    steps:
+    - template: /task_groups/security/get_appconfig_keys.yml@CorePipelines
+
+  - job: fortify_scan
+    dependsOn:
+    - app_config_keys
+    variables:
+      USE_FORTIFY: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_FORTIFY'] ]
+      USE_CONVISO: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_CONVISO'] ]
+      SKIP_SECURITY_GATE: $[ dependencies.app_config_keys.outputs['evaluate_flags.SKIP_SECURITY_GATE'] ]
+    condition: succeeded()
+
+    displayName: "SAST Scan"
+    steps:
+    - template: /task_groups/security/run_fortify_scan.yml@CorePipelines
+      parameters:
+        isGitFlow: true
+        gateCondition: and(
+                        succeeded(),
+                        ne(variables.skip_fortify_gate, true),
+                        ne(variables.USE_CONVISO, 'true')
+                      )
+        fortifyExclusionRepository: ${{ parameters.fortifyExclusionRepository }}
+        skipSecurityGate: $(SKIP_SECURITY_GATE)
+    - template: /tasks/telemetry/telemetry.yml@CorePipelines
+
+  - job: sca_scan
+    dependsOn: app_config_keys
+    variables: 
+      USE_DEPENDENCY_TRACK: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_DEPENDENCY_TRACK'] ]
+      USE_CONVISO: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_CONVISO'] ]
+      SKIP_SECURITY_GATE_SCA: $[ dependencies.app_config_keys.outputs['evaluate_flags.SKIP_SECURITY_GATE_SCA'] ]
+      USE_DT_DOCKER: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_DT_DOCKER'] ]
+    condition: and(
+                succeeded(),
+                eq(variables.USE_DEPENDENCY_TRACK, 'true'),
+                eq(variables.USE_DT_DOCKER, 'false'),
+                eq(variables.flowIsToReview, true),
+                not(startsWith(variables['Build.SourceBranch'], 'refs/tags/'))
+              )
+    displayName: "SCA Scan"
+    steps:
+    - template: /task_groups/security/run_sca_scan.yml@CorePipelines
+      parameters:
+        skipSecurityGate: $(SKIP_SECURITY_GATE_SCA) 
+
+  

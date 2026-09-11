@@ -1,0 +1,73 @@
+parameters:
+- name: dryRun
+  type: boolean
+  default: false
+
+- name: versionsToKeep
+  default: 0
+  
+- name: daysFromLastDownload
+  default: 0
+
+- name: feedName
+  type: string
+
+- name: projectName
+  type: string
+
+- name: elkServiceConnection
+  default: $(ELK_SERVICE_CONNECTION)
+
+- name: azureArtifactsToken
+  default: $(System.AccessToken)
+
+stages:
+- stage: stage_select_packages
+  pool: $(PRIVATE_AGENT_DEFAULT)
+  displayName: "Select and Purge Packages"
+  dependsOn:
+  - stage_init
+  jobs:
+  - job: akv_secrets
+    displayName: Get AKV Secrets
+    steps:
+    - task: AzureKeyVault@2
+      displayName: 'Getting AKV credentials'
+      timeoutInMinutes: 1
+      retryCountOnTaskFailure: 5  
+      inputs:    
+        azureSubscription: DevOpsSharedResources    
+        KeyVaultName: $(AKV_DEVOPS_NAME)
+        SecretsFilter: 'ELK-CERTIFICATE'
+    - bash: |
+        echo "##[debug]Exporting 'ELK-CERTIFICATE' secret to 'ELK_CERTIFICATE' var"
+        echo "##vso[task.setvariable variable=ELK_CERTIFICATE;issecret=true;isOutput=true;]$(ELK-CERTIFICATE)"
+      name: export_secrets
+      displayName: Exporting Secrets
+
+  - job: job_select_packages
+    dependsOn:
+    - akv_secrets
+    displayName: "Select and Purge Packages"
+    variables:
+      ACRONYM: $[ stageDependencies.stage_init.job_init.outputs['get_acronym.ACRONYM'] ]
+      ELK_CERTIFICATE: $[ dependencies.akv_secrets.outputs['export_secrets.ELK_CERTIFICATE'] ]
+    steps:
+    - bash: |
+        echo "##[debug]Creating 'elk-cacert.pem' file..."
+        echo -n ${ELK_CERTIFICATE} | base64 --decode > $(Build.SourcesDirectory)/elk-cacert.pem
+      displayName: Generate config files
+      env:
+        ELK_CERTIFICATE: $(ELK_CERTIFICATE)
+    - task: VivoCorePipelines-DVPS-AzArtifactsExpurgoSelectPurgeVersions@1
+      inputs:
+        dryRun: ${{ parameters.dryRun }}
+        acronym: $(ACRONYM)
+        versionsToKeep: ${{ parameters.versionsToKeep }}
+        feedName: ${{ parameters.feedName }}
+        projectName: ${{ parameters.projectName }}
+        azureArtifactsToken: ${{ parameters.azureArtifactsToken }}
+        serviceConnectionName: ${{ parameters.elkServiceConnection }}
+      env:
+        PROXY: $(PROXY_AGENT_HTTP)
+        ELK_CA_CERTS: "$(Build.SourcesDirectory)/elk-cacert.pem"

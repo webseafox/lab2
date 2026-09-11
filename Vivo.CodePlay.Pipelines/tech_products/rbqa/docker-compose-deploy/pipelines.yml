@@ -1,0 +1,156 @@
+# Dependências do pipeline consumidor:
+#
+# Variable Group:
+# - REGISTRY_USERNAME
+# - REGISTRY_PASSWORD
+
+parameters:
+
+- name: environment
+  type: string
+  default: qa
+
+- name: agentPool
+  type: string
+  default: GeneralPurposeLinuxAgentsCD
+
+- name: sshServiceConnection
+  type: string
+
+- name: deploymentPath
+  type: string
+
+- name: registryUrl
+  type: string
+
+- name: imageName
+  type: string
+
+- name: healthCheckUrl
+  type: string
+  default: ''
+
+- name: composeFile
+  type: string
+  default: docker-compose.yml
+
+variables:
+
+- name: DEPLOYMENT_PATH
+  value: ${{ parameters.deploymentPath }}
+
+stages:
+- stage: Preparation
+  displayName: Preparation
+  pool:
+    name: ${{ parameters.agentPool }}
+  jobs:
+  - job: ValidateConnection
+    displayName: Validate SSH Connection
+    steps:
+    - checkout: self
+    - script: |
+        #VERSION=$(grep '^version =' pyproject.toml \
+        #  | head -1 \
+        #  | cut -d '"' -f2)
+
+        VERSION=$(awk '
+        /^\[tool.poetry\]/ {found=1; next}
+        /^\[/ && found {exit}
+        found && /^version =/ {
+        gsub(/"/,"",$3)
+        print $3
+        }
+        ' pyproject.toml)
+
+        echo "Version found: ${VERSION}"
+        echo "##vso[task.setvariable variable=IMAGE_TAG]${VERSION}"
+      displayName: Resolve Image Version
+    
+    - task: SSH@0
+      displayName: Validate SSH Connectivity
+      inputs:
+        sshEndpoint: ${{ parameters.sshServiceConnection }}
+        runOptions: inline
+        failOnStdErr: false
+        inline: |
+          echo "Validando conectividade SSH..."
+          hostname
+          whoami
+          docker --version
+          docker compose version
+          mkdir -p "$(DEPLOYMENT_PATH)"
+          test -w "$(DEPLOYMENT_PATH)"
+
+      env:
+        DEPLOYMENT_PATH: $(DEPLOYMENT_PATH)
+
+- stage: Deploy
+  displayName: Deploy
+  dependsOn: Preparation
+  pool:
+    name: ${{ parameters.agentPool }}
+  jobs:
+  - job: DockerComposeDeployment
+    displayName: Docker Compose Deployment
+    steps:
+    - task: Docker@2
+      displayName: 'Docker login to registry (via service connection)'
+      inputs:
+        command: 'login'
+        containerRegistry: 'ACR-DEVOPS'
+        
+    - task: SSH@0
+      displayName: Deploy Containers
+      inputs:
+        sshEndpoint: ${{ parameters.sshServiceConnection }}
+        runOptions: inline
+        failOnStdErr: false
+        inline: |
+          set -e
+          echo "===================================="
+          echo "Docker Compose Deployment"
+          echo "===================================="
+          cd "${DEPLOYMENT_PATH}"
+          echo "Deployment path:"
+          pwd
+          echo "Docker login..."
+          docker login "${REGISTRY_URL}" \
+            -u "${REGISTRY_USERNAME}" \
+            -p "${REGISTRY_PASSWORD}"
+          echo "Using image tag: ${IMAGE_TAG}"
+          echo "Using image:"
+          echo "${REGISTRY_URL}/${IMAGE_NAME}:${IMAGE_TAG}"
+          cat > .env << EOF
+          IMAGE_TAG=${IMAGE_TAG}
+          IMAGE_NAME=${IMAGE_NAME}
+          REGISTRY_URL=${REGISTRY_URL}
+          EOF
+          echo "Pulling image..."
+          docker compose -f "${COMPOSE_FILE}" pull
+          echo "Starting containers..."
+          docker compose -f "${COMPOSE_FILE}" up -d
+          
+          echo "Container status:"
+          docker compose -f "${COMPOSE_FILE}" ps
+      env:
+        DEPLOYMENT_PATH: ${{ parameters.deploymentPath }}
+        REGISTRY_URL: ${{ parameters.registryUrl }}
+        COMPOSE_FILE: ${{ parameters.composeFile }}
+        IMAGE_NAME: ${{ parameters.imageName }}
+        IMAGE_TAG: $(IMAGE_TAG)
+        REGISTRY_USERNAME: $(REGISTRY_USERNAME)
+        REGISTRY_PASSWORD: $(REGISTRY_PASSWORD)
+    - ${{ if ne(parameters.healthCheckUrl, '') }}:
+      - task: SSH@0
+        displayName: Health Check
+        inputs:
+          sshEndpoint: ${{ parameters.sshServiceConnection }}
+          runOptions: inline
+          failOnStdErr: true
+          inline: |
+            echo "Waiting application startup..."
+            sleep 30
+            curl -f "${HEALTHCHECK_URL}"
+        env:
+          HEALTHCHECK_URL: ${{ parameters.healthCheckUrl }}

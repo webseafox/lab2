@@ -1,0 +1,145 @@
+parameters:
+- name: environment
+  type: string
+- name: buildType
+  type: string
+  default: 'java'
+  values:
+  - java
+  - gradle
+  - nodejs
+- name: skipComponentTest
+  type: boolean
+  default: false
+- name: skipPackage
+  type: boolean
+  default: false
+- name: skipDeploy
+  type: boolean
+  default: false
+- name: infrastructureType
+  type: string
+- name: buildEnvironment
+  type: string
+  default: ''
+- name: legacy
+  type: boolean
+  default: false
+- name: packageVersion
+  type: string
+  default: ''
+- name: skipRestart
+  type: boolean
+  default: false
+
+## -> Parameters RBQA
+- name: rbqa_jira_id
+  type: string
+  default: ''
+- name: rbqa_component_test_id
+  type: string
+  default: ''
+- name: rbqa_octane_workspace
+  type: string
+  default: ''
+- name: rbqa_docker_image
+  type: string
+  default: ''
+- name: rbqa_octane_environment
+  type: string
+  default: ''
+
+stages:
+## -> Stage: Initialize Environment
+- template: /tech_products/oss/initialize/default_environment.yml
+
+## -> Stage: Build 
+- ${{ if eq(parameters.buildType, 'java') }}:
+  - template: /tech_products/oss/templates/ci/ci_build_java_oss.yml
+    parameters:
+      environment: ${{ parameters.environment }}
+
+- ${{ if eq(parameters.buildType, 'gradle') }}:
+  - template: /tech_products/oss/templates/ci/ci_build_gradle_oss.yml
+    parameters:
+      environment: ${{ parameters.environment }}
+      buildEnvironment: ${{ parameters.buildEnvironment }}
+
+- ${{ if eq(parameters.buildType, 'nodejs') }}:
+  - template: /tech_products/oss/templates/ci/ci_build_nodejs_oss.yml
+    parameters:
+      environment: ${{ parameters.environment }}
+
+## -> Stage: Gates (Quality e Security)
+- template: /tech_products/oss/initialize/gates_environment.yml
+
+- template: /tech_products/oss/templates/ci/ci_quality_gate_oss.yml
+  parameters:
+    environment: ${{ parameters.environment }}
+
+- template: /tech_products/oss/templates/ci/ci_security_oss.yml
+  parameters:
+    fortifyExclusionRepository: FortifyExclusion
+    ## -> Stage: Publish Artifact
+- ${{ if eq(parameters.buildType, 'java') }}:
+  - template: /tech_products/oss/templates/ci/ci_publish_java_oss.yml
+    parameters:
+      infrastructureType: ${{ parameters.infrastructureType }}
+
+- ${{ if eq(parameters.buildType, 'gradle') }}:
+  - template: /tech_products/oss/templates/ci/ci_publish_gradle_oss.yml
+    parameters:
+      infrastructureType: ${{ parameters.infrastructureType }}
+
+- ${{ if eq(parameters.buildType, 'nodejs') }}:
+  - template: /tech_products/oss/templates/ci/ci_publish_nodejs_oss.yml
+
+## -> Stage:Package 
+- ${{ if ne(parameters.skipPackage, True) }}:
+  - ${{ if or(and(ne(parameters.infrastructureType, 'weblogic'), ne(parameters.infrastructureType, 'weblogic-with-sanity-check')), eq(parameters.buildType, 'nodejs')) }}:
+    - template: /tech_products/oss/templates/ci/ci_package_oss.yml
+      parameters:
+        infrastructureType: ${{ parameters.infrastructureType }}
+
+## -> Stage: Deploy
+- ${{ if and(ne(parameters.skipPackage, True), ne(parameters.skipDeploy, True)) }}:
+  - ${{ if or(eq(parameters.infrastructureType, 'weblogic'), eq(parameters.infrastructureType, 'weblogic-with-sanity-check')) }}:
+    ## -> Deploy Weblogic
+    - template: /tech_products/oss/templates/cd/cd_deploy_weblogic_oss.yml
+      parameters:
+        environment: ${{ parameters.environment }}
+        infrastructureType: ${{ parameters.infrastructureType }}
+        skipRestart: ${{ parameters.skipRestart }}
+  
+  - ${{ else }}:
+    ## -> Initialize Deploy Environment
+    - template: /tech_products/oss/initialize/deploy_environment.yml
+      parameters:
+        environment: ${{ parameters.environment }}
+        infrastructureType: ${{ parameters.infrastructureType }}
+
+    ## -> Deploy Helm
+    - template: /tech_products/oss/templates/cd/cd_deploy_helm_oss.yml
+      parameters:
+        environment: ${{ parameters.environment }}
+        infrastructureType: ${{ parameters.infrastructureType }}
+        packageVersion: ${{ parameters.packageVersion }}
+        legacy: ${{ parameters.legacy }}
+        ${{ if eq(parameters.buildType, 'java') }}:
+          pipelineType: 'vivo-codeplay-pipelines/oss/deploy-helm-java'
+        ${{ if eq(parameters.buildType, 'gradle') }}:
+          pipelineType: 'vivo-codeplay-pipelines/oss/deploy-helm-gradle'
+        ${{ if eq(parameters.buildType, 'nodejs') }}:
+          pipelineType: 'vivo-codeplay-pipelines/oss/deploy-helm-nodejs'
+
+## -> Stage: RBQA 
+- ${{ if and(ne(parameters.rbqa_jira_id, ''), ne(parameters.rbqa_jira_id, 'none')) }}:
+  - template: /tech_products/rbqa/test-execution-stage/latest/pipeline_rbqa_testexecution_stage.yml
+    parameters:
+      jira_id: "${{ parameters.rbqa_jira_id }}"
+      test_environment: "${{ parameters.environment }}"
+      component_test_id: "${{ parameters.rbqa_component_test_id }}"
+      octane_workspace: "${{ parameters.rbqa_octane_workspace }}"
+      docker_image: "${{ parameters.rbqa_docker_image }}"
+      octane_environment: "${{ parameters.rbqa_octane_environment }}"
+      dependsOn: cd_deploy

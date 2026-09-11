@@ -1,0 +1,69 @@
+stages:
+- stage: gate
+  displayName: "Quality Gates"
+  dependsOn: 
+  - build_test
+  variables:
+    - name: APP_VERSION
+      value: $[ stageDependencies.build_test.bump_version.outputs['component_bump_version.LIB_NEW_VERSION'] ]
+    - name: SONAR_BREAK_ENABLED
+      value : $[ dependencies.app_sonar_config_keys.outputs['evaluate_flags_sonar.SONAR_BREAK_ENABLED'] ]
+  pool: $(PRIVATE_AGENT_DEFAULT)
+  jobs:
+  - job: gates_development_flow
+    displayName: "Check development flow"
+    condition: and(
+                eq(variables.DEVELOPMENT_ENVIRONMENT_FLOW, true),
+                notIn(
+                  variables['Build.SourceBranch'], 'refs/heads/main', 'refs/heads/master'
+                )
+            )
+    steps:
+    - bash: echo "##[warning] Pulando validações de quality gates devido ser um fluxo de desenvolvimento"
+      displayName: "About stage"
+ 
+  - job: app_sonar_config_keys
+    displayName: "Get AppSec Config Keys"
+    steps:
+    - template: /tech_products/ecmc/core-pipelines/task_groups/gates/get_appconfig_keys.yml
+
+  - job: sonarqube
+    dependsOn: app_sonar_config_keys
+    condition: and(
+                  succeeded(),
+                  eq(variables.flowIsTagging, false),
+                  ne(variables.skip_sonarqube, true),
+                  ne(variables.DEVELOPMENT_ENVIRONMENT_FLOW, true)
+              ) 
+    displayName: Code Analysis
+    steps:
+      - ${{ if or(in(variables['Build.SourceBranch'], 'refs/heads/main', 'refs/heads/master'), and(ne(variables.DEVELOPMENT_ENVIRONMENT_FLOW, true), startsWith(variables['Build.SourceBranch'], 'refs/pull/'))) }}:
+        - template: /tech_products/ecmc/core-pipelines/tasks/catalog_info/extract_variables.yml
+          parameters:
+            skipDownload: true
+            workingDirectory: $(Build.SourcesDirectory)
+        - template: /tech_products/ecmc/core-pipelines/task_groups/gates/run_sonarqube_scan.yml
+          parameters:
+            stack: "NODE"
+            projectKey: "$(SONAR_PROJECT_KEY)"
+        - template: /tech_products/ecmc/core-pipelines/tasks/telemetry/telemetry.yml
+
+  
+  - job: governance
+    condition: and(
+                succeeded(),
+                and( 
+                  eq(variables.flowIsPullRequest, false),
+                  not(startsWith(variables['Build.SourceBranch'], 'refs/tags/'))
+                ),
+                eq(lower(variables.GOVAPP_INTEGRATION_ENABLED), 'true')
+              )
+    displayName: Governance Policies Check
+    steps:
+      - template: /tech_products/ecmc/core-pipelines/task_groups/governance/check_govapp_policies.yml
+        parameters:
+          govAppBreakglass: false
+          govAppOperation: "validate"
+          continueOnError: false
+          environment: ${{ parameters.environment }}
+          stack: "NODEJS"

@@ -1,0 +1,254 @@
+﻿parameters:
+- name: use_flutter_version_latest
+  default: false
+
+stages:
+
+- stage: build_test
+  displayName: "Build Dep & Analyse"
+  jobs:
+  - job: build_app
+    displayName: Build & Analyse     
+    pool: $(PRIVATE_AGENT_SHARED)
+    steps:
+          
+    - checkout: self
+      persistCredentials: true
+      clean: true
+
+    # Reset Git Config
+    - task: Bash@3
+      displayName: 'Reset Git Config'
+      name: reset_git_config
+      continueOnError: true
+      inputs:
+        targetType: inline
+        script: |
+
+          echo "Git config before:"
+          git config --global --list
+
+          # Define a pattern to match the keys you want to remove
+          patterns=(
+            "ADCP%20-%20FLUTTER"
+            "ECVV%20-%20ECOSISTEMA%20VIVO"
+          )
+
+          for pattern in "${patterns[@]}"; do
+              for key in $(git config --global --get-regexp "url\..*${pattern}.*" | awk '{print $1}'); do
+                  git config --global --unset-all "$key"
+              done
+          done
+
+          echo "Git config after:"
+          git config --global --list
+
+    # Set Git Config
+    - task: Bash@3
+      displayName: 'Set Git Config'
+      name: git_config
+      inputs:
+        targetType: inline
+        script: |
+
+          git config --global user.email "azuredevops@telefonicati.onmicrosoft.com"
+          git config --global user.name "Azure DevOps"
+          git config --global url."https://$GIT_ACCESS_TOKEN@dev.azure.com/telefonica-vivo-brasil/ECVV%20-%20ECOSISTEMA%20VIVO".insteadOf "https://telefonica-vivo-brasil@dev.azure.com/telefonica-vivo-brasil/ECVV%20-%20ECOSISTEMA%20VIVO"
+          git config --global url."https://$GIT_ACCESS_TOKEN@dev.azure.com/telefonica-vivo-brasil/ADCP%20-%20FLUTTER".insteadOf "https://telefonica-vivo-brasil@dev.azure.com/telefonica-vivo-brasil/ADCP%20-%20FLUTTER"
+          git config --global --list
+      env:
+        GIT_ACCESS_TOKEN: $(GIT_ACCESS_TOKEN)
+
+    - ${{ if eq(parameters.use_flutter_version_latest, 'True' ) }}: 
+
+      - task: Cache@2
+        displayName: "Flutter Install Cache"
+        inputs:
+          key: 'Flutter | "$(Agent.OS)" | "$(FLUTTER_VERSION_LATEST)"'
+          path: '$(Agent.ToolsDirectory)/Flutter'
+          cacheHitVar: FLUTTER_INSTALL_RESTORED
+
+      # Install Flutter
+      - task: FlutterInstall@0
+        displayName: "Install Flutter SDK"
+        inputs:
+          mode: 'auto'
+          channel: 'stable'
+          version: 'custom'
+          customVersion: $(FLUTTER_VERSION_LATEST)
+
+    - ${{ else }}:
+      # Set Flutter Env in Vivo Agent
+      - task: FlutterEnv@0
+        displayName: 'Flutter Env'
+        inputs:
+          pathType: flutterDirectory
+          flutterDirectory: '/home/svc_devopscorp/.asdf/installs/flutter/3.19.5'     
+
+
+    # Flutter Clean
+    - task: Bash@3
+      displayName: Flutter Clean
+      inputs:
+        targetType: 'inline'
+        script: |
+          flutter clean      
+
+    # Flutter fetches and installs the dependencies specified in your pubspec.yaml file
+    - task: CmdLine@2
+      displayName: "Flutter Get Dependencies"
+      inputs:
+        #script: 'flutter pub get'
+        script: 'flutter pub get --verbose'
+      env:
+        ASDF_JAVA_VERSION: 'openjdk-17.0.2'       
+
+    #- task: CmdLine@2
+    #  displayName: "Static Analysis"
+    #  inputs:
+    #    script: 'dart run lib/generate_lint_rules_json_output.dart .'
+    #  env:
+    #    ASDF_JAVA_VERSION: 'openjdk-17.0.2'   
+
+    # Flutter Diagnostics if failed
+    - task: FlutterCommand@0
+      displayName: "Flutter Diagnostics"
+      condition: failed()
+      inputs:
+        projectDirectory: '.'
+        arguments: 'doctor -v'
+      env:
+        ASDF_JAVA_VERSION: 'openjdk-17.0.2'       
+
+    # Analyze Dart code for potential issues
+    - task: Bash@3
+      displayName: Dart Analyze 
+      continueOnError: true
+      inputs:
+        workingDirectory: '$(Build.SourcesDirectory)'
+        targetType: inline
+        script: | 
+        
+          #export FLUTTER_ROOT=/home/svc_devopscorp/.asdf/installs/flutter/3.19.5
+
+          echo "##[debug]Executando comando: 'dart analyze --no-fatal-warnings' e exportando relatório para 'analyze-report.txt'"
+          #dart analyze --no-fatal-warnings > analyze-report.txt
+          dart analyze lib --no-fatal-warnings > analyze-report.txt
+
+          echo "##[debug]Resultado da analise:"
+          cat analyze-report.txt
+      env:
+        ASDF_JAVA_VERSION: 'openjdk-17.0.2'       
+
+    ## TEST
+
+    # Run unit tests
+    - task: FlutterTest@0
+      displayName: "Unit Tests"   
+      inputs:
+        generateCodeCoverageReport: true
+        projectDirectory: '$(Build.SourcesDirectory)'        
+      env:
+        ASDF_JAVA_VERSION: 'openjdk-17.0.2'       
+
+    # Dart cobertura e publish disabled
+    # Issue: https://github.com/flutter/flutter/issues/140639
+    - task: Bash@3
+      displayName: Dart Cobertura 
+      continueOnError: true
+      inputs:
+        workingDirectory: '$(Build.SourcesDirectory)'
+        targetType: inline
+        script: | 
+          export FLUTTER_ROOT=/home/svc_devopscorp/.asdf/installs/flutter/3.19.5
+          export PATH="$PATH":"$HOME/.pub-cache/bin"          
+          echo "##[debug]List folder: 'coverage' before"
+          pwd
+          ls -la coverage
+          echo "##[debug]Executando comando: 'dart pub global activate cobertura'"
+          dart pub global activate cobertura          
+          cd $(build.sourcesDirectory)
+          echo "##[debug]Executando comando: 'cobertura convert'"
+          cobertura convert
+          echo "##[debug]List folder: 'coverage' after"
+          pwd
+          ls -la coverage
+      env:
+        ASDF_JAVA_VERSION: 'openjdk-17.0.2'
+
+    - task: PublishCodeCoverageResults@2
+      displayName: 'Publish Code Coverage Cobertura'
+      inputs:
+        codecoverageTool: cobertura
+        summaryFileLocation: '$(build.sourcesDirectory)/coverage/cobertura.xml'
+        #failIfCoverageEmpty: true
+
+    # Check Code Coverage Threshold
+    - task: Bash@3
+      displayName: 'Check Code Coverage Threshold (80%)'
+      continueOnError: true
+      inputs:
+        workingDirectory: '$(Build.SourcesDirectory)'
+        targetType: inline
+        script: |
+          # Parse coverage percentage from cobertura.xml
+          if [ -f "coverage/cobertura.xml" ]; then
+            echo "##[debug]Checking coverage threshold in cobertura.xml"
+            
+            # Extract line coverage percentage from cobertura.xml
+            COVERAGE_PERCENT=$(grep -o 'line-rate="[0-9.]*"' coverage/cobertura.xml | head -1 | grep -o '[0-9.]*')
+            
+            if [ -z "$COVERAGE_PERCENT" ]; then
+              echo "##[error]Could not extract coverage percentage from cobertura.xml"
+              exit 1
+            fi
+            
+            # Convert to percentage (cobertura uses decimal format 0.0-1.0)
+            COVERAGE_PERCENT_INT=$(echo "$COVERAGE_PERCENT * 100" | bc -l | cut -d. -f1)
+            
+            echo "##[section]Code Coverage: ${COVERAGE_PERCENT_INT}%"
+            echo "##vso[task.setvariable variable=CodeCoveragePercent]${COVERAGE_PERCENT_INT}"
+            
+            # Check if coverage is below 80%
+            if [ "$COVERAGE_PERCENT_INT" -lt 80 ]; then
+              echo "##[error]Code coverage (${COVERAGE_PERCENT_INT}%) is below the required threshold of 80%"
+              echo "##[error]Please increase test coverage before proceeding"
+              exit 1
+            else
+              echo "##[section]✅ Code coverage (${COVERAGE_PERCENT_INT}%) meets the required threshold of 80%"
+            fi
+          else
+            echo "##[error]Coverage file not found: coverage/cobertura.xml"
+            exit 1
+          fi
+      env:
+        ASDF_JAVA_VERSION: 'openjdk-17.0.2'
+        
+    # Artifact
+    - task: CopyFiles@2
+      displayName: 'Copy Lib to Staging Directory'
+      inputs:
+        TargetFolder: '$(Build.ArtifactStagingDirectory)'
+        OverWrite: true
+        CleanTargetFolder: true
+        Contents: '**/*'
+
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Lib Artifact'
+      inputs:
+        ArtifactName: app
+        StoreAsTar: true
+
+    # Clear Git Config
+    - task: Bash@3
+      displayName: 'Clear Git Config'
+      name: clear_git_config
+      condition: always()
+      continueOnError: true
+      inputs:
+        targetType: inline
+        script: |
+          git config --global --unset-all url."https://$GIT_ACCESS_TOKEN@dev.azure.com/telefonica-vivo-brasil/ECVV%20-%20ECOSISTEMA%20VIVO".insteadOf "https://telefonica-vivo-brasil@dev.azure.com/telefonica-vivo-brasil/ECVV%20-%20ECOSISTEMA%20VIVO"
+          git config --global --unset-all url."https://$GIT_ACCESS_TOKEN@dev.azure.com/telefonica-vivo-brasil/ADCP%20-%20FLUTTER".insteadOf "https://telefonica-vivo-brasil@dev.azure.com/telefonica-vivo-brasil/ADCP%20-%20FLUTTER"
+      env:
+        GIT_ACCESS_TOKEN: $(GIT_ACCESS_TOKEN)

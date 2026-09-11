@@ -1,0 +1,110 @@
+parameters:
+  - name: use_flutter_version_latest
+    default: true
+
+stages:
+
+- stage: package
+  displayName: "Build & Package"
+  dependsOn:
+  - gates
+  - security
+  pool: $(PRIVATE_AGENT_DEFAULT)
+  jobs:
+ 
+  - job: "Package"
+    condition: or (
+      in(variables['Build.SourceBranch'], 'refs/heads/master'),
+      startsWith(variables['Build.SourceBranch'], 'refs/heads/feature/')
+      )
+    displayName: "Package (Web)"
+    pool: $(PRIVATE_AGENT_SHARED)
+    steps:
+
+    - checkout: self
+      persistCredentials: true
+
+    # Git Config
+    - task: Bash@3
+      displayName: "Set Git Config"
+      inputs:
+        targetType: 'inline'
+        script: |
+          export PUB_CACHE=$(Agent.ToolsDirectory)/.pub-cache
+
+          # Usa System.CollectionUri para extrair a organização
+          COLLECTION_URI="$(System.CollectionUri)"
+        # Remove 'https://' e trailing '/'										
+          ORG_PATH=${COLLECTION_URI#https://}
+          ORG_PATH=${ORG_PATH%/}
+
+          # Extrai apenas o nome da organização
+          ORG_NAME=$(echo "$ORG_PATH" | cut -d'/' -f2)
+
+          echo "##[debug]Collection: $COLLECTION_URI"
+          echo "##[debug]Organização: $ORG_NAME"
+
+          # Configura Git com autenticação via System Access Token
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0="url.https://$(System.AccessToken)@dev.azure.com/${ORG_NAME}/.insteadOf"
+          export GIT_CONFIG_VALUE_0="https://${ORG_NAME}@dev.azure.com/${ORG_NAME}/"
+
+    - ${{ if eq(parameters.use_flutter_version_latest, 'True' ) }}: 
+
+      - task: Cache@2
+        displayName: "Flutter Install Cache"
+        inputs:
+          key: 'Flutter | "$(Agent.OS)" | "$(FLUTTER_VERSION_LATEST)"'
+          path: '$(Agent.ToolsDirectory)/Flutter'
+          cacheHitVar: FLUTTER_INSTALL_RESTORED
+
+      # Install Flutter
+      - task: FlutterInstall@0
+        displayName: "Install Flutter SDK"
+        inputs:
+          mode: 'auto'
+          channel: 'stable'
+          version: 'custom'
+          customVersion: $(FLUTTER_VERSION_LATEST)
+
+    - ${{ else }}:
+      # Set Flutter Env in Vivo Agent
+      - task: FlutterEnv@0
+        displayName: 'Flutter Env'
+        inputs:
+          pathType: flutterDirectory
+          flutterDirectory: '/home/svc_devopscorp/.asdf/installs/flutter/3.19.5'     
+
+    # Flutter Build Web
+    - task: FlutterBuild@0
+      inputs:
+        target: 'web'
+        projectDirectory: '.'
+        extraArgsSeparator: '--web-renderer canvaskit --release'
+      env:
+        ASDF_JAVA_VERSION: 'openjdk-17.0.2'       
+
+    # Run Flutter diagnostics if build fails
+    - task: FlutterCommand@0
+      displayName: "Run Flutter diagnostics"
+      condition: failed()
+      inputs:
+        projectDirectory: '.'
+        arguments: 'doctor -v'
+      env:
+        ASDF_JAVA_VERSION: 'openjdk-17.0.2'       
+
+    - task: CopyFiles@2
+      displayName: "Copy Web to Staging"
+      inputs:
+        sourceFolder: '$(Build.SourcesDirectory)'
+        contents: '**'
+        targetFolder: '$(Build.StagingDirectory)'
+        flattenFolders: false
+
+    - task: PublishBuildArtifacts@1
+      displayName: "Publish Web Artifacts"
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+        ArtifactName: 'web_package'
+        publishLocation: 'Container'

@@ -1,0 +1,140 @@
+parameters:
+- name: environment
+  type: string
+  default: ''
+- name: infrastructureType
+  type: string
+  default: ''
+- name: namespace
+  type: string
+  default: 'default'
+- name: deploymentName
+  type: string
+  default: ''
+- name: retentionDays
+  type: number
+  default: 15
+  values:
+  - 1
+  - 5
+  - 7
+  - 15
+  - 20
+
+## -> Initialize global variables
+variables:
+- template: /tech_products/oss/initialize/variables_global.yml
+- name: CORPORATE_WIKI_DOC_URL
+  value: "TBD"
+
+stages:
+- stage: cd_clear_path
+  displayName: "CD - Clear Path - ${{ parameters.environment }}"
+  pool:
+    name: $(AGENT_POOL_CD)
+  condition: succeeded()
+  
+  jobs:
+  - deployment: clear
+    displayName: 'Clear Path'
+    environment:
+      name: deploy-${{ parameters.environment }}
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          ## -> Download Artifacts
+          - download: none
+
+          ## -> Log in to Kubernetes
+          - task: Kubernetes@1
+            displayName: Kubernetes Cluster Login
+            inputs:
+              connectionType: 'Kubernetes Service Connection'
+              kubernetesServiceEndpoint: 'kube-${{ parameters.infrastructureType }}-${{ parameters.environment }}'
+              command: 'login'
+          
+          ## -> List Deployments
+          - task: Bash@3
+            displayName: "Count Deployments Before Deletion"
+            inputs:
+              targetType: inline
+              script: |
+                echo "Counting deployments before deletion..."
+                kubectl get deployments -n ${{parameters.namespace}} | awk '{print $1}'   
+
+          ## -> Delete Releases
+          - task: Bash@3
+            displayName: "Delete Helm Releases Older Than ${{ parameters.retentionDays }} Days"
+            inputs:
+              targetType: inline
+              script: |
+                RETENTION_DAYS=${{ parameters.retentionDays }}
+                echo "Deleting Helm releases older than $RETENTION_DAYS days (excluding protected releases)..."
+
+                ## -> Protected Releases
+                PROTECTED_RELEASES="^(oss-k8s-cert-storage)$"
+
+                ## -> Releases To Delete (older than specified retention days)
+                RELEASES_TO_DELETE=$(helm ls --all --date --output yaml \
+                  | awk -v date="$(date -d "$RETENTION_DAYS days ago" +%Y-%m-%d)" '
+                      $0 ~ /updated:/ { gsub("T.*", "", $2); if ($2 < date) old=1 }
+                      old && $0 ~ /name:/ { print $2; old=0 }
+                    ' \
+                  | grep -Ev "$PROTECTED_RELEASES" || true)
+
+                if [ -z "$RELEASES_TO_DELETE" ]; then
+                  echo "No releases older than $RETENTION_DAYS days to delete."
+                  exit 0
+                fi
+
+                echo "The following releases will be deleted:"
+                echo "$RELEASES_TO_DELETE"
+                echo "-------------------------------------------------------------"
+
+                echo "$RELEASES_TO_DELETE" | xargs -r -n 1 helm delete
+
+                echo "-------------------------------------------------------------"
+                echo "Cleanup finished."
+                
+          ## -> List Deployments
+          - task: Bash@3
+            displayName: "Count Deployments After Deletion"
+            inputs:
+              targetType: inline
+              script: |
+                echo "Counting deployments after deletion..."
+                kubectl get deployments -n ${{parameters.namespace}} | awk '{print $1}' 
+
+          ## -> Logout of Kubernetes
+          - task: Kubernetes@1
+            displayName: Kubernetes Cluster Logout
+            condition: always()
+            continueOnError: true
+            timeoutInMinutes: 1            
+            inputs:
+              command: 'logout'
+        on:
+          success:
+            steps:
+            - task: Bash@3
+              displayName: Cleanup Success
+              name: t_success_message
+              inputs:
+                targetType: inline
+                script: |
+                  echo "##[section] ================================================================================================================================="
+                  echo "##[section]                                                      CLEAN UP WAS SUCCESSFUL! "
+                  echo "##[section] ================================================================================================================================="
+          
+          failure:
+            steps:
+            - task: Bash@3
+              displayName: Cleanup Failure
+              name: t_failure_message
+              inputs:
+                targetType: inline
+                script: |
+                  echo "##[error] ================================================================================================================================="
+                  echo "##[error]                                                    CLEAN UP WAS NOT SUCCESSFUL! "
+                  echo "##[error] ================================================================================================================================="            

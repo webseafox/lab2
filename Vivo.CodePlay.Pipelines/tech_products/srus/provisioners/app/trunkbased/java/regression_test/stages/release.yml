@@ -1,0 +1,65 @@
+stages:
+- stage: validate
+  displayName: Prepare Deploy
+  dependsOn:
+    - pipeline_init
+  variables:
+  - template: /tech_products/srus/provisioners/app/trunkbased/java/regression_test/variables/override.yml
+  pool: $(PRIVATE_AGENT_DEFAULT)
+  jobs:
+  - job: validate
+    steps:
+    - template: /tech_products/srus/tasks/catalog_info/extract_variables.yml
+      parameters:
+        workingDirectory: $(Build.SourcesDirectory)
+        skipDownload: true
+    - template: /tech_products/srus/global/general/set-output-variable.yml
+      parameters:
+        variable: APP_VERSION
+        command: $(DOCKER_CMD_EXTRACT_POM_XML_VERSION)
+    - template: /tech_products/srus/task_groups/release/run_validate.yml
+
+# Deploy QA Environments
+- stage: release
+  pool: ${{ parameters.private_agent_pool }}
+  displayName: "Deploy ${{ parameters.environment }}"
+  dependsOn:
+  - validate
+  variables:
+  - template: /tech_products/srus/provisioners/app/trunkbased/java/regression_test/variables/override.yml
+  jobs:
+  - deployment: ${{ parameters.environment }}
+    workspace:
+      clean: all
+    displayName: Deploy
+    environment: "deploy-${{ parameters.environment }}"
+    strategy:
+      runOnce:
+        preDeploy:
+          steps:
+          - template: /tech_products/srus/task_groups/deploy/run_pre_deploy.yml
+              
+        deploy:
+          steps:
+          - template: /tech_products/srus/task_groups/release/run_deploy.yml
+            parameters:
+              environment: ${{ parameters.environment }}
+              kubeconfig: ${{ parameters.kubeconfig }}
+              helmReleaseNamePrefix: ${{ parameters.helm_release_name_prefix }}
+              useExternalEnv: ${{ parameters.useExternalEnv }}
+
+        on:
+          success:
+            steps:
+            - template: /tech_products/srus/task_groups/release/run_pos_deploy_success.yml
+            - template: /tech_products/srus/task_groups/governance/check_govapp_policies.yml
+              parameters:
+                govAppBreakglass: false
+                govAppOperation: "deploy"
+                continueOnError: false
+                environment: ${{ parameters.environment }}
+                stack: "JAVA"
+              
+          failure:
+            steps:
+              - template: /tech_products/srus/task_groups/release/run_pos_deploy_failure.yml

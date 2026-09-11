@@ -1,0 +1,770 @@
+# ==================================================================
+# Pipeline: CD Databricks - DTFN
+# ------------------------------------------------------------------
+# Template de Entrega Contínua do produto DTFN (Databricks).
+# Localização: tech_products/dtfn/cd-pipeline.yaml @ Vivo.CodePlay.Pipelines
+#
+# Estrutura:
+#   1. SecurityAnalysis - Fortify (SAST) + SCA (Dependency-Track)
+#   2. Backup_QA        - Exporta jobs e notebooks de QA como artefato
+#   3. Plan_QA          - Visão geral de diferenças (jobs + notebooks)
+#                          entre o artefato da CI e o estado real de QA
+#   4. QA               - Deploy de jobs e notebooks em QA
+#   5. Backup_Prod      - Exporta jobs e notebooks de PROD como artefato
+#   6. Plan_Prod        - Visão geral de diferenças (jobs + notebooks)
+#                          entre o artefato da CI e o estado real de PROD
+#   7. PROD             - Apply (escrita), com approval próprio
+#      (depende de QA, Backup_Prod E Plan_Prod, para garantir que o
+#      snapshot e o plano de PROD sempre terminam ANTES de qualquer
+#      alteração em PROD)
+#
+# Os artefatos consumidos pelo deploy (DatabricksJobs / DatabricksNotebooks)
+# vêm da pipeline de CI, declarada como resources.pipelines no arquivo raiz
+# do repositório do produto.
+# ==================================================================
+
+parameters:
+# ==================================================================
+# Infraestrutura e Ambiente
+# ==================================================================
+  - name: agentPoolCI
+    type: string
+    default: 'GeneralPurposeLinuxAgentsCI'
+    displayName: 'Pool de agentes para jobs de análise e backup'
+
+  - name: agentPoolCD
+    type: string
+    default: 'GeneralPurposeLinuxAgentsCD'
+    displayName: 'Pool de agentes para jobs de deploy'
+
+  - name: ciPipelineAlias
+    type: string
+    default: 'ciPipeline'
+    displayName: 'Alias do resources.pipelines declarado no arquivo raiz'
+
+  - name: prodRepoAlias
+    type: string
+    default: 'prodRepo'
+    displayName: 'Alias do resources.repositories do repositório de notebooks de PROD (comp-dtfn-prod), declarado no arquivo raiz'
+
+# ==================================================================
+# Controle de Fluxo
+# ------------------------------------------------------------------
+# Substituto do "Stages to run" nativo, que não fica disponível em
+# pipelines que usam extends com template de outro repositório.
+# Cada stage sempre existe no YAML compilado (evita quebrar dependsOn
+# de outros stages); desmarcar aqui só faz o stage terminar como
+# "Skipped" em vez de "Succeeded" — os stages seguintes já aceitam
+# 'Skipped' como suficiente para continuar (exceto onde a stage
+# anterior escreve algo que o próximo passo depende de fato).
+# ==================================================================
+  - name: runSecurityAnalysis
+    type: boolean
+    default: true
+    displayName: 'Executar Análise de Segurança'
+
+  - name: runBackupQa
+    type: boolean
+    default: true
+    displayName: 'Executar Backup QA'
+
+  - name: runPlanQa
+    type: boolean
+    default: true
+    displayName: 'Executar Plan QA (visão geral de diferenças, jobs + notebooks)'
+
+  - name: runQA
+    type: boolean
+    default: true
+    displayName: 'Executar Deploy QA'
+
+  - name: runBackupProd
+    type: boolean
+    default: true
+    displayName: 'Executar Backup PROD'
+
+  - name: runPlanProd
+    type: boolean
+    default: true
+    displayName: 'Executar Plan PROD (visão geral de diferenças, jobs + notebooks)'
+
+  - name: runProd
+    type: boolean
+    default: true
+    displayName: 'Executar Deploy PROD'
+
+# ==================================================================
+# Variable Groups (Library)
+# ------------------------------------------------------------------
+# Os Approvals/Checks são configurados NOS PRÓPRIOS Variable Groups,
+# pela UI do Azure DevOps. Por isso cada stage de PROD referencia um
+# grupo distinto: é o que permite ter um gate no Plan e outro no Apply.
+# ==================================================================
+  - name: variableGroupQa
+    type: string
+    default: 'vg-dtfn-cd-qa'
+    displayName: 'Variable Group do ambiente de QA (usado no Backup_QA, Plan_QA e no Deploy QA)'
+
+  - name: variableGroupProdBackup
+    type: string
+    default: 'vg-dtfn-cd-prod-backup'
+    displayName: 'Variable Group do backup de PROD'
+
+  - name: variableGroupProdPlan
+    type: string
+    default: 'vg-dtfn-cd-prod-plan'
+    displayName: 'Variable Group da stage de Plan em PROD'
+
+  - name: variableGroupProdApply
+    type: string
+    default: 'vg-dtfn-cd-prod-apply'
+    displayName: 'Variable Group do job de Apply em PROD'
+
+# ==================================================================
+# Configurações de Segurança
+# ==================================================================
+  - name: fortifyExclusionRepository
+    type: string
+    default: 'FortifyExclusion'
+    displayName: 'Alias do repositório de exclusões do Fortify'
+
+  - name: enableFortifyExclusions
+    type: boolean
+    default: true
+    displayName: 'Usar exclusões do Fortify'
+
+  - name: convisoCompany
+    type: number
+    default: 430
+    displayName: 'Conviso Company ID'
+
+  - name: vivoFlow
+    type: string
+    default: 'DTFN_Preprod'
+    displayName: 'Fluxo Vivo para AppSec'
+
+# ==================================================================
+# Configurações do Databricks / Git
+# ==================================================================
+  - name: qaBranch
+    type: string
+    default: 'DTFN_Qa'
+    displayName: 'Branch de notebooks do ambiente de QA'
+
+  - name: prodBranch
+    type: string
+    default: 'DTFN_Prod'
+    displayName: 'Branch de notebooks do ambiente de PROD'
+
+  - name: qaRepoId
+    type: string
+    default: '2051188230664694'
+    displayName: 'Repo ID do Databricks Repos em QA'
+
+  - name: prodRepoId
+    type: string
+    default: '4073870711034147'
+    displayName: 'Repo ID do Databricks Repos em PROD'
+
+# ==================================================================
+# Azure Key Vault
+# ==================================================================
+  - name: keyVaultProdServiceConnection
+    type: string
+    default: 'sc-adf-dtfn-brsouth-prod'
+    displayName: 'Service Connection do Key Vault de PROD'
+
+  - name: keyVaultProdName
+    type: string
+    default: 'kv-dtfn-brsouth-001-prod'
+    displayName: 'Nome do Key Vault de PROD'
+
+  - name: keyVaultQaServiceConnection
+    type: string
+    default: 'sc-adf-dtfn-brsouth-test'
+    displayName: 'Service Connection do Key Vault de QA'
+
+  - name: keyVaultQaName
+    type: string
+    default: 'kv-dtfn-brsouth-001-e1'
+    displayName: 'Nome do Key Vault de QA'
+
+# ==================================================================
+# Caminhos no repositório do produto
+# ------------------------------------------------------------------
+# Resolvidos a partir do checkout do repositório do produto (self),
+# não deste repositório de templates.
+# ==================================================================
+  - name: scriptsPath
+    type: string
+    default: 'scripts/ci-cd'
+    displayName: 'Diretório dos scripts de CI/CD no repositório do produto'
+
+  - name: mappingsPath
+    type: string
+    default: 'config/job-mappings'
+    displayName: 'Diretório dos manifestos de mapeamento de jobs'
+
+# ==================================================================
+# Estágios do Pipeline
+# ==================================================================
+stages:
+
+# ==================================================================
+# Stage 1: SecurityAnalysis - SAST (Fortify) e SCA (Dependency-Track)
+# ==================================================================
+- stage: SecurityAnalysis
+  displayName: 'Análise de Segurança'
+  condition: ${{ parameters.runSecurityAnalysis }}
+  jobs:
+    - job: AppSecConfigKeys
+      displayName: 'Get AppSec Config Keys'
+      pool:
+        name: ${{ parameters.agentPoolCI }}
+      steps:
+        - template: /security/get_appconfig_keys_framework.yml@CodePlay
+          parameters:
+            azureSubscription: DevOpsSharedResources
+            appConfigurationEndpoint: https://appcs-azdevops-shared.azconfig.io
+
+    - job: FortifyScan
+      displayName: 'Fortify Scan'
+      dependsOn:
+        - AppSecConfigKeys
+      variables:
+        USE_FORTIFY: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.USE_FORTIFY'] ]
+        USE_CONVISO: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.USE_CONVISO'] ]
+        SKIP_SECURITY_GATE: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.SKIP_SECURITY_GATE'] ]
+        FORTIFY_LOCAL_SCANCENTRAL_VERSION: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.FORTIFY_LOCAL_SCANCENTRAL_VERSION'] ]
+      condition: and(succeeded(), eq(variables.USE_FORTIFY, 'true'))
+      pool:
+        name: ${{ parameters.agentPoolCI }}
+      steps:
+        - template: /security/define_appsec_app_version.yml@CodePlay
+
+        - template: /security/run_fortify_scan.yml@CodePlay
+          parameters:
+            fortifyExclusionRepository: ${{ parameters.fortifyExclusionRepository }}
+            enableFortifyExclusions: ${{ parameters.enableFortifyExclusions }}
+            appLanguage: 'other'
+            appVersion: "$(FORTIFY_APP_VERSION)"
+            vivoFlow: ${{ parameters.vivoFlow }}
+
+    # ------------------------------------------
+    # PREPARAÇÃO PARA O SCA
+    # ------------------------------------------
+    - job: PrepareSCAArtifact
+      displayName: 'Preparar Artefato para SCA'
+      dependsOn:
+        - AppSecConfigKeys
+      pool:
+        name: ${{ parameters.agentPoolCI }}
+      steps:
+        - checkout: self
+        - task: PublishBuildArtifacts@1
+          inputs:
+            pathToPublish: '$(Build.SourcesDirectory)'
+            artifactName: 'app'
+            publishLocation: 'Container'
+          displayName: 'Publicar Código Fonte como artefato app'
+
+    # ------------------------------------------
+    # SCAN SCA (Dependency-Track)
+    # ------------------------------------------
+    - job: SCAScan
+      displayName: 'SCA Scan'
+      dependsOn:
+        - AppSecConfigKeys
+        - PrepareSCAArtifact
+      variables:
+        USE_DEPENDENCY_TRACK: $[ dependencies.AppSecConfigKeys.outputs['evaluate_flags.USE_DEPENDENCY_TRACK'] ]
+        AKV_DEVOPS_NAME: 'kv-azdevops-shared'
+        FORTIFY_APP_DEFAULT_VERSION: 'DevSecOps'
+      condition: and(succeeded(), eq(variables.USE_DEPENDENCY_TRACK, 'true'))
+      pool:
+        name: ${{ parameters.agentPoolCI }}
+      steps:
+        - template: /security/define_appsec_app_version.yml@CodePlay
+
+        - template: /security/run_sca_scan.yml@CodePlay
+          parameters:
+            appVersion: "$(FORTIFY_APP_VERSION)"
+            convisoCompany: ${{ parameters.convisoCompany }}
+            vivoFlow: ${{ parameters.vivoFlow }}
+
+# ==================================================================
+# Stage 2: Backup_QA - Snapshot do ambiente de QA antes do deploy
+# ==================================================================
+- stage: Backup_QA
+  displayName: 'Backup Qa'
+  condition: and(${{ parameters.runBackupQa }}, in(dependencies.SecurityAnalysis.result, 'Succeeded', 'SucceededWithIssues', 'Skipped'))
+  variables:
+    - group: ${{ parameters.variableGroupQa }}
+  jobs:
+    - job: ExportacaoJobseVivoeNotebooks
+      displayName: 'Exportar Jobs, Vivo e Notebooks'
+      pool:
+        name: ${{ parameters.agentPoolCI }}
+      steps:
+        - checkout: self
+          path: s
+          persistCredentials: true
+          clean: true
+
+        - task: PythonScript@0
+          displayName: 'Exportar e Formatar Jobs de QA'
+          inputs:
+            scriptSource: filePath
+            scriptPath: ${{ parameters.scriptsPath }}/backup_qa.py
+            arguments: --workspace-url $(QA_URL) --token $(QA_TOKEN)
+
+        - task: PublishBuildArtifacts@1
+          displayName: 'Publicar Jobs QA como artefato'
+          inputs:
+            pathToPublish: '$(System.DefaultWorkingDirectory)/jobs'
+            artifactName: 'DatabricksJobsQA'
+            publishLocation: 'Container'
+
+        # ------------------------------------------
+        # Checkout da branch de notebooks de QA
+        # ------------------------------------------
+        - script: |
+            set -euo pipefail
+            git fetch --all
+            git checkout ${{ parameters.qaBranch }}
+          displayName: 'Checkout branch ${{ parameters.qaBranch }}'
+
+        - task: PublishBuildArtifacts@1
+          displayName: 'Publicar Notebooks QA como artefato'
+          inputs:
+            pathToPublish: '$(System.DefaultWorkingDirectory)/databricks'
+            artifactName: 'DatabricksNotebooksQA'
+            publishLocation: 'Container'
+
+# ==================================================================
+# Stage 3: Plan_QA - Visão geral de diferenças (jobs + notebooks) entre
+# o artefato da CI e o estado real de QA. Só leitura, nunca escreve.
+# ------------------------------------------------------------------
+# Depende de Backup_QA (o backup precisa terminar antes do plano rodar).
+# ==================================================================
+- stage: Plan_QA
+  displayName: 'Plan QA'
+  dependsOn:
+    - Backup_QA
+  condition: and(${{ parameters.runPlanQa }}, in(dependencies.Backup_QA.result, 'Succeeded', 'SucceededWithIssues', 'Skipped'))
+  variables:
+    - group: ${{ parameters.variableGroupQa }}
+  jobs:
+    - job: PlanQA
+      displayName: 'Plan QA'
+      pool:
+        name: ${{ parameters.agentPoolCD }}
+      steps:
+        - download: ${{ parameters.ciPipelineAlias }}
+          artifact: DatabricksJobs
+          displayName: Download Jobs Artifact
+
+        - download: ${{ parameters.ciPipelineAlias }}
+          artifact: DatabricksNotebooks
+          displayName: Download Notebooks Artifact
+
+        - task: PythonScript@0
+          displayName: 'Plan de ambiente (QA) — jobs e notebooks'
+          inputs:
+            scriptSource: filePath
+            scriptPath: ${{ parameters.scriptsPath }}/cd-planambiente_sp_qa_v1.py
+            arguments: '--client-secret $(AZURE_CLIENT_SECRET_QA) --jobs-folder $(Pipeline.Workspace)/${{ parameters.ciPipelineAlias }}/DatabricksJobs --notebooks-folder $(Pipeline.Workspace)/${{ parameters.ciPipelineAlias }}/DatabricksNotebooks --mapping-file $(System.DefaultWorkingDirectory)/${{ parameters.mappingsPath }}/qa.json'
+
+# ==================================================================
+# Stage 4: QA - Deploy de jobs e notebooks no ambiente de QA
+# ------------------------------------------------------------------
+# Depende de Backup_QA (o backup sempre termina antes do deploy
+# sobrescrever o estado atual de QA) e de Plan_QA (o plano de
+# diferenças/identidade precisa ter rodado limpo antes de aplicar).
+# ==================================================================
+- stage: QA
+  displayName: Deploy QA
+  dependsOn:
+    - Backup_QA
+    - Plan_QA
+  condition: and(${{ parameters.runQA }}, in(dependencies.Backup_QA.result, 'Succeeded', 'Skipped'), in(dependencies.Plan_QA.result, 'Succeeded', 'Skipped'))
+  variables:
+    - group: ${{ parameters.variableGroupQa }}
+  jobs:
+    - job: DeployQA
+      pool:
+        name: ${{ parameters.agentPoolCD }}
+      steps:
+        # Remove apenas downloads residuais de execuções anteriores no agente.
+        # Não remove o workspace do agente nem qualquer recurso do Databricks.
+        - task: Bash@3
+          displayName: Limpar artefatos Databricks residuais
+          inputs:
+            targetType: inline
+            script: |
+              set -euo pipefail
+
+              workspace_dir='$(Pipeline.Workspace)'
+              artifacts_root="${workspace_dir}/${{ parameters.ciPipelineAlias }}"
+              jobs_dir="${artifacts_root}/DatabricksJobs"
+              notebooks_dir="${artifacts_root}/DatabricksNotebooks"
+
+              for target_dir in "${jobs_dir}" "${notebooks_dir}"; do
+                case "${target_dir}" in
+                  "${artifacts_root}/DatabricksJobs"|"${artifacts_root}/DatabricksNotebooks") ;;
+                  *)
+                    echo "Caminho de limpeza inválido: ${target_dir}"
+                    exit 1
+                    ;;
+                esac
+
+                if [ -d "${target_dir}" ]; then
+                  echo "Removendo download residual: ${target_dir}"
+                  rm -rf -- "${target_dir}"
+                fi
+              done
+
+        - download: ${{ parameters.ciPipelineAlias }}
+          artifact: DatabricksJobs
+          displayName: Download Jobs Artifact
+
+        - download: ${{ parameters.ciPipelineAlias }}
+          artifact: DatabricksNotebooks
+          displayName: Download Notebooks Artifact
+
+        # ------------------------------------------
+        # TOKEN KEY VAULT
+        # ------------------------------------------
+        - task: AzureKeyVault@2
+          displayName: 'Azure Key Vault: token-databricks'
+          inputs:
+            azureSubscription: ${{ parameters.keyVaultQaServiceConnection }}
+            KeyVaultName: ${{ parameters.keyVaultQaName }}
+            SecretsFilter: 'token-databricks'
+            RunAsPreJob: false
+
+        # ------------------------------------------
+        # Teste Implantação job temporário
+        # ------------------------------------------
+        - task: PythonScript@0
+          displayName: Testar Job Temporário
+          inputs:
+            scriptSource: filePath
+            scriptPath: ${{ parameters.scriptsPath }}/test-implantajobs-temp_sp_qa_v2.py
+            arguments: '--client-secret $(AZURE_CLIENT_SECRET_QA) --jobs-folder $(Pipeline.Workspace)/${{ parameters.ciPipelineAlias }}/DatabricksJobs'
+
+        # ------------------------------------------
+        # Implantação jobs no ambiente Databricks
+        # ------------------------------------------
+        - task: PythonScript@0
+          displayName: Implantação Jobs Databricks
+          inputs:
+            scriptSource: filePath
+            scriptPath: ${{ parameters.scriptsPath }}/cd-importarjobs_sp_qa_v10_cluster.py
+            arguments: '--client-secret $(AZURE_CLIENT_SECRET_QA) --jobs-folder $(Pipeline.Workspace)/${{ parameters.ciPipelineAlias }}/DatabricksJobs --mapping-file $(System.DefaultWorkingDirectory)/${{ parameters.mappingsPath }}/qa.json'
+
+        # ------------------------------------------
+        # Implantação dos notebooks alterados
+        # ------------------------------------------
+        - task: PythonScript@0
+          displayName: Copia Notebooks Repo
+          inputs:
+            scriptSource: filePath
+            scriptPath: ${{ parameters.scriptsPath }}/cd-clonarepo_qa_v3.py
+            arguments: '--notebooks-folder $(Pipeline.Workspace)/${{ parameters.ciPipelineAlias }}/DatabricksNotebooks'
+          env:
+            SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+            TARGET_BRANCH: ${{ parameters.qaBranch }}
+
+        - task: PythonScript@0
+          displayName: Implanta Notebooks
+          inputs:
+            arguments: '$(token-databricks) ${{ parameters.qaBranch }} ${{ parameters.qaRepoId }}'
+            scriptSource: inline
+            script: |
+              import os
+              import sys
+              import requests
+
+              def update_databricks_repo_via_api():
+                  databricks_instance = os.getenv('QA_URL')
+                  token = sys.argv[1]
+                  branch_name = sys.argv[2]
+                  repo_id = sys.argv[3]
+
+                  print(f"Nome da Branch a ser enviada: {branch_name}")
+
+                  headers = {
+                      "Authorization": f"Bearer {token}",
+                      "Content-Type": "application/json"
+                  }
+                  data = {"branch": branch_name}
+                  url = f"{databricks_instance}/api/2.0/repos/{repo_id}"
+
+                  response = requests.patch(url, headers=headers, json=data)
+                  print(f"Status Code: {response.status_code}")
+                  try:
+                      print(f"Response JSON: {response.json()}")
+                  except ValueError:
+                      print(f"Response Text: {response.text}")
+
+                  if response.status_code == 200:
+                      print("Repositório no Databricks atualizado com sucesso.")
+                  else:
+                      raise RuntimeError(f"Erro ao atualizar o repositório no Databricks: {response.text}")
+
+              if __name__ == "__main__":
+                  update_databricks_repo_via_api()
+
+# ==================================================================
+# Stage 5: Backup_Prod - Snapshot de PROD antes do deploy
+# ------------------------------------------------------------------
+# Depende implicitamente de QA (stage anterior na lista).
+# ==================================================================
+- stage: Backup_Prod
+  displayName: 'Backup Prod'
+  condition: and(${{ parameters.runBackupProd }}, in(dependencies.QA.result, 'Succeeded', 'Skipped'))
+  variables:
+    - group: ${{ parameters.variableGroupProdBackup }}
+  jobs:
+    - job: ExportacaoJobseVivoeNotebooks
+      displayName: 'Exportar Jobs, Vivo e Notebooks'
+      pool:
+        name: ${{ parameters.agentPoolCI }}
+      steps:
+        # ------------------------------------------
+        # Checkout inicial (branch padrão do repositório, onde ficam
+        # os scripts de CI/CD)
+        # ------------------------------------------
+        - checkout: self
+          path: s
+          persistCredentials: true
+
+        - task: PythonScript@0
+          displayName: 'Exportar e Formatar Jobs de PROD'
+          inputs:
+            scriptSource: filePath
+            scriptPath: ${{ parameters.scriptsPath }}/backup_prod.py
+            arguments: --workspace-url $(PROD_URL) --token $(prod_token)
+
+        - task: PublishBuildArtifacts@1
+          displayName: Publicar Jobs como artefato
+          inputs:
+            pathToPublish: '$(System.DefaultWorkingDirectory)/jobs'
+            artifactName: 'DatabricksJobsPROD'
+            publishLocation: 'Container'
+
+        # ------------------------------------------
+        # Checkout dos notebooks de PROD
+        # ------------------------------------------
+        - checkout: ${{ parameters.prodRepoAlias }}
+          path: prod-repo
+          persistCredentials: true
+
+        - task: PublishBuildArtifacts@1
+          displayName: Publicar Notebooks como artefato
+          inputs:
+            pathToPublish: '$(Pipeline.Workspace)/prod-repo/databricks'
+            artifactName: 'DatabricksNotebooksPROD'
+            publishLocation: 'Container'
+
+# ==================================================================
+# Stage 6: Plan_Prod - Visão geral de diferenças (jobs + notebooks)
+# entre o artefato da CI e o estado real de PROD. Só leitura, nunca
+# escreve.
+# ------------------------------------------------------------------
+# Depende de Backup_Prod (o backup precisa terminar antes do plano
+# rodar).
+# ==================================================================
+- stage: Plan_Prod
+  displayName: 'Plan PROD'
+  dependsOn:
+    - Backup_Prod
+  condition: and(${{ parameters.runPlanProd }}, in(dependencies.Backup_Prod.result, 'Succeeded', 'SucceededWithIssues', 'Skipped'))
+  variables:
+    - group: ${{ parameters.variableGroupProdPlan }}
+  jobs:
+    - job: PlanProd
+      displayName: 'Plan PROD'
+      pool:
+        name: ${{ parameters.agentPoolCD }}
+      steps:
+        - download: ${{ parameters.ciPipelineAlias }}
+          artifact: DatabricksJobs
+          displayName: Download Jobs Artifact
+
+        - download: ${{ parameters.ciPipelineAlias }}
+          artifact: DatabricksNotebooks
+          displayName: Download Notebooks Artifact
+
+        - task: PythonScript@0
+          displayName: 'Plan de ambiente (PROD) — jobs e notebooks'
+          inputs:
+            scriptSource: filePath
+            scriptPath: ${{ parameters.scriptsPath }}/cd-planambiente_sp_prod_v1.py
+            arguments: '--client-secret-prod $(AZURE_CLIENT_SECRET_PROD) --jobs-folder $(Pipeline.Workspace)/${{ parameters.ciPipelineAlias }}/DatabricksJobs --notebooks-folder $(Pipeline.Workspace)/${{ parameters.ciPipelineAlias }}/DatabricksNotebooks --mapping-file $(System.DefaultWorkingDirectory)/${{ parameters.mappingsPath }}/prod.json'
+
+# ==================================================================
+# Stage 7: PROD - Apply (escrita), com approval próprio
+# ------------------------------------------------------------------
+# Depende de QA, Backup_Prod e Plan_Prod — garante que o deploy em QA,
+# o snapshot de PROD e o plano de diferenças de PROD sempre terminam
+# ANTES de qualquer alteração ser aplicada em PROD.
+# ==================================================================
+- stage: PROD
+  displayName: Deploy PROD
+  dependsOn:
+    - QA
+    - Backup_Prod
+    - Plan_Prod
+  condition: and(${{ parameters.runProd }}, in(dependencies.QA.result, 'Succeeded', 'Skipped'), in(dependencies.Backup_Prod.result, 'Succeeded'), in(dependencies.Plan_Prod.result, 'Succeeded', 'Skipped'))
+  jobs:
+    # ------------------------------------------
+    # JOB: Apply — sob approval próprio (vg-dtfn-cd-prod-apply)
+    # ------------------------------------------
+    - job: ApplyProd
+      displayName: Apply PROD
+      pool:
+        name: ${{ parameters.agentPoolCD }}
+      variables:
+        - group: ${{ parameters.variableGroupProdApply }}
+      steps:
+        # ------------------------------------------
+        # Checkout do repositório self (onde vivem os scripts de CI/CD
+        # usados pelos steps deste job via scriptPath relativo).
+        # ------------------------------------------
+        # Precisa ser explícito porque, assim que qualquer outro
+        # checkout aparece no job (o do prodRepo abaixo), o Azure DevOps
+        # PARA de fazer o checkout implícito do self — sem isso aqui,
+        # $(System.DefaultWorkingDirectory) passa a apontar pro
+        # prod-repo, e todo scriptPath relativo (que vive no self) quebra.
+        - checkout: self
+          path: s
+          persistCredentials: true
+
+        # ------------------------------------------
+        # Checkout do repositório de notebooks de PROD (comp-dtfn-prod)
+        # ------------------------------------------
+        # Esse job só fazia downloads de artefato, nunca checkout de
+        # repositório — sem um checkout explícito aqui, o Azure DevOps
+        # não concede ao System.AccessToken acesso ao comp-dtfn-prod
+        # (repositório SEPARADO do self, diferente do que acontece em
+        # QA, onde cd-clonarepo_qa_v3.py clona o próprio repositório da
+        # pipeline). O cd-clonarepo_prod_v3.py faz seu próprio clone num
+        # diretório temporário — este checkout existe só para obter a
+        # concessão de acesso ao repo neste job, não para uso direto.
+        - checkout: ${{ parameters.prodRepoAlias }}
+          path: prod-repo
+          persistCredentials: true
+
+        - download: ${{ parameters.ciPipelineAlias }}
+          artifact: DatabricksJobs
+          displayName: Download Jobs Artifact
+
+        - download: ${{ parameters.ciPipelineAlias }}
+          artifact: DatabricksNotebooks
+          displayName: Download Notebooks Artifact
+
+        - task: AzureKeyVault@2
+          displayName: 'Azure Key Vault: token-pat'
+          inputs:
+            azureSubscription: ${{ parameters.keyVaultProdServiceConnection }}
+            KeyVaultName: ${{ parameters.keyVaultProdName }}
+            SecretsFilter: 'token-pat'
+            RunAsPreJob: false
+
+        # ------------------------------------------
+        # VERIFICAÇÃO TOKEN KV
+        # ------------------------------------------
+        - task: PythonScript@0
+          displayName: Teste PAT
+          inputs:
+            scriptSource: inline
+            script: |
+              token = "$(token-pat)"
+
+              if len(token) > 10:
+                  print("PAT carregado")
+              else:
+                  raise Exception("PAT inválido")
+
+        # ------------------------------------------
+        # Teste Implantação job temporário
+        # ------------------------------------------
+        - task: PythonScript@0
+          displayName: Testar Job Temporário
+          inputs:
+            scriptSource: filePath
+            scriptPath: ${{ parameters.scriptsPath }}/test-implantajobs-temp_sp_prod_v4.py
+            arguments: '--client-secret-prod $(AZURE_CLIENT_SECRET_PROD) --jobs-folder $(Pipeline.Workspace)/${{ parameters.ciPipelineAlias }}/DatabricksJobs'
+
+        - task: AzureKeyVault@2
+          displayName: 'Azure Key Vault: token-databricks-prod'
+          inputs:
+            azureSubscription: ${{ parameters.keyVaultProdServiceConnection }}
+            KeyVaultName: ${{ parameters.keyVaultProdName }}
+            SecretsFilter: 'token-databricks'
+            RunAsPreJob: false
+
+        # ------------------------------------------
+        # Implantação jobs no ambiente Databricks (PROD)
+        # ------------------------------------------
+        - task: PythonScript@0
+          displayName: Implantação Jobs Databricks (PROD)
+          inputs:
+            scriptSource: filePath
+            scriptPath: ${{ parameters.scriptsPath }}/cd-importarjobs_sp_prod_v9_cluster.py
+            arguments: '--client-secret-prod $(AZURE_CLIENT_SECRET_PROD) --jobs-folder $(Pipeline.Workspace)/${{ parameters.ciPipelineAlias }}/DatabricksJobs --mapping-file $(System.DefaultWorkingDirectory)/${{ parameters.mappingsPath }}/prod.json'
+
+        # ------------------------------------------
+        # Implantação dos notebooks alterados (PROD)
+        # ------------------------------------------
+        - task: PythonScript@0
+          displayName: Copia Notebooks Repo (PROD)
+          inputs:
+            scriptSource: filePath
+            scriptPath: ${{ parameters.scriptsPath }}/cd-clonarepo_prod_v3.py
+            arguments: '--notebooks-folder $(Pipeline.Workspace)/${{ parameters.ciPipelineAlias }}/DatabricksNotebooks'
+          env:
+            SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+            TARGET_BRANCH: ${{ parameters.prodBranch }}
+
+        - task: PythonScript@0
+          displayName: Implanta Notebooks (PROD)
+          inputs:
+            arguments: '$(token-databricks) ${{ parameters.prodBranch }} ${{ parameters.prodRepoId }}'
+            scriptSource: inline
+            script: |
+              import os
+              import sys
+              import requests
+
+              def update_databricks_repo_via_api():
+                  databricks_instance = os.getenv('PROD_URL')
+                  token = sys.argv[1]
+                  branch_name = sys.argv[2]
+                  repo_id = sys.argv[3]
+
+                  print(f"Nome da Branch a ser enviada: {branch_name}")
+
+                  headers = {
+                      "Authorization": f"Bearer {token}",
+                      "Content-Type": "application/json"
+                  }
+                  data = {"branch": branch_name}
+                  url = f"{databricks_instance}/api/2.0/repos/{repo_id}"
+
+                  response = requests.patch(url, headers=headers, json=data)
+                  print(f"Status Code: {response.status_code}")
+                  try:
+                      print(f"Response JSON: {response.json()}")
+                  except ValueError:
+                      print(f"Response Text: {response.text}")
+
+                  if response.status_code == 200:
+                      print("Repositório no Databricks atualizado com sucesso.")
+                  else:
+                      raise RuntimeError(f"Erro ao atualizar o repositório no Databricks: {response.text}")
+
+              if __name__ == "__main__":
+                  update_databricks_repo_via_api()

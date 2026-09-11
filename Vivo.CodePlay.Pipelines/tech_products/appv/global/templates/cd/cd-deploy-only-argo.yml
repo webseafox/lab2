@@ -1,0 +1,806 @@
+parameters:
+  - name: setEnvironment
+    type: string
+    displayName: "Environment Target (dev, staging, prod, etc)"
+  - name: setVersion
+    type: string
+    default: " "
+    displayName: "Version to Deploy (leave empty for auto-detect)"
+  - name: deployOnly
+    type: boolean
+    displayName: "Deploy Only (skip CI build)"
+  - name: nativeBuild
+    type: boolean
+    default: False
+    displayName: "Native Build (GraalVM)"
+  - name: forceSync
+    type: boolean
+    default: False
+    displayName: "Force ArgoCD Sync"
+  - name: setProduction
+    type: boolean
+    default: False
+    displayName: "Production Validations"
+  - name: resourcesAndHpaValues
+    type: object
+    displayName: "Resources and HPA Configuration"
+
+stages:
+  - stage: cd_deploy
+    displayName: "CD - Deploy | Rollback (Argo)"
+    pool:
+      name: GeneralPurposeLinuxAgentsCD
+    dependsOn:
+      - environment_init
+      # Argo deploy will only depend on "cd_environment_checklist" when in "bff", "front" or "spa-front" namespaces
+      - ${{ if not(or(contains(parameters.setEnvironment, 'ms'), contains(parameters.setEnvironment, 'tools'))) }}:
+          - cd_environment_checklist
+      - ${{ if and( eq(parameters.deployOnly, False), eq(parameters.setProduction, False)) }}:
+          - ci_build
+          - ${{ if eq(parameters.nativeBuild, False) }}:
+              - ci_package
+          - ${{ if eq(parameters.nativeBuild, True) }}:
+              - ci_package_native
+    condition: succeeded()
+    variables:
+      - name: setVersion
+        ${{ if eq(parameters.setVersion, ' ') }}:
+          value: $[ stageDependencies.ci_build.build.outputs['new_version.NEW_VERSION'] ]
+        ${{ else }}:
+          value: $(echo "${{ parameters.setVersion }}" | xargs)
+      - name: NEXUS_DEFAULT_USR
+        value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEFAULT_USR'] ]
+      - name: NEXUS_DEFAULT_PSW
+        value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEFAULT_PSW'] ]
+      - name: IS_ROLLBACK
+        value: $[ stageDependencies.cd_environment_checklist.environment_checklist.outputs['compare_versions.IS_ROLLBACK'] ]
+      - name: PROD_VERSION
+        value: $[ stageDependencies.cd_environment_checklist.environment_checklist.outputs['compare_versions.PROD_VERSION'] ]
+
+    jobs:
+      - job: waitForValidation
+        displayName: Validação de rollback
+        pool: server
+        timeoutInMinutes: 4320 # 3 days
+        steps:
+          - task: ManualValidation@0
+            displayName: Aprovação de rollback
+            timeoutInMinutes: 1440 # 1 day
+            # Wait for approval if there is a rollback attempt in production environment
+            condition: and(succeeded(), eq(variables['IS_ROLLBACK'], 'true'), in('${{ parameters.setEnvironment }}', 'prod', 'prod-front', 'prod-bff'))
+            inputs:
+              notifyUsers: |
+                meuvivoecare.br@telefonica.com
+                ert-digital.br@telefonica.com
+                raphaels.silva@telefonica.com
+                rafaelc.gomes@telefonica.com
+                victor.pinheiro@telefonica.com
+                junior.francisco@telefonica.com
+              instructions: |
+                Foi identificado uma tentativa de ROLLBACK na execução da pipeline.
+
+                Um relatório HTML com informações sobre a execução foi gerado na aba "HTML Viewer".
+
+                Variáveis:
+                Ambiente (setEnvironment): ${{ parameters.setEnvironment }}
+                Rollback (IS_ROLLBACK): $(IS_ROLLBACK)
+                Versão no cluster (PROD_VERSION): $(PROD_VERSION)
+                Versão no repositório (setVersion): ${{ parameters.setVersion }}
+
+                Tem certeza de que quer fazer isso?
+              onTimeout: "reject"
+
+      - deployment: deploy
+        dependsOn:
+          - waitForValidation
+        displayName: "Deploy"
+        condition: succeeded()
+        ${{if or(eq(parameters.setEnvironment, 'prod'), eq(parameters.setEnvironment, 'prod-front'), eq(parameters.setEnvironment, 'prod-bff'), eq(parameters.setEnvironment, 'prod-ms'), eq(parameters.setEnvironment, 'prod-tools'))}}:
+          environment: $(DEPLOY_ENVIRONMENT_PROD)
+        ${{ else }}:
+          environment: $(DEPLOY_ENVIRONMENT_LIB)
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                  displayName: Checkout Source Code
+                  name: checkout_source_code
+                  clean: true
+                  path: sourcecode
+                  submodules: recursive
+                  condition: succeeded()
+
+                - script: |
+                    if [ -z "$(setVersion)" ]; then
+                      echo "##[debug] setVersion is empty."
+                      echo "##vso[task.logissue type=error] Version cannot be empty."
+                      exit 1;
+                    else
+                      echo "##[debug] setVersion is not empty."
+                      echo "##[debug] setVersion: $(setVersion)"
+                    fi
+                  displayName: Verify Version
+
+                - script: |
+                    if [ "$(System.JobAttempt)" != "1" ]; then
+                      echo "##vso[task.logissue type=error]Reruns não são permitidos nesta pipeline. Realize uma nova execução."
+                      exit 1
+                    fi
+                  displayName: "Block reruns"
+
+                - task: Bash@3
+                  displayName: "Remap Environment Variable"
+                  condition: succeeded()
+                  inputs:
+                    targetType: "inline"
+                    script: |
+                      echo "##[debug] Original environment: ${{ parameters.setEnvironment }}"
+
+                      REMAPPED_ENV="${{ parameters.setEnvironment }}"
+
+                      if [[ "$REMAPPED_ENV" == *"esteira01"* ]]; then
+                        REMAPPED_ENV="${REMAPPED_ENV/esteira01/esteira1}"
+                        echo "##[debug] Remapping namespace: $REMAPPED_ENV"
+                      else
+                        echo "##[debug] No remapping needed for: $REMAPPED_ENV"
+                      fi
+
+                      echo "##[debug] Final remapped environment: $REMAPPED_ENV"
+                      echo "##vso[task.setvariable variable=REMAPPED_ENVIRONMENT;isOutput=true]$REMAPPED_ENV"
+                  name: "remap_env"
+
+                - ${{if or(eq(parameters.setEnvironment, 'prod'), eq(parameters.setEnvironment, 'prod-front'), eq(parameters.setEnvironment, 'prod-bff'), eq(parameters.setEnvironment, 'prod-tools'), eq(parameters.setEnvironment, 'prod-ms'), contains(parameters.setEnvironment, 'darklaunch'))}}:
+                    - checkout: git://FRBR - FRAMEWORK BRASIL/infra.infra-devops-aks-prod@refs/heads/master
+                      clean: true
+                      path: gitops
+                      persistCredentials: "true"
+                      displayName: Checkout GitOps Repository
+                - ${{ else }}:
+                    - checkout: git://FRBR - FRAMEWORK BRASIL/infra.infra-devops-aks-preprod@refs/heads/master
+                      clean: true
+                      path: gitops
+                      persistCredentials: "true"
+                      displayName: Checkout GitOps Repository
+
+                - task: Bash@3
+                  displayName: Read Values File
+                  name: read_values_file
+                  inputs:
+                    targetType: inline
+                    script: |
+
+                      echo "##[debug] Looking for values.(yml,yaml) file..."
+                      valuesFile=$(find $(Pipeline.Workspace)/sourcecode/.azuredevops/config/${{ parameters.setEnvironment }} -name 'values*')
+
+                      if [ -z $valuesFile ] ; then
+                        echo "##[error] values.(yml,yaml) not found. Aborting..."
+                        exit 1;
+                      fi
+
+                      echo "##vso[task.setvariable variable=VALUES_FILE]$valuesFile"
+
+                      echo "##[debug] Found values file: $valuesFile"
+                      echo "##[group] Values File Content"
+                      cat "$valuesFile"
+                      echo "##[endgroup]"
+
+                - ${{ if not(in(parameters.setEnvironment, 'prod-tools')) }}:
+                    - template: /tech_products/appv/global/templates/cd/app-resources-hpa-config-cd.yml
+                      parameters:
+                        setEnvironment: ${{ parameters.setEnvironment }}
+                        resourcesAndHpaValues: ${{ parameters.resourcesAndHpaValues }}
+
+                - task: Bash@3
+                  displayName: Generate Helm Template
+                  name: helm_template
+                  inputs:
+                    targetType: inline
+                    script: |
+
+                      echo "##[debug] Looking for values.(yml,yaml) file..."
+                      valuesFile=$(find $(Pipeline.Workspace)/sourcecode/.azuredevops/config/${{ parameters.setEnvironment }} -name 'values*')
+
+                      if [ -z $valuesFile ] ; then
+                        echo "##[error] values.(yml,yaml) not found. Aborting..."
+                        exit 1;
+                      fi
+
+                      mkdir -p $(System.DefaultWorkingDirectory)/chart
+                      echo "Chart $(CHART_NAME)-$(CHART_VERSION)"
+                      echo "Downloading 'https://nexus.telefonica.com.br/repository/$(CHART_REPOSITORY)/$(CHART_NAME)-$(CHART_VERSION).tgz'"
+
+                      curl -u '$(NEXUS_DEFAULT_USR)':'$(NEXUS_DEFAULT_PSW)' -O https://nexus.telefonica.com.br/repository/$(CHART_REPOSITORY)/$(CHART_NAME)-$(CHART_VERSION).tgz
+                      file "$(CHART_NAME)-$(CHART_VERSION).tgz"                  
+                      tar -zxvf "$(CHART_NAME)-$(CHART_VERSION).tgz" -C $(System.DefaultWorkingDirectory)/chart
+                      rm "$(CHART_NAME)-$(CHART_VERSION).tgz"
+
+                      echo "##[group] Properties for deployment"
+                      echo "##[debug]FULL IMAGE NAME : '$(IMAGE_REGISTRY)/$(IMAGE_NAME):$(setVersion)'"
+                      echo "##[debug]CHART_NAME: $(CHART_NAME)"
+                      echo "##[debug]CHART_REPOSITORY: $(CHART_REPOSITORY)"
+                      echo "##[debug]CHART_VERSION: $(CHART_VERSION)"
+                      echo "##[debug]IMAGE_NAME: $(IMAGE_NAME)"
+                      echo "##[debug]IMAGE_REGISTRY: $(IMAGE_REGISTRY)"
+                      echo "##[debug]IMAGE_VERSION: $(setVersion)"
+                      echo "##[debug]NAMESPACE: $(remap_env.REMAPPED_ENVIRONMENT)"
+                      echo "##[debug]APPLICATION_NAME: $(APPLICATION_NAME)"
+                      echo "##[debug]TIMEOUT: $(setTimeout)"
+                      echo "##[endgroup]"
+
+                      helm template $(APPLICATION_NAME) $(System.DefaultWorkingDirectory)/chart/$(CHART_NAME) \
+                      -f "$valuesFile" \
+                      --namespace $(remap_env.REMAPPED_ENVIRONMENT) \
+                      --set image.tag=$(setVersion) \
+                      --set image.name=$(IMAGE_NAME) \
+                      --set image.repository=$(IMAGE_REGISTRY) > $(Build.ArtifactStagingDirectory)/manifests.yaml
+
+                      echo "##[group] Generated Helm Template Manifests"
+                      cat $(Build.ArtifactStagingDirectory)/manifests.yaml
+                      echo "##[endgroup]"
+
+                - task: PublishBuildArtifacts@1
+                  displayName: Publish Manifest
+                  inputs:
+                    PathtoPublish: "$(Build.ArtifactStagingDirectory)/manifests.yaml"
+                    ArtifactName: "manifests"
+                    publishLocation: "Container"
+
+                - script: |
+                    echo "##[debug]Creating directory: 'gitops/src/$(remap_env.REMAPPED_ENVIRONMENT)/apps/$(APPLICATION_NAME)'"
+                    mkdir -p $(Pipeline.Workspace)/gitops/src/$(remap_env.REMAPPED_ENVIRONMENT)/apps/$(APPLICATION_NAME)
+
+                    echo "##[debug]Copying manifest to: 'gitops/src/$(remap_env.REMAPPED_ENVIRONMENT)/apps/$(APPLICATION_NAME)'"
+                    cp $(Build.ArtifactStagingDirectory)/manifests.yaml $(Pipeline.Workspace)/gitops/src/$(remap_env.REMAPPED_ENVIRONMENT)/apps/$(APPLICATION_NAME)
+                  displayName: Copy Manifest to GitOps Repository
+
+                - task: Bash@3
+                  displayName: "GitOps Commit with Retry"
+                  name: gitops_commit
+                  inputs:
+                    targetType: 'inline'
+                    script: |
+                      echo "##[section]Starting GitOps commit with retry mechanism..."
+                      
+                      MAX_ATTEMPTS=3
+                      RETRY_DELAY=5
+                      COMMIT_PUSHED=false
+                      
+                      cd $(Pipeline.Workspace)/gitops/src
+                      git status
+                      git add .
+                      
+                      # Check if there are changes to commit
+                      if git diff --cached --quiet; then
+                        echo "##[warning] No changes detected in manifests"
+                        echo "##vso[task.setvariable variable=COMMIT_PUSHED;isOutput=true]true"
+                        echo "##vso[task.setvariable variable=NO_CHANGES;isOutput=true]true"
+                        exit 0
+                      fi
+                      
+                      git commit -m "[ARGO DEPLOY] Updating manifests, environment: $(remap_env.REMAPPED_ENVIRONMENT), application: $(APPLICATION_NAME), queued by: $(Build.QueuedBy)."
+                      
+                      for attempt in $(seq 1 $MAX_ATTEMPTS); do
+                        echo "##[debug] Push attempt $attempt of $MAX_ATTEMPTS"
+                        
+                        # Pull with rebase before pushing
+                        if ! git pull --rebase origin master; then
+                          # Check for real merge conflicts
+                          if git status | grep -q "both modified\|both added"; then
+                            echo "##[error] Merge conflict detected - manual resolution required"
+                            echo "##[error] Conflicting files:"
+                            git status --short | grep "^UU\|^AA\|^DD"
+                            git rebase --abort
+                            exit 1
+                          fi
+                        fi
+                        
+                        if git push origin HEAD:master; then
+                          echo "##[section] Git push successful on attempt $attempt"
+                          COMMIT_PUSHED=true
+                          break
+                        else
+                          echo "##[warning] Git push failed on attempt $attempt"
+                          
+                          if [ $attempt -lt $MAX_ATTEMPTS ]; then
+                            echo "##[debug] Waiting ${RETRY_DELAY}s before retry..."
+                            sleep $RETRY_DELAY
+                          fi
+                        fi
+                      done
+                      
+                      if [ "$COMMIT_PUSHED" = false ]; then
+                        echo "##[error] Failed to push after $MAX_ATTEMPTS attempts"
+                        echo "##[error] This may indicate:"
+                        echo "##[error] - Multiple pipelines running simultaneously"
+                        echo "##[error] - Network connectivity issues"
+                        echo "##[error] - Repository access problems"
+                        exit 1
+                      fi
+                      
+                      # Store commit hash for later verification
+                      LAST_COMMIT=$(git rev-parse HEAD)
+                      echo "##[debug] Commit hash: $LAST_COMMIT"
+                      echo "##vso[task.setvariable variable=LAST_COMMIT_HASH;isOutput=true]$LAST_COMMIT"
+                      echo "##vso[task.setvariable variable=COMMIT_PUSHED;isOutput=true]true"
+
+                - task: Bash@3
+                  displayName: "Verify Commit Status"
+                  name: verify_commit
+                  inputs:
+                    targetType: 'inline'
+                    script: |
+                      echo "##[section]Verifying commit was pushed to remote repository..."
+                      
+                      # Skip verification if no changes were made
+                      if [ "$(gitops_commit.NO_CHANGES)" = "true" ]; then
+                        echo "##[debug] Skipping verification - no changes were committed"
+                        echo "##vso[task.setvariable variable=COMMIT_VERIFIED;isOutput=true]true"
+                        exit 0
+                      fi
+                      
+                      LOCAL_HASH="$(gitops_commit.LAST_COMMIT_HASH)"
+                      
+                      if [ -z "$LOCAL_HASH" ]; then
+                        echo "##[warning] Could not retrieve local commit hash"
+                        echo "##vso[task.setvariable variable=COMMIT_VERIFIED;isOutput=true]false"
+                        exit 0
+                      fi
+                      
+                      cd $(Pipeline.Workspace)/gitops/src
+                      REMOTE_HASH=$(git ls-remote origin master | cut -f1)
+                      
+                      echo "##[debug] Local commit: $LOCAL_HASH"
+                      echo "##[debug] Remote HEAD: $REMOTE_HASH"
+                      
+                      if git merge-base --is-ancestor "$LOCAL_HASH" "$REMOTE_HASH" || [ "$LOCAL_HASH" = "$REMOTE_HASH" ]; then
+                        echo "##[section] Commit successfully verified on remote repository"
+                        echo "##vso[task.setvariable variable=COMMIT_VERIFIED;isOutput=true]true"
+                      else
+                        echo "##[warning] Commit verification uncertain - will monitor sync closely"
+                        echo "##vso[task.setvariable variable=COMMIT_VERIFIED;isOutput=true]false"
+                      fi
+
+                - task: Bash@3
+                  inputs:
+                    targetType: 'inline'
+                    script: |
+                      echo "##[warning]========================================"
+                      echo "##[warning] Creating/Verifying ArgoCD Application"
+                      echo "##[warning] App: $(APPLICATION_NAME)"
+                      echo "##[warning] Environment: $(remap_env.REMAPPED_ENVIRONMENT)"
+                      echo "##[warning]========================================"
+                      
+                      bash $(Pipeline.Workspace)/gitops/scripts/create_argo_application.sh
+                  env:
+                    ARGO_USERNAME: $(ARGO_USERNAME)
+                    ARGO_PASSWORD: $(ARGO_PASSWORD)
+                    ENVIRONMENT: $(remap_env.REMAPPED_ENVIRONMENT)
+                    ARGO_URL: $(ARGO_URL)
+                    APPLICATION_NAME: $(APPLICATION_NAME)
+                  displayName: "Create ArgoCD Application"
+
+                - task: Bash@3
+                  inputs:
+                    targetType: 'inline'
+                    script: |
+                      echo "##[warning]========================================"
+                      echo "##[warning] Enabling ArgoCD Application AutoSync"
+                      echo "##[warning] This allows ArgoCD to auto-deploy changes"
+                      echo "##[warning]========================================"
+                      
+                      bash $(Pipeline.Workspace)/gitops/scripts/edit_argo_application.sh
+                  env:
+                    ARGO_USERNAME: $(ARGO_USERNAME)
+                    ARGO_PASSWORD: $(ARGO_PASSWORD)
+                    ENVIRONMENT: $(remap_env.REMAPPED_ENVIRONMENT)
+                    ARGO_URL: $(ARGO_URL)
+                    APPLICATION_NAME: $(APPLICATION_NAME)
+                    AUTO_SYNC: "true"
+                  displayName: "Enable ArgoCD Application AutoSync"
+
+                - script: |
+                    LAST_PART="${APPLICATION_NAME##*-}"
+
+                    if [[ "$LAST_PART" == "front" || "$LAST_PART" == "bff" || "$LAST_PART" == "ms" ]]; then
+                        APP_BASE_NAME="${APPLICATION_NAME%-*}"
+                    else
+                        APP_BASE_NAME="$APPLICATION_NAME"
+                    fi
+
+                    FULL_APP_NAME="$APP_BASE_NAME-$(remap_env.REMAPPED_ENVIRONMENT)"
+
+                    echo "##[debug] Application name in ArgoCD: $FULL_APP_NAME"
+                    echo "##[debug] Track the application in ArgoCD: $(ARGO_URL)/applications/$FULL_APP_NAME"
+                  displayName: "Verify ArgoCD Application"
+
+                - task: Bash@3
+                  displayName: "Sync ArgoCD Application with Retry"
+                  name: sync_argocd
+                  continueOnError: true
+                  condition: and(succeeded(), ne(variables['gitops_commit.NO_CHANGES'], 'true'))
+                  inputs:
+                    targetType: 'inline'
+                    script: |
+                      echo "##[section]Starting ArgoCD Sync with intelligent retry..."
+                      
+                      MAX_ATTEMPTS=10
+                      RETRY_DELAY=30
+                      SYNC_SUCCESS=false
+                      ABORT_RETRY=false
+                      ERROR_CATEGORY=""
+                      ACTUAL_ATTEMPTS=0
+                      
+                      should_abort_retry() {
+                        local error_output="$1"
+                        
+                        if echo "$error_output" | grep -iq "imagepullbackoff\|errimagepull\|image not found\|manifest unknown\|not found"; then
+                          ERROR_CATEGORY="IMAGE_NOT_FOUND"
+                          return 0
+                        fi
+                        
+                        if echo "$error_output" | grep -iq "already synced\|already at desired version"; then
+                          ERROR_CATEGORY="ALREADY_DEPLOYED"
+                          return 0
+                        fi
+                        
+                        if echo "$error_output" | grep -iq "application is deleting\|application not found\|application does not exist"; then
+                          ERROR_CATEGORY="APPLICATION_STATE_ERROR"
+                          return 0
+                        fi
+                        
+                        if echo "$error_output" | grep -iq "another operation is already in progress"; then
+                          ERROR_CATEGORY="OPERATION_IN_PROGRESS"
+                        elif echo "$error_output" | grep -iq "timeout\|timed out"; then
+                          ERROR_CATEGORY="TIMEOUT"
+                        else
+                          ERROR_CATEGORY="GENERIC_ERROR"
+                        fi
+                        
+                        return 1
+                      }
+                      
+                      for attempt in $(seq 1 $MAX_ATTEMPTS); do
+                        ACTUAL_ATTEMPTS=$attempt
+                        TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+                        
+                        echo "##[group]========== Sync Attempt $attempt of $MAX_ATTEMPTS =========="
+                        echo "##[section]Starting sync attempt $attempt at $TIMESTAMP"
+                        
+                        SYNC_OUTPUT=$(bash $(Pipeline.Workspace)/gitops/scripts/sync-argo/sync_argo_application.sh 2>&1)
+                        SYNC_EXIT_CODE=$?
+                        
+                        echo "##[debug]Sync script exit code: $SYNC_EXIT_CODE"
+                        echo "##[endgroup]"
+                        
+                        if [ $SYNC_EXIT_CODE -eq 0 ]; then
+                          echo "##[section]================================================================"
+                          echo "##[section] SYNC SUCCESSFUL ON ATTEMPT $attempt OF $MAX_ATTEMPTS"
+                          echo "##[section]================================================================"
+                          SYNC_SUCCESS=true
+                          echo "##vso[task.setvariable variable=SYNC_STATUS;isOutput=true]SUCCESS"
+                          echo "##vso[task.setvariable variable=ATTEMPTS;isOutput=true]$attempt"
+                          break
+                        fi
+                        
+                        if should_abort_retry "$SYNC_OUTPUT"; then
+                          echo "##[error]================================================================"
+                          echo "##[error] ABORTING - UNRECOVERABLE ERROR DETECTED"
+                          echo "##[error]================================================================"
+                          echo "##[error] Error Category: $ERROR_CATEGORY"
+                          echo "##[error] Attempt: $attempt of $MAX_ATTEMPTS"
+                          echo "##[error] This error type cannot be resolved by retrying"
+                          echo "##[error]================================================================"
+                          echo "##[group]Error Output from Sync Script"
+                          echo "$SYNC_OUTPUT"
+                          echo "##[endgroup]"
+                          
+                          if [ "$ERROR_CATEGORY" = "ALREADY_DEPLOYED" ]; then
+                            SYNC_SUCCESS=true
+                          fi
+                          
+                          ABORT_RETRY=true
+                          break
+                        fi
+                        
+                        echo "##[warning]================================================================"
+                        echo "##[warning] Attempt $attempt failed - Error: $ERROR_CATEGORY"
+                        echo "##[warning]================================================================"
+                        echo "##[group]Error Details from Attempt $attempt"
+                        echo "$SYNC_OUTPUT"
+                        echo "##[endgroup]"
+                        
+                        if [ $attempt -lt $MAX_ATTEMPTS ]; then
+                          echo "##[debug]Waiting ${RETRY_DELAY}s before retry..."
+                          sleep $RETRY_DELAY
+                        fi
+                      done
+                      
+                      echo "##[section]================================================================"
+                      echo "##[section] SYNC RETRY SUMMARY"
+                      echo "##[section]================================================================"
+                      echo "##[section] Total attempts made: $ACTUAL_ATTEMPTS of $MAX_ATTEMPTS"
+                      echo "##[section] Error category: $ERROR_CATEGORY"
+                      echo "##[section] Sync success: $SYNC_SUCCESS"
+                      echo "##[section] Aborted due to unrecoverable error: $ABORT_RETRY"
+                      echo "##[section]================================================================"
+                      
+                      echo "##vso[task.setvariable variable=ERROR_CATEGORY;isOutput=true]$ERROR_CATEGORY"
+                      echo "##vso[task.setvariable variable=SYNC_SUCCESS;isOutput=true]$SYNC_SUCCESS"
+                      echo "##vso[task.setvariable variable=ACTUAL_ATTEMPTS;isOutput=true]$ACTUAL_ATTEMPTS"
+                      
+                      if [ "$SYNC_SUCCESS" = false ]; then
+                        if [ "$ABORT_RETRY" = true ]; then
+                          echo "##[error]================================================================"
+                          echo "##[error] SYNC ABORTED AFTER $ACTUAL_ATTEMPTS ATTEMPT(S)"
+                          echo "##[error]================================================================"
+                          echo "##[error] Unrecoverable error type: $ERROR_CATEGORY"
+                          echo "##[error] Further retries would not resolve this issue"
+                          echo "##[error]================================================================"
+                        else
+                          echo "##[error]================================================================"
+                          echo "##[error] SYNC FAILED AFTER $ACTUAL_ATTEMPTS ATTEMPTS"
+                          echo "##[error]================================================================"
+                          echo "##[error] All retry attempts exhausted"
+                          echo "##[error] Error category: $ERROR_CATEGORY"
+                          echo "##[error]================================================================"
+                        fi
+                        exit 1
+                      fi
+                  env:
+                    ARGO_USERNAME: $(ARGO_USERNAME)
+                    ARGO_PASSWORD: $(ARGO_PASSWORD)
+                    ENVIRONMENT: $(remap_env.REMAPPED_ENVIRONMENT)
+                    ARGO_URL: $(ARGO_URL)
+                    APPLICATION_NAME: $(APPLICATION_NAME)
+                    FORCE_SYNC: ${{ parameters.forceSync }}
+                    ARGO_READONLY_USERNAME: $(ARGO_READONLY_USERNAME)
+                    ARGO_READONLY_PASSWORD: $(ARGO_READONLY_PASSWORD)
+
+                - task: Bash@3
+                  displayName: "Evaluate Deployment Status"
+                  inputs:
+                    targetType: 'inline'
+                    script: |
+                      echo "##[section]Evaluating deployment status..."
+                      
+                      SYNC_FAILED=false
+                      if [ "$(Agent.JobStatus)" != "Succeeded" ]; then
+                        SYNC_FAILED=true
+                      fi
+                      
+                      COMMIT_VERIFIED="$(verify_commit.COMMIT_VERIFIED)"
+                      COMMIT_PUSHED="$(gitops_commit.COMMIT_PUSHED)"
+                      NO_CHANGES="${gitops_commit.NO_CHANGES:-false}"
+                      ERROR_CATEGORY="$(sync_argocd.ERROR_CATEGORY)"
+                      SYNC_STATUS="$(sync_argocd.SYNC_STATUS)"
+                      ATTEMPTS="$(sync_argocd.ATTEMPTS)"
+                      ACTUAL_ATTEMPTS="$(sync_argocd.ACTUAL_ATTEMPTS)"
+                      
+                      echo "##[debug] Sync failed: $SYNC_FAILED"
+                      echo "##[debug] Sync status: $SYNC_STATUS"
+                      echo "##[debug] Error category: $ERROR_CATEGORY"
+                      echo "##[debug] Attempts made: $ATTEMPTS"
+                      echo "##[debug] Actual attempts: $ACTUAL_ATTEMPTS"
+                      echo "##[debug] Commit pushed: $COMMIT_PUSHED"
+                      echo "##[debug] Commit verified: $COMMIT_VERIFIED"
+                      echo "##[debug] No changes: $NO_CHANGES"
+                      
+                      if [ "$NO_CHANGES" = "true" ]; then
+                        echo "##[section]================================================================"
+                        echo "##[section] NO CHANGES DETECTED"
+                        echo "##[section]================================================================"
+                        echo "##[section] Manifests are already up to date"
+                        echo "##[section] No synchronization needed"
+                        echo "##[section] Application: $(APPLICATION_NAME)"
+                        echo "##[section] Environment: $(remap_env.REMAPPED_ENVIRONMENT)"
+                        echo "##[section]================================================================"
+                        exit 0
+                      fi
+                      
+                      if [ "$ERROR_CATEGORY" = "IMAGE_NOT_FOUND" ]; then
+                        echo "##[error]================================================================"
+                        echo "##[error] DEPLOYMENT FAILED - IMAGE NOT FOUND"
+                        echo "##[error]================================================================"
+                        echo "##[error] The specified image does not exist in the registry"
+                        echo "##[error] Attempts made: ${ACTUAL_ATTEMPTS:-1}"
+                        echo "##[error] "
+                        echo "##[error] Possible causes:"
+                        echo "##[error] - Image version is incorrect"
+                        echo "##[error] - Image was not built/published successfully"
+                        echo "##[error] - Registry credentials are invalid"
+                        echo "##[error] "
+                        echo "##[error] Action required:"
+                        echo "##[error] 1. Verify image exists in registry"
+                        echo "##[error] 2. Check previous CI stages for build failures"
+                        echo "##[error] 3. Verify image tag/version is correct"
+                        echo "##[error] "
+                        echo "##[error] NOTE: This error was detected immediately to avoid"
+                        echo "##[error] unnecessary waiting - no retries were attempted"
+                        echo "##[error]================================================================"
+                        exit 1
+                      fi
+                      
+                      if [ "$ERROR_CATEGORY" = "APPLICATION_STATE_ERROR" ]; then
+                        echo "##[error]================================================================"
+                        echo "##[error] DEPLOYMENT FAILED - APPLICATION STATE ERROR"
+                        echo "##[error]================================================================"
+                        echo "##[error] The ArgoCD Application is in an invalid state"
+                        echo "##[error] Attempts made: ${ACTUAL_ATTEMPTS:-1}"
+                        echo "##[error] "
+                        echo "##[error] Common causes:"
+                        echo "##[error] - Application is being deleted"
+                        echo "##[error] - Application does not exist in ArgoCD"
+                        echo "##[error] - Application was removed manually"
+                        echo "##[error] "
+                        echo "##[error] Action required:"
+                        echo "##[error] 1. Verify application exists in ArgoCD UI"
+                        echo "##[error] 2. Check if application is being deleted by another process"
+                        echo "##[error] 3. Contact DevOps team if issue persists"
+                        echo "##[error] "
+                        echo "##[error] NOTE: This error was detected immediately to avoid"
+                        echo "##[error] unnecessary waiting - no retries were attempted"
+                        echo "##[error]================================================================"
+                        exit 1
+                      fi
+                      
+                      if [ "$SYNC_STATUS" = "SUCCESS" ]; then
+                        if [ "$ATTEMPTS" = "1" ]; then
+                          echo "##[section]================================================================"
+                          echo "##[section] DEPLOYMENT SUCCESSFUL (IMMEDIATE)"
+                          echo "##[section]================================================================"
+                          echo "##[section] ArgoCD synchronized successfully on first attempt"
+                          echo "##[section] Application: $(APPLICATION_NAME)"
+                          echo "##[section] Environment: $(remap_env.REMAPPED_ENVIRONMENT)"
+                          echo "##[section]================================================================"
+                        else
+                          echo "##[warning]================================================================"
+                          echo "##[warning] DEPLOYMENT SUCCESSFUL (AFTER RETRIES)"
+                          echo "##[warning]================================================================"
+                          echo "##[warning] ArgoCD synchronized successfully after retries"
+                          echo "##[warning] Attempts needed: $ATTEMPTS of 10"
+                          echo "##[warning] Application: $(APPLICATION_NAME)"
+                          echo "##[warning] Environment: $(remap_env.REMAPPED_ENVIRONMENT)"
+                          echo "##[warning] "
+                          echo "##[warning] This is not an error - deployment completed successfully"
+                          echo "##[warning] Retries may occur due to cluster load or network latency"
+                          echo "##[warning]================================================================"
+                        fi
+                        exit 0
+                      fi
+                      
+                      if [ "$SYNC_FAILED" = false ]; then
+                        echo "##[section]================================================================"
+                        echo "##[section] DEPLOYMENT SUCCESSFUL"
+                        echo "##[section]================================================================"
+                        echo "##[section] ArgoCD synchronized successfully"
+                        echo "##[section] Application: $(APPLICATION_NAME)"
+                        echo "##[section] Environment: $(remap_env.REMAPPED_ENVIRONMENT)"
+                        if [ -n "$ACTUAL_ATTEMPTS" ] && [ "$ACTUAL_ATTEMPTS" != "0" ]; then
+                          echo "##[section] Total attempts: $ACTUAL_ATTEMPTS"
+                        fi
+                        echo "##[section]================================================================"
+                        exit 0
+                      fi
+                      
+                      if [ "$COMMIT_VERIFIED" = "true" ] || [ "$COMMIT_PUSHED" = "true" ]; then
+                        echo "##[warning]================================================================"
+                        echo "##[warning] DEPLOYMENT WILL COMPLETE AUTOMATICALLY"
+                        echo "##[warning]================================================================"
+                        echo "##[warning] ArgoCD sync timeout occurred, but manifest was committed successfully"
+                        echo "##[warning] ArgoCD will synchronize the application automatically in the next cycle"
+                        echo "##[warning] "
+                        echo "##[warning] To verify deployment status, access ArgoCD UI:"
+                        echo "##[warning] $(ARGO_URL)/applications/$(APPLICATION_NAME)-$(remap_env.REMAPPED_ENVIRONMENT)"
+                        echo "##[warning] "
+                        echo "##[warning] Credentials (read-only):"
+                        echo "##[warning] Username: readonly"
+                        echo "##[warning] Password: ReadOnly2024"
+                        echo "##[warning] "
+                        echo "##[warning] Expected sync time: 3-5 minutes"
+                        echo "##[warning]================================================================"
+                        exit 0
+                      fi
+                      
+                      echo "##[error]================================================================"
+                      echo "##[error] DEPLOYMENT FAILED"
+                      echo "##[error]================================================================"
+                      echo "##[error] Both commit and sync operations failed"
+                      if [ -n "$ACTUAL_ATTEMPTS" ] && [ "$ACTUAL_ATTEMPTS" != "0" ]; then
+                        echo "##[error] Total sync attempts: $ACTUAL_ATTEMPTS"
+                      fi
+                      if [ -n "$ERROR_CATEGORY" ]; then
+                        echo "##[error] Error category: $ERROR_CATEGORY"
+                      fi
+                      echo "##[error] "
+                      echo "##[error] Review logs above for details"
+                      echo "##[error] "
+                      echo "##[error] Recommended actions:"
+                      echo "##[error] 1. Check if there are other pipelines running for the same application"
+                      echo "##[error] 2. Verify repository access and credentials"
+                      echo "##[error] 3. Review GitOps repository for conflicts"
+                      echo "##[error] 4. Contact DevOps team if the issue persists"
+                      echo "##[error]================================================================"
+                      exit 1
+
+                - script: |
+                    if [ "$(IS_ROLLBACK)" = "true" ]; then
+                      DEPLOY_TYPE="Rollback"
+                    else
+                      DEPLOY_TYPE="Release"
+                    fi
+
+                    echo "##[debug] Tipo de deploy: $DEPLOY_TYPE"
+
+                    echo "##[group] Variáveis"
+                    echo "##[debug] IS_ROLLBACK=$(IS_ROLLBACK)"
+                    echo "##[debug] PROD_VERSION=$(PROD_VERSION)"
+                    echo "##[debug] setVersion=$(setVersion)"
+                    echo "##[debug] DEPLOY_TYPE=$DEPLOY_TYPE"
+                    echo "##[endgroup]"
+
+                    echo "##vso[task.setvariable variable=DEPLOY_TYPE]$DEPLOY_TYPE"
+                  displayName: Output Deploy Type Information
+
+            on:
+              success:
+                steps:
+                  - task: Bash@3
+                    displayName: Deploy Success
+                    name: t_success_message
+                    inputs:
+                      targetType: inline
+                      script: |
+                        echo "##[section] ================================================================================================================================="
+                        echo "##[section]                                                      DEPLOY WAS SUCCESSFUL! "
+                        echo "##[section] ================================================================================================================================="
+                        echo "##[section] Parabéns sua aplicação foi implantada com sucesso no ambiente de runtime." 
+                        echo "##[section] Acesse a url da sua aplicação e valide  se sua nova versão foi entregue com sucesso."
+                        echo "##[section] "
+                        echo "##[section] $(ALERT_MESSAGE_ARROW) Sua aplicação foi implantada com sucesso no ambiente."
+                        echo "##[section] $(ALERT_MESSAGE_ARROW) Verifique com o responsável técnico como acessar acessar a sua aplicação."
+                        echo "##[section] $(ALERT_MESSAGE_ARROW) Caso não esteja conseguindo acessar a sua aplicação entre em contato com suporte."
+                        echo "##[section] "
+                        echo "##[section] Caso tenha dúvidas sobre essa fase do pipeline acesse a nossa documentação: $(CORPORATE_WIKI_DOC_URL)"
+                        echo "##[section]================================================================================================================================="
+
+              failure:
+                steps:
+                  - task: Bash@3
+                    displayName: Deploy Failure
+                    name: t_failure_message
+                    inputs:
+                      targetType: inline
+                      script: |
+                        echo "##[error] ================================================================================================================================="
+                        echo "##[error]                                                    DEPLOY WAS NOT SUCCESSFUL! "
+                        echo "##[error] ================================================================================================================================="
+                        echo "##[error] Se está vendo essa mensagem é porque aconteceu algo erro durante a implantação da sua apliação."
+                        echo "##[error] "
+                        echo "##[error] Segue abaixo umas dicas para o Troubleshooting:"
+                        echo "##[error] $(ALERT_MESSAGE_ARROW) Consulte o log do estágio de deploy da aplicação."
+                        echo "##[error] $(ALERT_MESSAGE_ARROW) Verifique com o responsável técnico como proceder em caso de falha de ambiente."                  
+                        echo "##[error] "
+                        echo "##[error] Caso tenha dúvidas sobre essa fase do pipeline acesse a nossa documentação: $(CORPORATE_WIKI_DOC_URL)"
+                        echo "##[error] ================================================================================================================================="
+
+      - job: recordDeployAndVersion
+        displayName: "Register Deploy & Version"
+        dependsOn: deploy
+        pool:
+          name: GeneralPurposeLinuxAgentsCD
+        condition: succeeded()
+        steps:
+          - task: VivoEventHubTools@2
+            displayName: "Register Deploy in Event Hub"
+            inputs:
+              action: "recordDeploy"
+              environment: "${{ parameters.setEnvironment }}"
+              version: "$(setVersion)"
+            continueOnError: true
+
+          - task: VersionManagerVivo@8
+            inputs:
+              command: 'getLatestVersion'
+            displayName: 'Get Latest Version'
+            continueOnError: true

@@ -1,0 +1,139 @@
+## -> Parameters:
+parameters:
+- name: setEnvironment
+  type: string
+  default: ''
+
+- name: deployOnly
+  type: boolean
+  default: False
+
+- name: gatesEnabled
+  type: boolean
+  default: False
+
+- name: setProduction
+  type: boolean
+  default: False
+
+- name: setVersion
+  type: string
+  default: ''
+
+- name: libOnly
+  type: boolean
+  default: False
+
+- name : forceUpgrade
+  type: boolean
+  default: False
+
+- name: setTimeout
+  type: string
+  default: '300s'
+
+- name : notifyChangelog
+  type: boolean
+  default: False
+
+## -> Resources:
+resources:
+  repositories:
+  - repository: FortifyExclusion
+    name: DevOps/Vivo.Fortify.Exclusions
+    type: git
+    ref: refs/heads/master
+    endpoint: CorePipelines
+  - repository: CorePipelines
+    name: DevOps/Vivo.Core.Pipelines
+    type: git
+    ref: refs/heads/master
+    endpoint: CorePipelines
+
+## -> Initialize global variables
+variables:
+
+- template: /tech_products/ecmc/framework-brasil/appv/initialize/variables_global.yml
+- template: /tech_products/ecmc/framework-brasil/appv/initialize/variables_nodejs.yml
+- template: /tech_products/ecmc/framework-brasil/appv/initialize/variables_docker.yml
+- template: /tech_products/ecmc/framework-brasil/appv/initialize/variables_gates.yml
+
+- ${{ if and(eq(parameters.gatesEnabled, False), not(in(variables['Build.SourceBranch'], 'refs/heads/master', 'refs/heads/main'))) }}:
+  - name: NODEJS_CMD_BUILD_TEST
+    value: echo "Skipping tests as it has already been done in merge validator or Gate is disabled."
+
+## -> Override global variables, with variables set in Library/Variable Groups (Pipelines)
+## -> Use this to change the variables on runtime
+- group: "${{ variables['Build.DefinitionName'] }}"
+
+- name: CORPORATE_WIKI_DOC_URL
+  value: "TBD"
+- name: gatesEnabled
+  value: "${{parameters.gatesEnabled}}"
+
+stages:
+
+## -> Initialize pipeline enviroment
+- template: /tech_products/ecmc/framework-brasil/appv/initialize/nodejs_environment.yml
+
+- ${{ if and(ne(parameters.deployOnly, True), eq(parameters.setProduction, False)) }}:
+## -> Build for CI - NodeJS
+  - template: /tech_products/appv_node/templates/ci/ci_build_nodejs_appv.yml
+    parameters:
+      setEnvironment: "${{ parameters.setEnvironment }}"
+      enviroment: ${{ parameters.setEnvironment }}
+      setProduction: "${{ parameters.setProduction }}"
+
+## -> initialize gates environment
+  # Execute Quality and Security gates when gatesEnabled=True OR always for master/main branches
+  - template: /tech_products/ecmc/framework-brasil/appv/initialize/gates_environment.yml
+  - ${{ if or(eq(variables['Build.SourceBranch'], 'refs/heads/master'), eq(variables['Build.SourceBranch'], 'refs/heads/main'), eq(variables['Build.Reason'], 'PullRequest')) }}:
+    - template: /tech_products/appv_node/templates/ci/ci_quality_gate_appv.yml
+      parameters:
+        breakOnQualityGateFailure: ${{ eq(variables['Build.Reason'], 'PullRequest') }}
+        isPullRequest: ${{ eq(variables['Build.Reason'], 'PullRequest') }}
+    - template: /tech_products/appv_node/templates/ci/ci_security_appv.yml
+      parameters:
+        fortifyExclusionRepository: FortifyExclusion
+        
+## -> Publish Build for CI - NodeJS
+  - template: /tech_products/appv_node/templates/ci/ci_publish_nodejs_appv.yml
+    parameters:
+      gatesEnabled: "${{parameters.gatesEnabled}}"
+  - ${{ if eq(parameters.notifyChangelog, True) }}:
+    - template: /tech_products/ecmc/framework-brasil/appv/templates/ci/ci_changelog_notification_appv.yml
+
+  - ${{ if ne(parameters.libOnly, True) }}:
+## -> Package for CI - NodeJS
+    - template: /tech_products/appv_node/templates/ci/ci_package_nodejs_appv.yml
+      parameters:
+        setEnvironment: "${{ parameters.setEnvironment }}"
+
+## -> Deploy for CD - NodeJS
+    - template: /tech_products/ecmc/framework-brasil/appv/initialize/deploy_environment.yml
+    - template: /tech_products/appv_node/templates/cd/cd_deploy_helm_nodejs.yml
+      parameters:
+        setEnvironment: "${{ parameters.setEnvironment }}"
+        namespace: "${{ parameters.setEnvironment }}"
+
+- ${{ if and(ne(parameters.deployOnly, False), eq(parameters.setProduction, False)) }}:
+  - template: /tech_products/ecmc/framework-brasil/appv/initialize/deploy_environment.yml
+  - template: /tech_products/appv_node/templates/cd/cd_deploy_only_helm_nodejs.yml
+    parameters:
+      setEnvironment: "${{ parameters.setEnvironment }}"
+      namespace: "${{ parameters.setEnvironment }}"
+      setVersion: "${{ parameters.setVersion }}"
+      setProduction: "${{ parameters.setProduction }}"
+      forceUpgrade: "${{ parameters.forceUpgrade }}"
+      setTimeout: "${{ parameters.setTimeout }}"
+
+- ${{ if and(ne(parameters.deployOnly, True), eq(parameters.setProduction, True)) }}:
+  - template: /tech_products/ecmc/framework-brasil/appv/initialize/deploy_environment_prod.yml
+  - template: /tech_products/appv_node/templates/cd/cd_deploy_only_prod_helm_nodejs.yml
+    parameters:
+      setEnvironment: "${{ parameters.setEnvironment }}"
+      namespace: "${{ parameters.setEnvironment }}"
+      setVersion: "${{ parameters.setVersion }}"
+      setProduction: "${{ parameters.setProduction }}"
+      forceUpgrade: "${{ parameters.forceUpgrade }}"
+      setTimeout: "${{ parameters.setTimeout }}"

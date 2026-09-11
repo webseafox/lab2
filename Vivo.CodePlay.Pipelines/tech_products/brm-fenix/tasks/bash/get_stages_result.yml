@@ -1,0 +1,64 @@
+# This YAML file defines a pipeline task that retrieves the stages result of a build in Azure DevOps.
+
+steps: 
+- task: PowerShell@2
+  name: get_stages_result
+  displayName: "Get Stages Result"
+  inputs:
+    targetType: 'inline'
+    script: |
+      # Initialize arrays to store job in progress and job completed information
+      $jobInProgress=@()
+      $jobCompleted=@()
+      
+      # Construct the URI to retrieve the build timeline
+      $uri = "$(System.CollectionUri)$(System.TeamProject)/_apis/build/builds/$(Build.BuildId)/timeline?api-version=6.0"
+        
+      # Create the basic authentication header using the system access token
+      $basicAuth = ("{0}:{1}" -f "", $env:SYSTEM_ACCESSTOKEN)
+      $basicAuth = [System.Text.Encoding]::UTF8.GetBytes($basicAuth)
+      $basicAuth = [System.Convert]::ToBase64String($basicAuth)
+      $headers = @{Authorization=("Basic {0}" -f $basicAuth)}
+      
+      # Invoke the REST API to retrieve the build timeline
+      $Response = Invoke-RestMethod -Uri "$uri" -headers $headers -Method 'get'
+
+      # Iterate through each record in the build timeline
+      $response.records | ForEach-Object {
+        if($_.type -eq "Stage"){ 
+          Write-Host "########## Stage: $($_.name) > $($_.state) > $($_.result)"
+
+          if($_.state -eq "inProgress"){ 
+            $inProId = $_.id
+            $inProName = $_.name
+
+            # Iterate through each record to find child records of the in-progress stage
+            $response.records | ForEach-Object {
+              if($_.parentId -eq $inProId){ 
+                Write-Host "**** $($_.name) [$($_.result)]"
+
+                # Append the job in progress information to the array
+                if($jobInProgress.count -gt 0){
+                  $jobInProgress+=";$inProName,$($_.name),$($_.result)"
+                } else {
+                  $jobInProgress+="$inProName,$($_.name),$($_.result)"
+                }
+              }
+            }
+          } elseif ($_.state -eq "completed"){
+            # Append the job completed information to the array
+            if($jobCompleted.count -gt 0){
+              $jobCompleted+=";$($_.name),$($_.state),$($_.result)"
+            } else {
+              $jobCompleted+="$($_.name),$($_.state),$($_.result)"
+            }
+          } 
+        }
+      }
+
+      # Set the pipeline variables to output the job completed and job in progress information
+      echo "##vso[task.setvariable variable=JOBS_COMPLETED_RESULT;isoutput=true]$jobCompleted"
+      echo "##vso[task.setvariable variable=JOBS_INPROGRESS_RESULT;isoutput=true]$jobInProgress"
+    pwsh: true
+  env:
+    SYSTEM_ACCESSTOKEN: $(System.AccessToken)

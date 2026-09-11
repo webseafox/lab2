@@ -1,0 +1,222 @@
+parameters:
+- name: environment
+  displayName: Escolha o ambiente para publicar
+  type: string
+  default: dev
+  values:
+  - dev
+  - preprod
+  - prod
+
+- name: vivonow_chg
+  displayName: Numero CHG do VivoNow, somente para 'prod'
+  default: CHG0000001
+
+# Parametro adicinado para reduzir o uso de VariableGroups
+# para baixar o SecretFile do kube.config a validacao ocorre em tempo de template.
+- name: sigla_bu
+  default: 'techarch'
+  displayName: Sigla BU 'techarch', 'mvpk', 'oss'...
+
+
+stages:
+- stage: deploy_kube
+  displayName: Deploy on (${{ parameters.environment }})
+  variables:
+  - name: System.debug
+    value: "true"
+
+  - name: DOCKER_TAG_SUFIX
+    ${{ if eq('${{ parameters.environment }}', 'prod') }}:
+      value: 'RELEASE'
+    ${{ else }}:
+      value: 'SNAPSHOT'
+  pool: 
+    name: DefaultDevopsAgents
+  jobs:
+  - deployment: deploy_on_kube
+    displayName: ${{ parameters.environment }}
+    # creates an environment if it doesn't exist
+    environment: 
+      name: 'deploy-${{ parameters.environment }}'
+    strategy:
+      runOnce:
+        deploy:
+          displayName: Deploy on (${{ parameters.environment }})
+          steps:
+          - checkout: self
+            fetchDepth: 1
+
+          - task: XmlParseFromVivo@4
+            displayName: Get Main Info
+            name: pom_info
+            inputs:
+              type: 'file'
+              origin: pom.xml
+              jpaths: |
+                var POM_XML_VERSION = .project.version._text
+                var POM_XML_ARTIFACT_ID = .project.artifactId._text
+                var POM_XML_GROUP_ID = .project.groupId._text
+          
+          - task: YamlParseFromVivo@4
+            displayName: Get Metadata Info
+            name: catalog_info
+            inputs:
+              type: 'file'
+              origin: catalog-info.yaml
+              jpaths: |-
+                var CATALOG_YAML_NAME = .metadata.name
+                var CATALOG_YAML_ACRONYM = .metadata.annotations['techarch.governance-app.acronym']
+                var CATALOG_YAML_SIGLA_BU = .metadata.annotations['techarch.governance-app.sigla_bu']
+                var CATALOG_YAML_RG = .metadata.annotations['techarch.governance-app.resource_group']
+                var CATALOG_YAML_MODULE = .metadata.annotations['techarch.governance-app.module']
+                var CATALOG_YAML_SONAR_PROJECT_KEY = .metadata.annotations['sonarqube.org/project-key']
+                var CATALOG_YAML_JAVA_LANGUAGE_VERSION = .metadata.annotations['arqtech.telefonica.com.br/language-version']
+                var CATALOG_YAML_K8S_NS = .metadata.annotations['vivo.io/kubernetes-k8s-namespace-${{ parameters.environment }}']
+          
+          - task: NunjucksInline@4
+            displayName: Bind Variables
+            inputs:
+              sourceType: 'text'
+              source: |
+                var HELM_REPO_PREFIX = {{ CATALOG_YAML_ACRONYM or 'devops'}}
+
+          - task: AzureKeyVault@2  
+            displayName: 'Getting AKV credentials'
+            timeoutInMinutes: 1
+            retryCountOnTaskFailure: 5  
+            inputs:    
+              azureSubscription: DevOpsSharedResources    
+              KeyVaultName: kv-azdevops-shared
+              SecretsFilter: >- 
+                DOCKER-REGISTRY-ACR-USERNAME, DOCKER-REGISTRY-ACR-PASSWORD,
+                HELM-REGISTRY-NEXUS-USERNAME, HELM-REGISTRY-NEXUS-PASSWORD,
+                HELM-REGISTRY-ACR-USERNAME, HELM-REGISTRY-ACR-PASSWORD,
+                NEXUS-DEPS-USR, NEXUS-DEPS-PSW
+
+          - task: DownloadSecureFile@1
+            name: kubeconfig
+            displayName: 'Download config from (${{parameters.environment}})'
+            inputs:
+              # secureFile: 'aks-${{parameters.sigla_bu}}-${{parameters.environment}}'
+              secureFile: 'kube-${{parameters.environment}}'
+          
+          - task: Bash@3
+            displayName: Helm repo add
+            continueOnError: false
+            inputs:
+              targetType: inline
+              script: >-
+                helm repo add
+                --force-update
+                $(HELM_REPO_PREFIX)-helm
+                https://nexus.telefonica.com.br/repository/devops-helm
+                --insecure-skip-tls-verify
+                --username $(HELM-REGISTRY-NEXUS-USERNAME)
+                --password $(HELM-REGISTRY-NEXUS-PASSWORD)
+                --kubeconfig $(kubeconfig.secureFilePath)
+
+          - task: Bash@3
+            displayName: Helm repo update
+            continueOnError: false
+            inputs:
+              targetType: inline
+              script: >-
+                helm repo update --kubeconfig $(kubeconfig.secureFilePath)
+
+          - task: Bash@3
+            displayName: Helm login
+            continueOnError: false
+            inputs:
+              targetType: inline
+              script: >-
+                helm registry login 
+                acrsharedservices01.azurecr.io
+                --username $(HELM-REGISTRY-ACR-USERNAME)
+                --password "$(HELM-REGISTRY-ACR-PASSWORD)"
+
+                
+          - task: Bash@3
+            displayName: 'Deploy on (${{ parameters.environment }})'
+            condition: succeeded()
+            inputs:
+              workingDirectory: $(Build.SourcesDirectory)
+              targetType: inline
+              script: >-
+                helm upgrade $(CATALOG_YAML_NAME)
+                oci://acrsharedservices01.azurecr.io/helm/devops/generic-java-microservice
+                --version "1.0.15"
+                -f "./.azuredevops/config/${{ parameters.environment }}/values.yml"
+                -f "./.azuredevops/config/${{ parameters.environment }}/environments_variables.yml"
+                -f "./.azuredevops/config/${{ parameters.environment }}/secrets.yaml"
+                --kubeconfig $(kubeconfig.secureFilePath)
+                --namespace "$(CATALOG_YAML_K8S_NS)"
+                --install 
+                --insecure-skip-tls-verify
+                --wait
+                --timeout 30s
+                --set "nameOverride=$(CATALOG_YAML_NAME)"
+                --set "fullnameOverride=$(CATALOG_YAML_NAME)"
+                --set "containerName=$(CATALOG_YAML_NAME)"
+                --set "image.repository=acrsharedservices01.azurecr.io/$(CATALOG_YAML_ACRONYM)/$(CATALOG_YAML_NAME)"
+                --set "image.tag=$(POM_XML_VERSION)-$(DOCKER_TAG_SUFIX)"
+                --set "imagePullSecrets[0].name=acr-$(CATALOG_YAML_ACRONYM)"
+                --output table
+                --history-max 2
+                --atomic
+                --debug
+
+        on:
+          success:
+            steps:
+            - checkout: self
+              fetchDepth: 1
+
+            - task: XmlParseFromVivo@4
+              displayName: Get Main Info
+              inputs:
+                type: 'file'
+                origin: pom.xml
+                jpaths: |
+                  var POM_XML_VERSION = .project.version._text
+
+            - task: YamlParseFromVivo@4
+              displayName: Get Metadata Info
+              inputs:
+                type: 'file'
+                origin: catalog-info.yaml
+                jpaths: |-
+                  var CATALOG_YAML_K8S_NS = .metadata.annotations['vivo.io/kubernetes-k8s-namespace-${{ parameters.environment }}']
+            # - task: Governance@0
+            #   continueOnError: False
+            #   displayName: Gov App
+            #   inputs:
+            #     breakglass: False
+            #     cluster: aks-shared
+            #     component: $(Build.DefinitionName)
+            #     deployment: $(Build.DefinitionName)
+            #     environment: ${{ parameters.environment }}
+            #     namespace: $(CATALOG_YAML_K8S_NS)
+            #     operation: deploy
+            #     serverEndpoint: governanceapi
+            #     version: $(POM_XML_VERSION)
+          failure:
+            steps:
+            - task: Bash@3
+              displayName: Run pos deploy failure
+              inputs:
+                targetType: inline
+                script: |
+                  RED='\033[0;31m'
+                  GREEN='\033[0;32m'
+                  BLUE='\033[0;34m'
+                  YELLOW='\033[1;33m'
+                  BG_GREEN='\033[42;1;37m'
+
+                  printf "
+                  ${GREEN}=================================================================================================================================
+                  ${GREEN}                                                       NOT IMPLEMENTED
+                  ${GREEN}=================================================================================================================================
+                  "
+
+

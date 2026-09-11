@@ -1,0 +1,133 @@
+parameters:
+- name: environment
+- name: helmReleaseNamePrefix
+- name: helmRepoName
+  default: $(HELM_REGISTRY_NEXUS_REPO_NAME)
+- name: helmOciChartBaseUrl
+  default: $(HELM_REGISTRY_ACR_CHART_BASE_URL)
+- name: helmChartName
+  default: $(DEFAULT_GENERIC_JAVA_CHART_NAME)
+- name: helmChartVersion
+  default: $(DEFAULT_GENERIC_JAVA_CHART_VERSION)
+- name: helmReleaseName
+  default: $(HELM_RELEASE_NAME)
+- name: helmReleaseNamespace
+  default: $(K8S_NAMESPACE)
+- name: helmTimeout
+  default: $(HELM_UPGRADE_TIMEOUT)
+- name: helmImageRepository
+  default: $(HELM_IMAGE_REPOSITORY)
+- name: helmImageTag
+  default: $(HELM_IMAGE_TAG)
+- name: helmImagePullSecret
+  default: $(HELM_IMAGE_PULL_SECRET)
+- name: helmHistoryMax
+  default: $(HELM_UPGRADE_HISTORY_MAX)
+- name: azureServiceConnectionEnabled
+  default: true
+- name: kubernetesServiceConnectionEnabled
+  default: false
+
+steps:
+- script: |
+    echo "##[debug] HELM_REGISTRY_ACR_ENABLED...: ${HELM_REGISTRY_ACR_ENABLED}"
+    echo "##[debug] HELM_CHART_NAME.............: ${HELM_CHART_NAME}"
+    echo "##[debug] HELM_CHART_VERSION..........: ${{ parameters.helmChartVersion }}"
+    echo "##[debug] HELM_RELEASE_NAME_PREFIX....: ${{ parameters.helmReleaseNamePrefix }}"
+    echo "##[debug] HELM_RELEASE_NAME...........: ${{ parameters.helmReleaseName }}"
+    echo "##[debug] HELM_RELEASE_NAMESPACE......: ${{ parameters.helmReleaseNamespace }}"
+    echo "##[debug] HELM_TIMEOUT................: ${{ parameters.helmTimeout }}"
+    echo "##[debug] HELM_IMAGE_REPOSITORY.......: ${{ parameters.helmImageRepository }}"
+    echo "##[debug] HELM_IMAGE_TAG..............: ${{ parameters.helmImageTag }}"
+    echo "##[debug] HELM_IMAGE_PULL_SECRET......: ${{ parameters.helmImagePullSecret }}"
+    echo "##[debug] HELM_HISTORY_MAX............: ${{ parameters.helmHistoryMax }}"
+    echo "##[debug] ENVIRONMENT.................: ${{ parameters.environment }}"
+
+    if [ "${HELM_REGISTRY_ACR_ENABLED}" == "true" ]; then
+      echo "##[debug] HELM_OCI_CHART_BASE_URL.....: ${HELM_OCI_CHART_BASE_URL}"
+      HELM_FULL_CHART_NAME="${HELM_OCI_CHART_BASE_URL}${HELM_CHART_NAME}"
+    else
+      echo "##[debug] HELM_REPO_NAME:.............: ${HELM_REPO_NAME}"
+      HELM_FULL_CHART_NAME="${HELM_REPO_NAME}/${HELM_CHART_NAME}"
+    fi
+
+    echo "##[debug] HELM_FULL_CHART_NAME........: ${HELM_FULL_CHART_NAME}"
+    echo "##vso[task.setvariable variable=HELM_FULL_CHART_NAME;]$HELM_FULL_CHART_NAME"
+
+    echo "##[debug] serviceConnectionDeploySuffix........: ${serviceConnectionDeploySuffix}"
+    echo "##[debug] azureServiceConnectionPrefix.........: ${azureServiceConnectionPrefix}"
+    echo "##[debug] azureResourceGroupPrefix.............. ${azureResourceGroupPrefix}"
+    echo "##[debug] azureKubernetesClusterPrefix.........: ${azureKubernetesClusterPrefix}"
+    echo "##[debug] kubernetesServiceConnectionPrefix....: ${kubernetesServiceConnectionPrefix}"
+  displayName: "Show Helm variables"
+  env:
+    HELM_REGISTRY_ACR_ENABLED: $(HELM_REGISTRY_ACR_ENABLED)
+    HELM_CHART_NAME: ${{ parameters.helmChartName }}
+    HELM_REPO_NAME: ${{ parameters.helmRepoName }}
+    HELM_OCI_CHART_BASE_URL: ${{ parameters.helmOciChartBaseUrl }}
+    serviceConnectionDeploySuffix: $(serviceConnectionDeploySuffix)
+    azureServiceConnectionPrefix: $(azureServiceConnectionPrefix)
+    azureResourceGroupPrefix: $(azureResourceGroupPrefix)
+    azureKubernetesClusterPrefix: $(azureKubernetesClusterPrefix)
+    kubernetesServiceConnectionPrefix: $(kubernetesServiceConnectionPrefix)
+
+- task: HelmDeploy@0
+  displayName: '[Nexus] Helm repo add'
+  condition: and( succeeded(), ne(variables['HELM_REGISTRY_ACR_ENABLED'], 'true') )
+  inputs:
+    ${{ if eq(parameters.azureServiceConnectionEnabled, true) }}:
+      azureSubscription: "$(azureServiceConnectionPrefix)-$(serviceConnectionDeploySuffix)"
+      azureResourceGroup: "$(azureResourceGroupPrefix)-$(serviceConnectionDeploySuffix)"
+      kubernetesCluster: "$(azureKubernetesClusterPrefix)-$(serviceConnectionDeploySuffix)"
+    ${{ elseif eq(parameters.kubernetesServiceConnectionEnabled, true) }}:
+      kubernetesServiceConnection: "$(kubernetesServiceConnectionPrefix)-$(serviceConnectionDeploySuffix)"
+    command: 'repo'
+    arguments: 'add $(HELM_REGISTRY_NEXUS_REPO_NAME) "$(HELM_REGISTRY_NEXUS_URL)/$(HELM_REGISTRY_NEXUS_REPO_NAME)" --force-update --insecure-skip-tls-verify --username $(HELM-REGISTRY-NEXUS-USERNAME) --password $(HELM-REGISTRY-NEXUS-PASSWORD)'
+
+- task: HelmDeploy@0
+  displayName: 'Helm Upgrade (Service Connection)'
+  inputs:
+    namespace: ${{ parameters.helmReleaseNamespace }}
+    command: upgrade
+    chartName: $(HELM_FULL_CHART_NAME)
+    chartVersion: ${{ parameters.helmChartVersion }}
+    releaseName: ${{ parameters.helmReleaseNamePrefix }}${{ parameters.helmReleaseName }}
+    overrideValues: |
+      nameOverride=${{ parameters.helmReleaseNamePrefix }}${{ parameters.helmReleaseName }}
+      fullnameOverride=${{ parameters.helmReleaseNamePrefix }}${{ parameters.helmReleaseName }}
+      containerName=${{ parameters.helmReleaseNamePrefix }}${{ parameters.helmReleaseName }}
+      image.repository=${{ parameters.helmImageRepository }}
+      image.tag=${{ parameters.helmImageTag }}
+      imagePullSecrets[0].name=${{ parameters.helmImagePullSecret }}
+    valueFile: .azuredevops/config/${{ parameters.environment }}/values.yml
+    arguments: '--install --wait --atomic --insecure-skip-tls-verify --timeout ${{ parameters.helmTimeout }} -f "$(Build.SourcesDirectory)/.azuredevops/config/${{ parameters.environment }}/environments_variables.yml" -f "$(Build.SourcesDirectory)/.azuredevops/config/${{ parameters.environment }}/secrets.yaml" --history-max ${{ parameters.helmHistoryMax }} --debug --output table'
+    ${{ if eq(parameters.azureServiceConnectionEnabled, true) }}:
+      azureSubscription: "$(azureServiceConnectionPrefix)-$(serviceConnectionDeploySuffix)"
+      azureResourceGroup: "$(azureResourceGroupPrefix)-$(serviceConnectionDeploySuffix)"
+      kubernetesCluster: "$(azureKubernetesClusterPrefix)-$(serviceConnectionDeploySuffix)"
+    ${{ elseif eq(parameters.kubernetesServiceConnectionEnabled, true) }}:
+      kubernetesServiceConnection: "$(kubernetesServiceConnectionPrefix)-$(serviceConnectionDeploySuffix)"
+  condition: succeeded()
+
+- task: Bash@3
+  displayName: 'Troubleshooting help'
+  condition: failed()
+  inputs:
+    targetType: 'inline'
+    script: |
+      echo "Analisando erro do Helm Upgrade..."
+          echo "Por favor, verifique se o erro se encaixa em um dos dois cenários"
+          echo ""
+          echo "❌ ERRO 1: Permissão negada ao tentar acessar o cluster Kubernetes."
+          echo ""
+          echo "💡 SUGESTÕES PARA CORRIGIR:"
+          echo "1. Certifique-se de que o usuário de serviço tem as permissões necessárias no AKS"
+          echo "2. Verifique a configuração da Service Connection usada no Azure DevOps. Certifique-se de que está conectando ao cluster corretamente."
+          echo ""
+          echo "❌ ERRO 2: Helm upgrade failed!"
+          echo ""
+          echo "💡 SUGESTÕES PARA CORRIGIR:"
+          echo "Verifique como está o status da release ${{ parameters.helmReleaseNamePrefix }}${{ parameters.helmReleaseName }}"
+          echo "contido no namespace ${{ parameters.helmReleaseNamespace }}"
+          echo "do kubernetes/AKS desta aplicação ou seu deployment"
+      exit 1

@@ -1,0 +1,115 @@
+
+variables:
+- name: System.debug
+  value: "true"
+
+stages:
+- stage: stage_build
+  displayName: 'Build'
+  # pool: VivoAzureCloudSharedAgents
+  pool: GeneralPurposeLinuxAgentsCI
+  jobs:
+  - job: job_build
+    displayName: 'Build, Unit Test and Pack'
+    variables:
+    - name: ASDF_JDK_11
+      value: "openjdk-11.0.2"
+    - name: SONARQUBE_PROJECT_NAME
+      value: "$(System.TeamProject)-$(Build.Repository.Name)"
+
+    steps:
+    - checkout: self
+      fetchDepth: 1
+      persistCredentials: true
+
+    # - task: DownloadBuildArtifacts@1
+    #   displayName: 'Download Artifact'
+    #   inputs:
+    #     buildType: 'current'
+    #     downloadPath: '$(System.ArtifactsDirectory)'
+    - task: DownloadBuildArtifacts@1
+      displayName: 'Download Artifact'
+      inputs:
+        # project: 'fe8feffb-bf5e-4598-8cc7-3b096fdd8b7f'
+        project: MIGR-Processum2
+        # pipeline: '24394'
+        pipeline: src.src-apuracao
+        buildVersionToDownload: 'specific'
+        buildId: '376048'
+        buildType: 'specific'
+        # itemPattern: |
+        #   bin/**/*.*ar
+        #   bin/**/pom.xml
+        downloadPath: '$(System.ArtifactsDirectory)'
+        cleanDestinationFolder: true
+
+    - task: XmlParseFromVivo@4
+      displayName: 'Get pom.xml info'
+      name: pom_info
+      inputs:
+        type: 'file'
+        origin: $(Build.SourcesDirectory)/pom.xml
+        jpaths: |
+          var POM_XML_VERSION = .project.version._text
+          var POM_XML_ARTIFACT_ID = .project.artifactId._text
+          var POM_XML_GROUP_ID = .project.groupId._text
+
+    - task: YamlParseFromVivo@4
+      displayName: 'Get Metadata Info'
+      name: catalog_info
+      inputs:
+        type: 'file'
+        origin: $(Build.SourcesDirectory)/catalog-info.yaml
+        jpaths: |
+          var CATALOG_YAML_ACRONYM = .metadata.annotations['techarch.governance-app.acronym']
+          var CATALOG_YAML_MODULE = .metadata.annotations['techarch.governance-app.module']
+          var CATALOG_YAML_SONAR_PROJECT_KEY = .metadata.annotations['sonarqube.org/project-key']
+          var CATALOG_YAML_JAVA_LANGUAGE_VERSION = .metadata.annotations['arqtech.telefonica.com.br/language-version']
+
+    - task: ListFilesAndFolders@4
+      displayName: 'Find "sonar.java.binaries"'
+      inputs:
+        scriptSource: 'text'
+        separator: ','
+        # script: |
+        #   var://BINARIES_DIRECTORIES = **/target/classes
+        script: |
+          var://BINARIES_DIRECTORIES = $(System.ArtifactsDirectory)/**/target/classes
+
+    - task: SonarQubePrepare@5
+      displayName: 'Config Sonar'
+      inputs:
+        SonarQube: VIVO_SONARQUBE
+        scannerMode: "CLI"
+        # configFile Não funciona no scannerMode Other, apenas CLI (https://learn.microsoft.com/pt-br/azure/devops/pipelines/tasks/reference/sonar-qube-prepare-v5?view=azure-pipelines)
+        configFile: $(Build.SourcesDirectory)/sonar-project.properties
+        extraProperties: |
+          sonar.scm.disabled=True
+          sonar.projectBaseDir=$(Build.SourcesDirectory)
+          sonar.projectKey=$(CATALOG_YAML_SONAR_PROJECT_KEY)
+          sonar.projectName=$(SONARQUBE_PROJECT_NAME)
+          sonar.projectVersion=$(new_version.NEW_VERSION)
+          sonar.analysis.repositoryName=$(Build.Repository.Name)
+          sonar.analysis.buildId=$(Build.BuildId)
+          sonar.analysis.repositoryId=$(Build.Repository.ID)
+          sonar.analysis.projectName=$(System.TeamProject)
+          sonar.analysis.projectId=$(System.TeamProjectId)
+          sonar.links.homepage=$(System.TeamFoundationCollectionUri)$(System.TeamProject)
+          sonar.links.ci=$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)&_a=summary
+          sonar.links.issue=$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_workitems
+          sonar.links.scm=$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_git/$(Build.Repository.Name)
+          sonar.scanner.metadataFilePath=$(Agent.TempDirectory)/sonar/$(Build.BuildId)/report-task.txt
+          sonar.qualitygate.wait=true
+          sonar.qualitygate.timeout=300
+          sonar.sources=.
+          sonar.inclusions=**/src/main/java/**/*
+          sonar.java.binaries=$(BINARIES_DIRECTORIES)
+
+    - script: asdf install java $(ASDF_JDK_11)
+      displayName: 'Ensure Sonarqube'
+
+    - task: SonarQubeAnalyze@5
+      displayName: 'Sonar Scan'
+      continueOnError: true
+      env:
+        ASDF_JAVA_VERSION: $(ASDF_JDK_11)

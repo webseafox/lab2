@@ -1,0 +1,172 @@
+###
+### ISTO NAO E UM TEMPLATE 
+###
+### E UM TESTE PARA DEPLOY NO WEBLOGIC
+###
+
+trigger:
+  branches:
+    exclude:
+      - '*'
+  paths:
+    exclude:
+      - '*'
+  
+parameters:  
+- name: deploymentName
+  displayName: Escolha o modulo para publicar no WebLogic
+  values:
+  - wizard
+  - admin
+
+- name: environment
+  displayName: Escolha a esteira de QA para para deploy
+  type: string
+  default: DEV
+  values:
+  - DEV
+  - ESTEIRA1
+  - ESTEIRA2
+  - PREPROD
+  - PRODLIKE
+  - PROD 
+
+#Incluir Variaveis da Library
+variables:
+  - group: GPS-NEXT.WeblogicCreds.${{ parameters.environment }}
+  - name: System.debug
+    value: "true"
+
+stages:
+- stage: deploy
+  displayName: Deploy
+  jobs:
+  - job: deploy_on_weblogic
+    displayName: Deploy on WebLogic
+    pool: DefaultDevOpsAgents
+    steps:
+    - task: XmlParseFromVivo@4
+      displayName: Get Main Info
+      name: pom_info
+      inputs:
+        sourceType: 'file'
+        source: pom.xml
+        queries: |
+          var POM_XML_VERSION = .project.version._text
+
+    - task: AzureKeyVault@2
+      inputs:
+        azureSubscription: 'DevOpsSharedResources'
+        KeyVaultName: 'kv-azdevops-shared'
+        SecretsFilter: 'NEXUS-DEPS-USR, NEXUS-DEPS-PSW'
+        RunAsPreJob: true  
+
+    - task: SSH@0
+      displayName: Check SSH connection
+      inputs:
+        sshEndpoint: 'WL_GPS-NEXT-${{parameters.environment}}'
+        runOptions: 'inline'
+        inline: 'ls -lha'
+        readyTimeout: '20000'
+
+    - script: >-
+        curl
+        -u $(NEXUS-DEPS-USR):$(NEXUS-DEPS-PSW) 
+        https://nexus.telefonica.com.br/repository/gps2-mvn/br/com/vivo/gps4/wizard-next-ear/$(POM_XML_VERSION)/wizard-next-ear-$(POM_XML_VERSION).ear
+        -o $(System.ArtifactsDirectory)/wizard-next-ear-$(POM_XML_VERSION).ear
+      condition: ${{ eq(parameters.deploymentName, 'wizard') }}
+      displayName: Download wizard
+
+    - task: CopyFilesOverSSH@0
+      condition: ${{ eq(parameters.deploymentName, 'wizard') }}
+      displayName: Transfering wizard-next-ear
+      inputs:
+        sshEndpoint: 'WL_GPS-NEXT-${{parameters.environment}}'
+        sourceFolder: $(System.ArtifactsDirectory)
+        contents: wizard-next-ear*.ear
+        targetFolder: '/opt/web/applications/'
+        readyTimeout: '20000'
+
+    - task: SSH@0
+      condition: ${{ eq(parameters.deploymentName, 'wizard') }}
+      displayName: Undeploy/Retiring wizard-next-ear
+      inputs:
+        sshEndpoint: 'WL_GPS-NEXT-${{parameters.environment}}'
+        runOptions: 'commands'
+        commands: >
+          /opt/web/wl/current/oracle_common/common/bin/wlst.sh
+          /opt/web/scripts/UndeployAppRetired.py
+          $(WEBLOGIC_USER)
+          $(WEBLOGIC_PASS)
+          $(WEBLOGIC_ADMIN_SERVER_URL)
+          wizard-next-ear
+        readyTimeout: '20000'
+
+    - task: SSH@0
+      condition: ${{ eq(parameters.deploymentName, 'wizard') }}
+      displayName: Update wizard-next-ear
+      inputs:
+        sshEndpoint: 'WL_GPS-NEXT-${{parameters.environment}}'
+        runOptions: 'commands'
+        commands: >
+          /opt/web/wl/current/oracle_common/common/bin/wlst.sh
+          /opt/web/scripts/HotDeployApp.py
+          $(WEBLOGIC_USER)
+          $(WEBLOGIC_PASS)
+          $(WEBLOGIC_ADMIN_SERVER_URL)
+          wizard-next-ear
+          /opt/web/applications/wizard-next-ear-$(POM_XML_VERSION).ear
+          WLS_GPSNEXT_PROD_CLUSTER
+        readyTimeout: '20000'
+
+
+    - script: >-
+        curl
+        -u $(NEXUS-DEPS-USR):$(NEXUS-DEPS-PSW) 
+        https://nexus.telefonica.com.br/repository/gps2-mvn/br/com/vivo/gps4/admin-next-ear/$(POM_XML_VERSION)/admin-next-ear-$(POM_XML_VERSION).ear
+        -o $(System.ArtifactsDirectory)/admin-next-ear-$(POM_XML_VERSION).ear
+      condition: ${{ eq(parameters.deploymentName, 'admin') }}
+      displayName: Download admin
+
+    - task: CopyFilesOverSSH@0
+      condition: ${{ eq(parameters.deploymentName, 'admin') }}
+      displayName: Transfering admin-next-ear
+      inputs:
+        sshEndpoint: 'WL_GPS-NEXT-${{parameters.environment}}'
+        sourceFolder: $(System.ArtifactsDirectory)
+        contents: admin-next-ear*.ear
+        targetFolder: '/opt/web/applications/'
+        readyTimeout: '20000'
+
+    - task: SSH@0
+      condition: ${{ eq(parameters.deploymentName, 'admin') }}
+      displayName: Undeploy/Retiring admin-next-ear
+      inputs:
+        sshEndpoint: 'WL_GPS-NEXT-${{parameters.environment}}'
+        runOptions: 'commands'
+        commands: >
+          /opt/web/wl/current/oracle_common/common/bin/wlst.sh
+          /opt/web/scripts/UndeployAppRetired.py
+          $(WEBLOGIC_USER)
+          $(WEBLOGIC_PASS)
+          $(WEBLOGIC_ADMIN_SERVER_URL)
+          admin-next-ear
+        readyTimeout: '20000'
+
+    - task: SSH@0
+      condition: ${{ eq(parameters.deploymentName, 'admin') }}
+      displayName: Update admin-next-ear
+      inputs:
+        sshEndpoint: 'WL_GPS-NEXT-${{parameters.environment}}'
+        runOptions: 'commands'
+        commands: >
+          /opt/web/wl/current/oracle_common/common/bin/wlst.sh
+          /opt/web/scripts/HotDeployApp.py
+          $(WEBLOGIC_USER)
+          $(WEBLOGIC_PASS)
+          $(WEBLOGIC_ADMIN_SERVER_URL)
+          admin-next-ear
+          /opt/web/applications/admin-next-ear-$(POM_XML_VERSION).ear
+          WLS_GPSNEXT_PROD_CLUSTER
+        readyTimeout: '20000'
+

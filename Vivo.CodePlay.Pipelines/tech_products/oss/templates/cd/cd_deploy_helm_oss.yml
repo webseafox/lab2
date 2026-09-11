@@ -1,0 +1,971 @@
+parameters:
+  - name: environment
+  - name: infrastructureType
+  - name: packageVersion
+    default: ''
+  - name: legacy
+    type: boolean
+    default: false
+  - name: pipelineType
+    displayName: 'Pipeline Type Reference'
+    type: string
+    default: ''
+  - name: deployStrategy
+    default: ''
+
+stages:
+  - stage: cd_deploy
+    displayName: "CD - Deploy ${{ parameters.environment }}"
+    pool:
+      name: $(AGENT_POOL_CD)
+
+    ${{ if or(eq(parameters.packageVersion, ''), eq(parameters.packageVersion, 'none')) }}:
+      dependsOn:
+      - environment_init
+      - ci_build
+      - ci_publish
+      - ci_package
+      - deploy_environment_init
+    ${{ else }}:
+      dependsOn:
+      - environment_init
+      - deploy_environment_init
+
+    ## -> Loads variables from other stages.
+    variables:
+
+      - name: DOCKER_REGISTRY_USERNAME
+        value: $[ stageDependencies.deploy_environment_init.environment.outputs['credentials.DOCKER_REGISTRY_USERNAME'] ]
+      - name: DOCKER_REGISTRY_PASSWORD
+        value: $[ stageDependencies.deploy_environment_init.environment.outputs['credentials.DOCKER_REGISTRY_PASSWORD'] ]
+
+      - ${{ if and(ne(parameters.packageVersion, ''), ne(parameters.packageVersion, 'none')) }}:
+        - name: DEPLOY_VERSION
+          value: ${{ parameters.packageVersion }}
+      - ${{ else }}:
+        - name: DEPLOY_VERSION
+          value: $[ stageDependencies.ci_build.build.outputs['new_version.NEW_VERSION'] ]
+
+      - template: /tech_products/oss/initialize/variables_catalog_info.yml
+
+    jobs:
+
+      - deployment: deploy
+        displayName: 'Deploy'
+        condition: and(
+          succeeded(),
+          or(
+          eq(variables['Build.SourceBranchName'],'master'),
+          eq(variables['Build.SourceBranchName'],'main'),
+          startsWith(variables['Build.SourceBranchName'],'hotfix'),
+          eq(variables['Build.SourceBranchName'],'prodlike'),
+          eq(variables['Build.SourceBranchName'],'preprod'),
+          eq(variables['Build.SourceBranchName'],'esteira1'),
+          eq(variables['Build.SourceBranchName'],'esteira2'),
+          eq(variables['Build.SourceBranchName'],'dev')))
+        environment:
+          name: deploy-${{ parameters.environment }}
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+
+                ## -> Skip Download
+                - download: none
+
+                ## -> Checkout the source code.
+                - checkout: self
+                  displayName: Checkout Source Code
+                  name: checkout_source_code
+                  clean: true
+                  path: sourcecode
+                  submodules: recursive
+
+                ## -> Clean the pipeline workspace and checkout the code for HELM CHART.
+                - checkout: OSSDevOpsHelm
+                  displayName: Clone Helm Chart
+                  name: clone_helm_chart
+                  path: helmchart
+                  clean: true
+                  submodules: true
+                  persistCredentials: true
+
+                ## -> Log in to kubernetes
+                - task: Kubernetes@1
+                  displayName: Kubernetes Cluster Login
+                  inputs:
+                    connectionType: 'Kubernetes Service Connection'
+                    kubernetesServiceEndpoint: 'kube-${{ parameters.infrastructureType }}-${{ parameters.environment }}'
+                    command: 'login'
+
+                ## -> Set HELM variables and K8S/AKS namespaces
+                - task: Bash@3
+                  displayName: 'Set variables for deploy'
+                  condition: succeeded()
+                  inputs:
+                    targetType: inline
+                    script: |
+
+                      selected_var=$(echo "K8S_NAMESPACE_${{ parameters.environment }}" |  tr 'a-z' 'A-Z')
+                      NAMESPACE=${!selected_var}
+
+                      if [ -z "$NAMESPACE" ] && [ ! -z "$(K8S_NAMESPACE)" ]; then
+                        NAMESPACE=$(K8S_NAMESPACE)
+                      fi
+
+                      echo "##[debug] NAMESPACE: $NAMESPACE"
+
+                      if [[ -z "$NAMESPACE" ]]; then
+                        echo "##[error] Unable to identify the deployment environment, contact the pipeline administrator."
+                        exit 1;
+                      fi
+
+                      echo "##vso[task.setvariable variable=NAMESPACE;]$NAMESPACE"
+
+                      echo "##[debug] Looking for istio.json file to enable istio merge task..."
+                      istioFile=$(find "$(Pipeline.Workspace)/sourcecode/.azuredevops/config/${{ parameters.environment }}" -maxdepth 1 -type f -name 'istio.json' | head -n1)
+
+                      ## -> Setting variable to control istio merge task
+                      if [ -n "$istioFile" ]; then
+                        echo "##[debug] istio.json file found. Istio merge task will be enabled."
+                        echo "##vso[task.setvariable variable=ISTIO_MERGE_ENABLED;]true"
+                        echo "##vso[task.setvariable variable=ISTIO_FILE;]$istioFile"
+                      else
+                        echo "##[debug] No istio.json file found. Istio merge task will be skipped."
+                        echo "##vso[task.setvariable variable=ISTIO_MERGE_ENABLED;]false"
+                      fi
+
+                      echo "##[debug] Looking for values.(yml,yaml) file..."
+                      valuesFile=$(find $(Pipeline.Workspace)/sourcecode/.azuredevops/config/${{ parameters.environment }} -name 'values*')
+
+                      if [ -z $valuesFile ] ; then
+                        echo "##[error] values.(yml,yaml) not found. Aborting..."
+                        exit 1;
+                      fi
+
+                      echo "##[debug] Found values file: $valuesFile"
+
+                      echo "##vso[task.setvariable variable=VALUES_FILE;]$valuesFile"
+
+                ## -> Create Helm Chart Package
+                - task: Bash@3
+                  displayName: 'Create helm chart package '
+                  name: helm_chart_package
+                  condition: succeeded()
+                  inputs:
+                    targetType: inline
+                    script: |
+
+                      echo "##[debug] Creating helm package..."
+                      helmChart=$(helm package $(Pipeline.Workspace)/helmchart)
+                      echo "##[debug] $helmChart"
+
+                      helmChartPackage=$(ls | grep -E "\.tgz$" | head -n 1)
+                      echo "##[debug] Helm chart package: $helmChartPackage"
+                      echo "##vso[task.setvariable variable=HELM_CHART_PACKAGE;]$helmChartPackage"
+
+                ## -> Check if namespace exists on K8S/AKS
+                - task: Bash@3
+                  displayName: 'Verify Namespace'
+                  condition: succeeded()
+                  inputs:
+                    targetType: inline
+                    script: |
+                      echo "##[debug]Check if namespace [$(NAMESPACE)] exists"
+
+                      NAMESPACES=$(kubectl get ns -o json --insecure-skip-tls-verify)
+
+                      echo "##[group] Namespaces in cluster"
+                      echo "##[debug] ${NAMESPACES}"
+                      echo "##[endgroup]"
+
+                      NS=$(echo $NAMESPACES | jq -c '.items[].metadata | select(.name=="$(NAMESPACE)")' | jq -r '.name')
+
+                      if [ "$NS" = "$(NAMESPACE)" ]; then
+                        echo "##[debug] Namespace [$(NAMESPACE)] OK."
+                      else
+                        echo "##[error] Namespace [$(NAMESPACE)] not found."
+                        exit 1;
+                      fi
+
+                ## -> Create docker registry secret if do not exists
+                - task: Bash@3
+                  displayName: 'Create docker registry secret '
+                  condition: and(
+                    succeeded(),
+                    eq('${{ parameters.legacy }}', 'false')
+                    )
+                  inputs:
+                    targetType: inline
+                    script: |
+
+                      dockerSecretName=$(echo $(DOCKER_SERVICE_CONNECTION) | tr A-Z a-z)
+
+
+                      echo "##[group] All secrets available"
+                      kubectl get secrets \
+                      -n $(NAMESPACE) \
+                      --insecure-skip-tls-verify
+
+                      if [ $? -gt 0 ]; then
+                        echo "##[endgroup]"
+                        echo "##[error] Error retriving secrets!"
+                        exit 1;
+                      else
+                        echo "##[endgroup]"
+                      fi
+
+                      echo "##[debug] Searching for $dockerSecretName in secrets..."
+                      kubectl get secrets $dockerSecretName \
+                        -n $(NAMESPACE) \
+                        --insecure-skip-tls-verify
+
+                      if [ $? -gt 0 ]; then
+                        echo "##[debug] Setup docker registry."
+
+                        kubectl create secret docker-registry $dockerSecretName \
+                          --docker-server=$(DOCKER_REGISTRY) \
+                          --docker-username=$(DOCKER_REGISTRY_USERNAME) \
+                          --docker-password=$(DOCKER_REGISTRY_PASSWORD) \
+                          --docker-email=$(DOCKER_REGISTRY_EMAIL) \
+                          -n $(NAMESPACE) \
+                          --insecure-skip-tls-verify
+
+                        if [ $? -gt 0 ]; then
+                          echo "##[error] Error create docker registry $dockerSecretName"
+                          exit 1;
+                        else
+                          echo "##[debug] Docker registry $dockerSecretName configured success!"
+                        fi
+                      else
+                        echo "##[debug] Registry $dockerSecretName exists!"
+                      fi
+
+                      echo "##vso[task.setvariable variable=IMAGE_REPOSITORY_SECRET_NAME;]$dockerSecretName"
+
+                - task: Bash@3
+                  displayName: 'Merge Istio and Values files'
+                  condition: and(
+                    succeeded(),
+                    eq(variables['ISTIO_MERGE_ENABLED'], 'true')
+                    )
+                  inputs:
+                    targetType: inline
+                    script: |
+                      istioFile="$(ISTIO_FILE)"
+                      valuesFile="$(VALUES_FILE)"
+
+                      echo "##[group]Contents of istio.json"
+                      cat "$istioFile"
+                      echo "##[endgroup]"
+
+                      echo "##[debug] Quick YAML syntax validation using yq for $valuesFile"
+                      echo "##[debug] Validating YAML syntax using library variable DOCKER_CMD_YQ_VALIDATE_VALUES_FILE"
+
+                      VALUES_FILE="$valuesFile" eval "${DOCKER_CMD_YQ_VALIDATE_VALUES_FILE}" 2>/dev/null
+
+                      if [ $? -ne 0 ]; then
+                        echo "##[error] Invalid YAML syntax in $valuesFile"
+                        exit 1
+                      fi
+
+                      echo "##[group]Contents of values file before istio merge"
+                      cat $valuesFile
+                      echo "##[endgroup]"
+
+                      YQ_IMAGE="${YQ_IMAGE}"
+                      ISTIO_FILE="$istioFile"
+                      VALUES_FILE="$valuesFile"
+                      ISTIO_YML="$(pwd)/istio.yml"
+
+                      echo "##[debug] Converting istio.json -> istio.yml using variable DOCKER_CMD_YQ_CONVERT_ISTIO_JSON"
+                      eval "ISTIO_FILE=\"$ISTIO_FILE\" YQ_IMAGE=\"$YQ_IMAGE\" ${DOCKER_CMD_YQ_CONVERT_ISTIO_JSON}"
+
+                      if [ $? -ne 0 ] || [ ! -s istio.yml ]; then
+                        echo "##[error] Conversion failed or istio.yml empty. Aborting merge."
+                        exit 1
+                      fi
+
+                      echo "##[debug] Merging values.yml + istio.yml using variable DOCKER_CMD_YQ_MERGE_VALUES_ISTIO"
+                      eval "VALUES_FILE=\"$VALUES_FILE\" ISTIO_YML=\"$ISTIO_YML\" YQ_IMAGE=\"$YQ_IMAGE\" ${DOCKER_CMD_YQ_MERGE_VALUES_ISTIO}"
+
+                      if [ $? -ne 0 ] || [ ! -s temp.yml ]; then
+                        echo "##[error] Merge failed or temp.yml empty. Aborting."
+                        exit 1
+                      fi
+
+                      echo "##[debug] Backing up original values.yml to values.yml.bak"
+                      cp "$valuesFile" "${valuesFile}.bak"
+                      mv temp.yml "$valuesFile"
+
+                      echo "##[debug] Normalizing whitespace (trimming trailing spaces and extra blank lines)"
+                      # Remove trailing spaces
+                      sed -i 's/[[:space:]]*$//' "$valuesFile"
+
+                      ## -> Collapse multiple blank lines into a single blank line
+                      awk 'NF{blank=0} !NF{blank++; if(blank>1) next} {print}' "$valuesFile" > values.norm && mv values.norm "$valuesFile"
+
+                      ## -> Ensure file ends with single newline
+                      printf '\n' >> "$valuesFile"
+
+                      echo "##[debug] Validating merged YAML"
+                      echo "##[debug] valuesFile absolute path: $valuesFile"
+
+                      if [ -d "$valuesFile" ]; then
+                        echo "##[error] Path '$valuesFile' is a directory, expected values file. Aborting."
+                        mv "${valuesFile}.bak" "$valuesFile" 2>/dev/null || true
+                        exit 1
+                      fi
+
+                      echo "##[debug] Final merged YAML validation using DOCKER_CMD_YQ_VALIDATE_VALUES_FILE"
+                      VALUES_FILE="$valuesFile" eval "${DOCKER_CMD_YQ_VALIDATE_VALUES_FILE}" 2>/dev/null
+
+                      if [ $? -ne 0 ]; then
+                        echo "##[error] Merged file invalid YAML. Restoring backup."
+                        mv "${valuesFile}.bak" "$valuesFile" 2>/dev/null || true
+                        exit 1
+                      fi
+
+                      echo "##[group]Content of values.yml after istio merge"
+                      cat "$valuesFile" | $YQ_DOCKER eval '.' -P
+                      echo "##[endgroup]"
+
+                      echo "##[debug] Istio merge and validation completed successfully."
+
+                ## -> Install application on K8S/AKS with Helm - Legacy
+                - task: Bash@3
+                  displayName: "Deploy through helm - LEGACY"
+                  condition: and(
+                    succeeded(),
+                    eq('${{ parameters.legacy }}', 'true')
+                    )
+                  inputs:
+                    targetType: inline
+                    script: |
+
+                      ## -> Function to collect Kubernetes events and filter by creation time
+                      collect_events() {
+                        echo "##[debug] Collecting Kubernetes events of the deployment"
+
+                        kubectl get events --namespace $NAMESPACE --watch-only | \
+                        while IFS= read -r line; do echo "$(date '+%H:%M:%S.%3N') $line"; done \
+                        > collected_events.md
+                      }
+
+                      ## -> Function to collect pod log
+                      collect_pod_logs() {
+                        local containerName=$APP_NAME
+                        local sleepTimeout=2
+                        > collected_pod_logs.log
+
+                        ## -> Wait for the new pod with the deployed version to be scheduled
+                        sleep 10
+
+                        ## -> Polling until find the pod with the new deployed version
+                        while true; do
+
+                          echo "##[debug] Waiting for pod with image version $DEPLOY_VERSION to be scheduled..."
+
+                          runningPods=$(kubectl get pods --namespace $NAMESPACE \
+                            --selector=app.kubernetes.io/instance=$APP_NAME \
+                            --output=jsonpath="{range .items[*]}{.metadata.name}{'||'}{.spec.containers[?(@.name==\"${containerName}\")].image}{'\n'}{end}")
+
+                          upgradeNewPods=$(echo "$runningPods" | tr ' ' '\n' | grep "$APP_NAME:$DEPLOY_VERSION" | sed 's/||.*//')
+                          echo $upgradeNewPods > upgrade_new_pods.tmp
+                          upgradeNewPodsArray=($upgradeNewPods)
+
+                          if [ ${#upgradeNewPodsArray[@]} -gt 0 ]; then
+                            echo "##[debug] Found pod ${upgradeNewPodsArray[0]} with image version $DEPLOY_VERSION"
+                            break
+                          fi
+
+                          sleep $sleepTimeout
+                        done
+
+                        ## -> Loop to collect logs from the new pod
+                        while true; do
+                          podName=${upgradeNewPodsArray[0]}
+                          maxAttempts=10
+
+                          ## -> Check if pod still exists
+                          if ! kubectl get pod "$podName" --namespace $NAMESPACE > /dev/null 2>&1; then
+                            echo "##[debug] Pod $podName not found in namespace $NAMESPACE. Exiting log collection."
+                            break
+                          fi
+
+                          containerState=$(kubectl get pod "$podName" \
+                            --namespace $NAMESPACE \
+                            --output=jsonpath="{.status.containerStatuses[?(@.name==\"${containerName}\")].state}")
+
+                          ## -> Wait until the container is ready in the pod
+                          if ! echo "$containerState" | grep -q '"running"'; then
+                            sleep $sleepTimeout
+                            continue
+                          fi
+
+                          attempts=$((attempts + 1))
+
+                          local currentTime=$(date +%s)
+                          local elapsedDeployTime=$((currentTime - deployStartTime))
+
+                          echo "##[debug] Collecting logs of container $containerName in pod ${upgradeNewPodsArray[0]} attempt #$attempts"
+
+                          echo "━━━━━━━━━━━━━━━━━━━━━━━ Begin of Pod Logs Attempt #$attempts ━━━━━━━━━━━━━━━━━━━━━━━" >> collected_pod_logs.log
+
+                          kubectl logs "${upgradeNewPodsArray[0]}" \
+                            --namespace $NAMESPACE \
+                            --since ${elapsedDeployTime}s \
+                            --timestamps=true \
+                            --ignore-errors=true \
+                            --follow=true \
+                            --container=$containerName \
+                            >> collected_pod_logs.log 2>/dev/null
+
+                          echo "━━━━━━━━━━━━━━━━━━━━━━━ End of Logs Attempt #$attempts ━━━━━━━━━━━━━━━━━━━━━━━" >> collected_pod_logs.log
+                          echo "" >> collected_pod_logs.log
+
+                          if [ $attempts -ge $maxAttempts ]; then
+                            echo "##[debug] Reached maximum attempts ($maxAttempts) to collect pod logs. Exiting log collection."
+                            break
+                          fi
+
+                          sleep $sleepTimeout
+                        done
+                      }
+
+                      ## -> function to print the collected k8s events and pod logs
+                      print_collected_data() {
+                        echo -e "\n\033[1;35m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m"
+                        echo -e "\033[1;33m👇 CHECK POD LOGS AND EVENTS BELOW! Expand the sections to view collected data 👇\033[0m"
+
+                        echo "##[group]Collected Deployment Events:"
+                        echo "TIME         LAST SEEN   TYPE     REASON                     OBJECT                                                          MESSAGE"
+                        if [ -s collected_events.md ]; then
+                          cat collected_events.md | grep $APP_NAME
+                        fi
+                        echo "##[endgroup]"
+
+                        upgradeNewPodsArray=($(cat upgrade_new_pods.tmp 2>/dev/null))
+
+                        echo "##[group]Collected Pod ${upgradeNewPodsArray[0]} Logs:"
+                        if [ -s collected_pod_logs.log ]; then
+                          cat collected_pod_logs.log
+                        else
+                          echo "##[warning] No Logs found for deployment $(APP_NAME) in namespace $(NAMESPACE)"
+                          echo "##[warning] This USUALLY indicates that no pods were created during the helm upgrade"
+                          echo "##[warning] Possible causes:"
+                          echo "##[warning]   - There was already a pod running with the same version deployed"
+                          echo "##[warning]   - Pod restarts"
+                          echo "##[warning]   - Image pull failures (check ImagePullBackOff events)"
+                          echo "##[warning]   - Resource quota exceeded ( like CPU/Memory limits )"
+                          echo "##[warning]   - Invalid values specification"
+                        fi
+                        echo "##[endgroup]"
+                        echo -e "\n\033[1;35m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m"
+                      }
+
+                      ## -> Check if required environment variables are set
+                      if [ -z "$(IMAGE_REPOSITORY_LEGACY)" ] || [ -z "$(GLOBAL_IMAGE_REGISTRY_LEGACY)" ] || [ -z "$(APPLICATION_NAME_LEGACY)" ]; then
+                        echo "##[error] One or more required legacy variables are not set."
+                        echo "##[error] Set the following library variables:"
+                        echo "##[error] IMAGE_REPOSITORY_LEGACY with the value of image.repository from values file"
+                        echo "##[error] GLOBAL_IMAGE_REGISTRY_LEGACY with the value of global.imageRegistry from values file"
+                        echo "##[error] APPLICATION_NAME_LEGACY with the value of commons.application.name from values file"
+                        exit 1
+                      else
+                        echo "##[debug] Working with legacy values:"
+                        echo "##[debug] IMAGE_REPOSITORY_LEGACY: $(IMAGE_REPOSITORY_LEGACY)"
+                        echo "##[debug] GLOBAL_IMAGE_REGISTRY_LEGACY: $(GLOBAL_IMAGE_REGISTRY_LEGACY)"
+                        echo "##[debug] APPLICATION_NAME_LEGACY: $(APPLICATION_NAME_LEGACY)"
+                      fi
+
+                      echo "##[section] HELM upgrade ${APPLICATION_NAME_LEGACY} version $(DEPLOY_VERSION):"
+
+                      echo "##[debug] Using helm chart at $(HELM_CHART_PACKAGE)"
+
+                      echo "##[debug] Looking for legacy.(yml,yaml) file..."
+                      valuesFile=$(find "$(Pipeline.Workspace)/sourcecode/.azuredevops/config/${{ parameters.environment }}" -maxdepth 1 -type f \( -name 'legacy.yml' -o -name 'legacy.yaml' -o -name 'legacy*.yml' -o -name 'legacy*.yaml' \) | head -n1)
+
+                      if [ -z "$valuesFile" ] || [ ! -f "$valuesFile" ]; then
+                        echo "##[error] legacy.(yml,yaml) not found. Trying values.(yml,yaml)."
+
+                        echo "##[debug] Looking for values.(yml,yaml) file..."
+                        valuesFile=$(find "$(Pipeline.Workspace)/sourcecode/.azuredevops/config/${{ parameters.environment }}" -maxdepth 1 -type f \( -name 'values.yml' -o -name 'values.yaml' -o -name 'values*.yml' -o -name 'values*.yaml' \) | head -n1)
+                        if [ -z "$valuesFile" ] || [ ! -f "$valuesFile" ]; then
+                          echo "##[error] values.(yml,yaml) not found. Ensure the file exists and is correctly specified."
+                          exit 1;
+                        fi
+                        # Quick YAML syntax check (non-legacy)
+                        yqImage="vcr-docker.nexus.telefonica.com.br/ossd/oss-yq:d9968a3"
+                        echo "##[debug] Quick YAML syntax validation using yq for $valuesFile"
+                        echo "##[debug] Validating YAML syntax (non-legacy) using library variable DOCKER_CMD_YQ_VALIDATE_VALUES_FILE"
+                        VALUES_FILE="$valuesFile" eval "${DOCKER_CMD_YQ_VALIDATE_VALUES_FILE}" 2>/dev/null
+                        if [ $? -ne 0 ]; then
+                          echo "##[error] Invalid YAML syntax in $valuesFile"
+                          exit 1
+                        fi
+                      fi
+
+                      echo "##[warning] Values file will be update with LEGACY values..."
+
+                      echo "##[group] Values file before update"
+                      cat "$valuesFile"
+                      echo "##[endgroup]"
+
+                      sed -i 's|^\( *repository:\).*|\1 $(IMAGE_REPOSITORY_LEGACY)|' "$valuesFile"
+                      echo "##[debug] Updated image.repository value in $valuesFile"
+
+                      awk '/global:/ {print; getline; sub(/imageRegistry:.*/, "imageRegistry: $(GLOBAL_IMAGE_REGISTRY_LEGACY)")}1' "$valuesFile" > tmp && mv tmp "$valuesFile"
+                      echo "##[debug] Updated global.imageRegistry value in $valuesFile"
+
+                      awk '/application:/ {print; getline; sub(/name:.*/, "name: $(APPLICATION_NAME_LEGACY)")}1' "$valuesFile" > tmp && mv tmp "$valuesFile"
+                      echo "##[debug] Updated commons.application.name value in $valuesFile"
+
+                      echo "##[group] Values file after update"
+                      cat "$valuesFile"
+                      echo "##[endgroup]"
+
+                      ## -> Trap on exit to print the deploy events and pod log and kill background jobs
+                      trap '
+                        print_collected_data
+                        kill -9 $collectPodLogsPid > /dev/null 2>&1
+                        kill -9 $collectEventsPid > /dev/null 2>&1
+                      ' EXIT
+
+                      ## -> Record the deploy start time to calculate elapsed time for pod logs
+                      deployStartTime=$(date +%s)
+
+                      ## -> Run collect pod logs and events in background and save the PID to kill on exit
+                      collect_pod_logs &
+                      collectPodLogsPid=$!
+                      collect_events &
+                      collectEventsPid=$!
+
+                      echo "##vso[task.setvariable variable=VALUES_FILE;]$valuesFile"
+
+                      helm upgrade $(APPLICATION_NAME_LEGACY) \
+                        $(HELM_CHART_PACKAGE) \
+                        -f $valuesFile \
+                        --namespace $(NAMESPACE) \
+                        --install \
+                        --insecure-skip-tls-verify \
+                        --wait \
+                        --timeout $(HELM_UPGRADE_TIMEOUT) \
+                        --set "image.repository=$(IMAGE_REPOSITORY_LEGACY)" \
+                        --set "image.tag=$(DEPLOY_VERSION)" \
+                        --set "imagePullSecrets[0].name=nexus" \
+                        --output table \
+                        --history-max $(HELM_UPGRADE_HISTORY_MAX) \
+                        --atomic \
+                        --debug
+
+                ## -> Install application on K8S/AKS with Helm
+                - task: Bash@3
+                  displayName: "Deploy through helm"
+                  condition: and(
+                    succeeded(),
+                    eq('${{ parameters.legacy }}', 'false')
+                    )
+                  inputs:
+                    targetType: inline
+                    script: |
+
+                      ## -> Function to collect Kubernetes events and filter by creation time
+                      collect_events() {
+                        echo "##[debug] Collecting Kubernetes events of the deployment"
+
+                        kubectl get events --namespace $NAMESPACE --watch-only | \
+                        while IFS= read -r line; do echo "$(date '+%H:%M:%S.%3N') $line"; done \
+                        > collected_events.md
+                      }
+
+                      ## -> Function to collect pod log
+                      collect_pod_logs() {
+                        local containerName=$APP_NAME
+                        local sleepTimeout=2
+                        > collected_pod_logs.log
+
+                        ## -> Wait for the new pod with the deployed version to be scheduled
+                        sleep 10
+
+                        ## -> Polling until find the pod with the new deployed version
+                        while true; do
+
+                          echo "##[debug] Waiting for pod with image version $DEPLOY_VERSION to be scheduled..."
+
+                          runningPods=$(kubectl get pods --namespace $NAMESPACE \
+                            --selector=app.kubernetes.io/instance=$APP_NAME \
+                            --output=jsonpath="{range .items[*]}{.metadata.name}{'||'}{.spec.containers[?(@.name==\"${containerName}\")].image}{'\n'}{end}")
+
+                          upgradeNewPods=$(echo "$runningPods" | tr ' ' '\n' | grep "$APP_NAME:$DEPLOY_VERSION" | sed 's/||.*//')
+                          echo $upgradeNewPods > upgrade_new_pods.tmp
+                          upgradeNewPodsArray=($upgradeNewPods)
+
+                          if [ ${#upgradeNewPodsArray[@]} -gt 0 ]; then
+                            echo "##[debug] Found pod ${upgradeNewPodsArray[0]} with image version $DEPLOY_VERSION"
+                            break
+                          fi
+
+                          sleep $sleepTimeout
+                        done
+
+                        ## -> Loop to collect logs from the new pod
+                        while true; do
+                          podName=${upgradeNewPodsArray[0]}
+                          maxAttempts=10
+
+                          ## -> Check if pod still exists
+                          if ! kubectl get pod "$podName" --namespace $NAMESPACE > /dev/null 2>&1; then
+                            echo "##[debug] Pod $podName not found in namespace $NAMESPACE. Exiting log collection."
+                            break
+                          fi
+
+                          containerState=$(kubectl get pod "$podName" \
+                            --namespace $NAMESPACE \
+                            --output=jsonpath="{.status.containerStatuses[?(@.name==\"${containerName}\")].state}")
+
+                          ## -> Wait until the container is ready in the pod
+                          if ! echo "$containerState" | grep -q '"running"'; then
+                            sleep $sleepTimeout
+                            continue
+                          fi
+
+                          attempts=$((attempts + 1))
+
+                          local currentTime=$(date +%s)
+                          local elapsedDeployTime=$((currentTime - deployStartTime))
+
+                          echo "##[debug] Collecting logs of container $containerName in pod ${upgradeNewPodsArray[0]} attempt #$attempts"
+
+                          echo "━━━━━━━━━━━━━━━━━━━━━━━ Begin of Pod Logs Attempt #$attempts ━━━━━━━━━━━━━━━━━━━━━━━" >> collected_pod_logs.log
+
+                          kubectl logs "${upgradeNewPodsArray[0]}" \
+                            --namespace $NAMESPACE \
+                            --since ${elapsedDeployTime}s \
+                            --timestamps=true \
+                            --ignore-errors=true \
+                            --follow=true \
+                            --container=$containerName \
+                            >> collected_pod_logs.log 2>/dev/null
+
+                          echo "━━━━━━━━━━━━━━━━━━━━━━━ End of Logs Attempt #$attempts ━━━━━━━━━━━━━━━━━━━━━━━" >> collected_pod_logs.log
+                          echo "" >> collected_pod_logs.log
+
+                          if [ $attempts -ge $maxAttempts ]; then
+                            echo "##[debug] Reached maximum attempts ($maxAttempts) to collect pod logs. Exiting log collection."
+                            break
+                          fi
+
+                          sleep $sleepTimeout
+                        done
+                      }
+
+                      ## -> function to print the collected events and pod logs
+                      print_collected_data() {
+                        echo -e "\n\033[1;35m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m"
+                        echo -e "\033[1;33m👇 CHECK POD LOGS AND EVENTS BELOW! Expand the sections to view collected data 👇\033[0m"
+
+                        echo "##[group]Collected Deployment Events:"
+                        echo "TIME         LAST SEEN   TYPE     REASON                     OBJECT                                                          MESSAGE"
+                        if [ -s collected_events.md ]; then
+                          cat collected_events.md | grep $APP_NAME
+                        fi
+                        echo "##[endgroup]"
+
+                        upgradeNewPodsArray=($(cat upgrade_new_pods.tmp 2>/dev/null))
+
+                        echo "##[group]Collected Pod ${upgradeNewPodsArray[0]} Logs:"
+                        if [ -s collected_pod_logs.log ]; then
+                          cat collected_pod_logs.log
+                        else
+                          echo "##[warning] No Logs found for deployment $(APP_NAME) in namespace $(NAMESPACE)"
+                          echo "##[warning] This USUALLY indicates that no pods were created during the helm upgrade"
+                          echo "##[warning] Possible causes:"
+                          echo "##[warning]   - There was already a pod running with the same version deployed"
+                          echo "##[warning]   - Pod restarts"
+                          echo "##[warning]   - Image pull failures (check ImagePullBackOff events)"
+                          echo "##[warning]   - Resource quota exceeded ( like CPU/Memory limits )"
+                          echo "##[warning]   - Invalid values specification"
+                        fi
+                        echo "##[endgroup]"
+                        echo -e "\n\033[1;35m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m"
+                      }
+
+                      echo "##[section] HELM upgrade ${APP_NAME} version $(DEPLOY_VERSION):"
+
+                      echo "##[debug] Using helm chart at $(HELM_CHART_PACKAGE)"
+
+                      echo "##[debug] Looking for values.(yml,yaml) file..."
+                      valuesFile=$(find "$(Pipeline.Workspace)/sourcecode/.azuredevops/config/${{ parameters.environment }}" -maxdepth 1 -type f \( -name 'values.yml' -o -name 'values.yaml' -o -name 'values*.yml' -o -name 'values*.yaml' \) | head -n1)
+                      echo "##[debug] Using values file: $valuesFile"
+
+                      if [ -z "$valuesFile" ] || [ ! -f "$valuesFile" ]; then
+                        echo "##[error] values.(yml,yaml) not found. Ensure the file exists and is correctly specified."
+                        exit 1;
+                      fi
+
+                      echo "##[group]Contents of values file"
+                      cat $valuesFile
+                      echo "##[endgroup]"
+
+                      trap '
+                        print_collected_data
+                        kill -9 $collectPodLogsPid > /dev/null 2>&1
+                        kill -9 $collectEventsPid > /dev/null 2>&1
+                      ' EXIT
+
+                      ## -> Record the deploy start time to calculate elapsed time for pod logs
+                      deployStartTime=$(date +%s)
+
+                      ## -> Run collect pod logs and events in background and save the PID to kill on exit
+                      collect_pod_logs &
+                      collectPodLogsPid=$!
+                      collect_events &
+                      collectEventsPid=$!
+
+                      ## -> Helm Upgrade
+                      helm upgrade $(APP_NAME) \
+                        $(HELM_CHART_PACKAGE) \
+                        -f $valuesFile \
+                        --namespace $(NAMESPACE) \
+                        --install \
+                        --insecure-skip-tls-verify \
+                        --wait \
+                        --timeout $(HELM_UPGRADE_TIMEOUT) \
+                        --set "image.repository=${GOV_APP_ACRONYM}/${APP_NAME}" \
+                        --set "image.tag=$(DEPLOY_VERSION)" \
+                        --set "imagePullSecrets[0].name=$(IMAGE_REPOSITORY_SECRET_NAME)" \
+                        --output table \
+                        --history-max $(HELM_UPGRADE_HISTORY_MAX) \
+                        --atomic \
+                        --debug
+
+
+                  ## -> Check if Health Check URL has been exposed
+                - task: Bash@3
+                  displayName: 'Validate Health Check URL'
+                  condition: succeeded()
+                  continueOnError: true
+                  inputs:
+                    targetType: inline
+                    script: |
+
+                      valuesFilePath="$(VALUES_FILE)"
+                      YQ_IMAGE="${YQ_IMAGE}"
+
+                      echo "##[debug] Using valuesFile: $valuesFilePath"
+                      echo "##[debug] Using YQ_IMAGE: $YQ_IMAGE"
+
+                      ## -> Check if valuesFile exists
+                      if [ ! -f "$valuesFilePath" ]; then
+                        echo "##vso[task.logissue type=error] valuesFile not found: $valuesFilePath"
+                        echo "##vso[task.complete result=Failed;]"
+                        exit 1
+                      fi
+
+                      ## -> Check if virtualService exists in the Helm template
+                      if helm template $(APP_NAME) $(HELM_CHART_PACKAGE) -f "$valuesFilePath" | grep -i -E -q "kind: *[vV]irtualService"; then
+                        echo "##[debug] virtualService is active in the Helm template. Continuing the task."
+                      else
+                        echo "##[debug] virtualService is not active in the Helm template. Skipping the task."
+                        echo "##vso[task.setvariable variable=K8S_APP_URL;]N/A"
+                        exit 0
+                      fi
+
+                      echo "##[debug] Extracting values using yq..."
+
+                      ## -> Get directory and filename
+                      valuesDir=$(dirname "$valuesFilePath")
+                      valuesFile=$(basename "$valuesFilePath")
+
+                      echo "##[debug] Values directory: $valuesDir"
+                      echo "##[debug] Values filename: $valuesFile"
+
+                      ## -> Extract livenessProbe path
+                      livenessPath=$(docker run --rm -v "$valuesDir":/workdir $YQ_IMAGE eval '.deployment.containers.livenessProbe.httpGet.path // ""' /workdir/$valuesFile 2>/dev/null | tr -d '\n\r' | sed 's|^/||;s|/$||')
+
+                      ## -> Extract readinessProbe path
+                      readinessPath=$(docker run --rm -v "$valuesDir":/workdir $YQ_IMAGE eval '.deployment.containers.readinessProbe.httpGet.path // ""' /workdir/$valuesFile 2>/dev/null | tr -d '\n\r' | sed 's|^/||;s|/$||')
+
+                      ## -> Extract virtualService host
+                      hostValue=$(docker run --rm -v "$valuesDir":/workdir $YQ_IMAGE eval '.virtualService.host // ""' /workdir/$valuesFile 2>/dev/null | tr -d '\n\r')
+
+                      ## -> Output extracted values
+                      echo "##[debug] Liveness Probe Path: '$livenessPath'"
+                      echo "##[debug] Readiness Probe Path: '$readinessPath'"
+                      echo "##[debug] Virtual Service Host: '$hostValue'"
+
+                      ## -> Validate host was extracted
+                      if [ -z "$hostValue" ]; then
+                        echo "##vso[task.logissue type=error] VALIDATION FAILED: virtualService.host is empty or not found"
+                        echo "##[error] Please verify the values.yml structure at path: virtualService.host"
+                        echo "##vso[task.complete result=Failed;]"
+                        exit 1
+                      fi
+
+                      ## -> Check if at least one probe path exists
+                      if [ -z "$livenessPath" ] && [ -z "$readinessPath" ]; then
+                        echo "##vso[task.logissue type=error] VALIDATION FAILED: Both probe paths are empty"
+                        echo "##[error] Please verify paths in values.yml:"
+                        echo "##[error]   - deployment.containers.livenessProbe.httpGet.path"
+                        echo "##[error]   - deployment.containers.readinessProbe.httpGet.path"
+                        echo "##vso[task.complete result=Failed;]"
+                        exit 1
+                      fi
+
+                      ## -> Select path to use
+                      if [ -n "$livenessPath" ]; then
+                        pathToUse="$livenessPath"
+                        echo "##[debug] Using livenessProbe path"
+                      else
+                        pathToUse="$readinessPath"
+                        echo "##[debug] Using readinessProbe path"
+                      fi
+
+                      ## -> Construct health check URL
+                      healthCheckUrl="https://${hostValue}/${pathToUse}"
+
+                      echo "##vso[task.setvariable variable=K8S_APP_URL;]$healthCheckUrl"
+                      
+                      echo "##[section] Health Check URL: $healthCheckUrl"
+
+                      ## -> Validate URL format
+                      if ! [[ "$healthCheckUrl" =~ ^https?://[a-zA-Z0-9.-]+/.+ ]]; then
+                        echo "##vso[task.logissue type=error] VALIDATION FAILED: Malformed URL: $healthCheckUrl"
+                        echo "##vso[task.complete result=Failed;]"
+                        exit 1
+                      fi
+
+                      echo "##[section] Performing health check..."
+                      
+                      MAX_RETRIES=5
+                      RETRY_DELAY=10
+                      
+                      for attempt in $(seq 1 $MAX_RETRIES); do
+                        echo "##[debug] Attempt $attempt of $MAX_RETRIES..."
+                        
+                        statusCode=$(curl -k --connect-timeout 10 --max-time 30 --write-out "%{http_code}" --silent --output /dev/null "$healthCheckUrl" 2>/dev/null || echo "")
+                        
+                        ## -> Validate statusCode
+                        if [ -z "$statusCode" ]; then
+                          echo "##[warning] Attempt $attempt: Failed to retrieve HTTP status code (curl error)"
+                        elif ! [[ "$statusCode" =~ ^[0-9]+$ ]]; then
+                          echo "##[warning] Attempt $attempt: Invalid status code received: '$statusCode'"
+                        elif [ "$statusCode" -eq 200 ]; then
+                          echo "##[section] HTTP status code: $statusCode"
+                          
+                          responseBody=$(curl -k --connect-timeout 10 --max-time 30 --silent "$healthCheckUrl" 2>/dev/null)
+                          
+                          echo "##[debug] Checking URL content body..."
+                          echo "##[group] Response body"
+                          echo "$responseBody"
+                          echo "##[endgroup]"
+
+                          echo "##[section] Health Check URL is healthy!"
+                          echo "##vso[task.complete result=Succeeded;]"
+                          exit 0
+                        else
+                          echo "##[warning] Attempt $attempt: HTTP $statusCode (expected 200)"
+                        fi
+                        
+                        ## -> Wait before retry (except on last attempt)
+                        if [ $attempt -lt $MAX_RETRIES ]; then
+                          echo "##[debug] Waiting ${RETRY_DELAY}s before retry..."
+                          sleep $RETRY_DELAY
+                        fi
+                      done
+
+                      ## -> All retries failed
+                      echo "##vso[task.logissue type=error] HEALTH CHECK FAILED after $MAX_RETRIES attempts"
+                      echo "##[error] URL: $healthCheckUrl"
+                      echo "##[error] Last status code: ${statusCode:-N/A}"
+                      
+                      if [ -n "$statusCode" ] && [[ "$statusCode" =~ ^[0-9]+$ ]]; then
+                        responseBody=$(curl -k --connect-timeout 10 --max-time 30 --silent "$healthCheckUrl" 2>/dev/null || echo "Unable to retrieve response")
+                        echo "##[group] Response body (for debugging)"
+                        echo "$responseBody"
+                        echo "##[endgroup]"
+                      fi
+                      
+                      echo "##vso[task.complete result=Failed;]"
+                      exit 1
+
+                ## -> Register deploy in Event Hub
+                - task: VivoEventHubTools@3
+                  displayName: 'Register deploy in Event Hub'
+                  condition: always()
+                  continueOnError: true
+                  inputs:
+                    command: 'deploy'
+                    eventHubConnection: 'EVHCodeProd'
+                    componentVersion: '$(DEPLOY_VERSION)'
+                    ${{ if eq(parameters.legacy, true) }}:
+                      deployArtifactName: $(GLOBAL_IMAGE_REGISTRY_LEGACY)/$(IMAGE_REPOSITORY_LEGACY):$(DEPLOY_VERSION)
+                      annotations: 'helm-chart=$(HELM_CHART_PACKAGE),helm-release=$(APPLICATION_NAME_LEGACY)'
+                    ${{ if ne(parameters.legacy, true) }}:
+                      deployArtifactName: $(DOCKER_REGISTRY)/$(GOV_APP_ACRONYM)/$(APP_NAME):$(DEPLOY_VERSION)
+                      annotations: 'helm-chart=$(HELM_CHART_PACKAGE),helm-release=$(APP_NAME)'
+                    deployArtifactType: 'container'
+                    deployEnvironmentType: 'kubernetes'
+                    deployEnvironmentName: ${{ parameters.environment }}
+                    deployEnvironmentCluster: 'kube-${{ parameters.infrastructureType }}-${{ parameters.environment }}'
+                    deployEnvironmentNamespace: $(NAMESPACE)
+                    deployEnvironmentAccessUrl: $(K8S_APP_URL)
+                    pipelineType: ${{ parameters.pipelineType }}
+                    deployStrategy: ${{ parameters.deployStrategy }}
+
+                ## -> Logout of kubernetes
+                - task: Kubernetes@1
+                  displayName: Kubernetes Cluster Logout
+                  condition: always()
+                  continueOnError: true
+                  timeoutInMinutes: 1          
+                  inputs:
+                    command: 'logout'
+
+            on:
+              success:
+                steps:
+                  - task: Bash@3
+                    displayName: Publish Success
+                    name: t_success_message
+                    inputs:
+                      targetType: inline
+                      script: |
+                        echo "##[section] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                        echo "##[section]                                                      DEPLOY WAS SUCCESSFUL! "
+                        echo "##[section] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                        echo "##[section] Parabéns sua aplicação foi implantada com sucesso no ambiente de runtime."
+                        echo "##[section] Acesse a url da sua aplicação e valide  se sua nova versão foi entregue com sucesso."
+                        echo "##[section] "
+                        echo "##[section] $(ALERT_MESSAGE_ARROW) Sua aplicação foi implantada com sucesso no ambiente."
+                        echo "##[section] $(ALERT_MESSAGE_ARROW) Verifique com o responsável técnico como acessar acessar a sua aplicação."
+                        echo "##[section] $(ALERT_MESSAGE_ARROW) Caso não esteja conseguindo acessar a sua aplicação entre em contato com suporte."
+                        echo "##[section] "
+                        echo "##[section] Caso tenha dúvidas sobre essa fase do pipeline acesse a nossa documentação: $(CORPORATE_WIKI_DOC_URL)"
+                        echo "##[section] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+                        ## -> Set Pipeline Tag on success
+                        echo "##vso[build.addbuildtag]deploy-${{ parameters.environment }}=succeeded"
+              failure:
+                steps:
+                  - task: Bash@3
+                    displayName: Publish Failure
+                    name: t_failure_message
+                    inputs:
+                      targetType: inline
+                      script: |
+                        echo "##[error] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                        echo "##[error]                                                    DEPLOY WAS NOT SUCCESSFUL! "
+                        echo "##[error] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                        echo "##[error] Se está vendo essa mensagem é porque aconteceu algo erro durante a impplantação da sua apliação."
+                        echo "##[error] "
+                        echo "##[error] Segue abaixo umas dicas para o Troubleshooting:"
+                        echo "##[error] $(ALERT_MESSAGE_ARROW) Consulte o log do estágio de deploy da aplicação."
+                        echo "##[error] $(ALERT_MESSAGE_ARROW) Verifique com o responsável técnico como proceder em caso de falha de ambiente."
+                        echo "##[error] "
+                        echo "##[error] Caso tenha dúvidas sobre essa fase do pipeline acesse a nossa documentação: $(CORPORATE_WIKI_DOC_URL)"
+                        echo "##[error] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+                        ## -> Set Pipeline Tag on failure
+                        echo "##vso[build.addbuildtag]deploy-${{ parameters.environment }}=failed"

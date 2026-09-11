@@ -1,0 +1,63 @@
+stages:
+- stage: validation
+  displayName: "Build"
+  pool:
+    name: $(PRIVATE_AGENT_DEFAULT)
+  jobs:
+    - job: "start_build"
+      displayName: "Start build"
+      workspace:
+        clean: all
+      timeoutInMinutes: 120
+      pool:
+        name: $(PRIVATE_AGENT_DEFAULT)
+      steps:
+      - checkout: self
+        persistCredentials: true
+        fetchDepth: 1
+        displayName: "Checkout project"
+
+      # ==================================================================
+      # [Compliance] Verifica se o repositório está em conformidade com as políticas de configuração
+      # ==================================================================
+      - task: VivoDevOpsConfigCompliance@1
+        displayName: 'Check DevOps Config Compliance'
+        inputs:
+          policySets: |
+            image-definition-files
+
+      - bash: |
+          AGENT_UID=$(id -u $(whoami))
+          AGENT_GID=$(id -g $(whoami))
+          echo "UID do agente: $AGENT_UID"
+          echo "GID do agente: $AGENT_GID"
+          pwd
+          ls -la
+          NEW_VERSION=$(date +%d%m%y-%H%M%S)
+          echo "$NEW_VERSION" > $(Build.SourcesDirectory)/VERSION-TEMP.txt
+          pwd
+          rm -rf argocd
+          rm -rf src-lojaonline-vivo-hybris
+          echo "delete argo"
+          docker run --rm --entrypoint "/bin/sh" --network host -v $(pwd):/home/aztemp -w /home/aztemp devops-framework-docker.nexus.telefonica.com.br/vivohybris:latest -c "$(HYBRIS_INSTALL)"
+          docker build -t lojaonline-dkr-temp.nexus.telefonica.com.br/ecmc/lojaonline-vivo-hybris:$NEW_VERSION -f .azuredevops/runtime.Dockerfile .
+          docker login lojaonline-dkr-temp.nexus.telefonica.com.br -u="${DOCKER_USERNAME}" -p="${JKS_PASS}"
+          docker push lojaonline-dkr-temp.nexus.telefonica.com.br/ecmc/lojaonline-vivo-hybris:$NEW_VERSION
+        displayName: 'BUILD Vivo-Hybris'
+        env:
+          JKS_PASS: $(JKS_PASS)
+
+      - task: CopyFiles@2
+        displayName: "Copy VERSION file to Staging Directory"
+        inputs:
+          TargetFolder: "$(Build.ArtifactStagingDirectory)"
+          OverWrite: true
+          CleanTargetFolder: true
+          Contents: |
+            $(Build.SourcesDirectory)/VERSION-TEMP.txt
+
+      - task: PublishPipelineArtifact@1
+        displayName: "Publish VERSION-TEMP.txt"
+        inputs:
+          artifactName: "version-temp"
+          targetPath: "$(Build.ArtifactStagingDirectory)"

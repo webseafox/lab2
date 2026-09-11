@@ -1,0 +1,345 @@
+parameters:
+- name: envs
+  type: object
+  default: {}
+
+- name: agentPool
+  type: string
+  default: 'GeneralPurposeLinuxAgentsCI'
+
+# Mantido com este nome por compatibilidade com os pipelines chamadores.
+# Agora representa a versão do Node usada pelo UseNode@1.
+- name: nodeImage
+  type: string
+  default: '20.x'
+
+jobs:
+# ==========================================
+# JOB EXCLUSIVO DE BUILD & PUBLISH NODE.JS
+# ==========================================
+- job: build
+  displayName: Build & Publish Node.js
+
+  pool: ${{ parameters.agentPool }}
+
+  variables:
+    NPM_BUMP_VERSION: ${{ parameters.envs.NPM_BUMP_VERSION }}
+    RELEASE: ${{ parameters.envs.RELEASE }}
+    SKIP_STEPS: ${{ parameters.envs.SKIP_STEPS }}
+    CACHE_APP_DEPENDENCIES: ${{ parameters.envs.CACHE_APP_DEPENDENCIES }}
+
+    # Defaults para impedir que macros não resolvidas sejam enviadas ao Bash.
+    INSTALL_CMDS: ''
+    NPMRC_FILE: ''
+    GITCRYPT_KEY: ''
+    HAS_PACKAGE_LOCK: 'false'
+
+    PACKAGE_JSON: 'package.json'
+    APPLICATION: 'aura'
+    SPECIFIC_PATHS: '/hmlapi|/api-hml'
+    AKV_DEVOPS_NAME: 'kv-azdevops-shared'
+
+  workspace:
+    clean: all
+
+  steps:
+  - bash: |
+      set -euo pipefail
+
+      echo "##[section] Limpando lixo residual da pasta /tmp do agente..."
+      rm -rf /tmp/DedupManifestArtifactClient* || true
+      rm -rf /tmp/*.manifest || true
+    displayName: 'Fix Infra: Limpar /tmp'
+    continueOnError: true
+
+  - checkout: self
+    persistCredentials: true
+    fetchDepth: 0
+    clean: true
+
+  - task: DownloadSecureFile@1
+    name: npmrc_aura
+    inputs:
+      secureFile: 'npmrc_build'
+
+  - task: DownloadSecureFile@1
+    name: aura_git_crypt_key
+    inputs:
+      secureFile: 'aura-git-crypt.key'
+
+  - script: |
+      echo "##vso[task.setvariable variable=NPMRC_FILE]$(npmrc_aura.secureFilePath)"
+      echo "##vso[task.setvariable variable=GITCRYPT_KEY]$(aura_git_crypt_key.secureFilePath)"
+    displayName: 'Set Security Variables'
+
+  # ==========================================
+  # DESCRIPTOGRAFAR REPOSITÓRIO
+  # ==========================================
+  - bash: |
+      set -euo pipefail
+
+      cat << 'EOF' > azdo-script.sh
+      cp -f /tmp/aura-git-crypt.key /app/aura-git-crypt.key
+      cd /app
+      /usr/bin/git-crypt unlock /app/aura-git-crypt.key
+      rm -f /app/aura-git-crypt.key
+      EOF
+
+      chmod +x azdo-script.sh
+
+      docker run --rm \
+        -v "$(Build.SourcesDirectory):/app" \
+        -v "$GITCRYPT_KEY:/tmp/aura-git-crypt.key" \
+        --entrypoint=/bin/sh \
+        quay.io/picturepipe/git-crypt:0.7.0-1 \
+        /app/azdo-script.sh
+    displayName: 'Executar git-crypt no Docker'
+    env:
+      GITCRYPT_KEY: $(GITCRYPT_KEY)
+
+  # ==========================================
+  # INSTALAR NODE
+  # ==========================================
+  - task: UseNode@1
+    displayName: 'Instalar Node.js ${{ parameters.nodeImage }}'
+    inputs:
+      version: ${{ parameters.nodeImage }}
+
+  # ==========================================
+  # VALIDAR URLS DO AMBIENTE PROD
+  # ==========================================
+  - task: Bash@3
+    displayName: 'Evaluate Envs'
+    inputs:
+      targetType: 'inline'
+      script: |
+        set -euo pipefail
+
+        ENV_FILE='settings/PRO/.env'
+
+        if [[ ! -f "$ENV_FILE" ]]; then
+          echo "=> Arquivo $ENV_FILE não encontrado. Validação de URLs ignorada."
+          exit 0
+        fi
+
+        if grep -E 'https?://' "$ENV_FILE" | grep -Eq "$SPECIFIC_PATHS"; then
+          echo "##vso[task.logissue type=error]Error: Found PRE URL in PRO .env"
+          exit 1
+        fi
+
+        echo "=> Nenhuma URL de PRE encontrada no arquivo $ENV_FILE."
+    env:
+      SPECIFIC_PATHS: $(SPECIFIC_PATHS)
+
+  # ==========================================
+  # IDENTIFICAR OPTIONAL DEPENDENCIES
+  # ==========================================
+  - task: Bash@3
+    name: get_optional_deps
+    displayName: 'Get Optional Dependencies'
+    inputs:
+      targetType: 'inline'
+      script: |
+        set -euo pipefail
+
+        if [[ ! -f "$PACKAGE_JSON" ]]; then
+          echo "##vso[task.logissue type=error]Arquivo $PACKAGE_JSON não encontrado."
+          exit 1
+        fi
+
+        INSTALL_CMDS="$(
+          jq -r '
+            (.optionalDependencies // {})
+            | to_entries
+            | map("\(.key)@\(.value)")
+            | join(" ")
+          ' "$PACKAGE_JSON"
+        )"
+
+        if [[ -n "${INSTALL_CMDS//[[:space:]]/}" ]]; then
+          echo "=> Dependências opcionais encontradas: $INSTALL_CMDS"
+        else
+          echo "=> Nenhuma dependência opcional adicional encontrada."
+        fi
+
+        # A variável é publicada mesmo quando estiver vazia.
+        echo "##vso[task.setvariable variable=INSTALL_CMDS]$INSTALL_CMDS"
+    env:
+      PACKAGE_JSON: $(PACKAGE_JSON)
+
+  # ==========================================
+  # VALIDAR EXISTÊNCIA DO LOCKFILE
+  # ==========================================
+  - task: Bash@3
+    name: check_package_lock
+    displayName: 'Verificar package-lock.json'
+    inputs:
+      targetType: 'inline'
+      script: |
+        set -euo pipefail
+
+        if [[ -f package-lock.json ]]; then
+          echo "=> package-lock.json encontrado."
+          echo "##vso[task.setvariable variable=HAS_PACKAGE_LOCK]true"
+        else
+          echo "=> package-lock.json não encontrado. Cache npm será ignorado."
+          echo "##vso[task.setvariable variable=HAS_PACKAGE_LOCK]false"
+        fi
+
+  # ==========================================
+  # CACHE NPM
+  # ==========================================
+  - task: Cache@2
+    displayName: 'Cache de dependências npm'
+    condition: and(succeeded(), eq(variables['CACHE_APP_DEPENDENCIES'], 'true'), eq(variables['HAS_PACKAGE_LOCK'], 'true'))
+    inputs:
+      key: 'npm | "$(Agent.OS)" | "node-${{ parameters.nodeImage }}" | package-lock.json'
+      restoreKeys: |
+        npm | "$(Agent.OS)" | "node-${{ parameters.nodeImage }}"
+      path: '$(Pipeline.Workspace)/.npm'
+
+  # ==========================================
+  # BUMP DE VERSÃO
+  # ==========================================
+  - task: Bash@3
+    displayName: 'Bump Package Version'
+    condition: and(succeeded(), startsWith(variables['Build.SourceBranch'], 'refs/heads/release/'))
+    inputs:
+      targetType: 'inline'
+      script: |
+        set -euo pipefail
+
+        if [[ -z "${NPM_BUMP_VERSION//[[:space:]]/}" ]]; then
+          echo "##vso[task.logissue type=error]NPM_BUMP_VERSION não foi informado para a branch de release."
+          exit 1
+        fi
+
+        echo "##[command] npm version $NPM_BUMP_VERSION --no-git-tag-version"
+        npm version "$NPM_BUMP_VERSION" --no-git-tag-version
+    env:
+      NPM_BUMP_VERSION: $(NPM_BUMP_VERSION)
+
+  # ==========================================
+  # BUILD, TESTES E PUBLICAÇÃO
+  # ==========================================
+  - bash: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+
+      if [[ -z "${NPMRC_FILE:-}" || ! -f "$NPMRC_FILE" ]]; then
+        echo "##vso[task.logissue type=error]Arquivo .npmrc seguro não foi disponibilizado."
+        exit 1
+      fi
+
+      export NPM_CONFIG_USERCONFIG="$NPMRC_FILE"
+
+      echo "=> Node: $(node --version)"
+      echo "=> npm: $(npm --version)"
+      echo "=> Instalando dependências..."
+
+      # Proteção caso alguma macro não tenha sido resolvida pelo Azure DevOps.
+      if [[ "${INSTALL_CMDS:-}" == '$(INSTALL_CMDS)' ]]; then
+        echo "##vso[task.logissue type=warning]INSTALL_CMDS não foi resolvido. Executando npm install padrão."
+        INSTALL_CMDS=''
+      fi
+
+      if [[ -n "${INSTALL_CMDS//[[:space:]]/}" ]]; then
+        echo "=> Instalando com dependências opcionais: $INSTALL_CMDS"
+
+        NORMALIZED_INSTALL_CMDS="$(
+          printf '%s' "$INSTALL_CMDS" | sed 's/\^/~/g'
+        )"
+
+        read -r -a INSTALL_ARGS <<< "$NORMALIZED_INSTALL_CMDS"
+
+        npm install --legacy-peer-deps "${INSTALL_ARGS[@]}"
+      else
+        echo "=> INSTALL_CMDS vazio. Executando npm install padrão..."
+        npm install --legacy-peer-deps
+      fi
+
+      echo "=> Executando build..."
+      npm run build
+
+      if [[ "${SKIP_STEPS:-}" == *"test"* ]]; then
+        echo "=> Skipping tests"
+      else
+        echo "=> Executando testes..."
+        npm run test
+      fi
+
+      if [[ "$GIT_BRANCH" != refs/heads/release/* ]]; then
+        echo "=> Branch não é release. Publicação ignorada."
+        exit 0
+      fi
+
+      if [[ -z "${NPM_BUMP_VERSION//[[:space:]]/}" ]]; then
+        echo "##vso[task.logissue type=error]NPM_BUMP_VERSION não foi informado para publicação de release."
+        exit 1
+      fi
+
+      echo "=> Verificando publicação..."
+      echo "##[debug] Branch de release identificada. Iniciando publicação no registry."
+
+      publish_attempt=1
+      max_publish_attempts=10
+      published=false
+
+      while (( publish_attempt <= max_publish_attempts )); do
+        current_version="$(node -p "require('./package.json').version")"
+
+        echo "=> Tentativa $publish_attempt para versão $current_version"
+
+        set +e
+        publish_output="$(npm publish 2>&1)"
+        publish_status=$?
+        set -e
+
+        if [[ "$publish_status" -eq 0 ]]; then
+          echo "=> Publicação bem-sucedida."
+          published=true
+          break
+        fi
+
+        if printf '%s\n' "$publish_output" | grep -Eiq \
+          'already contains file|already exists|previously published|cannot publish over'; then
+
+          echo "=> A versão já existe no registry."
+
+          if (( publish_attempt == max_publish_attempts )); then
+            break
+          fi
+
+          echo "=> Executando novo bump de versão..."
+          npm version "$NPM_BUMP_VERSION" --no-git-tag-version --force
+
+          publish_attempt=$((publish_attempt + 1))
+          continue
+        fi
+
+        echo "=> Falha na publicação. Status: $publish_status"
+        printf '%s\n' "$publish_output"
+        exit "$publish_status"
+      done
+
+      if [[ "$published" != 'true' ]]; then
+        echo "##vso[task.logissue type=error]Não foi possível publicar o pacote após $max_publish_attempts tentativas."
+        exit 1
+      fi
+    displayName: 'Executar Build, Testes e Publish (Nativo)'
+    env:
+      INSTALL_CMDS: $(INSTALL_CMDS)
+      SKIP_STEPS: $(SKIP_STEPS)
+      GIT_BRANCH: $(Build.SourceBranch)
+      NPM_BUMP_VERSION: $(NPM_BUMP_VERSION)
+      NPMRC_FILE: $(NPMRC_FILE)
+      NPM_CONFIG_CACHE: $(Pipeline.Workspace)/.npm
+
+  # ==========================================
+  # PUBLICAR PACKAGE.JSON COMO ARTEFATO
+  # ==========================================
+  - task: PublishPipelineArtifact@1
+    displayName: 'Publish Package JSON'
+    inputs:
+      targetPath: 'package.json'
+      artifactName: 'package'

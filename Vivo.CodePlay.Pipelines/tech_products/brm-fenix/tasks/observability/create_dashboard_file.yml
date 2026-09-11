@@ -1,0 +1,168 @@
+parameters:
+  environmentsObservability: ""
+  filesPath: ""
+  dashboardHistoryUrl: ""
+
+steps:
+  - task: CmdLine@2
+    displayName: "Create Dashboard Files"
+    inputs:
+      script: |
+        echo "##[debug] ENVIRONMENTS OBSERVABILITY ................................: ${{ parameters.environmentsObservability }}"
+        echo "##[debug] FILES PATH ................................................: ${{ parameters.filesPath }}"
+        echo "##[debug] DASHBOARD HISTORY URL .....................................: ${{ parameters.dashboardHistoryUrl }}"
+
+        for env in $(echo "${{ parameters.environmentsObservability }}" | tr ',' ' '); do
+          env_upper=$(echo "$env" | tr '[:lower:]' '[:upper:]')
+
+          pod_var_name="NON_RUNNING_PODS_${env_upper}"
+          NON_RUNNING_PODS=$(eval echo \$${pod_var_name})
+
+          node_var_name="NON_READY_NODES_${env_upper}"
+          NON_READY_NODES=$(eval echo \$${node_var_name})
+          
+          echo ""
+          echo "==================== ${env_upper} ===================="
+
+          if [ -z "$NON_RUNNING_PODS" ] || [ -z "$NON_READY_NODES" ]; then
+            echo "##[warning]Skipping: Missing observability data (NON_RUNNING_PODS or NON_READY_NODES)"
+            continue
+          fi
+
+          status_file="${{ parameters.filesPath }}/${env}.md"
+
+          # Create directory if it doesn't exist
+          mkdir -p "${{ parameters.filesPath }}"
+
+          if [ ! -f "${status_file}" ]; then
+            echo ">> Creating new dashboard file"
+            # Create directory if it doesn't exist
+            mkdir -p "${{ parameters.filesPath }}"
+            touch "$status_file"
+          fi
+
+          echo ">> Non-Ready Nodes: $NON_READY_NODES"
+          echo ">> Non-Running Pods: $NON_RUNNING_PODS"
+          echo ">> Status file: $status_file"
+
+          {
+            overall_status="🟢"
+            if [ "$NON_READY_NODES" != "NONE" ] || [ "$NON_RUNNING_PODS" != "NONE" ]; then
+              overall_status="⚠️"
+            fi
+
+            # Verifica se existe entrada no arquivo de history
+            history_file="${{ parameters.filesPath }}/${env}_history.md"
+            info_icon=""
+            if [ -f "$history_file" ]; then
+              entry_count=$(grep -E '^\|' "$history_file" | grep -v '^| #' | grep -v '^|---' | wc -l | tr -d ' ')
+              if [ "$entry_count" -gt 0 ]; then
+                info_icon=" 🛈"
+              fi
+            fi
+
+            echo "# $overall_status $(echo "${env}" | tr '[:lower:]' '[:upper:]') $info_icon"
+            echo ""
+            
+            # Add history link if URL is provided
+            if [ -n "${{ parameters.dashboardHistoryUrl }}" ]; then
+              history_dashboard_url="${{ parameters.dashboardHistoryUrl }}"
+              # Replace {env} placeholder with actual environment name
+              history_dashboard_url="${history_dashboard_url//\{env\}/${env}}"
+              echo "**📅 Last Updated:** \`$(date '+%d/%m/%Y %H:%M')\` **🔢 Build:** \`$(Build.BuildNumber)\` [📊 View History](${history_dashboard_url})"
+            else
+              echo "**📅 Last Updated:** \`$(date '+%d/%m/%Y %H:%M')\` **🔢 Build:** \`$(Build.BuildNumber)\`"
+            fi
+            
+            echo ""
+            
+            echo "## 📊 Status Summary"
+            echo ""
+            if [ "$NON_READY_NODES" != "NONE" ]; then
+              echo "- 🖥️ **Nodes:** ⚠️ Issues detected"
+            else
+              echo "- 🖥️ **Nodes:** ✅ All healthy"
+            fi
+            
+            if [ "$NON_RUNNING_PODS" != "NONE" ]; then
+              echo "- 📦 **Pods:** ⚠️ Issues detected"
+            else
+              echo "- 📦 **Pods:** ✅ All running"
+            fi
+            
+            echo "---"
+            echo "---"
+            echo "---"
+
+            if [ "$NON_READY_NODES" != "NONE" ]; then
+              echo "## 🖥️ Nodes with Issues"
+              echo ""
+              echo "| 🔍 Node IP | ⚠️ Status | 🔄 Action |"
+              echo "|-------------|-----------|-----------|"
+              while IFS= read -r nline; do
+                [ -z "$nline" ] && continue
+                n_ip=$(echo "$nline" | cut -d',' -f1)
+                n_status=$(echo "$nline" | cut -d',' -f2)
+                if [ "$n_status" != "Ready" ]; then
+                  echo "| \`$n_ip\` | **$n_status** | Investigate |"
+                fi
+              done < <(echo "$NON_READY_NODES" | tr ';' '\n')
+            else
+              echo "## 🖥️ Nodes Status"
+              echo ""
+              echo "> ✅ **All nodes are Ready and healthy**"
+            fi
+
+            echo ""
+            echo "---"
+            echo ""
+
+            if [ "$NON_RUNNING_PODS" != "NONE" ]; then
+              echo "## 📦 Pods with Issues"
+              echo ""
+              echo "| 🔍 Pod Name | ⚠️ Status |"
+              echo "|-------------|-----------|"
+              while IFS= read -r pline; do
+                [ -z "$pline" ] && continue
+                p_name=$(echo "$pline" | cut -d',' -f1)
+                p_status=$(echo "$pline" | cut -d',' -f2)
+                if [ "$p_status" != "Running" ] && [ "$p_status" != "Completed" ]; then
+                  echo "| \`$p_name\` | **$p_status** |"
+                fi
+              done < <(echo "$NON_RUNNING_PODS" | tr ';' '\n')
+            else
+              echo "## 📦 Pods Status"
+              echo ""
+              echo "> ✅ **All pods are Running or Completed**"
+            fi
+
+            echo ""
+            echo "---"
+            echo ""
+            
+            # Service impact assessment
+            echo "## 🎯 Test Scenarios [Coming Soon]"
+            echo ""
+            if [ "$NON_READY_NODES" != "NONE" ] || [ "$NON_RUNNING_PODS" != "NONE" ]; then
+              echo "⚠️ **ATTENTION:** Issues detected that may impact Test Scenarios availability"
+              echo ""
+              echo "**Recommended Actions:**"
+              if [ "$NON_READY_NODES" != "NONE" ]; then
+                echo "- 🔧 Investigate node connectivity and resource usage"
+              fi
+              if [ "$NON_RUNNING_PODS" != "NONE" ]; then
+                echo "- 📋 Check pod logs and restart if necessary"
+              fi
+              echo "- 📞 Consider escalating if issues persist"
+            else
+              echo "✅ **NO IMPACT:** All Test Scenarios are operating normally"
+              echo ""
+              echo "- All infrastructure components are healthy"
+              echo "- No immediate action required"
+            fi
+          } > "$status_file"
+
+          echo "##[group]>> Status File Content"
+          cat $status_file
+          echo "##[endgroup]"
+        done

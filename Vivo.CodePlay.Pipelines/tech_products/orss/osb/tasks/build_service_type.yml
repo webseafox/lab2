@@ -1,0 +1,110 @@
+steps:
+  - checkout: none
+
+  - task: Docker@2
+    displayName: "Login ACR"
+    inputs:
+      containerRegistry: 'ACR-DEVOPS'
+      command: 'login'
+
+  - bash: |
+      echo "Clonando o repositório..."
+      REPO_URI=$(Build.Repository.Uri)
+      REPO_NAME="${REPO_URI:105}"
+
+      #remove o repositório caso já exista
+      if test -d "$(pwd)/$REPO_NAME"
+      then
+          echo "Repo existente: $(pwd)/$REPO_NAME"
+          echo "Excluindo o repositório..."
+          rm -rf "$(pwd)/$REPO_NAME"
+      fi
+      
+      #clona o repositório
+      git clone https://${SYSTEM_ACCESSTOKEN}@dev.azure.com/telefonica-vivo-brasil/ORSS%20-%20ORACLE%20SOA%20SUITE/_git/$REPO_NAME
+      cd $REPO_NAME
+
+      #faz o checkout para a branch com as alterações
+      git fetch origin refs/pull/$(System.PullRequest.PullRequestId)/merge:$(System.PullRequest.PullRequestId)
+      git switch $(System.PullRequest.PullRequestId)
+      HASH_LIST=$(git show --pretty=format:'%h')
+      echo "##vso[task.setvariable variable=HASH_LIST]$HASH_LIST"
+
+      # Obtém o caminho absoluto do diretório atual
+      repoPath=$(pwd)
+      echo $repoPath
+      echo "##vso[task.setvariable variable=REPO_PATH]$repoPath"
+    displayName: 'Clone Repository'
+    env:
+      SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+      HASH_LIST: $(HASH_LIST)
+
+  - task: DownloadPackage@1
+    displayName: "Download OSB Builder"
+    inputs:
+      packageType: 'upack'
+      feed: '/3d53bc62-8749-4931-ae46-a443b73bc87a'
+      view: 
+      definition: '$(OSB_BUILDER_ARTIFACTID).jar'
+      version: '$(OSB_BUILDER_VERSION)'
+      downloadPath: '$(REPO_PATH)'
+
+  - bash: |
+        docker run --rm --entrypoint '/bin/bash' \
+          -v $(REPO_PATH):/builds \
+          -w /builds \
+          -e HASH_LIST=${HASH_LIST} \
+          $(DOCKER_IMAGE) \
+          -c "chmod +x ../build.sh; ../build.sh"
+        ls -l
+        cd $(REPO_PATH)
+        mv sbconfig.jar sbconfig_partial.jar
+        if [ $? == 1 ]; then echo "##vso[task.complete result=Failed;]"; fi
+        ls -l
+        find . -name \\pom.xml -type f -delete -print
+    displayName: "Run OSB Builder"
+    env:
+      HASH_LIST: $(HASH_LIST)
+    
+  - bash: |
+        cd $(REPO_PATH)
+
+        # Extrai o conteúdo do JAR para um diretório temporário
+        tempDir=$(mktemp -d)
+        unzip sbconfig_partial.jar -d $tempDir
+
+        # Verifica se existem arquivos além do ExportInfo
+        hasOtherFiles=false
+
+        # Itera sobre os arquivos extraídos
+        for file in "$tempDir"/*; do
+            # Verifica se o arquivo não é o ExportInfo
+            if [[ "$(basename "$file")" != "ExportInfo" ]]; then
+                hasOtherFiles=true
+                echo "Arquivo encontrado além do ExportInfo: $(basename "$file")"
+            fi
+        done
+
+        # Exibe mensagem se não houver outros arquivos
+        if [ "$hasOtherFiles" = false ]; then
+            echo "Nenhum arquivo encontrado além do ExportInfo."
+            echo "##vso[task.complete result=Failed;]"
+        fi
+    displayName: "Verify Jar"
+
+  - task: NexusUploadMvnFromVivo@5
+    displayName: "Upload SBConfig to Nexus"
+    inputs:
+      nexusEndpoint: 'NEXUS-DEVOPS'
+      nexusRepoMaven: '$(NEXUS_PUBLISH_REPOSITORY)'
+      groupId: '$(NEXUS_PUBLISH_REPOSITORY_GROUP_ID)'
+      artifactId: 'sbconfig_partial'
+      artifactVersion: '$(System.PullRequest.PullRequestId)'
+      artifactFile1: '$(REPO_PATH)/sbconfig_partial.jar'
+      artifactExtension1: 'jar'
+
+  - bash: |
+      cd $(REPO_PATH)
+      git tag -a $(System.PullRequest.PullRequestId) -m ""
+      git push --tags
+    displayName: "Create Tag"

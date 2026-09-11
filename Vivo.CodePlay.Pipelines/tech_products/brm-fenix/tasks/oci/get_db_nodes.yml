@@ -1,0 +1,77 @@
+parameters:
+  - name: condition
+    default: succeeded()
+  - name: environment
+  - name: action
+  - name: compartmentId
+  - name: databaseId
+  - name: databaseName
+  - name: databaseNodeCount
+
+steps:
+  - task: CmdLine@2
+    name: get_nodes
+    displayName: "Get ${{ parameters.environment }} Database Nodes"
+    condition: ${{ parameters.condition }}
+    inputs:
+      script: |
+        NODES=""
+
+        echo "##[debug] ENVIRONMENT ..............................................: ${{ parameters.environment }}"
+        echo "##[debug] ACTION ...................................................: ${{ parameters.action }}" 
+        echo "##[debug] CONDITION ................................................: ${{ parameters.condition }}"
+        echo "##[debug] COMPARTMENT ID ...........................................: ${{ parameters.compartmentId }}"
+        echo "##[debug] DATABASE ID ..............................................: ${{ parameters.databaseId }}"
+        echo "##[debug] DATABASE NAME ............................................: ${{ parameters.databaseName }}"
+        echo "##[debug] DATABASE NODE COUNT ......................................: ${{ parameters.databaseNodeCount }}"
+        echo ""
+
+        echo "##[group]>>>>> Get "$(echo ${{ parameters.environment }} | tr '[:lower:]' '[:upper:]')" Database Nodes ..."
+        echo "##[command]oci db node list --compartment-id ${{ parameters.compartmentId }} --db-system-id ${{ parameters.databaseId }} --query '\"db-system-id\" == '${{ parameters.databaseId }}' && (\"lifecycle-state\" == 'AVAILABLE' || \"lifecycle-state\" == 'STOPPED')].{hostname:hostname,id:id,'fault-domain':'fault-domain',state:'lifecycle-state','vnic-id':'vnic-id'}'"
+        RETURNED_NODES=$(oci db node list \
+                --compartment-id ${{ parameters.compartmentId }} \
+                --db-system-id ${{ parameters.databaseId }} \
+                --query "data[?\"db-system-id\" == '${{ parameters.databaseId }}' && (\"lifecycle-state\" == 'AVAILABLE' || \"lifecycle-state\" == 'STOPPED')].{hostname:hostname,id:id,\"fault-domain\":\"fault-domain\",state:\"lifecycle-state\",\"vnic-id\":\"vnic-id\"}")
+        
+        RETURNED_NODES_COUNT=$(echo "$RETURNED_NODES" | jq '. | length')
+        echo "$RETURNED_NODES | jq ."
+        echo "##[endgroup]"
+
+        echo ""
+        echo "##[debug] NODES COUNT ..............................................: $RETURNED_NODES_COUNT"
+
+        if [ "$RETURNED_NODES_COUNT" -eq 0 ]; then
+          echo "##[warning]No nodes found in $EXPECTED_LIFECYCLE_STATE state for ${{ parameters.databaseName }}"
+        fi
+
+        NODE_INDEX=0
+        MAX_ITERATIONS=$((RETURNED_NODES_COUNT - 1))
+
+        for i in $(seq 0 $MAX_ITERATIONS); do
+          NODE_INDEX=$((NODE_INDEX + 1))
+
+          NODE_NAME=$(echo $RETURNED_NODES | jq -r ".[$i].hostname")
+          NODE_ID=$(echo $RETURNED_NODES | jq -r ".[$i].id")
+          NODE_STATE=$(echo $RETURNED_NODES | jq -r ".[$i].state")
+          NODE_FAULT_DOMAIN=$(echo $RETURNED_NODES | jq -r ".[$i].\"fault-domain\"")
+          NODE_VNIC_ID=$(echo $RETURNED_NODES | jq -r ".[$i].\"vnic-id\"")
+          
+          echo ""
+          echo ">>>>> Node $NODE_INDEX:"
+          echo ">> Name: $NODE_NAME"
+          echo ">> Id: $NODE_ID"
+          echo ">> State: $NODE_STATE"
+          echo ">> Fault Domain: $NODE_FAULT_DOMAIN"
+          echo ">> Vnic Id: $NODE_VNIC_ID"
+          
+          if [ -z "$NODES" ]; then
+            NODES="$NODE_NAME,$NODE_ID,$NODE_FAULT_DOMAIN,$NODE_STATE,$NODE_VNIC_ID"
+          else
+            NODES="$NODES;$NODE_NAME,$NODE_ID,$NODE_FAULT_DOMAIN,$NODE_STATE,$NODE_VNIC_ID"
+          fi
+        done
+
+        echo ""
+        echo "##[section]Nodes selected for action: $NODES"
+
+        echo "##vso[task.setvariable variable=NODES;isOutput=true]$NODES"

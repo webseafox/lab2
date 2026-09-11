@@ -1,0 +1,143 @@
+parameters:
+- name: componentNewVersion
+  type: string
+- name: bashScript
+  type: object
+- name: condition
+  type: object
+- name: createGitTag
+  type: boolean
+  default: false
+- name: usePullRequest
+  type: boolean
+  default: false
+
+steps:
+
+- bash: ${{ parameters.bashScript.content }}
+  displayName: 'Update Component Version'
+  condition: ${{ parameters.condition }}
+  ${{ if ne(parameters.bashScript.envs, '') }}:
+    env: ${{ parameters.bashScript.envs }}
+
+# Step para depuração
+- bash: |
+    echo "##[debug] usePullRequest: ${USE_PULL_REQUEST}"
+    echo "##[debug] createGitTag: ${CREATE_GIT_TAG}"
+    echo "##[debug] condition: ${CONDITION}"
+    echo "##[debug] componentNewVersion: ${COMPONENT_NEW_VERSION}"
+  displayName: 'Debug Parameters'
+  env:
+    USE_PULL_REQUEST: "${{ parameters.usePullRequest }}"
+    CREATE_GIT_TAG: "${{ parameters.createGitTag }}"
+    CONDITION: "${{ parameters.condition }}"
+    COMPONENT_NEW_VERSION: "${{ parameters.componentNewVersion }}"
+
+# Step para commits diretos, condicionado ao parâmetro usePullRequest
+- bash: |
+    TAG_PUSH_PARAM=""
+
+    echo "##[debug] TAG_REPO.....: ${TAG_REPO}"
+
+    cd $(Build.SourcesDirectory)/$(Build.Repository.Name)
+    git add .
+    git commit -am "[CI SKIP] Project version has been updated. Released version '${COMPONENT_NEW_VERSION}'" --author="$BUILD_REQUESTEDFOR <$BUILD_REQUESTEDFOREMAIL>"
+
+    if [[ "${TAG_REPO}" == "true" ]]; then
+      TAG_PUSH_PARAM="--tags"
+      git tag ${COMPONENT_NEW_VERSION}
+    fi
+
+    git status
+    echo "##[command] git push origin ${TAG_PUSH_PARAM} ${BRANCH_NAME}"
+    git push origin ${TAG_PUSH_PARAM} ${BRANCH_NAME}
+
+    if [ $? -ne 0 ]; then 
+      echo "##vso[task.logissue type=error;] Git push failed. Permission denied"
+      echo "##vso[task.complete result=Failed;]"
+      exit 1
+    fi  
+
+    echo "Version updated to ${COMPONENT_NEW_VERSION}"
+  displayName: 'Commit Updated Version Directly'
+  condition: and(succeeded(), ne('${{ parameters.usePullRequest }}', 'true'))
+  env:
+    COMPONENT_NEW_VERSION: ${{ parameters.componentNewVersion }}
+    BRANCH_NAME: "$(Build.SourceBranchName)"
+    TAG_REPO: "${{ lower(parameters.createGitTag) }}"
+    BUILD_REQUESTEDFOR: "$(Build.RequestedFor)"
+    BUILD_REQUESTEDFOREMAIL: "$(Build.RequestedForEmail)"
+
+# Step para commits via PR, condicionado ao parâmetro usePullRequest
+- bash: |
+    NEW_BRANCH_NAME="update-version-${BUILD_BUILDID}"
+    TAG_PUSH_PARAM=""
+
+    echo "##[debug] Creating new branch ${NEW_BRANCH_NAME}"
+
+    cd $(Build.SourcesDirectory)/$(Build.Repository.Name)
+
+    git config user.email "$BUILD_REQUESTEDFOREMAIL"
+    git config user.name "$BUILD_REQUESTEDFOR"
+
+    git checkout -b ${NEW_BRANCH_NAME}
+
+    git add .
+    git commit -m "[CI SKIP] Project version has been updated. Released version '${COMPONENT_NEW_VERSION}'" --author="$BUILD_REQUESTEDFOR <$BUILD_REQUESTEDFOREMAIL>"
+
+    if [[ "${TAG_REPO}" == "true" ]]; then
+      TAG_PUSH_PARAM="--tags"
+      git tag ${COMPONENT_NEW_VERSION}
+    fi
+
+    git push origin ${TAG_PUSH_PARAM} ${NEW_BRANCH_NAME}
+
+    if [ $? -ne 0 ]; then 
+      echo "##vso[task.logissue type=error;] Git push failed. Permission denied"
+      echo "##vso[task.complete result=Failed;]"
+      exit 1
+    fi  
+
+    echo "Version updated to ${COMPONENT_NEW_VERSION}"
+  displayName: 'Commit Updated Version to New Branch'
+  condition: and(succeeded(), eq('${{ parameters.usePullRequest }}', 'true'))
+  env:
+    COMPONENT_NEW_VERSION: ${{ parameters.componentNewVersion }}
+    TAG_REPO: "${{ lower(parameters.createGitTag) }}"
+    BUILD_REQUESTEDFOR: "$(Build.RequestedFor)"
+    BUILD_REQUESTEDFOREMAIL: "$(Build.RequestedForEmail)"
+
+# Step para criação de PR, condicionado ao parâmetro usePullRequest
+- bash: |
+    NEW_BRANCH_NAME="update-version-${BUILD_BUILDID}"
+    PR_TITLE="Update version to ${COMPONENT_NEW_VERSION}"
+    PR_DESCRIPTION="[CI SKIP] Automated PR to update project version to ${COMPONENT_NEW_VERSION}"
+
+    echo "##[debug] Creating PR from ${NEW_BRANCH_NAME} to ${BRANCH_NAME}"
+
+    PR_PAYLOAD=$(jq -n --arg src "$NEW_BRANCH_NAME" --arg tgt "$BRANCH_NAME" --arg title "$PR_TITLE" --arg description "$PR_DESCRIPTION" '{
+      "sourceRefName": "refs/heads/\($src)",
+      "targetRefName": "refs/heads/\($tgt)",
+      "title": $title,
+      "description": $description,
+      "reviewers": []
+    }')
+
+    curl -X POST \
+      -H "Content-Type: application/json" \
+      -H "Authorization: Bearer $(System.AccessToken)" \
+      "https://dev.azure.com/$(System.CollectionUri)$(System.TeamProject)/_apis/git/repositories/$(Build.Repository.Name)/pullRequests?api-version=6.0" \
+      -d "$PR_PAYLOAD"
+
+    if [ $? -ne 0 ]; then 
+      echo "##vso[task.logissue type=error;] PR creation failed"
+      echo "##vso[task.complete result=Failed;]"
+      exit 1
+    fi  
+
+    echo "Pull Request created successfully"
+  displayName: 'Create Pull Request'
+  condition: and(succeeded(), eq('${{ parameters.usePullRequest }}', 'true'))
+  env:
+    COMPONENT_NEW_VERSION: ${{ parameters.componentNewVersion }}
+    BRANCH_NAME: "$(Build.SourceBranchName)"

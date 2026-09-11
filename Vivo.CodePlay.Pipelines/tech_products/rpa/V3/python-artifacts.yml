@@ -1,0 +1,864 @@
+parameters:
+  - name: PUBLISH_ARTIFACT_ID
+    type: string
+    default: "default-value"
+  - name: versionFile
+    type: string
+    default: 'pyproject.toml'
+    displayName: 'Arquivo de versionamento (pyproject.toml)'
+  - name: twinePublishPattern
+    type: string
+    default: 'python-package/*.whl python-package/*.tar.gz'
+    displayName: 'Padrão de arquivos para publicar com Twine (ex: python-package/*)'
+  - name: resourcesPath
+    type: string
+    default: '.azuredevops/resources'
+    displayName: 'Caminho do arquivo resources com lista de VMs'
+  - name: pythonVersion
+    type: string
+    default: '3.13.15'
+    displayName: 'Versão do Python usada no build/publicação'
+  - name: rpaScriptsRef
+    type: string
+    default: 'master'
+    displayName: 'Branch/tag do repositório de scripts de deploy'
+  - name: buildExecutable
+    type: boolean
+    default: false
+    displayName: 'Gerar executável Windows com PyInstaller no deploy'
+  - name: pyInstallerEntryPoint
+    type: string
+    default: ''
+    displayName: 'Arquivo Python principal para gerar o executável'
+  - name: pyInstallerExecutableName
+    type: string
+    default: ''
+    displayName: 'Nome do executável gerado (sem .exe). Se vazio, usa PUBLISH_ARTIFACT_ID'
+  - name: pyInstallerAddData
+    type: object
+    default: []
+    displayName: 'Lista de argumentos --add-data do PyInstaller'
+  - name: pyInstallerExtraArgs
+    type: object
+    default: []
+    displayName: 'Argumentos extras do PyInstaller'
+  - name: pyInstallerIncludeEnv
+    type: boolean
+    default: false
+    displayName: 'Incluir arquivo .env no executável'
+  - name: deployAdditionalArguments
+    type: string
+    default: ''
+    displayName: 'Argumentos adicionais para o script de deploy'
+
+resources:
+  repositories:
+    - repository: RPAScripts
+      name: DevOps/Vivo.CodePlay.Pipelines
+      type: git
+      ref: refs/heads/master
+      endpoint: CodePlay
+
+variables:
+  - name: SIGLA
+    value: $[ lower(split(variables['System.TeamProject'],' ')[0]) ]
+  - name: DEFAULT_FEED_NAME
+    value: 'RPAT'
+  - name: AZURE_FEED_NAME
+    value: 'RPAT'
+  - name: AZURE_FEED_URL
+    value: 'https://pkgs.dev.azure.com/telefonica-vivo-brasil/a96e48f0-27ec-4749-98a8-97f5ba41992c/_packaging/RPAT/pypi/simple/'
+  - name: PYTHON_VERSION
+    value: ${{ parameters.pythonVersion }}
+  - name: ASDF_PYTHON_VERSION
+    value: ${{ parameters.pythonVersion }}
+  - name: UV_VERSION
+    value: '0.5.30'
+  - name: workingDirectory
+    value: $(Build.SourcesDirectory)
+  - name: isMasterBranch
+    value: $[eq(variables['Build.SourceBranch'], 'refs/heads/master')]
+  - name: isStagingBranch
+    value: $[eq(variables['Build.SourceBranch'], 'refs/heads/staging')]
+  - name: isDeployBranch
+    value: $[eq(variables['Build.SourceBranch'], 'refs/heads/deploy')]
+
+# ==================================================================
+# Estágios do Pipeline
+# ==================================================================
+# Fluxo:
+#   staging -> VersionUpdate + Build (testa o build)
+#   master  -> Publish no Azure Artifacts + Push da versão
+#   deploy  -> Download do artefato + Deploy para VMs
+# ==================================================================
+stages:
+  # Stage 1: VersionUpdate - Atualiza a versão do pacote baseado em commits.
+  - stage: PublishVersionUpdate
+    displayName: 'Atualizar Versão'
+    condition: eq(variables.isStagingBranch, true)
+    jobs:
+      - job: VersionUpdate
+        pool: GeneralPurposeLinuxAgentsCI
+        steps:
+          - checkout: self
+            persistCredentials: true
+
+          - task: VersionManagerVivo@4
+            displayName: 'Create Version Definitions'
+            name: SetVersion
+            inputs:
+              command: 'nextVersion'
+              versionFile: $(workingDirectory)/${{ parameters.versionFile }}
+              useCommitMessage: false
+              method: 'patch'
+
+  # Stage 2: Build - Realiza o build e testes da biblioteca Python (staging)
+  - stage: Build
+    displayName: 'Build Python Package'
+    dependsOn: PublishVersionUpdate
+    condition: and(succeeded(), eq(variables.isStagingBranch, true))
+    variables:
+      # Variável no nível do stage para capturar output do stage anterior
+      nextVersion: $[ stageDependencies.PublishVersionUpdate.VersionUpdate.outputs['SetVersion.VERSION'] ]
+    jobs:
+      - job: BuildPackage
+        displayName: 'Build com uv'
+        pool: GeneralPurposeLinuxAgentsCI
+        steps:
+          # Configuração inicial e checkout do código
+          - checkout: self
+            persistCredentials: true
+
+          - bash: |
+              set -euo pipefail
+
+              CONFIG_FILE_PATH=".tool-versions"
+              REQUESTED_VERSION="$(ASDF_PYTHON_VERSION)"
+
+              if [ -f "${CONFIG_FILE_PATH}" ]; then
+                FILE_VERSION="$(awk '/^python[[:space:]]/{print $2; exit}' "${CONFIG_FILE_PATH}")"
+                if [ -n "${FILE_VERSION}" ]; then
+                  REQUESTED_VERSION="${FILE_VERSION}"
+                fi
+              else
+                echo "python ${REQUESTED_VERSION}" > "${CONFIG_FILE_PATH}"
+              fi
+
+              echo "##[command] asdf local python ${REQUESTED_VERSION}"
+              asdf local python "${REQUESTED_VERSION}"
+
+              PYTHON_DIR="$(asdf where python "${REQUESTED_VERSION}")"
+              echo "##vso[task.prependpath]${PYTHON_DIR}/bin"
+              python --version
+            displayName: 'Configurar Python via ASDF'
+            workingDirectory: $(workingDirectory)
+
+          # Instalação de dependências no padrão corporativo (agentes compartilhados)
+          - bash: |
+              export PIP_INDEX_URL="https://AzureDevOps:${AZDO_FEED_PASSWORD}@pkgs.dev.azure.com/telefonica-vivo-brasil/_packaging/DevOps/pypi/simple/"
+              python --version
+              python -m pip install --upgrade pip
+              echo "##[section] Instalando UV"
+              pip install "uv==$(UV_VERSION)"
+              uv --version
+            displayName: 'Instalar gerenciador de pacotes (uv)'
+            env:
+              AZDO_FEED_PASSWORD: $(System.AccessToken)
+
+          # Sincronizar dependências com uv
+          - bash: |
+              echo "##[section] Instalando dependências com UV"
+              export UV_INDEX_URL="https://AzureDevOps:${AZDO_FEED_PASSWORD}@pkgs.dev.azure.com/telefonica-vivo-brasil/_packaging/DevOps/pypi/simple/"
+              # O feed DevOps (UV_INDEX_URL) é escopado à ORGANIZAÇÃO e atua como
+              # proxy do PyPI público. Já o feed interno (DEFAULT_FEED_NAME, ex.:
+              # RPAT) é escopado ao PROJETO, então a URL exige o segmento do
+              # projeto — aqui via $(System.TeamProjectId), o mesmo identificador
+              # usado nos steps de download de artefato deste template.
+              # Sem esse segmento a URL resolve para o escopo de organização, onde
+              # o feed do projeto não existe: o índice responde como vazio e o uv
+              # falha com "<pacote> was not found in the package registry /
+              # No solution found when resolving dependencies" para qualquer
+              # dependência interna publicada no feed do projeto.
+              # Usamos o ID (e não $(System.TeamProject)) porque o nome do projeto
+              # pode conter espaços e caracteres que quebram a URL.
+              export UV_EXTRA_INDEX_URL="https://AzureDevOps:${AZDO_FEED_PASSWORD}@pkgs.dev.azure.com/telefonica-vivo-brasil/$(System.TeamProjectId)/_packaging/$(DEFAULT_FEED_NAME)/pypi/simple/"
+              uv sync --no-cache --python "$(PYTHON_VERSION)"
+            displayName: 'Sincronizar dependências com uv'
+            workingDirectory: $(workingDirectory)
+            env:
+              AZDO_FEED_PASSWORD: $(System.AccessToken)
+
+          # Limpar pasta dist antes do build
+          - bash: |
+              rm -rf dist/
+              mkdir -p dist/
+            displayName: 'Limpar pasta dist'
+            workingDirectory: $(workingDirectory)
+
+          # Atualizar versão no pyproject.toml ANTES do build
+          - bash: |
+              set -x
+              PYPROJECT_FILE="pyproject.toml"
+
+              # Extrai um valor de versão semântica válido (major.minor.patch,
+              # com suporte opcional a pré-release/build metadata, ex.:
+              # 1.2.3-rc.1 ou 1.2.3+build.5) de uma string potencialmente
+              # suja. A VersionManagerVivo@4 já produziu saídas corrompidas
+              # com caracteres extras ao redor do valor (ex: 1.0.1'), que
+              # quebravam o parser TOML no build seguinte. Diferente de um
+              # simples "tr -cd '0-9.'", esta função preserva identificadores
+              # de pré-release/build válidos em vez de descartar qualquer
+              # caractere fora de dígitos e pontos.
+              # NOTA: esta função é duplicada (idêntica) no step "Commit e
+              # push da versão" mais abaixo neste mesmo arquivo. Os dois
+              # steps são tasks Bash@3 independentes (sem estado de shell
+              # compartilhado) e os jobs não fazem checkout do repositório
+              # CodePlay, então centralizar em um script externo exigiria um
+              # checkout adicional do CodePlay em todo build só para isso —
+              # optou-se por manter a duplicação, documentada, em vez de
+              # adicionar esse custo/latência a cada execução.
+              sanitize_version() {
+                local v="$1"
+                v="$(printf '%s' "$v" | tr -d '\r\n')"
+                v="$(printf '%s' "$v" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+([+-][A-Za-z0-9.]+)?' | head -n1)"
+                printf '%s' "$v"
+              }
+
+              echo "[DEBUG] Variável nextVersion: '$(nextVersion)'"
+              echo "[DEBUG] Conteúdo atual do pyproject.toml:"
+              grep -E '^version\s*=' "$PYPROJECT_FILE" || echo "Linha version não encontrada"
+              
+              NEXT_VERSION="$(nextVersion)"
+              NEXT_VERSION="$(sanitize_version "$NEXT_VERSION")"
+
+              # Se nextVersion estiver vazio, tenta incrementar a versão atual
+              if [ -z "$NEXT_VERSION" ] || [ "$NEXT_VERSION" = "" ]; then
+                echo "[VERSION] nextVersion não definido. Incrementando versão atual..."
+                CURRENT_VERSION=$(grep -E '^version\s*=' "$PYPROJECT_FILE" | head -1 | sed 's/.*=\s*"\([^"]*\)".*/\1/' | tr -d '\r\n')
+                echo "[VERSION] Versão atual: $CURRENT_VERSION"
+                
+                # Incrementa o patch version (0.1.0 -> 0.1.1)
+                if [ -n "$CURRENT_VERSION" ]; then
+                  IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT_VERSION"
+                  PATCH=$((PATCH + 1))
+                  NEXT_VERSION="$MAJOR.$MINOR.$PATCH"
+                  echo "[VERSION] Nova versão calculada: $NEXT_VERSION"
+                fi
+              fi
+              
+              if [ -n "$NEXT_VERSION" ] && [ -f "$PYPROJECT_FILE" ]; then
+                echo "[VERSION] Atualizando pyproject.toml para versão: $NEXT_VERSION"
+                sed -i "s/^version\s*=\s*\"[^\"]*\"/version = \"$NEXT_VERSION\"/" "$PYPROJECT_FILE"
+                echo "[VERSION] Versão atualizada:"
+                grep -E '^version\s*=' "$PYPROJECT_FILE"
+                
+                # Exporta a versão para os próximos steps
+                echo "##vso[task.setvariable variable=nextVersion]$NEXT_VERSION"
+              else
+                echo "[VERSION] ERRO: Não foi possível determinar a próxima versão"
+                exit 1
+              fi
+            displayName: 'Atualizar versão antes do build'
+            workingDirectory: $(workingDirectory)
+
+          # Build do pacote
+          - bash: |
+              export PATH="$HOME/.cargo/bin:$PATH"
+              uv build
+              ls -la dist/
+            displayName: 'Build do pacote com uv'
+            workingDirectory: $(workingDirectory)
+
+            # Gerar pacote ZIP adicional a partir do sdist
+          - bash: |
+              set -euo pipefail
+
+              python - <<'PY'
+              import os
+              import pathlib
+              import shutil
+              import tarfile
+              import tempfile
+              import zipfile
+
+              dist_dir = pathlib.Path('dist').resolve()
+              if not dist_dir.is_dir():
+                raise SystemExit(f"Diretório de artefatos não encontrado: {dist_dir}")
+
+              tarballs = sorted(dist_dir.glob('*.tar.gz'))
+              if not tarballs:
+                raise SystemExit('Nenhum arquivo .tar.gz encontrado em dist/ para conversão em .zip.')
+
+              for tar_path in tarballs:
+                base_name = tar_path.name[:-7]  # remove sufixo .tar.gz
+                zip_path = dist_dir / f"{base_name}.zip"
+
+                if zip_path.exists():
+                  print(f"[ZIP] {zip_path.name} já existe. Pulando conversão.")
+                  continue
+
+                temp_dir = pathlib.Path(tempfile.mkdtemp(prefix='sdist_zip_'))
+                try:
+                  with tarfile.open(tar_path, 'r:gz') as tar:
+                    def _safe_extract(member, target_dir):
+                      target_path = pathlib.Path(target_dir, member.name).resolve()
+                      if not str(target_path).startswith(str(target_dir.resolve())):
+                        raise SystemExit(f"Extração insegura detectada: {member.name}")
+                      tar.extract(member, path=target_dir)
+
+                    for member in tar.getmembers():
+                      _safe_extract(member, temp_dir)
+
+                  with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zip_file:
+                    for item in sorted(temp_dir.rglob('*')):
+                      relative = item.relative_to(temp_dir)
+                      arcname = relative.as_posix()
+                      if item.is_dir():
+                        if not any(item.iterdir()):
+                          zip_info = zipfile.ZipInfo(arcname.rstrip('/') + '/')
+                          zip_file.writestr(zip_info, '')
+                        continue
+                      zip_file.write(item, arcname)
+
+                  print(f"[ZIP] Gerado {zip_path.name} a partir de {tar_path.name}")
+                finally:
+                  shutil.rmtree(temp_dir, ignore_errors=True)
+              PY
+            displayName: 'Gerar pacote ZIP do sdist'
+            workingDirectory: $(workingDirectory)
+
+          # Publicar artefatos para o stage de Publish
+          - task: PublishPipelineArtifact@1
+            inputs:
+              targetPath: '$(workingDirectory)/dist'
+              artifact: 'python-package'
+            displayName: 'Publicar artefatos de build'
+
+          # Commit e push da versão atualizada no staging
+          - task: Bash@3
+            displayName: 'Commit e push da versão'
+            inputs:
+              targetType: 'inline'
+              script: |
+                set -euo pipefail
+                cd $(Build.SourcesDirectory)
+                
+                PYPROJECT_FILE="pyproject.toml"
+
+                # Mesma função de sanitização usada no step "Atualizar versão
+                # antes do build" (ver comentário detalhado lá sobre por que
+                # é duplicada em vez de centralizada em script externo).
+                sanitize_version() {
+                  local v="$1"
+                  v="$(printf '%s' "$v" | tr -d '\r\n')"
+                  v="$(printf '%s' "$v" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+([+-][A-Za-z0-9.]+)?' | head -n1)"
+                  printf '%s' "$v"
+                }
+
+                NEXT_VERSION="$(nextVersion)"
+                NEXT_VERSION="$(sanitize_version "$NEXT_VERSION")"
+
+                if [ -z "$NEXT_VERSION" ]; then
+                  echo "[VERSION] nextVersion não definido. Nada a commitar."
+                  exit 0
+                fi
+                
+                git config --local user.email "azuredevops@telefonica.com"
+                git config --local user.name "Azure DevOps"
+
+                # Garante que a branch local reflita o tip ATUAL da remota antes
+                # de reaplicar a versão. O checkout inicial do job (checkout: self)
+                # fixa a branch local no commit que disparou o build; sem este
+                # reset, um push concorrente de outro build (versionando a mesma
+                # branch) fica invisível aqui, o commit é criado sobre uma base
+                # desatualizada e o "git push" subsequente falha (non-fast-forward).
+                # Com "set -euo pipefail" essa falha agora interrompe o step ao
+                # invés de ser mascarada pelo echo final (que sempre retornava 0).
+                git fetch --prune --tags origin "${BUILD_SOURCEBRANCHNAME}"
+                git checkout -B "${BUILD_SOURCEBRANCHNAME}" "origin/${BUILD_SOURCEBRANCHNAME}"
+                
+                # Reaplicar a versão após checkout (o checkout sobrescreve alterações locais)
+                echo "[VERSION] Atualizando pyproject.toml para versão: $NEXT_VERSION"
+                sed -i "s/^version\s*=\s*\"[^\"]*\"/version = \"$NEXT_VERSION\"/" "$PYPROJECT_FILE"
+                grep -E '^version\s*=' "$PYPROJECT_FILE"
+                
+                # Verifica se há alterações no pyproject.toml
+                git add "$PYPROJECT_FILE"
+                if git diff --cached --quiet; then
+                  echo "[VERSION] Nenhuma alteração para commit."
+                  exit 0
+                fi
+                
+                # "[skip ci]" é convenção do GitHub/GitLab e NÃO é reconhecida
+                # pelo Azure Pipelines, que exige "***NO_CI***" na mensagem do
+                # commit para suprimir o trigger de CI. Sem isso, este commit
+                # automático reaciona o trigger em staging/master, gerando um
+                # novo build que bumpa a versão de novo — um loop infinito de
+                # auto-versionamento (observado na prática: 1.0.1 -> 1.0.2 ->
+                # 1.0.3 -> ... em minutos, com corrupção intermitente da
+                # VersionManagerVivo@4 se repetindo a cada iteração).
+                git commit -m "Version Updated to $NEXT_VERSION ***NO_CI***"
+                git push origin "HEAD:${BUILD_SOURCEBRANCHNAME}"
+                echo "[VERSION] Push realizado para ${BUILD_SOURCEBRANCHNAME}"
+
+  # Stage 3: Publish - Publica no Azure Artifacts (apenas master)
+  # Baixa o artefato do último build bem-sucedido da staging
+  - stage: Publish
+    displayName: 'Publicar no Azure Artifacts'
+    dependsOn: []
+    condition: eq(variables.isMasterBranch, true)
+    jobs:
+      - job: PublishPackage
+        displayName: 'Publicar Pacote no Feed RPAT'
+        pool: GeneralPurposeLinuxAgentsCI
+        steps:
+          - checkout: self
+            persistCredentials: true
+            displayName: 'Checkout repositório com credenciais'
+
+          # Obter versão do pyproject.toml
+          - task: PowerShell@2
+            displayName: 'Obter versão do projeto'
+            name: GetVersion
+            inputs:
+              targetType: 'inline'
+              script: |
+                $versionFile = "${{ parameters.versionFile }}"
+                Write-Host "Buscando versão em: $versionFile"
+                
+                if ($versionFile -eq "pyproject.toml" -and (Test-Path $versionFile)) {
+                  $version = (Get-Content $versionFile | Select-String -Pattern '^version\s*=\s*"([^"]+)"' | ForEach-Object { $_.Matches.Groups[1].Value })
+                } elseif (Test-Path "VERSION") {
+                  $version = (Get-Content "VERSION" -Raw).Trim()
+                } else {
+                  Write-Error "Arquivo de versão não encontrado"
+                  exit 1
+                }
+                
+                Write-Host "Versão encontrada: $version"
+                echo "##vso[task.setvariable variable=currentVersion;isOutput=true]$version"
+
+          - bash: |
+              set -euo pipefail
+
+              CONFIG_FILE_PATH=".tool-versions"
+              REQUESTED_VERSION="$(ASDF_PYTHON_VERSION)"
+
+              if [ -f "${CONFIG_FILE_PATH}" ]; then
+                FILE_VERSION="$(awk '/^python[[:space:]]/{print $2; exit}' "${CONFIG_FILE_PATH}")"
+                if [ -n "${FILE_VERSION}" ]; then
+                  REQUESTED_VERSION="${FILE_VERSION}"
+                fi
+              else
+                echo "python ${REQUESTED_VERSION}" > "${CONFIG_FILE_PATH}"
+              fi
+
+              echo "##[command] asdf local python ${REQUESTED_VERSION}"
+              asdf local python "${REQUESTED_VERSION}"
+
+              PYTHON_DIR="$(asdf where python "${REQUESTED_VERSION}")"
+              echo "##vso[task.prependpath]${PYTHON_DIR}/bin"
+              python --version
+            displayName: 'Configurar Python via ASDF'
+            workingDirectory: $(workingDirectory)
+
+          # Baixar artefato do último build bem-sucedido da staging
+          - task: DownloadPipelineArtifact@2
+            displayName: 'Baixar artefato do staging'
+            inputs:
+              buildType: 'specific'
+              project: '$(System.TeamProjectId)'
+              definition: '$(System.DefinitionId)'
+              buildVersionToDownload: 'latestFromBranch'
+              branchName: 'refs/heads/staging'
+              artifactName: 'python-package'
+              targetPath: '$(Build.SourcesDirectory)/python-package'
+
+          - script: |
+              python -m pip install --upgrade pip
+              python -m pip install twine keyring artifacts-keyring
+            displayName: 'Instalar twine e keyring'
+
+          - task: TwineAuthenticate@1
+            inputs:
+              artifactFeed: 'a96e48f0-27ec-4749-98a8-97f5ba41992c/RPAT'
+            displayName: 'Autenticar no Azure Artifacts Feed RPAT'
+
+          # Verificar artefatos baixados e extrair versão
+          - script: |
+              echo "=== Estrutura de diretórios ==="
+              pwd
+              ls -la
+              echo "=== Conteúdo de python-package ==="
+              ls -la python-package/
+              python - <<'PY'
+              from pathlib import Path
+              import re
+              from packaging.utils import parse_wheel_filename
+
+              pkg_dir = Path("python-package")
+              wheel_files = sorted(pkg_dir.glob("*.whl"))
+              sdist_files = sorted(pkg_dir.glob("*.tar.gz"))
+
+              artifact_version = None
+              if wheel_files:
+                _, version, _, _ = parse_wheel_filename(wheel_files[0].name)
+                artifact_version = str(version)
+              elif sdist_files:
+                match = re.match(r"^.+-([0-9][A-Za-z0-9._+-]*)\\.tar\\.gz$", sdist_files[0].name)
+                if match:
+                  artifact_version = match.group(1)
+
+              if not artifact_version:
+                raise SystemExit("Não foi possível extrair a versão dos artefatos (.whl/.tar.gz).")
+
+              print(f"Versão do artefato: {artifact_version}")
+              print(f"##vso[task.setvariable variable=artifactVersion]{artifact_version}")
+              PY
+            displayName: 'Verificar artefatos baixados'
+
+          - script: |
+              if [ -z "${PYPIRC_PATH:-}" ]; then
+                echo "##[error]PYPIRC_PATH não foi definido pelo TwineAuthenticate."
+                exit 1
+              fi
+
+              set +euo pipefail
+              OUTPUT=$(python -m twine upload \
+                -r RPAT \
+                --config-file "$PYPIRC_PATH" \
+                --non-interactive \
+                --verbose \
+                ${{ parameters.twinePublishPattern }} 2>&1)
+              EXIT_CODE=$?
+              echo "$OUTPUT"
+              
+              if [ $EXIT_CODE -ne 0 ]; then
+                if echo "$OUTPUT" | grep -qi "already contains\|already exists\|409 Conflict\|already a source distribution\|400 Bad Request"; then
+                  echo "##[warning]Pacote já existe no Azure Artifacts. Upload ignorado."
+                  exit 0
+                else
+                  echo "##[error]Falha no upload para Azure Artifacts"
+                  exit $EXIT_CODE
+                fi
+              fi
+            displayName: 'Upload para Azure Artifacts Feed RPAT'
+
+  # Stage 4: DownloadArtifact - Baixa o último artefato publicado para deploy
+  - stage: DownloadArtifact
+    displayName: 'Download Artefato para Deploy'
+    dependsOn: []
+    condition: eq(variables.isDeployBranch, true)
+    jobs:
+      - job: DownloadLatestArtifact
+        displayName: 'Baixar último artefato'
+        pool: GeneralPurposeLinuxAgentsCD
+        steps:
+          - checkout: self
+            displayName: 'Checkout repositório'
+
+          - task: PowerShell@2
+            displayName: 'Obter versão do projeto'
+            inputs:
+              targetType: 'inline'
+              script: |
+                $versionFile = "${{ parameters.versionFile }}"
+                Write-Host "Buscando versão em: $versionFile"
+                
+                if ($versionFile -eq "pyproject.toml" -and (Test-Path $versionFile)) {
+                  $version = (Get-Content $versionFile | Select-String -Pattern '^version\s*=\s*"([^"]+)"' | ForEach-Object { $_.Matches.Groups[1].Value })
+                } elseif (Test-Path "VERSION") {
+                  $version = (Get-Content "VERSION" -Raw).Trim()
+                } else {
+                  Write-Error "Arquivo de versão não encontrado"
+                  exit 1
+                }
+                
+                Write-Host "Versão encontrada: $version"
+                echo "##vso[task.setvariable variable=Version]$version"
+
+          # Baixar artefato do último build bem-sucedido do staging
+          - task: DownloadPipelineArtifact@2
+            displayName: 'Baixar artefato python-package do staging'
+            inputs:
+              buildType: 'specific'
+              project: '$(System.TeamProjectId)'
+              definition: '$(System.DefinitionId)'
+              buildVersionToDownload: 'latestFromBranch'
+              branchName: 'refs/heads/staging'
+              artifactName: 'python-package'
+              targetPath: '$(System.DefaultWorkingDirectory)/python-package'
+
+          - task: PowerShell@2
+            displayName: 'Listar artefatos baixados'
+            inputs:
+              targetType: 'inline'
+              script: |
+                Write-Host "=== Conteúdo do diretório de artefatos ==="
+                Get-ChildItem -Path "$(System.DefaultWorkingDirectory)" -Recurse | Format-Table Name, Length, LastWriteTime
+                
+                $zipFiles = Get-ChildItem -Path "$(System.DefaultWorkingDirectory)" -Filter "*.zip" -Recurse
+                if ($zipFiles.Count -gt 0) {
+                  Write-Host "Arquivos .zip encontrados:"
+                  $zipFiles | ForEach-Object { Write-Host "  - $($_.FullName)" }
+                } else {
+                  Write-Warning "Nenhum arquivo .zip encontrado"
+                }
+
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publicar artefato para deploy'
+            inputs:
+              PathtoPublish: '$(System.DefaultWorkingDirectory)/python-package'
+              ArtifactName: 'bin'
+              publishLocation: 'Container'
+
+  # Stage 5: Deploy - Distribui o pacote para as VMs listadas no arquivo resources
+  - stage: DeployApplication
+    displayName: 'Deploy para VMs'
+    dependsOn: DownloadArtifact
+    condition: and(succeeded('DownloadArtifact'), eq(variables.isDeployBranch, true))
+    variables:
+      - group: RPADEVOPS
+    jobs:
+      - job: Deploy
+        displayName: 'Deploy do pacote para VMs'
+        pool:
+          name: "RPAAgents"
+          demands: "csharp"
+        steps:
+          - checkout: self
+            persistCredentials: true
+            displayName: 'Checkout repositório'
+          - checkout: RPAScripts
+            persistCredentials: true
+            displayName: 'Checkout scripts de deploy'
+          - task: PowerShell@2
+            displayName: 'Selecionar versão dos scripts de deploy'
+            inputs:
+              targetType: 'inline'
+              script: |
+                $repositoryPath = "$(Build.SourcesDirectory)/Vivo.CodePlay.Pipelines"
+                $requestedRef = $env:RPA_SCRIPTS_REF
+
+                git -C $repositoryPath fetch origin $requestedRef
+                if ($LASTEXITCODE -ne 0) {
+                  Write-Error "Não foi possível localizar o ref '$requestedRef' dos scripts de deploy."
+                  exit $LASTEXITCODE
+                }
+
+                git -C $repositoryPath checkout --detach FETCH_HEAD
+                if ($LASTEXITCODE -ne 0) {
+                  Write-Error "Não foi possível selecionar o ref '$requestedRef' dos scripts de deploy."
+                  exit $LASTEXITCODE
+                }
+            env:
+              RPA_SCRIPTS_REF: ${{ parameters.rpaScriptsRef }}
+          - task: DownloadBuildArtifacts@1
+            displayName: 'Download Build Artifact: bin'
+            inputs:
+              buildType: 'current'
+              artifactName: 'bin'
+              downloadPath: '$(System.ArtifactsDirectory)'
+
+          - ${{ if eq(parameters.buildExecutable, true) }}:
+            - task: PowerShell@2
+              displayName: 'Gerar executável Windows com PyInstaller'
+              inputs:
+                targetType: 'inline'
+                script: |
+                  $ErrorActionPreference = "Stop"
+
+                  if ([string]::IsNullOrWhiteSpace($env:PYINSTALLER_ENTRYPOINT)) {
+                    throw "Parâmetro pyInstallerEntryPoint obrigatório quando buildExecutable=true."
+                  }
+
+                  $repoCandidates = @(
+                    "$(Build.SourcesDirectory)\$(Build.Repository.Name)",
+                    "$(Build.SourcesDirectory)"
+                  )
+                  $repoPath = $null
+                  foreach ($candidate in $repoCandidates) {
+                    if (Test-Path -Path (Join-Path $candidate $env:PYINSTALLER_ENTRYPOINT) -PathType Leaf) {
+                      $repoPath = $candidate
+                      break
+                    }
+                  }
+
+                  if ([string]::IsNullOrWhiteSpace($repoPath)) {
+                    throw "Arquivo principal do PyInstaller não encontrado: '$env:PYINSTALLER_ENTRYPOINT'."
+                  }
+
+                  $exeName = $env:PYINSTALLER_EXECUTABLE_NAME
+                  if ([string]::IsNullOrWhiteSpace($exeName)) {
+                    $exeName = $env:PUBLISH_ARTIFACT_ID
+                  }
+                  if ([string]::IsNullOrWhiteSpace($exeName)) {
+                    throw "Nome do executável não definido. Informe pyInstallerExecutableName ou PUBLISH_ARTIFACT_ID."
+                  }
+
+                  $entryPoint = Join-Path $repoPath $env:PYINSTALLER_ENTRYPOINT
+                  $distPath = Join-Path $repoPath "dist\pyinstaller"
+                  $workPath = Join-Path $repoPath "build\pyinstaller"
+                  $specPath = Join-Path $repoPath "build\pyinstaller-spec"
+                  $packageRoot = Join-Path "$(Agent.TempDirectory)" "pyinstaller-package"
+                  $artifactBinPath = "$(System.ArtifactsDirectory)\bin"
+                  $zipPath = Join-Path $artifactBinPath "$($env:PUBLISH_ARTIFACT_ID)-executable.zip"
+
+                  Remove-Item -Path $distPath, $workPath, $specPath, $packageRoot -Recurse -Force -ErrorAction SilentlyContinue
+                  New-Item -Path $distPath, $workPath, $specPath, $packageRoot, $artifactBinPath -ItemType Directory -Force | Out-Null
+
+                  Set-Location $repoPath
+
+                  $env:PIP_INDEX_URL = "https://AzureDevOps:$($env:AZDO_FEED_PASSWORD)@pkgs.dev.azure.com/telefonica-vivo-brasil/_packaging/DevOps/pypi/simple/"
+                  $env:UV_INDEX_URL = "https://AzureDevOps:$($env:AZDO_FEED_PASSWORD)@pkgs.dev.azure.com/telefonica-vivo-brasil/_packaging/DevOps/pypi/simple/"
+                  $env:UV_EXTRA_INDEX_URL = "https://AzureDevOps:$($env:AZDO_FEED_PASSWORD)@pkgs.dev.azure.com/telefonica-vivo-brasil/$(System.TeamProjectId)/_packaging/$(DEFAULT_FEED_NAME)/pypi/simple/"
+
+                  python --version
+                  python -m pip install --upgrade pip
+                  python -m pip install "uv==$env:UV_VERSION"
+                  uv --version
+                  uv sync --no-cache --python "$env:PYTHON_VERSION" --no-dev
+
+                  $pyInstallerArgs = @(
+                    "run",
+                    "--with", "pyinstaller",
+                    "pyinstaller",
+                    "--onefile",
+                    "--name", $exeName,
+                    "--distpath", $distPath,
+                    "--workpath", $workPath,
+                    "--specpath", $specPath
+                  )
+
+                  if ($env:PYINSTALLER_INCLUDE_ENV -ieq "true") {
+                    $envFile = Join-Path $repoPath ".env"
+                    if (-not (Test-Path -Path $envFile -PathType Leaf)) {
+                      throw "pyInstallerIncludeEnv=true, mas o arquivo .env não foi encontrado no repositório."
+                    }
+                    $pyInstallerArgs += @("--add-data", ".env;.")
+                  }
+
+                  function Convert-JsonArray {
+                    param([string]$Json)
+                    if ([string]::IsNullOrWhiteSpace($Json)) {
+                      return @()
+                    }
+                    $items = ConvertFrom-Json -InputObject $Json
+                    if ($null -eq $items) {
+                      return @()
+                    }
+                    return @($items)
+                  }
+
+                  foreach ($dataFile in Convert-JsonArray -Json $env:PYINSTALLER_ADD_DATA_JSON) {
+                    $pyInstallerArgs += @("--add-data", [string]$dataFile)
+                  }
+
+                  foreach ($extraArg in Convert-JsonArray -Json $env:PYINSTALLER_EXTRA_ARGS_JSON) {
+                    $pyInstallerArgs += [string]$extraArg
+                  }
+
+                  $pyInstallerArgs += $entryPoint
+
+                  Write-Host "Executando: uv $($pyInstallerArgs -join ' ')"
+                  & uv @pyInstallerArgs
+                  if ($LASTEXITCODE -ne 0) {
+                    exit $LASTEXITCODE
+                  }
+
+                  $exePath = Join-Path $distPath "$exeName.exe"
+                  if (-not (Test-Path -Path $exePath -PathType Leaf)) {
+                    throw "Executável não gerado em '$exePath'."
+                  }
+
+                  Copy-Item -Path $exePath -Destination $packageRoot -Force
+                  Compress-Archive -Path (Join-Path $packageRoot "*") -DestinationPath $zipPath -Force
+                  Write-Host "Executável empacotado em: $zipPath"
+              env:
+                AZDO_FEED_PASSWORD: $(System.AccessToken)
+                PUBLISH_ARTIFACT_ID: ${{ parameters.PUBLISH_ARTIFACT_ID }}
+                PYINSTALLER_ENTRYPOINT: ${{ parameters.pyInstallerEntryPoint }}
+                PYINSTALLER_EXECUTABLE_NAME: ${{ parameters.pyInstallerExecutableName }}
+                PYINSTALLER_INCLUDE_ENV: ${{ parameters.pyInstallerIncludeEnv }}
+                PYINSTALLER_ADD_DATA_JSON: '${{ convertToJson(parameters.pyInstallerAddData) }}'
+                PYINSTALLER_EXTRA_ARGS_JSON: '${{ convertToJson(parameters.pyInstallerExtraArgs) }}'
+
+          - task: PowerShell@2
+            displayName: 'Obter lista de VMs do arquivo resources'
+            inputs:
+              targetType: 'inline'
+              script: |
+                # Busca o arquivo resources em caminhos possíveis
+                $possiblePaths = @(
+                  "$(Build.Repository.Name)/${{ parameters.resourcesPath }}/resources",
+                  "$(Build.Repository.Name)/.azuredevops/resources",
+                  "$(Build.SourcesDirectory)/${{ parameters.resourcesPath }}/resources",
+                  "$(Build.SourcesDirectory)/.azuredevops/resources",
+                  "$(Build.SourcesDirectory)/resources"
+                )
+                
+                $resourcesFile = $null
+                foreach ($path in $possiblePaths) {
+                  if (Test-Path $path) {
+                    $resourcesFile = $path
+                    Write-Host "Arquivo resources encontrado em: $path"
+                    break
+                  }
+                }
+                
+                if (-not $resourcesFile) {
+                  Write-Error "Arquivo resources não encontrado em nenhum dos caminhos esperados"
+                  $possiblePaths | ForEach-Object { Write-Host "  Verificado: $_" }
+                  exit 1
+                }
+                
+                # Lê o conteúdo bruto
+                $rawContent = Get-Content -Raw $resourcesFile
+                Write-Host "Conteúdo bruto do arquivo resources:"
+                Write-Host $rawContent
+                
+                # Normaliza: divide por vários delimitadores e limpa
+                $machines = $rawContent -split '[,;\s\r\n]+' | ForEach-Object {
+                  $item = $_.Trim()
+                  # Remove aspas simples e duplas nas extremidades e quaisquer
+                  # residuais internas. Trim/Replace evitam regex literals com
+                  # aspas escapadas, que quebravam o parser do PowerShell
+                  # (\" dentro de string entre aspas duplas nao e um escape
+                  # valido - PowerShell usa crase como caractere de escape).
+                  $item = $item.Trim("'`"")
+                  $item = $item.Replace('"','').Replace("'",'')
+                  $item.Trim()
+                } | Where-Object { 
+                  $_ -ne '' -and -not $_.StartsWith('#') 
+                }
+                
+                if ($machines.Count -eq 0) {
+                  Write-Error "Nenhuma VM encontrada no arquivo resources"
+                  exit 1
+                }
+                
+                $cleanedResources = $machines -join ','
+                Write-Host "Máquinas normalizadas ($($machines.Count)): $cleanedResources"
+                echo "##vso[task.setvariable variable=Resources]$cleanedResources"
+
+          - task: PowerShell@2
+            displayName: 'Deploy Python Package'
+            inputs:
+              targetType: 'filePath'
+              filePath: '$(Build.SourcesDirectory)/Vivo.CodePlay.Pipelines/tech_products/rpa/V3/Deploy_Python_v1.ps1'
+              arguments: >
+                -listDestination "$(Resources)"
+                -PathFile "$(System.ArtifactsDirectory)\bin"
+                -ArquivoProjeto "${{ parameters.PUBLISH_ARTIFACT_ID }}"
+                -usuario "$(User)"
+                -senha "$(PASS)"
+                -AllowPlainPassword
+                -logFile "$(System.ArtifactsDirectory)\bin\logDeployPython.txt"
+                ${{ parameters.deployAdditionalArguments }}
+
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publicar logs de deploy'
+            condition: always()
+            inputs:
+              PathtoPublish: '$(System.ArtifactsDirectory)\bin'
+              ArtifactName: 'deploy-logs'

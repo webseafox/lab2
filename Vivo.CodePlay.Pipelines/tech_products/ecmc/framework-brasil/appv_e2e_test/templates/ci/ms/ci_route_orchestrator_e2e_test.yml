@@ -1,0 +1,89 @@
+stages:
+- stage: e2e_test
+  displayName: "CI - E2e Test"
+  pool:
+    name: GeneralPurposeLinuxAgentsCI
+  dependsOn:
+  - environment_init
+
+  variables:
+  - name: NEXUS_DEPS_USR
+    value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEPS_USR'] ]
+  - name: NEXUS_DEPS_PSW
+    value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEPS_PSW'] ]
+  - name: NEXUS_DEFAULT_USR
+    value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEFAULT_USR'] ]
+  - name: NEXUS_DEFAULT_PSW
+    value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEFAULT_PSW'] ]
+  
+  jobs:      
+  - job: test
+    displayName: Test
+    steps:
+
+
+    - task: 6d15af64-176c-496d-b583-fd2ae21d4df4@1
+      displayName: Checkout Code
+      name: checkout_code 
+      inputs:
+        repository: self
+        persistCredentials: "true"
+        clean: true
+
+    # ==================================================================
+    # [Compliance] Verifica se o repositório está em conformidade com as políticas de configuração
+    # ==================================================================
+    - task: VivoDevOpsConfigCompliance@1
+      displayName: 'Check DevOps Config Compliance'
+      inputs:
+        policySets: |
+          image-definition-files
+
+    - task: Bash@3
+      displayName: Executing E2E Test
+      name: run_tests
+      condition: succeeded()
+      inputs:
+        targetType: inline
+        script:  >
+          BUILDER_IMAGE_NAME="cypress/node"
+            docker build -t $BUILDER_IMAGE_NAME -f ./modules/${{ parameters.context }}/${{ parameters.module }}/pipelines/builder.Dockerfile .
+            set -e
+              docker run --rm \
+                --user="$(DOCKER_CMD_USERNAME):$(DOCKER_CMD_GROUP)" \
+                --network host \
+                --log-driver none \
+                -e NPM_CONFIG_USERCONFIG="/tmp/.npmrc" \
+                -e HTTPS_PROXY=$(PROXY_AGENT_HTTPS) \
+                -e HTTP_PROXY=$(PROXY_AGENT_HTTP) \
+                -e NO_PROXY=$(PROXY_AGENT_NO_PROXY) \
+                -e NO_PROXY="nexus.telefonica.com.br,pre-mg-api.telefonicabigdata.com,authhml.vivo.com.br,hml-app.vivo.com.br,app.vivo.com.br" \
+                -e CYPRESS_CACHE_FOLDER=/.cache/Cypress \
+                -e TZ="America/Sao_Paulo" \
+                -e SYSTEM_ACCESSTOKEN="$(System.AccessToken)" \
+                -e NEXUS_DEPS_USR="$(NEXUS_DEPS_USR)" \
+                -e NEXUS_DEPS_PSW="$(NEXUS_DEPS_PSW)" \
+                -e ENVIRONMENT="${{ parameters.environment }}" \
+                -e DISPLAY=:99 \
+                -v $(pwd):/app \
+                -v $(DEFAULT_NPMRC_TEMP_FILE_PATH):/tmp/.npmrc \
+                -w $(DOCKER_WORKDIR) \
+                $BUILDER_IMAGE_NAME sh -c "Xvfb -screen 0 1024x768x24 :99 & npm ci && ENV=${{ parameters.environment }} npm run test:${{ parameters.context }}:${{ parameters.module }}"
+ 
+
+      
+    - task: Bash@3
+      displayName: 'Publish Report'
+      name: publish_report
+      condition: always()
+      env: 
+        HTTPS_PROXY: http://10.240.58.39:3128 
+      inputs:
+        targetType: 'inline'
+        script: |
+          curl --insecure -v --user $(NEXUS_DEFAULT_USR):$(NEXUS_DEFAULT_PSW) --upload-file './modules/${{ parameters.context }}/${{ parameters.module }}/reports/report.html' 'https://nexus.telefonica.com.br/repository/framework-brasil-raw/tests-e2e/modules/${{ parameters.context }}/${{ parameters.module }}/report.html'
+          echo "-------REPORT------: https://nexus.telefonica.com.br/repository/framework-brasil-raw/tests-e2e/modules/${{ parameters.context }}/${{ parameters.module }}/report.html"
+
+
+
+  

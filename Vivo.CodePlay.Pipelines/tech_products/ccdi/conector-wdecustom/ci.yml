@@ -1,0 +1,101 @@
+# =============================================================================
+# CI Template - CCDI ClickOnce (Conector WDE Custom)
+# =============================================================================
+# Build .NET ClickOnce application e publica artefato para deploy.
+# Utilizado pelo pipeline pai: PIPES PAIS/CCDI/azure-pipelines.yml
+# =============================================================================
+
+parameters:
+- name: enablePublish
+  displayName: 'Habilitar publicação no Azure Artifacts'
+  type: boolean
+  default: false
+
+- name: feedPackage
+  displayName: 'Nome do pacote no Azure Artifacts'
+  type: string
+  default: ''
+
+- name: packageVersion
+  displayName: 'Versão do pacote (para publicação)'
+  type: string
+  default: ''
+
+stages:
+
+# ---------------------------------------------------------------------------
+# Stage: Build
+# ---------------------------------------------------------------------------
+- stage: Build
+  displayName: '🏗️ Build CCDI ClickOnce'
+  jobs:
+  - job: Build
+    displayName: '🏗️ Build CCDI'
+    pool:
+      name: Azure Pipelines
+      vmImage: 'windows-latest'
+    steps:
+
+      - checkout: self
+        displayName: '🔄 Checkout code'
+
+      - task: NuGetToolInstaller@1
+        displayName: '🔧 Install NuGet'
+
+      - task: NuGetCommand@2
+        displayName: '📦 Restore NuGet Packages'
+        inputs:
+          restoreSolution: 'CCDI/CCDI.sln'
+
+      - task: VSBuild@1
+        displayName: '🏗️ Build CCDI (MSBuild)'
+        inputs:
+          solution: 'CCDI/CCDI.sln'
+          platform: 'Any CPU'
+          configuration: 'Release'
+
+      - task: PowerShell@2
+        displayName: '🚀 Create ClickOnce package'
+        inputs:
+          filePath: 'CCDI/publish-clickonce-production.ps1'
+          arguments: '-SkipConfirmation -TargetFolder "$(targetFolder)" -ProjectRoot "$(Build.SourcesDirectory)"'
+          pwsh: true
+
+      - publish: 'C:\Temp\clickonce-ftp-package'
+        artifact: '$(clickOnceArtifactName)'
+        displayName: '📤 Publish ClickOnce Artifact'
+
+# ---------------------------------------------------------------------------
+# Stage: Publish (Azure Artifacts)
+# ---------------------------------------------------------------------------
+- stage: Publish
+  displayName: '📦 Publish to Azure Artifacts'
+  dependsOn: Build
+  condition: and(succeeded('Build'), eq('${{ parameters.enablePublish }}', 'true'))
+  jobs:
+  - job: Publish
+    displayName: '📦 Publish Universal Package'
+    pool:
+      name: Azure Pipelines
+      vmImage: 'windows-latest'
+    steps:
+
+      - checkout: self
+        displayName: '🔄 Checkout code'
+
+      - download: current
+        artifact: '$(clickOnceArtifactName)'
+        displayName: '⬇️ Download ClickOnce Artifact'
+
+      - task: UniversalPackages@0
+        name: UniversalPackages
+        displayName: '📦 Publish Azure Artifacts'
+        continueOnError: false
+        inputs:
+          command: 'publish'
+          publishDirectory: '$(Pipeline.Workspace)/$(clickOnceArtifactName)'
+          feedsToUsePublish: 'internal'
+          vstsFeedPublish: '3d53bc62-8749-4931-ae46-a443b73bc87a'
+          vstsFeedPackagePublish: '${{ parameters.feedPackage }}'
+          versionOption: 'custom'
+          versionPublish: '${{ parameters.packageVersion }}'

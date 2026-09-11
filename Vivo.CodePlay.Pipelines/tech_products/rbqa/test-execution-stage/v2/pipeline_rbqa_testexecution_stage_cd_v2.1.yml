@@ -1,0 +1,212 @@
+#  # Test Execution
+#  - template:  /tech_products/rbqa/test-execution-stage/v1/pipeline_rbqa_testexecution_stage_cd_v1.0.1.yml
+#    parameters:
+#      jira_id: PTI-1111-11
+#      test_environment: PREPROD
+#      component_id: src.src-test-habilitacao_b2c_movel
+#      octane_workspace: 102001
+#      docker_image: selenium
+
+parameters:
+- name: jira_id
+  displayName: ID da história que deve ser testada
+  type: string
+- name: test_environment
+  displayName: Ambiente onde o teste será executado
+  type: string
+- name: component_id
+  displayName: Componente que será testado
+  type: string
+  default: ""
+- name: octane_workspace
+  displayName: Workspace onde estão os testes no Octane
+  type: string
+  default: ""
+- name: test_type
+  type: string
+  default: ''
+- name: docker_image
+  type: string
+  default: selenium
+  values:
+    - selenium
+    - selenium-xfcb-chrome
+    - selenium-xfcb-edge
+    - selenium-xfcb-firefox
+    - uftdeveloper
+- name: framework
+  type: string
+  default: JUnit
+
+stages:
+- stage: e2e_test_execution_${{ parameters.test_environment }}      
+  displayName: "E2E - Test Execution"
+  
+  variables:
+    - name: SCRIPTS_FOLDER
+      value: $(Build.SourcesDirectory)/Vivo.CodePlay.Pipelines/tech_products/rbqa/test-execution-stage/v2/scripts  
+    - name: CONTAINER_IMAGE
+      ${{ if eq(parameters.docker_image, 'selenium') }}:
+        value: acrsharedservices01.azurecr.io/base/qa/selenium-junit/oraclient/runtime:1.0.1
+      ${{ elseif eq(parameters.docker_image, 'selenium-xfcb-chrome') }}:
+        value: acrsharedservices01.azurecr.io/base/qa/selenium-xvfb/chrome/runtime:1.0.2
+      ${{ elseif eq(parameters.docker_image, 'selenium-xfcb-edge') }}:
+        value: acrsharedservices01.azurecr.io/base/qa/selenium-xvfb/edge/runtime:1.0.2
+      ${{ elseif eq(parameters.docker_image, 'selenium-xfcb-firefox') }}:
+        value: acrsharedservices01.azurecr.io/base/qa/selenium-xvfb/firefox/runtime:1.0.2
+      ${{ elseif eq(parameters.docker_image, 'uftdeveloper') }}:
+        value: acrsharedservices01.azurecr.io/base/qa/uftdeveloper/chrome/runtime:1.0.2
+    - template: /tech_products/rbqa/test-execution-stage/v2/variables/variables.yml
+  
+  jobs:
+  - job: rbqa_test_execution_job
+    displayName: "Test Execution"
+    pool:
+      name: $(PRIVATE_AGENT_QA)
+      demands:
+      - Agent.Version -equals 3.232.3
+
+    steps:
+    - checkout: Tests
+      displayName: Checkout Test Repo
+      name: checkout_test_repo
+      persistCredentials: true
+      clean: true
+
+    - checkout: CodePlay
+      displayName: Checkout CodePlay
+      name: checkout_codeplay
+      persistCredentials: true
+      clean: true
+     ## Download NEXUS Credentials
+    - task: AzureKeyVault@2
+      displayName: 'Getting AKV Credentials'
+      timeoutInMinutes: 3
+      retryCountOnTaskFailure: 5
+      inputs:
+        azureSubscription: DevOpsSharedResources
+        KeyVaultName: $(AKV_DEVOPS_NAME)
+        SecretsFilter: 'NEXUS-DEPS-USR, NEXUS-DEPS-PSW, NEXUS-DEFAULT-USR, NEXUS-DEFAULT-PSW'                                     
+
+    ## -> Set NEXUS credentials to variables. This allows it to used in other stages, jobs or tasks.
+    ## -> NEXUS_DEPS_USR and NEXUS_DEPS_PSW, use these to download dependencies. 
+    ## -> NEXUS_DEFAULT_USR and NEXUS_DEFAULT_PSW, use these to upload artifacts. 
+    - task: Bash@3
+      displayName: 'Set Credentials Variables'
+      name: credentials
+      condition: and(
+        succeeded(),
+        ne(variables['NEXUS-DEPS-USR'], ''), ne(variables['NEXUS-DEPS-PSW'], ''),
+        ne(variables['NEXUS-DEFAULT-USR'], ''), ne(variables['NEXUS-DEFAULT-PSW'], ''))
+      continueOnError: false
+      inputs:
+        targetType: 'inline'
+        script: |          
+            echo "##[group] Variables to DOWNLOAD dependencies from NEXUS"
+            echo "##[debug] NEXUS-DEPS-USR: $(NEXUS-DEPS-USR). Use as >> NEXUS_DEPS_USR."
+            echo "##vso[task.setvariable variable=NEXUS_DEPS_USR;isOutput=true;isSecret=true]$(NEXUS-DEPS-USR)"
+            echo "##[debug] NEXUS-DEPS-PSW: $(NEXUS-DEPS-PSW). Use as >> NEXUS_DEPS_PSW"          
+            echo "##vso[task.setvariable variable=NEXUS_DEPS_PSW;isOutput=true;isSecret=true]$(NEXUS-DEPS-PSW)"
+            echo "##[endgroup]"
+        KeyVaultName: kv-azdevops-shared
+        SecretsFilter: 'NEXUS-DEPS-USR, NEXUS-DEPS-PSW'   
+
+    - task: GetOctaneTests@1.0.53
+      inputs:
+        rbqaURL: '$(ALM_SERVER)'
+        rbqaUser: $(ALM_USER)
+        rbqaPassword: $(ALM_PASSWORD)
+        rbqaSharedSpace: $(ALM_SHARED_SPACE)
+        rbqaWorkspace: ${{ parameters.octane_workspace }}
+        rbqaJiraId: ${{ parameters.jira_id }}
+        rbqaTestType: ${{ parameters.test_type }}
+      name: get_octane_tests
+      displayName: Get Octane Tests
+
+    - task: Bash@3
+      displayName: 'Set Variables'
+      name: testIDS
+      inputs:      
+        targetType: 'inline'
+        script: |
+            echo "##vso[task.setvariable variable=NEXUS_DEPS_USR;]$(credentials.NEXUS_DEPS_USR)"   
+            echo "##vso[task.setvariable variable=NEXUS_DEPS_PSW;]$(credentials.NEXUS_DEPS_PSW)"
+            echo "##vso[task.setvariable variable=TEST_IDS;]$(get_octane_tests.testIDs)"   
+            
+    - task: Docker@2
+      displayName: 'Auth for Azure Container Registry'
+      inputs:
+        command: 'login'
+        containerRegistry: ACR-DEVOPS
+        timeoutInMinutes: 90    
+
+    - task: Bash@3
+      displayName: "Set execute permissions for scripts"
+      inputs:
+        targetType: 'inline'
+        script: |
+            chmod +x $(SCRIPTS_FOLDER)/*
+            echo $(SCRIPTS_FOLDER)
+            ls -lha $(SCRIPTS_FOLDER)
+            sed -i -e 's/\r$//' $(SCRIPTS_FOLDER)/*.sh     
+            
+    - task: Bash@3 
+      displayName: "Executing scenario(s)"
+      inputs:
+        targetType: 'targetPath'
+        script: $(SCRIPTS_FOLDER)/docker_test_execution.sh
+      env:
+        SYSTEM_ACCESSTOKEN: '$(System.AccessToken)'
+        NEXUS_DEPS_USR: '$(NEXUS_DEPS_USR)'
+        NEXUS_DEPS_PSW: '$(NEXUS_DEPS_PSW)'
+        DEFAULT_MAX_MEMORY_BUILD: "$DEFAULT_MAX_MEMORY_BUILD"
+        ENVIRONMENT: '${{ parameters.test_environment }}'
+        SCENARIOS: '$(TEST_IDS)'
+        OPTIONALS: 'default-stage'
+        FRAMEWORK: ${{ parameters.framework }}
+        CONTAINER_IMAGE: '$(CONTAINER_IMAGE)'
+        DOCKER_IMAGE: ${{ parameters.docker_image }}
+        SCRIPTS_FOLDER: '$(SCRIPTS_FOLDER)'
+        AGENT_TMP_DIRECTORY: '$(Agent.TempDirectory)'
+        ALM_USER: '$(ALM_USER)'
+        ALM_PASSWORD: '$(ALM_PASSWORD)'
+        PROJECT_ID: ""
+        ENABLE_COLLECT_METRIC: False
+        COMPONENT_ID: ${{ parameters.component_id }}
+        TEST_TYPE: ${{ parameters.test_type }}                 
+
+    - publish: $(Agent.TempDirectory)
+      displayName: Publish logs
+      artifact: logs_${{ parameters.test_environment }}_${{ parameters.test_type }}
+      condition: always()
+
+    - publish: $(Build.SourcesDirectory)/RunResults
+      displayName: Publish RunResults
+      artifact: RunResults_${{ parameters.test_environment }}_${{ parameters.test_type }}
+      condition: always()
+
+    - task: Bash@3 
+      displayName: "Checking for failed tests"
+      inputs:
+        targetType: 'targetPath'
+        script: $(SCRIPTS_FOLDER)/check_for_failed_tests.sh
+      env:
+        FAIL_PIPELINE: True
+        BUILD_SOURCESDIRECTORY: $(Build.SourcesDirectory)
+
+    - task: DeleteFiles@1
+      displayName: "Clean logs directory"
+      inputs:
+        SourceFolder: '$(Agent.TempDirectory)'
+        Contents: '*.log'
+        removeSourceFolder: false
+      condition: always()
+
+    - task: Bash@3 
+      displayName: "Clean build sources directory"
+      inputs:
+        targetType: 'inline'
+        script: |
+            rm -rf $(Build.SourcesDirectory)/RunResults
+        removeSourceFolder: false
+      condition: always()

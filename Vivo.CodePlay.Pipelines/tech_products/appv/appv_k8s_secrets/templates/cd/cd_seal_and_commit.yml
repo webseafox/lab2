@@ -1,0 +1,276 @@
+## ============================================================================
+## Template: Seal and Commit to GitOps (Stage 2)
+## ============================================================================
+
+parameters:
+  - name: targetEnvironment
+    type: string
+  - name: secretName
+    type: string
+  - name: dryRun
+    type: boolean
+    default: false
+
+stages:
+  - stage: cd_seal_and_commit
+    displayName: "Seal & Commit"
+    pool:
+      name: GeneralPurposeLinuxAgentsCI
+    dependsOn:
+      - environment_init
+      - cd_validate_and_prepare
+    condition: and(succeeded(), eq(${{ parameters.dryRun }}, false), eq(dependencies.cd_validate_and_prepare.outputs['prepare_secret.merge_analysis.HAS_CHANGES'], 'true'))
+
+    variables:
+      - name: APP_NAME
+        value: $[ stageDependencies.cd_validate_and_prepare.validate_parameters.outputs['validate_parameters.validate.APP_NAME'] ]
+      - name: NAMESPACE
+        value: $[ stageDependencies.cd_validate_and_prepare.validate_parameters.outputs['validate_parameters.validate.NAMESPACE'] ]
+      - name: FULL_SECRET_NAME
+        value: $[ stageDependencies.cd_validate_and_prepare.validate_parameters.outputs['validate_parameters.validate.FULL_SECRET_NAME'] ]
+      - name: IS_GENERAL_SECRET
+        value: $[ stageDependencies.cd_validate_and_prepare.validate_parameters.outputs['validate_parameters.validate.IS_GENERAL_SECRET'] ]
+      - name: SECRET_MODE
+        value: $[ stageDependencies.cd_validate_and_prepare.prepare_secret.outputs['check_existing.SECRET_MODE'] ]
+      - name: NEXUS_DEPS_USR
+        value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEPS_USR'] ]
+      - name: NEXUS_DEPS_PSW
+        value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEPS_PSW'] ]
+
+    jobs:
+      - job: seal_and_commit
+        displayName: "Seal & Commit to GitOps"
+        steps:
+          - task: DownloadSecureFile@1
+            displayName: "Download Kubeconfig"
+            name: kubeconf
+            inputs:
+              secureFile: kubeconf-${{ parameters.targetEnvironment }}.yml
+              retryCount: 3
+
+          - task: DownloadPipelineArtifact@2
+            displayName: "Download Secret Manifest"
+            inputs:
+              buildType: "current"
+              artifactName: "secret-manifest-${{ parameters.secretName }}"
+              targetPath: "$(Pipeline.Workspace)/manifest/"
+
+          - ${{ if or(startsWith(parameters.targetEnvironment, 'darklaunch-'), startsWith(parameters.targetEnvironment, 'prod-')) }}:
+              - checkout: git://FRBR - FRAMEWORK BRASIL/infra.infra-devops-aks-prod@refs/heads/master
+                clean: true
+                path: gitops
+                persistCredentials: "true"
+                displayName: "Checkout GitOps (Production)"
+                condition: and(succeeded(), or(startsWith('${{ parameters.targetEnvironment }}', 'darklaunch-'), startsWith('${{ parameters.targetEnvironment }}', 'prod-')))
+          - ${{ else }}:
+              - checkout: git://FRBR - FRAMEWORK BRASIL/infra.infra-devops-aks-preprod@refs/heads/master
+                clean: true
+                path: gitops
+                persistCredentials: "true"
+                displayName: "Checkout GitOps (Pre-Production)"
+                condition: and(succeeded(), not(or(startsWith('${{ parameters.targetEnvironment }}', 'darklaunch-'), startsWith('${{ parameters.targetEnvironment }}', 'prod-'))))
+
+          - task: Bash@3
+            displayName: "Install kubeseal"
+            inputs:
+              targetType: inline
+              script: |
+                set -e
+
+                if command -v kubeseal &> /dev/null; then
+                  echo "kubeseal already available"
+                  kubeseal --version || true
+                  exit 0
+                fi
+
+                echo "Downloading kubeseal from Nexus..."
+
+                KUBESEAL_VERSION="0.30.0"
+                NEXUS_URL="$(NEXUS_REPOSITORY_URL)/framework-brasil-raw/kubeseal/kubeseal-${KUBESEAL_VERSION}-linux-amd64.tar.gz"
+
+                TEMP_DIR=$(mktemp -d)
+                cd "$TEMP_DIR"
+
+                curl -fsSL -u "$(NEXUS_DEPS_USR):$(NEXUS_DEPS_PSW)" \
+                  -o kubeseal.tar.gz "$NEXUS_URL"
+
+                if [ ! -f kubeseal.tar.gz ]; then
+                  echo "##[error]Failed to download kubeseal from Nexus."
+                  exit 1
+                fi
+
+                tar -xzf kubeseal.tar.gz
+
+                KUBESEAL_BIN=$(find . -name "kubeseal" -type f | head -1)
+                if [ -z "$KUBESEAL_BIN" ]; then
+                  echo "##[error]kubeseal binary not found after extraction."
+                  exit 1
+                fi
+
+                chmod +x "$KUBESEAL_BIN"
+
+                LOCAL_BIN="$HOME/.local/bin"
+                mkdir -p "$LOCAL_BIN"
+                cp "$KUBESEAL_BIN" "$LOCAL_BIN/kubeseal"
+
+                echo "##vso[task.prependpath]$LOCAL_BIN"
+
+                cd /
+                rm -rf "$TEMP_DIR"
+
+                echo "kubeseal installed successfully"
+
+          - task: Bash@3
+            displayName: "Seal Secret (Local Only)"
+            name: seal_secret
+            inputs:
+              targetType: inline
+              script: |
+                set -e
+
+                NAMESPACE="$(NAMESPACE)"
+                SECRET_NAME="$(FULL_SECRET_NAME)"
+                KUBECONFIG="$(kubeconf.secureFilePath)"
+                SECRET_MODE="$(SECRET_MODE)"
+                APP_NAME="$(APP_NAME)"
+                IS_GENERAL_SECRET="$(IS_GENERAL_SECRET)"
+                ENVIRONMENT="${{ parameters.targetEnvironment }}"
+
+                echo "Mode: $SECRET_MODE | Namespace: $NAMESPACE | Secret: $SECRET_NAME"
+
+                MANIFEST_FILE=$(find "$(Pipeline.Workspace)/manifest/" -name "*.yaml" -type f | head -1)
+
+                if [ -z "$MANIFEST_FILE" ] || [ ! -f "$MANIFEST_FILE" ]; then
+                  echo "##[error]Secret manifest not found in artifact."
+                  exit 1
+                fi
+
+                if [ "$IS_GENERAL_SECRET" = "true" ]; then
+                  GITOPS_DIR="$(Pipeline.Workspace)/gitops/src/$ENVIRONMENT/secrets"
+                else
+                  GITOPS_DIR="$(Pipeline.Workspace)/gitops/src/$ENVIRONMENT/apps/$APP_NAME/secrets"
+                fi
+
+                SEALED_SECRET_PATH="$GITOPS_DIR/${SECRET_NAME}-sealed.yml"
+                mkdir -p "$GITOPS_DIR"
+
+                echo "Target path: $SEALED_SECRET_PATH"
+
+                if [ -f "$SEALED_SECRET_PATH" ]; then
+                  echo "Existing SealedSecret found - merging keys"
+                  ACTUAL_SECRET_MODE="MERGE"
+                  
+                  EXISTING_KEY_COUNT=$(yq -r '.spec.encryptedData | keys | length' "$SEALED_SECRET_PATH" 2>/dev/null || echo "0")
+                  echo "Existing keys: $EXISTING_KEY_COUNT"
+                else
+                  echo "No existing SealedSecret - creating new"
+                  ACTUAL_SECRET_MODE="CREATE"
+                fi
+
+                if [ "$ACTUAL_SECRET_MODE" = "MERGE" ]; then
+                  cp "$SEALED_SECRET_PATH" /tmp/existing-sealed.yaml
+                  
+                  kubeseal --format yaml --kubeconfig="$KUBECONFIG" < "$MANIFEST_FILE" > /tmp/new-sealed.yaml
+
+                  yq eval '.spec.encryptedData' /tmp/existing-sealed.yaml > /tmp/existing-data.yaml
+                  yq eval '.spec.encryptedData' /tmp/new-sealed.yaml > /tmp/new-data.yaml
+                  yq eval-all '. as $item ireduce ({}; . * $item)' /tmp/existing-data.yaml /tmp/new-data.yaml > /tmp/merged-data.yaml
+                  
+                  cp /tmp/existing-sealed.yaml /tmp/merged-sealed.yaml
+                  yq eval -i ".spec.encryptedData = load(\"/tmp/merged-data.yaml\")" /tmp/merged-sealed.yaml
+                  cp /tmp/merged-sealed.yaml "$SEALED_SECRET_PATH"
+                  
+                  FINAL_KEY_COUNT=$(yq -r '.spec.encryptedData | keys | length' "$SEALED_SECRET_PATH" 2>/dev/null || echo "0")
+                  echo "Merged SealedSecret created - total keys: $FINAL_KEY_COUNT"
+                else
+                  kubeseal --format yaml --kubeconfig="$KUBECONFIG" < "$MANIFEST_FILE" > "$SEALED_SECRET_PATH"
+                  echo "New SealedSecret created"
+                fi
+
+                yq eval -i '.spec.template.metadata.annotations."sealedsecrets.bitnami.com/managed" = "true"' "$SEALED_SECRET_PATH"
+                yq eval -i '.spec.template.metadata.annotations."sealedsecrets.bitnami.com/patch" = "true"' "$SEALED_SECRET_PATH"
+
+                if ! yq e '.spec.encryptedData' "$SEALED_SECRET_PATH" > /dev/null 2>&1; then
+                  echo "##[error]Invalid SealedSecret format."
+                  exit 1
+                fi
+
+                echo "Secret sealed successfully"
+
+                echo "##vso[task.setvariable variable=SEALED_SECRET_PATH;isOutput=true]$SEALED_SECRET_PATH"
+                echo "##vso[task.setvariable variable=GITOPS_DIR;isOutput=true]$GITOPS_DIR"
+
+          - task: Bash@3
+            displayName: "Commit to GitOps Repository"
+            name: git_commit
+            inputs:
+              targetType: inline
+              script: |
+                set -e
+
+                APP_NAME="$(APP_NAME)"
+                NAMESPACE="$(NAMESPACE)"
+                SECRET_NAME="$(FULL_SECRET_NAME)"
+                ENVIRONMENT="${{ parameters.targetEnvironment }}"
+                IS_GENERAL_SECRET="$(IS_GENERAL_SECRET)"
+                SECRET_MODE="$(SECRET_MODE)"
+
+                if [[ "$ENVIRONMENT" =~ ^(darklaunch-.*|prod-.*)$ ]]; then
+                  REPO_TYPE="Production"
+                else
+                  REPO_TYPE="Pre-Production"
+                fi
+
+                echo "Repository: $REPO_TYPE | Operation: $SECRET_MODE"
+
+                if [ "$IS_GENERAL_SECRET" = "true" ]; then
+                  GIT_ADD_PATH="src/$ENVIRONMENT/secrets/"
+                else
+                  GIT_ADD_PATH="src/$ENVIRONMENT/apps/$APP_NAME/"
+                fi
+
+                cd "$(Pipeline.Workspace)/gitops"
+                git config user.name "Azure DevOps Pipeline"
+                git config user.email "pipeline@vivo.com.br"
+
+                git add "$GIT_ADD_PATH"
+
+                if git diff --cached --quiet; then
+                  echo "##[warning]No changes to commit - sealed secret already exists and is identical."
+                  echo "##vso[task.setvariable variable=COMMITTED;isOutput=true]false"
+                  exit 0
+                fi
+
+                if [ "$IS_GENERAL_SECRET" = "true" ]; then
+                  COMMIT_MSG="[SEALED-SECRET] $SECRET_NAME in $ENVIRONMENT (general)
+
+                Type: General Secret
+                Operation: $SECRET_MODE
+                Environment: $ENVIRONMENT
+                Secret: $SECRET_NAME
+                Pipeline: $(Build.DefinitionName)
+                Build: $(Build.BuildNumber)"
+                else
+                  COMMIT_MSG="[SEALED-SECRET] $SECRET_NAME for $APP_NAME in $ENVIRONMENT
+
+                Application: $APP_NAME
+                Operation: $SECRET_MODE
+                Environment: $ENVIRONMENT
+                Secret: $SECRET_NAME
+                Pipeline: $(Build.DefinitionName)
+                Build: $(Build.BuildNumber)"
+                fi
+
+                git commit -m "$COMMIT_MSG"
+                git push origin HEAD:master
+
+                echo "Committed to GitOps: $GIT_ADD_PATH"
+
+                echo "##vso[task.setvariable variable=COMMITTED;isOutput=true]true"
+
+          - task: PublishPipelineArtifact@1
+            displayName: "Publish Sealed Secret Artifact"
+            inputs:
+              targetPath: "$(seal_secret.SEALED_SECRET_PATH)"
+              artifact: "sealed-secret-${{ parameters.secretName }}"
+              publishLocation: "pipeline"

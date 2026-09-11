@@ -1,0 +1,220 @@
+parameters:
+- name: qa_environment
+- name: skip_deploy
+
+stages:
+
+- stage: deploy
+  displayName: "Deploy ${{ parameters.qa_environment }}"
+  dependsOn:
+  - package
+  pool: $(PRIVATE_AGENT_DEFAULT)
+  jobs:
+    - deployment: ${{ parameters.qa_environment }}
+      ## condition: and(always(), eq(variables.flowIsTagging, false), eq(variables.flowIsMain, true))
+      workspace:
+        clean: all
+      displayName: Deploy
+      environment: "deploy-${{ parameters.qa_environment }}"
+      strategy:
+        runOnce:      
+          deploy:
+            steps:
+            - download: none 
+            - checkout: self 
+
+            ## SETUP
+            - task: MavenAuthenticate@0
+              displayName: 'Maven Authenticate'
+              inputs:
+                artifactsFeeds: DevOps
+
+            - task: Cache@2
+              displayName: Cache Maven local repo
+              inputs:
+                key: 'maven | "$(Agent.OS)"'
+                path: '$(MAVEN_CACHE_FOLDER)'
+                cacheHitVar: 'CacheRestored'
+                restoreKeys: |
+                  maven | "$(Agent.OS)"
+                  maven
+
+            - task: DownloadPackage@1
+              displayName: 'Download Apache Maven'
+              inputs:
+                packageType: 'upack'
+                feed: '$(PACKAGE_FEED)'
+                view: '$(PACKAGE_VIEW)'
+                definition: '$(MAVEN_PACKAGE_DEFINITION)'
+                version: '$(MAVEN_PACKAGE_VERSION)'
+                downloadPath: '$(System.ArtifactsDirectory)'
+              env:
+                HTTPS_PROXY: "http://10.240.58.39:3128"
+
+            - task: ExtractFiles@1
+              displayName: 'Extract Apache Maven'
+              inputs:
+                  archiveFilePatterns: '$(System.ArtifactsDirectory)/$(MAVEN_PACKAGE_FILE)'
+                  destinationFolder: '$(build.sourcesdirectory)/maven'
+                  cleanDestinationFolder: false    
+
+            - task: DownloadPackage@1
+              displayName: 'Download Oracle JDK-8'
+              inputs:
+                packageType: 'upack'
+                feed: '$(PACKAGE_FEED)'
+                view: '$(PACKAGE_VIEW)'
+                definition: '$(JAVA_PACKAGE_DEFINITION)'
+                version: '$(JAVA_PACKAGE_VERSION)'
+                downloadPath: '$(System.ArtifactsDirectory)'
+              env:
+                HTTPS_PROXY: "http://10.240.58.39:3128"
+
+            - task: JavaToolInstaller@0
+              displayName: 'Use Java 8'
+              inputs:
+                versionSpec: 8
+                jdkArchitectureOption: x64
+                jdkSourceOption: LocalDirectory
+                jdkFile: '$(System.ArtifactsDirectory)/$(JAVA_PACKAGE_FILE)'
+                jdkDestinationDirectory: '$(build.sourcesdirectory)/java'
+                createExtractDirectory: false
+
+            - task: DownloadPackage@1
+              displayName: 'Download Oracle Weblogic 12.2.1-3-0'
+              inputs:
+                packageType: 'upack'
+                feed: '$(PACKAGE_FEED)'
+                view: '$(PACKAGE_VIEW)'
+                definition: '$(WEBLOGIC_PACKAGE_DEFINITION)'
+                version: '$(WEBLOGIC_PACKAGE_VERSION)'
+                downloadPath: '$(System.ArtifactsDirectory)'
+              env:
+                HTTPS_PROXY: "http://10.240.58.39:3128"
+
+            - task: ExtractFiles@1
+              displayName: 'Extract Oracle Weblogic'
+              inputs:
+                archiveFilePatterns: '$(System.ArtifactsDirectory)/$(WEBLOGIC_PACKAGE_FILE)'
+                destinationFolder: '$(System.ArtifactsDirectory)/oracle'
+                cleanDestinationFolder: false
+                overwriteExistingFiles: true
+
+            - task: Maven@4
+              displayName: 'Maven install Oracle Sync'
+              inputs:
+                mavenPomFile: ''
+                options: '-Dfile=$(System.ArtifactsDirectory)/$(WEBLOGIC_MIDDLEWARE_HOME)/$(ORACLE_MAVEN_SYNC_JAR) -DpomFile=$(System.ArtifactsDirectory)/$(WEBLOGIC_MIDDLEWARE_HOME)/$(ORACLE_MAVEN_SYNC_POM)'
+                mavenOptions: '-Xmx3072m $(MAVEN_OPTS)'
+                javaHomeOption: 'Path'
+                jdkDirectory: '$(build.sourcesdirectory)/$(JAVA_DIRECTORY)'
+                jdkArchitectureOption: 'x64'
+                mavenVersionOption: 'Path'
+                mavenDirectory: '$(build.sourcesdirectory)/$(MAVEN_DIRECTORY)'
+                mavenAuthenticateFeed: false
+                goals: 'install:install-file'
+
+            - task: Maven@4
+              displayName: 'Maven Oracle Sync Push'
+              inputs:
+                mavenPomFile: ''
+                options: '-DoracleHome=$(System.ArtifactsDirectory)/$(WEBLOGIC_MIDDLEWARE_HOME)'
+                mavenOptions: '-Xmx3072m $(MAVEN_OPTS)'
+                javaHomeOption: 'Path'
+                jdkDirectory: '$(build.sourcesdirectory)/$(JAVA_DIRECTORY)'
+                jdkArchitectureOption: 'x64'
+                mavenVersionOption: 'Path'
+                mavenDirectory: '$(build.sourcesdirectory)/$(MAVEN_DIRECTORY)'
+                mavenAuthenticateFeed: false
+                goals: '-P build com.oracle.maven:oracle-maven-sync:push'
+              env:
+                SYSTEM_ACCESSTOKEN: $(System.AccessToken) 
+
+            - task: DownloadBuildArtifacts@1
+              displayName: 'Download Build Artifacts'
+              inputs:
+                artifactName: app
+                parallelizationLimit: 20
+                extractTars: true
+            
+            ## DEPLOY
+            - task: WeblogicBaseCloudDeploy@1
+              displayName: Weblogic Deploy App
+              inputs:
+                mavenPomFile: '$(system.defaultWorkingDirectory)/pom.xml'
+                options: '-s settings.xml -Dweblogic.target=$(WEBLOGIC_TARGET)'
+                mavenOptions: '-Xmx3072m $(MAVEN_OPTS)'
+                javaHomeOption: 'Path'
+                jdkDirectory: '$(build.sourcesdirectory)/$(JAVA_DIRECTORY)'
+                jdkArchitectureOption: 'x64'
+                mavenVersionOption: 'Path'
+                mavenDirectory: '$(build.sourcesdirectory)/$(MAVEN_DIRECTORY)'
+                mavenAuthenticateFeed: false
+                publishJUnitResults: true
+                testResultsFiles: '**/surefire-reports/TEST-*.xml'
+                goals: '-P deploy com.oracle.weblogic:weblogic-maven-plugin:deploy'
+                serviceConnectionName: '$(WEBLOGIC_SERVICE_CONNECTION_NAME)'
+              env:
+                SYSTEM_ACCESSTOKEN: $(System.AccessToken) 
+
+          on:
+            success:
+              steps:
+              - download: none
+              - bash: |
+                  echo "##[debug]Deploy realizado com sucesso!"
+                  RED='\033[0;31m'
+                  GREEN='\033[0;32m'
+
+                  printf "
+                  ${GREEN}=================================================================================================================================
+                  ${GREEN}                                                 DEPLOYMENT SUCCESS
+                  ${GREEN}=================================================================================================================================
+                  Deployment realizado com sucesso!             
+                  ${GREEN}=================================================================================================================================
+                  "
+                name: sucesso
+                displayName: Successo
+
+  - job: governance_deploy
+    displayName: Governance Deploy
+    pool: $(PRIVATE_AGENT_DEFAULT)
+    
+    dependsOn: 
+    - ${{ parameters.qa_environment }}
+    condition: and(succeeded(), eq('${{ parameters.skip_deploy }}', false))    
+    steps:
+
+    - script: |
+        if [ ! -f "catalog-info.yaml" ]; then
+          echo "##vso[task.logissue type=error] Unable to find catalog-info.yaml file (path=$(pwd))."
+        fi
+
+        COMPONENT_NAME="$(yq -r 'select(documentIndex == 0) | .metadata.name | select (.!=null)' catalog-info.yaml)"
+        echo "##vso[task.setvariable variable=COMPONENT_NAME]${COMPONENT_NAME}"
+        echo "##vso[task.setvariable variable=CATALOG_INFO_FILE_CONTENT]$(cat catalog-info.yaml)"
+      name: export_catalog_info
+      displayName: Reading Catalog Info File
+
+    - bash: |
+        version=$(grep version pom.xml | grep -v '<?xml' | grep '<version>'|head -n 1|awk '{print $1}'| cut -d'>' -f 2 | cut -d'<' -f 1)
+        echo "##vso[task.setvariable variable=APP_VERSION]$version"
+        echo "##[debug] Exporting variable 'APP_VERSION': $version"
+      name: export_current_version
+      displayName: Extract App Version 
+
+    - task: VivoGovernance@1
+      inputs:
+        breakglass: $(GOVAPP_BREAK_GLASS)
+        cluster: "$(GOVAPP_CLUSTER)"
+        component: "$(COMPONENT_NAME)"
+        deployment: "$(COMPONENT_NAME)"
+        environment: "${{ parameters.qa_environment }}"
+        namespace: "$(GOVAPP_NAMESPACE)"
+        operation: "deploy"
+        serverEndpoint: $(GOVAPP_SERVICE_CONNECTION_NAME)
+        version: "$(APP_VERSION)"
+        catalogInfo: $(CATALOG_INFO_FILE_CONTENT)
+      continueOnError: true
+      condition: eq(lower(variables.GOVAPP_INTEGRATION_ENABLED), 'true')
+

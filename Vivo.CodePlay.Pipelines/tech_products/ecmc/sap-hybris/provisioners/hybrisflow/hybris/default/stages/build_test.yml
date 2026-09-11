@@ -1,0 +1,825 @@
+parameters:
+- name: nexusRepository
+  default: "hybris"
+- name: serviceConnectionName
+  default: $(SONARQUBE_SERVICE_CONNECTION_NAME)
+- name: artifactName
+  type: string
+  default: "app"
+- name: enableDevflowValidations
+  type: boolean
+  default: False
+- name: isDevEnvironment
+  type: boolean
+  default: False
+
+stages:
+- stage: build_test
+  displayName: "Build & Test"
+  dependsOn:
+  - ${{ if eq(parameters.enableDevflowValidations, True) }}:
+    - repo_validations
+  - ${{ else }}:
+    - pipeline_init
+
+  isSkippable: false
+  pool: $(PRIVATE_AGENT_DEFAULT_CD)
+  jobs:
+  - job: build
+    timeoutInMinutes: 120
+    workspace:
+      clean: all
+    displayName: "Build and Test Core Customize"
+    steps:
+    - checkout: self
+      persistCredentials: true
+      fetchDepth: 0
+
+    - bash: |
+        RED='\033[0;31m'
+        GREEN='\033[0;32m'
+        YELLOW='\033[0;33m'
+        BLUE='\033[0;34m'
+        NC='\033[0m'
+        current_directory=$(pwd)
+
+        git fetch origin
+
+        merge_base=$(git merge-base HEAD origin/master 2>/dev/null || git merge-base HEAD origin/main)
+
+        if [ -z "$merge_base" ]; then
+            echo -e "${RED}Erro: Não foi possível determinar o ponto de divergência da branch atual com a master/main.${NC}"
+            exit 1
+        fi
+
+        extract_columns_from_xml() {
+            local file_path=$1
+            local attributes=$(xmllint --xpath '//attribute/modifiers[@optional="false"]/parent::attribute' "$file_path" 2>/dev/null)
+            if [ -z "$attributes" ]; then
+                return
+            fi
+
+            echo "$attributes" | while IFS= read -r line; do
+                local qualifier=$(echo "$line" | sed -n 's/.*qualifier="\([^"]*\)".*/\1/p')
+                if [ -n "$qualifier" ]; then
+                    echo "$qualifier"
+                fi
+            done
+        }
+
+        print_error_header() {
+            printf "
+            ${YELLOW}=================================================================================================================================\n
+            ${RED}                                                          PIPELINE FALHOU\n
+            ${YELLOW}=================================================================================================================================\n
+            ${RED}ERRO: O pipeline falhou! Novas colunas com 'optional=\"false\"' foram detectadas, o que não é recomendado.\n\n
+            ${YELLOW}VERIFICAÇÃO: Verifique se essas novas colunas com 'optional=\"false\"' são realmente necessárias e reavalie a necessidade de mantê-las.\n\n
+            ${YELLOW}AÇÃO: Colunas com 'optional=\"false\"' podem causar problemas durante o deploy sem downtime no SAP Hybris Commerce Cloud. Evite adicionar novas colunas 'NOT NULL'.\n\n
+            ${RED}NOTA: Novas colunas com 'optional=\"false\"' não são recomendadas, pois podem causar falhas em cenários de deploy contínuo.\n\n
+            ${BLUE}Para mais informações sobre as fases do pipeline e práticas recomendadas, consulte a documentação:\n\n
+            ${BLUE}https://wikicorp.telefonica.com.br/x/4y6ZHw\n
+            ${YELLOW}=================================================================================================================================\n"
+        }
+
+        check_new_columns() {
+            local current_columns=$1
+            local previous_columns=$2
+            local file_path=$3
+            local is_new_file=$4
+
+            local has_error=false
+
+            while IFS= read -r current_qualifier; do
+                if [ "$is_new_file" = true ]; then
+                    printf "${YELLOW}Aviso: Arquivo novo '$file_path'. Coluna NOT NULL encontrada: '$current_qualifier'.\n${NC}"
+                    has_error=true
+                else
+                    if ! grep -q "$current_qualifier" <<< "$previous_columns"; then
+                        printf "${RED}Erro: Nova coluna '$current_qualifier' é NOT NULL no arquivo $file_path\n${NC}"
+                        has_error=true
+                    fi
+                fi
+            done <<< "$current_columns"
+
+            if [ "$has_error" = true ]; then
+                return 1
+            else
+                return 0
+            fi
+        }
+
+        has_any_error=false
+
+        # Use `git diff` com `awk` e `grep` para analisar apenas arquivos com sufixo `*-items.xml`
+        git diff --name-status "$merge_base" HEAD -- '*.xml' | grep '\-items\.xml$' | awk '{ if ($1 == "R") print $1 "\t" $3; else print $1 "\t" $2 }' | while IFS=$'\t' read -r status file_path; do
+
+            # Definir uma descrição amigável para cada status
+            if [ "$status" = "A" ]; then
+                status_desc="adicionado"
+            elif [ "$status" = "M" ]; then
+                status_desc="modificado"
+            elif [[ "$status" == R* ]]; then
+                status_desc="renomeado"
+            else
+                status_desc="desconhecido"
+            fi
+
+            # Cabeçalho para indicar início da análise de um novo arquivo
+            printf "${YELLOW}=================================================================================================================================\n"
+            printf "Analisando arquivo: ${file_path}\n"
+            printf "Status: ${status_desc}\n"
+            printf "${YELLOW}=================================================================================================================================\n${NC}"
+
+            if [ "$status" = "A" ]; then
+                printf "${YELLOW}Aviso: Arquivo novo detectado '$file_path'. Verificando atributos...\n${NC}"
+                new_columns=$(extract_columns_from_xml "$file_path")
+
+                if [ -n "$new_columns" ]; then
+                    if ! check_new_columns "$new_columns" "" "$file_path" true; then
+                        has_any_error=true
+                    fi
+                else
+                    printf "${GREEN}Nenhum atributo NOT NULL encontrado em arquivo novo '$file_path'.\n${NC}"
+                fi
+            elif [ "$status" = "M" ]; then
+                relative_path=$(realpath --relative-to="$current_directory" "$file_path")
+                current_columns=$(extract_columns_from_xml "$file_path")
+                previous_content=$(git show "$merge_base:$relative_path" 2>/dev/null)
+                previous_columns=$(extract_columns_from_xml <(echo "$previous_content"))
+
+                if [ -n "$current_columns" ]; then
+                    if ! check_new_columns "$current_columns" "$previous_columns" "$file_path" false; then
+                        has_any_error=true
+                    fi
+                fi
+            elif [[ "$status" == R* ]]; then
+                printf "${YELLOW}Aviso: Arquivo renomeado detectado '$file_path'. Verificando atributos...\n${NC}"
+                new_columns=$(extract_columns_from_xml "$file_path")
+
+                if [ -n "$new_columns" ]; then
+                    if ! check_new_columns "$new_columns" "" "$file_path" true; then
+                        has_any_error=true
+                    fi
+                else
+                    printf "${GREEN}Nenhum atributo NOT NULL encontrado em arquivo renomeado '$file_path'.\n${NC}"
+                fi
+            fi
+
+            # Adicionar quebra de linha após a análise de cada arquivo para clareza
+            printf "\n"
+        done
+
+        if [ "$has_any_error" = true ]; then
+            print_error_header
+            exit 1
+        else
+            printf "${GREEN}Nenhuma nova coluna NOT NULL encontrada.\n${NC}"
+        fi
+      displayName: 'Check for New Columns with NOT NULL Constraint'
+
+    - template: /tech_products/ecmc/sap-hybris/tasks/artifacts/download_cxcom.yaml
+
+    - script: |
+        CONFIG_FILE="$(Build.SourcesDirectory)/.azuredevops/sapcomm-versions.yaml"
+
+        if [ ! -f "$CONFIG_FILE" ]; then
+          echo "##[error]Arquivo de configuração não encontrado: $CONFIG_FILE"
+          echo "##[error]Crie o arquivo .azuredevops/sapcomm-versions.yaml com os atributos 'versions.sapcomm' e 'versions.telco'."
+          exit 1
+        fi
+
+        echo "##[section]####### Lendo versões do arquivo $CONFIG_FILE #######"
+        cat "$CONFIG_FILE"
+        echo "##[section]#####################################################"
+
+        JDK_VERSION=$(awk -F': ' '/jdk:/ {gsub(/[[:space:]]/, "", $2); print $2}' "$CONFIG_FILE")
+
+        # Use the Java version available in the agent
+        JAVA_HOME_LOCAL=$(asdf where java $JDK_VERSION)
+        if [ -z "$JAVA_HOME_LOCAL" ] || [ ! -x "$JAVA_HOME_LOCAL/bin/java" ]; then
+          echo "##[error]Failed to find Java 21 installation directory: '$JAVA_HOME_LOCAL'"
+          echo "##[section]Available Java versions:"
+          asdf list java || echo "No Java versions found"
+          exit 1
+        fi
+        echo "##[section]Java path: $JAVA_HOME_LOCAL"
+        "$JAVA_HOME_LOCAL/bin/java" -version
+        echo "##vso[task.setvariable variable=JAVA_HOME_LOCAL]$JAVA_HOME_LOCAL"
+        echo "##vso[task.prependpath]$JAVA_HOME_LOCAL/bin"
+      displayName: "Set Java Version from agent"
+
+    - script: |
+        java -version
+      displayName: "Validate Java Version"
+
+    - bash: |
+        cd $(System.DefaultWorkingDirectory)/core-customize
+        cat $(System.DefaultWorkingDirectory)/core-customize/hybris/bin/platform/build.number
+      displayName: "Hybris Build Number"
+
+    - bash: |
+        cd $(Build.SourcesDirectory)/core-customize/hybris/bin/platform
+        sed -i "2i export ANT_MEM_OPTS=\"$(BUILD_ANT_MEM_OPTS)\"" ./setantenv.sh
+        source ./setantenv.sh
+        export ANT_MEM_OPTS="$(BUILD_ANT_MEM_OPTS)"
+        cat ./setantenv.sh
+
+        echo "[section]Executando ant addoninstall -Daddonnames=\"${D_ADDON_NAMES}\" -DaddonStorefront.yacceleratorstorefront=\"${D_ADDON_NAMES_STORE_FRONT}\""
+        ant addoninstall -Daddonnames="${D_ADDON_NAMES}" -DaddonStorefront.yacceleratorstorefront="${D_ADDON_NAMES_STORE_FRONT}"
+      displayName: "ant addoninstall"
+      env:
+        HTTPS_PROXY: $(PROXY_AGENT_HTTPS)
+        HTTP_PROXY: $(PROXY_AGENT_HTTP)
+        NO_PROXY: $(PROXY_AGENT_NO_PROXY)
+        D_ADDON_NAMES: $(D_ADDON_NAMES)
+        D_ADDON_NAMES_STORE_FRONT: $(D_ADDON_NAMES_STORE_FRONT)
+
+    - bash: |
+        cd $(Build.SourcesDirectory)/core-customize/hybris/bin/platform
+        sed -i "2i export ANT_MEM_OPTS=\"$(BUILD_ANT_MEM_OPTS)\"" ./setantenv.sh
+        export ANT_MEM_OPTS="$(BUILD_ANT_MEM_OPTS)"
+        source ./setantenv.sh
+
+        ant customize
+      displayName: "ant customize"
+
+    - bash: |
+        PAT=$(System.AccessToken)
+        URI=$(System.CollectionUri)${SYSTEM_TEAMPROJECT}
+        REPO_ID=$(Build.Repository.ID)
+        PR_ID=$(System.PullRequest.PullRequestId)
+
+        # Função para verificar se um caminho corresponde aos padrões de exclusão
+        matches_exclusion_pattern() {
+          local file_path="$1"
+
+          # Remover barra inicial se existir
+          file_path="${file_path#/}"
+
+          local exclusions="$SONAR_COVERAGE_EXCLUSIONS"
+          local excluded_exts="$SONAR_EXCLUDEDEXTENSIONS"
+
+          # 1. Verificar padrões de exclusão do sonar.coverage.exclusions
+          if [ -n "$exclusions" ]; then
+            IFS=',' read -ra PATTERNS <<< "$exclusions"
+            for pattern in "${PATTERNS[@]}"; do
+              pattern=$(echo "$pattern" | xargs)
+              [ -z "$pattern" ] && continue
+              # Remover prefixo "file:" se existir (sintaxe SonarQube)
+              pattern="${pattern#file:}"
+              # Converter padrão SonarQube para regex:
+              # **/ -> .*
+              # *   -> [^/]*
+              regex_pattern=$(echo "$pattern" | sed 's|\*\*/|.*/|g' | sed 's|\*|[^/]*|g')
+              if echo "$file_path" | grep -qE "$regex_pattern"; then
+                #echo "[debug]Excluído por sonar.coverage.exclusions: $file_path -> $pattern"
+                return 0
+              fi
+            done
+          fi
+
+          # 2. Verificar padrões de exclusão do sonar.exclusions
+          local sonar_exclusions="$SONAR_EXCLUSIONS"
+          if [ -n "$sonar_exclusions" ]; then
+            IFS=',' read -ra PATTERNS <<< "$sonar_exclusions"
+            for pattern in "${PATTERNS[@]}"; do
+              pattern=$(echo "$pattern" | xargs)
+              [ -z "$pattern" ] && continue
+              # Remover prefixo "file:" se existir (sintaxe SonarQube)
+              pattern="${pattern#file:}"
+              regex_pattern=$(echo "$pattern" | sed 's|\*\*/|.*/|g' | sed 's|\*|[^/]*|g')
+              if echo "$file_path" | grep -qE "$regex_pattern"; then
+                return 0
+              fi
+            done
+          fi
+
+          # 3. Verificar padrões de caminho em sonar.excludedExtensions
+          # Aceita formato: "vivocore,vivofacades,somemodule"
+          # Se o caminho contém qualquer um desses padrões, deve ser excluído
+          if [ -n "$excluded_exts" ]; then
+            # Extrair o nome da extensão antes de /src/
+            extension_name=$(echo "$file_path" | sed -n 's|.*/\([^/]*\)/src/.*|\1|p')
+
+            if [ -n "$extension_name" ]; then
+              IFS=',' read -ra PATTERN_ARR <<< "$excluded_exts"
+              for pattern in "${PATTERN_ARR[@]}"; do
+                pattern=$(echo "$pattern" | xargs)
+                [ -z "$pattern" ] && continue
+                # Verificar match exato do nome da extensão
+                if [ "$extension_name" = "$pattern" ]; then
+                  return 0
+                fi
+              done
+            fi
+          fi
+
+          return 1  # Não excluído
+        }
+
+        # Função para verificar se um TESTE deve ser excluído
+        # Testes só são excluídos por sonar.excludedExtensions (módulos ignorados),
+        # NÃO por sonar.coverage.exclusions ou sonar.exclusions (que contêm **/testsrc/**)
+        matches_test_exclusion_pattern() {
+          local file_path="$1"
+          file_path="${file_path#/}"
+
+          local excluded_exts="$SONAR_EXCLUDEDEXTENSIONS"
+
+          if [ -n "$excluded_exts" ]; then
+            extension_name=$(echo "$file_path" | sed -n 's|.*/\([^/]*\)/testsrc/.*|\1|p')
+            [ -z "$extension_name" ] && extension_name=$(echo "$file_path" | sed -n 's|.*/\([^/]*\)/src/.*|\1|p')
+
+            if [ -n "$extension_name" ]; then
+              IFS=',' read -ra PATTERN_ARR <<< "$excluded_exts"
+              for pattern in "${PATTERN_ARR[@]}"; do
+                pattern=$(echo "$pattern" | xargs)
+                [ -z "$pattern" ] && continue
+                if [ "$extension_name" = "$pattern" ]; then
+                  return 0
+                fi
+              done
+            fi
+          fi
+
+          return 1  # Não excluído
+        }
+
+        URL_AZ_PR=$(echo "$URI/_apis/git/repositories/$REPO_ID/pullRequests/$PR_ID/iterations?api-version=7.1" | sed 's/ /%20/g')
+
+        echo "[debug]###############################################################"
+        echo "[debug]URI: $URI"
+        echo "[debug]REPO_ID: $REPO_ID"
+        echo "[debug]PR_ID: $PR_ID"
+        echo "[debug]URL SERVICE: $URL_AZ_PR"
+        echo "[debug]###############################################################"
+        echo ""
+
+        ITERATIONS_RESPONSE=$(curl -s -H 'accept: application/json;api-version=7.1' \
+            -H "Content-Type: application/json" \
+            -u ":$PAT" \
+            "$URL_AZ_PR")
+
+        # Validar se a resposta é um JSON válido
+        if ! echo "$ITERATIONS_RESPONSE" | jq empty 2>/dev/null; then
+          echo "##[error]Error to search PullRequest Iterations!"
+          exit 1
+        fi
+
+        # Verificar se o JSON tem a estrutura esperada
+        if ! echo "$ITERATIONS_RESPONSE" | jq -e '.value' >/dev/null 2>&1; then
+          echo "##[error]Error to get Value property in Json response"
+          exit 1
+        fi
+
+        # Extrair valor de sonar.coverage.exclusions do arquivo de propriedades
+        SONAR_COVERAGE_EXCLUSIONS=""
+        SONAR_EXCLUDEDEXTENSIONS=""
+        SONAR_EXCLUSIONS=""
+        if [ -f ".azuredevops/sonar-project.properties" ]; then
+          SONAR_COVERAGE_EXCLUSIONS=$(grep '^sonar.coverage.exclusions=' .azuredevops/sonar-project.properties | tail -1 | cut -d'=' -f2-)
+          SONAR_EXCLUDEDEXTENSIONS=$(grep '^sonar.excludedExtensions=' .azuredevops/sonar-project.properties | tail -1 | cut -d'=' -f2-)
+          SONAR_EXCLUSIONS=$(grep '^sonar.exclusions=' .azuredevops/sonar-project.properties | tail -1 | cut -d'=' -f2-)
+          echo "##[command] SONAR_COVERAGE_EXCLUSIONS: $SONAR_COVERAGE_EXCLUSIONS"
+          echo "##[command] SONAR_EXCLUDEDEXTENSIONS: $SONAR_EXCLUDEDEXTENSIONS"
+          echo "##[command] SONAR_EXCLUSIONS: $SONAR_EXCLUSIONS"
+        else
+          echo "##[warning]Arquivo pitest-project.properties não encontrado"
+        fi
+
+        COUNT_ITERATIONS=$(echo "$ITERATIONS_RESPONSE" | jq '.count')
+
+        # Criar arquivo temporário para armazenar todos os resultados
+        TEMP_FILE=$(mktemp)
+        TEMP_FILE_TESTS=$(mktemp)
+
+        # Extrai os IDs e itera sobre cada um
+        URL_AZ_CHANGES=$(echo "$URI/_apis/git/repositories/$REPO_ID/pullRequests/$PR_ID/iterations/$COUNT_ITERATIONS/changes?\$top=$(PULLREQUEST_CHANGES_NUMBER_API)&api-version=7.1" | sed 's/ /%20/g')
+
+        echo "[debug]################################################################"
+        echo "[debug]URL_AZ_CHANGES: $URL_AZ_CHANGES"
+        echo "[debug]################################################################"
+        echo ""
+
+        # Faz a chamada para cada ID de iteração
+        CHANGES_RESPONSE=$(curl -s -H 'accept: application/json;api-version=7.1' \
+            -H "Content-Type: application/json" \
+            -u ":$PAT" \
+            "$URL_AZ_CHANGES")
+
+        # Validar resposta das mudanças
+        if ! echo "$CHANGES_RESPONSE" | jq empty 2>/dev/null; then
+          echo "##[warning]Test classes not found in this iteration!"
+          exit 0
+        fi
+
+        # Extrair e filtrar caminhos dos arquivos Java
+        filtered_java_files=$(echo "$CHANGES_RESPONSE" | jq -r '.changeEntries[]?.item.path | select(. != null and endswith(".java"))' | while read -r file_path; do
+          if ! matches_exclusion_pattern "$file_path"; then
+            echo "$file_path"
+          fi
+        done)
+
+        # Extrair e filtrar caminhos dos testes (apenas por excludedExtensions, não por coverage/exclusions)
+        filtered_test_files=$(echo "$CHANGES_RESPONSE" | jq -r '.changeEntries[]?.item.path | select(. != null and endswith("Test.java"))' | while read -r file_path; do
+          if ! matches_test_exclusion_pattern "$file_path"; then
+            echo "$file_path"
+          fi
+        done)
+
+        echo "$filtered_java_files" > "$TEMP_FILE"
+        echo "$filtered_test_files" > "$TEMP_FILE_TESTS"
+
+        # Processa o arquivo: extrai as classes Java a partir de "br/" e substitui barras por pontos
+        PR_CLASSES=""
+        if [ -s "$TEMP_FILE" ]; then
+          PR_CLASSES=$(cat "$TEMP_FILE" | grep -v -E "(Test|IntegrationTest|UnitTest)\.java$" | grep -o "br/.*" | sed 's/\//./g' | sed 's/\.java$//' | sort -u | tr '\n' ',' | sed 's/,$//' || true)
+        fi
+
+        # Primeiro, extrair testes reais do TEMP_FILE_TESTS
+        # Processar testes reais com validação
+        PR_TESTS=""
+        if [ -s "$TEMP_FILE_TESTS" ]; then
+          PR_TESTS=$(cat "$TEMP_FILE_TESTS" | grep -o "br/.*" | sed 's/\//./g' | sed 's/\.java"*$//' | sort -u | tr '\n' ',' | sed 's/,$//' || true)
+        fi
+
+        # Depois, gerar classes inferidas baseado em PR_TESTS com sufixo "Test"
+        INFERRED_CLASSES=""
+        if [ -n "$PR_TESTS" ]; then
+          INFERRED_CLASSES=$(echo "$PR_TESTS" | sed 's/IntegrationTest//g' | sed 's/UnitTest//g' | sed 's/Test//g')
+        fi
+
+        # Depois, gerar testes inferidos baseado em PR_CLASSES com sufixo "Test"
+        INFERRED_TESTS=""
+        if [ -n "$PR_CLASSES" ]; then
+          INFERRED_TESTS=$(echo "$PR_CLASSES" | sed 's/,/Test,/g' | sed 's/$/Test/')
+        fi
+
+        # Combinar os dois tipos de testes, removendo duplicatas
+        ALL_CLASSES=""
+        if [ -n "$PR_CLASSES" ] && [ -n "$INFERRED_CLASSES" ]; then
+          # Combinar ambas as listas e remover duplicatas
+          ALL_CLASSES=$(echo "$PR_CLASSES,$INFERRED_CLASSES" | tr ',' '\n' | sed '/^$/d' | sort -u | tr '\n' ',' | sed 's/,$//')
+        elif [ -n "$PR_CLASSES" ]; then
+          ALL_CLASSES="$PR_CLASSES"
+        elif [ -n "$INFERRED_CLASSES" ]; then
+          ALL_CLASSES="$INFERRED_CLASSES"
+        fi
+
+        # Combinar os dois tipos de testes, removendo duplicatas
+        ALL_TESTS=""
+        if [ -n "$PR_TESTS" ] && [ -n "$INFERRED_TESTS" ]; then
+          # Combinar ambas as listas e remover duplicatas
+          ALL_TESTS=$(echo "$PR_TESTS,$INFERRED_TESTS" | tr ',' '\n' | sed '/^$/d' | sort -u | tr '\n' ',' | sed 's/,$//')
+        elif [ -n "$PR_TESTS" ]; then
+          ALL_TESTS="$PR_TESTS"
+        elif [ -n "$INFERRED_TESTS" ]; then
+          ALL_TESTS="$INFERRED_TESTS"
+        fi
+
+        # Remove o arquivo temporário
+        rm -f "$TEMP_FILE" "$TEMP_FILE_TESTS"
+
+        echo "##[command]ALL CLASSES=$ALL_CLASSES"
+        echo "##[command]ALL TESTS=$ALL_TESTS"
+
+        echo "##vso[task.setvariable variable=ALL_CHANGED_TESTS]$ALL_TESTS"
+        echo "##vso[task.setvariable variable=ALL_CHANGED_CLASSES]$ALL_CLASSES"
+      displayName: Getting updated classes files
+      condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+
+    - bash: |
+        cd $(Build.SourcesDirectory)/core-customize/hybris/bin/platform
+        source ./setantenv.sh
+        ant clean
+      displayName: "ant clean"
+
+    - bash: |
+        cd $(Build.SourcesDirectory)/core-customize/hybris/bin/platform
+        sed -i "2i export ANT_MEM_OPTS=\"$(BUILD_ANT_MEM_OPTS)\"" ./setantenv.sh
+        export ANT_MEM_OPTS="$(BUILD_ANT_MEM_OPTS)"
+        source ./setantenv.sh
+        ant all
+      displayName: "ant all"
+      env:
+        HTTPS_PROXY: $(PROXY_AGENT_HTTPS)
+        HTTP_PROXY: $(PROXY_AGENT_HTTP)
+        NO_PROXY: $(PROXY_AGENT_NO_PROXY)
+      retryCountOnTaskFailure: 4
+
+    - bash: |
+        cd $(Build.SourcesDirectory)/core-customize/hybris/bin/platform
+        sed -i "2i export ANT_MEM_OPTS=\"$(BUILD_ANT_MEM_OPTS)\"" ./setantenv.sh
+        export ANT_MEM_OPTS="$(BUILD_ANT_MEM_OPTS)"
+        source ./setantenv.sh
+        ant yunitinit
+      displayName: "ant yunitinit"
+
+    - bash: |
+        cd $(Build.SourcesDirectory)/core-customize/hybris/bin/platform
+        sed -i "2i export ANT_MEM_OPTS=\"$(BUILD_ANT_MEM_OPTS)\"" ./setantenv.sh
+        export ANT_MEM_OPTS="$(BUILD_ANT_MEM_OPTS)"
+        source ./setantenv.sh
+
+        JACOCO_EXEC=False
+        if [[ "$(Build.Reason)" == "PullRequest" ]]; then
+          if [[ -n "$(ALL_CHANGED_TESTS)" ]]; then
+            echo "##[section]Running tests for changed classes only: ant jacocoalltests -Dtestclasses.packages=$(ALL_CHANGED_TESTS) -DthreadCountValue=8"
+            ant jacocoalltests -Dtestclasses.packages=$(ALL_CHANGED_TESTS) -DthreadCountValue=8
+            JACOCO_EXEC=True
+          else
+            echo "##[section]Nenhum teste encontrado para execução do Jacoco. Pulando execução."
+          fi
+        else
+          echo "##[section]Running tests: ant jacocoalltests -DthreadCountValue=8"
+          ant jacocoalltests -DthreadCountValue=8
+          JACOCO_EXEC=True
+        fi
+        echo "##vso[task.setvariable variable=JACOCO_EXEC;isOutput=true]${JACOCO_EXEC}"
+        echo "[section]JACOCO_EXEC ...........: $JACOCO_EXEC"
+
+
+        if [ $? -ne 0 ]; then
+          echo "##[error]Falha na execução dos testes unitários com JaCoCo."
+          exit 1
+        fi
+
+        JACOCO_EXEC=True
+        echo "##vso[task.setvariable variable=JACOCO_EXEC;isOutput=true]${JACOCO_EXEC}"
+        echo "[section]JACOCO_EXEC ...........: $JACOCO_EXEC"
+      displayName: "ant jacocoalltests"
+      name: jacocoalltests
+      condition: and(succeeded(), eq(${{ parameters.isDevEnvironment }}, False))
+      env:
+        HTTPS_PROXY: $(PROXY_AGENT_HTTPS)
+        HTTP_PROXY: $(PROXY_AGENT_HTTP)
+        NO_PROXY: $(PROXY_AGENT_NO_PROXY)
+
+    - bash: |
+        cd $(Build.SourcesDirectory)/core-customize/hybris/bin/platform
+        sed -i "2i export ANT_MEM_OPTS=\"$(BUILD_ANT_MEM_OPTS)\"" ./setantenv.sh
+        export ANT_MEM_OPTS="$(BUILD_ANT_MEM_OPTS)"
+        source ./setantenv.sh
+
+        PITEST_EXEC=False
+        if [[ "$(Build.Reason)" == "PullRequest" && -n "$(ALL_CHANGED_CLASSES)" && -n "$(ALL_CHANGED_TESTS)" ]]; then
+          ant pitest -Dpitest.targetClasses=$(ALL_CHANGED_CLASSES) -Dpitest.targetTests=$(ALL_CHANGED_TESTS) -Dpitest.outputFormats=XML,HTML
+          PITEST_EXEC=True
+        else
+          echo "##[section]Nenhum teste encontrado para execução do PiTest. Pulando execução."
+          PITEST_EXEC=False
+        fi
+        echo "##vso[task.setvariable variable=PITEST_EXEC;isOutput=true]${PITEST_EXEC}"
+        echo "[section]PITEST_EXEC ...........: $PITEST_EXEC"
+      name: run_pitest
+      displayName: "ant pitest"
+      condition: and(eq(variables.PITEST_IS_ENABLED, 'True'), eq(variables['run_jacoco.JACOCO_EXEC'], 'True'),  eq(${{ parameters.isDevEnvironment }}, False))
+      continueOnError: true
+
+    - task: PublishPipelineArtifact@1
+      condition: always()
+      inputs:
+        targetPath: "$(Build.SourcesDirectory)/core-customize/hybris/log/junit"
+        artifactName: "JunitReport"
+        publishLocation: "Pipeline"
+      displayName: "Publish Junit Report"
+      continueOnError: true
+
+    - bash: |
+        echo "##[section]Config additional properties .azuredevops/sonar-project.properties"
+
+        if [[ "$(Build.Reason)" == "PullRequest" ]]; then
+          BRANCH=$(echo "$(System.PullRequest.SourceBranch)" | sed 's/refs\/heads\///g')
+          echo "sonar.newCode.referenceBranch=$(System.PullRequest.TargetBranchName)" >> $(Build.SourcesDirectory)/.azuredevops/sonar-project.properties
+        else
+          BRANCH=$(echo "$(Build.SourceBranch)" | sed 's/refs\/heads\///g')
+          echo "sonar.branch.name=$BRANCH" >> $(Build.SourcesDirectory)/.azuredevops/sonar-project.properties
+        fi
+
+        echo "sonar.analysisCache.enabled=$(SONAR_ANALYSIS_CACHE_ENABLED)" >> $(Build.SourcesDirectory)/.azuredevops/sonar-project.properties
+
+        APP_VERSION=$(cat VERSION)
+        echo "Setting variable APP_VERSION: ............... : ${APP_VERSION}"
+        echo "##vso[task.setvariable variable=APP_VERSION]$APP_VERSION"
+
+        PROJECT_KEY=$(cat .azuredevops/sonar-project.properties | grep  'sonar.projectKey' | sed 's/sonar.projectKey\=//')
+        echo "Setting variable PROJECT_KEY: ............... : ${PROJECT_KEY}"
+        echo "##vso[task.setvariable variable=PROJECT_KEY]$PROJECT_KEY"
+
+        sed  -i '/^sonar.log.level/d' $(Build.SourcesDirectory)/.azuredevops/sonar-project.properties
+        echo "sonar.log.level=${SONAR_LOG_LEVEL}" >> $(Build.SourcesDirectory)/.azuredevops/sonar-project.properties
+
+        echo "##[section]Detalhes do arquivo .azuredevops/sonar-project.properties"
+        echo "##[section]Para logs do Sonar com mais detalhes altere o valor da variável SONAR_LOG_LEVEL com o valor DEBUG"
+        cat $(Build.SourcesDirectory)/.azuredevops/sonar-project.properties
+      displayName: "Add properties to sonar-project.properties"
+      condition: and(succeeded(), eq(${{ parameters.isDevEnvironment }}, False))
+      env:
+        SONAR_LOG_LEVEL: $(SONAR_LOG_LEVEL)
+
+    - task: SonarQubePrepare@7
+      inputs:
+        SonarQube: "${{ parameters.serviceConnectionName }}"
+        scannerMode: "CLI"
+        configMode: "file"
+        configFile: ".azuredevops/sonar-project.properties"
+        extraProperties: |
+          sonar.projectName=$(System.TeamProject)-$(Build.Repository.Name)
+          sonar.analysis.repositoryName=$(Build.Repository.Name)
+          sonar.analysis.buildId=$(Build.BuildId)
+          sonar.analysis.repositoryId=$(Build.Repository.ID)
+          sonar.analysis.projectName=$(System.TeamProject)
+          sonar.analysis.projectId=$(System.TeamProjectId)
+          sonar.links.homepage=$(System.TeamFoundationCollectionUri)$(System.TeamProject)
+          sonar.links.ci=$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)&_a=summary
+          sonar.links.issue=$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_workitems
+          sonar.links.scm=$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_git/$(Build.Repository.Name)
+          sonar.scanner.metadataFilePath=$(Agent.TempDirectory)/sonar/$(Build.BuildId)/report-task.txt
+      condition: and(succeeded(), eq(${{ parameters.isDevEnvironment }}, False))
+
+    - task: SonarQubeAnalyze@7
+      continueOnError: true
+      inputs:
+        jdkversion: "JAVA_HOME_17_X64"
+      condition: and(succeeded(), eq(${{ parameters.isDevEnvironment }}, False))
+
+    - task: SonarQubePublish@7
+      continueOnError: true
+      inputs:
+        pollingTimeoutSec: "300"
+      condition: and(succeeded(), eq(${{ parameters.isDevEnvironment }}, False))
+
+    - bash: |
+        echo "Compactando o resultado do build em um arquivo zip..."
+        zip -r $(Build.ArtifactStagingDirectory)/hybris-build.zip $(Build.SourcesDirectory)/core-customize/hybris
+      displayName: 'Compactar Build para Artefato'
+      condition: and(succeeded(), eq(variables.UPLOAD_BUILD_AS_ZIP_ARTIFACT, 'true'))
+
+    - bash: |
+        cd $(Build.SourcesDirectory)/core-customize/hybris
+
+        echo "##[section]CRIANDO ARQUIVO .tar.gz COM OS ARQUIVOS .jar"
+
+        tar --warning=no-file-changed -hczf $FILE_TO_PUBLISH $(find -name "*.jar")
+
+        STATUS_TAR_CREATION=$?
+        if [[ $STATUS_TAR_CREATION != 0 ]]; then
+          SET_MSG="NÃO FOI POSSÍVEL GERAR O ARQUIVO app.tar.gz"
+          echo "##[error]$SET_MSG"
+          echo "##vso[task.logissue type=error;]$SET_MSG"
+          exit 1
+        fi
+
+        echo "##[section]ARQUIVO TAR CRIADO COM SUCESSO"
+        tar -tf $FILE_TO_PUBLISH
+      displayName: 'Generate app.tar.gz'
+      env:
+        FILE_TO_PUBLISH: $(Build.SourcesDirectory)/app.tar.gz
+        EXCLUDE_FILES: '{"*\.tar","*.tar\.gz","*/dist","\.pnpm-store","\.angular","*/mock","*/.git",".git/"}'
+
+    - task: CopyFiles@2
+      displayName: "Copy app.tar.gz to Staging Directory"
+      inputs:
+        TargetFolder: "$(Build.ArtifactStagingDirectory)"
+        OverWrite: true
+        CleanTargetFolder: true
+        Contents: |
+          $(Build.SourcesDirectory)/app.tar.gz
+
+    - task: PublishPipelineArtifact@1
+      displayName: "Publish app.tar.gz"
+      inputs:
+        artifactName: ${{ parameters.artifactName }}
+        targetPath: "$(Build.ArtifactStagingDirectory)"
+
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publicar Artefato do Build (app)'
+      condition: and(succeeded(), eq(variables.UPLOAD_BUILD_AS_ZIP_ARTIFACT, 'true'))
+      inputs:
+        targetPath: '$(Build.ArtifactStagingDirectory)/hybris-build.zip'
+        artifactName: 'app'
+        publishLocation: 'Pipeline'
+
+    - task: PublishPipelineArtifact@1
+      continueOnError: true
+      condition: eq(${{ parameters.isDevEnvironment }}, False)
+      inputs:
+        targetPath: "$(Build.SourcesDirectory)/core-customize/hybris/log/jacoco/csv"
+        artifact: "JacocoReports"
+      displayName: "Publish Jacoco Report"
+
+    - task: PublishTestResults@2
+      condition: eq(${{ parameters.isDevEnvironment }}, False)
+      inputs:
+        testResultsFiles: |
+          $(Build.SourcesDirectory)/core-customize/hybris/log/junit/web/TESTS-TestSuites.xml
+          $(Build.SourcesDirectory)/core-customize/hybris/log/junit/TESTS-TestSuites.xml
+        testResultsFormat: "JUnit"
+        mergeTestResults: true
+        failTaskOnFailedTests: false
+        testRunTitle: "JUnit Test Results"
+      env:
+        HTTPS_PROXY: $(PROXY_AGENT_HTTPS)
+        HTTP_PROXY: $(PROXY_AGENT_HTTP)
+        NO_PROXY: $(PROXY_AGENT_NO_PROXY)
+
+    - bash: |
+        RED='\033[0;31m'
+        GREEN='\033[0;32m'
+        YELLOW='\033[1;33m'
+        BLUE='\033[0;34m'
+
+        export TZ=America/Sao_Paulo
+        dayOfWeek=$(date +%u)
+        hourOfDay=$(date +%H)
+
+        if [ $dayOfWeek -le 5 ] && [ $hourOfDay -ge 7 ] && [ $hourOfDay -lt 18 ]; then
+          businessHours=true
+        else
+          businessHours=false
+        fi
+
+        XML_FILE1="$(Build.SourcesDirectory)/core-customize/hybris/log/junit/web/TESTS-TestSuites.xml"
+        XML_FILE2="$(Build.SourcesDirectory)/core-customize/hybris/log/junit/TESTS-TestSuites.xml"
+
+        PREVIOUS_VALUES_FILE="$(Build.ArtifactStagingDirectory)/previous_failures_and_errors.txt"
+
+        count_failures_and_errors() {
+            local file=$1
+            xmllint --xpath 'sum(//testsuite/@failures) + sum(//testsuite/@errors)' "$file"
+        }
+
+        if ! command -v xmllint &> /dev/null; then
+          echo "xmllint não foi encontrado, por favor, instale-o."
+          exit 1
+        fi
+
+        failures_and_errors_file1=$(count_failures_and_errors "$XML_FILE1")
+        failures_and_errors_file2=$(count_failures_and_errors "$XML_FILE2")
+        total_failures_and_errors=$(echo "$failures_and_errors_file1 + $failures_and_errors_file2" | bc)
+
+        read_previous_values() {
+          if [ -f "$PREVIOUS_VALUES_FILE" ]; then
+            previous_total_failures_and_errors=$(cat "$PREVIOUS_VALUES_FILE")
+          else
+            previous_total_failures_and_errors=0
+          fi
+        }
+
+        save_current_values() {
+          echo "$total_failures_and_errors" > "$PREVIOUS_VALUES_FILE"
+        }
+
+        read_previous_values
+
+        if [ "$total_failures_and_errors" -eq "$previous_total_failures_and_errors" ]; then
+          echo "O número de falhas e erros ($total_failures_and_errors) é o mesmo que o anterior. Pipeline continuará."
+          exit 0
+        elif [ "$total_failures_and_errors" -gt 930 ]; then
+          printf "
+          ${YELLOW}=================================================================================================================================
+          ${RED}                                                          PIPELINE FALHOU
+          ${YELLOW}=================================================================================================================================
+          ${RED}ERRO: O pipeline falhou! Nem todos os testes unitários foram executados com sucesso.
+
+          ${YELLOW}VERIFICAÇÃO: Verifique o artefato publicado na pipeline para o relatório JUnit e analise se novos testes inseridos (ou refatorados)
+          ${YELLOW}estão apresentando falhas.
+
+          ${YELLOW}AÇÃO: Se não houver novos testes com falhas e apenas os testes já conhecidos falhando, apresente evidências de que os novos
+          ${YELLOW}testes estão OK e entre em contato com o time de DevOps para avaliar a possibilidade de bypassar.
+
+          ${RED}NOTA: Esse step foi implementado para reprovar o pipeline em caso de falhas nos testes unitários, garantindo que apenas
+          códigos totalmente validados sejam integrados. O time de DevOps analisará se as falhas são relacionadas a novos códigos ou ao débito
+          técnico existente para determinar o próximo passo.
+
+          ${BLUE}Para mais informações sobre as fases do pipeline, consulte a documentação:
+
+          ${BLUE}https://wikicorp.telefonica.com.br/x/4y6ZHw
+
+          ${YELLOW}=================================================================================================================================
+          ${BLUE}                               RESUMO DOS RESULTADOS DOS TESTES
+          ${YELLOW}=================================================================================================================================
+          ${BLUE}RELATÓRIO                                 | FALHAS & ERROS                        | TOTAL DE TESTES
+          ${BLUE}---------------------------------------------------------------------------------------------------------------------------------
+          ${BLUE}Primeiro Relatório (TESTS-TestSuites.xml) | ${failures_and_errors_file1}          | $(xmllint --xpath 'sum(//testsuite/@tests)' "$XML_FILE1")
+          ${BLUE}Segundo Relatório (TESTS-TestSuites.xml)  | ${failures_and_errors_file2}          | $(xmllint --xpath 'sum(//testsuite/@tests)' "$XML_FILE2")
+          ${BLUE}Total                                     | ${total_failures_and_errors}          | $(echo "$(xmllint --xpath 'sum(//testsuite/@tests)' "$XML_FILE1") + $(xmllint --xpath 'sum(//testsuite/@tests)' "$XML_FILE2")" | bc)
+          ${YELLOW}=================================================================================================================================
+          "
+          save_current_values
+          exit 1
+        else
+          printf "
+          ${YELLOW}=================================================================================================================================
+          ${GREEN}                                                         PIPELINE COM SUCESSO
+          ${YELLOW}=================================================================================================================================
+          ${GREEN}SUCESSO: O pipeline foi executado sem falhas críticas nos testes unitários. O deploy pode continuar normalmente.
+
+          ${YELLOW}AÇÃO: Nenhuma ação adicional é necessária. O pipeline continuará normalmente.
+
+          ${YELLOW}=================================================================================================================================
+          "
+          exit 0
+        fi
+      condition: eq(${{ parameters.isDevEnvironment }}, False)
+      displayName: "Check test failures"

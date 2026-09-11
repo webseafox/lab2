@@ -1,0 +1,624 @@
+parameters:
+- name: environment
+- name: infrastructureType
+- name: evenOrOdd
+  type: string
+  default: 'ODD,EVEN'
+- name: pipelineType
+  type: string
+  default: 'cd_only'
+
+stages:
+- stage: cd_weblogic_sanity_check
+  displayName: "CD - Sanity Check - ${{ parameters.environment }}"
+  condition: succeeded()
+  dependsOn:
+    - ${{ if eq(parameters.pipelineType, 'cd_only') }}:
+        - environment_init
+    - ${{ else }}:
+        - environment_init
+        - ci_build
+        - ci_publish
+  ${{ if eq(parameters.environment, 'producao') }}:
+    pool:
+      $(PRIVATE_AGENT_PRODUCAO)
+  ${{ else }}:
+    pool:
+      $(AGENT_POOL_CD)
+
+  ## -> Loads variables from other stages.
+  variables:
+  - name: NEXUS_DEPS_USR
+    value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEPS_USR'] ]
+  - name: NEXUS_DEPS_PSW
+    value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEPS_PSW'] ]
+  - name: NEXUS_DEFAULT_USR
+    value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEFAULT_USR'] ]
+  - name: NEXUS_DEFAULT_PSW
+    value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEFAULT_PSW'] ]
+  - template: /tech_products/oss/initialize/variables_catalog_info.yml
+  - template: /tech_products/oss/initialize/variables_source_data.yml
+
+  jobs:
+
+  - job: weblogic_sanity_check
+    displayName: Environment Sanity Check
+    condition: and(
+      succeeded(),
+      or(
+      eq(variables['Build.SourceBranchName'],'master'),
+      eq(variables['Build.SourceBranchName'],'main'),
+      startsWith(variables['Build.SourceBranchName'],'hotfix'),
+      eq(variables['Build.SourceBranchName'],'producao'),
+      eq(variables['Build.SourceBranchName'],'prodlike'),
+      eq(variables['Build.SourceBranchName'],'preprod'),
+      eq(variables['Build.SourceBranchName'],'esteira1'),
+      eq(variables['Build.SourceBranchName'],'esteira2'),
+      eq(variables['Build.SourceBranchName'],'dev')))
+    steps:
+
+    ## -> Skip Download
+    - download: none
+
+    ## -> Checkout the source code.
+    - checkout: self
+      displayName: Checkout Source Code
+      name: checkout_source_code
+      clean: true
+      path: source_code
+      submodules: recursive
+
+    ## -> Clean the pipeline workspace and checkout the code for HELM CHART.
+    ## -> 6d15af64-176c-496d-b583-fd2ae21d4df4 is the decorator for checkout.
+    - task: 6d15af64-176c-496d-b583-fd2ae21d4df4@1
+      displayName: Checkout Code
+      name: checkout_scripts
+      inputs:
+        repository: OSSDevOpsWeblogic
+        persistCredentials: "true"
+        clean: true
+        path: weblogic
+
+    ## -> Set artifact information to variables.
+    - task: Bash@3
+      displayName: Get Weblogic Scripts
+      condition: succeeded()
+      inputs:
+        targetType: inline
+        script: |
+
+          echo "##[debug] Retrive from Repository:$(NEXUS_REPO_OSSDEVOPSLABS)."
+          nexusURL='$(NEXUS_ENDPOINT_API_REPOSITORY)/search/assets?repository=$(NEXUS_REPO_OSSDEVOPSLABS)&group=$(GROUP_ID_OSSDEVOPSLABS)&name=$(WEBLOGIC_OSS_SCRIPTS_REPO)&version=$(WEBLOGIC_OSS_SCRIPTS_VERSION)'
+          echo "##[debug] Search NEXUS url : $nexusURL"
+
+          downloadUrl=($(curl -u $(NEXUS_DEPS_USR):$(NEXUS_DEPS_PSW) $nexusURL | \
+          jq -r '.items[] | select(.downloadUrl | test("\\.(tar)$")) | .downloadUrl'))
+          echo "##[debug] Download NEXUS url : $downloadUrl"
+
+          echo "##[debug] Download URL for scripts: $downloadUrl"
+          echo "##vso[task.setvariable variable=DOWNLOAD_SCRIPTS_URL]$downloadUrl"
+
+          echo "##[debug] WEBLOGIC_TRANSFER_MODE: ${WEBLOGIC_TRANSFER_MODE}"
+          if [[ ("${WEBLOGIC_TRANSFER_MODE}" == 'ssh') ]]; then
+            echo "##[debug] Scripts will be transfer over SSH (AZURE to WEBLOGIC servers)."
+          else
+            echo "##[debug] Scripts will be downloaded directly in the WEBLOGIC servers."
+          fi
+
+    ## -> Check Weblogic User-Password Variables
+    - task: Bash@3
+      displayName: Check Weblogic User-Password Variables
+      name: weblogic_user_passwords
+      condition: succeeded()
+      inputs:
+        targetType: inline
+        workingDirectory: $(Pipeline.Workspace)/source_code
+        script: |
+
+            exit=false
+
+            echo "##[section] Variables from library variables"
+            environmentWeblogic=$(echo "${{ parameters.environment }}" | tr 'a-z' 'A-Z')
+            [[ "${{ parameters.environment }}" =~ ^(preprod|prodlike|esteira1|esteira2)$ ]] && environmentWeblogic="QA"
+            echo "##[debug] Using environment weblogic as: $environmentWeblogic"
+
+            set_library_variable() {
+              local varName=$1
+              local outputVarName=$2
+              local varValue=${!varName}
+
+              if [ -z "$varValue" ]; then
+                echo "##[error] '$varName' not found in the library variables."
+                exit=true
+              else
+                echo "##[debug] $outputVarName: $varValue"
+                echo "##vso[task.setvariable variable=$outputVarName]$varValue"
+              fi
+            }
+
+            ##-> WEBLOGIC_USER / WEBLOGIC_PASS
+            set_library_variable "${environmentWeblogic}_WEBLOGIC_USER" "WEBLOGIC_USER"
+
+            case "$environmentWeblogic" in
+              DEV) weblogicPass=$(DEV_WEBLOGIC_PASS) ;;
+              QA) weblogicPass=$(QA_WEBLOGIC_PASS) ;;
+              PRODUCAO) weblogicPass=$(PRODUCAO_WEBLOGIC_PASS) ;;
+            esac
+            if [ -z $weblogicPass ] ; then
+              echo "##[error] '${environmentWeblogic}_WEBLOGIC_PASS' not found in the library variables."
+              exit=true
+            else
+              echo "##[debug] WEBLOGIC_PASS: $weblogicPass"
+              echo "##vso[task.setvariable variable=WEBLOGIC_PASS]$weblogicPass"
+            fi
+
+            ##-> WEBLOGIC_SSH_USER / WEBLOGIC_SSH_PASS
+            set_library_variable "${environmentWeblogic}_WEBLOGIC_SSH_USER" "WEBLOGIC_SSH_USER"
+
+            case "$environmentWeblogic" in
+              DEV) weblogicSshPass=$(DEV_WEBLOGIC_SSH_PASS) ;;
+              QA) weblogicSshPass=$(QA_WEBLOGIC_SSH_PASS) ;;
+              PRODUCAO) weblogicSshPass=$(PRODUCAO_WEBLOGIC_SSH_PASS) ;;
+            esac
+            if [ -z $weblogicSshPass ] ; then
+              echo "##[error] '${environmentWeblogic}_WEBLOGIC_SSH_PASS' not found in the library variables."
+              exit=true
+            else
+              echo "##[debug] WEBLOGIC_SSH_PASS: $weblogicSshPass"
+              echo "##vso[task.setvariable variable=WEBLOGIC_SSH_PASS]$weblogicSshPass"
+            fi
+
+            if [ "$exit" == "true" ]; then
+              exit 1
+            fi
+
+    ## -> Check Weblogic Files And Properties
+    - task: Bash@3
+      displayName: Check Weblogic Files And Properties
+      name: weblogic_file_properties
+      condition: succeeded()
+      inputs:
+        targetType: inline
+        workingDirectory: $(Pipeline.Workspace)/source_code
+        script: |
+
+          exit=false
+
+          echo "##[section] Package folder"
+          echo "##[debug] Using environment: ${{ parameters.environment }}"
+          packageFolder="oss_deployment_sanity_check"
+          echo "##[debug] packageFolder: $packageFolder"
+
+          echo "##[section] Variables from weblogic file"
+          echo "##[debug] Looking for weblogic.(yml,yaml) file..."
+
+          weblogicConfigFile=$(find $(Pipeline.Workspace)/source_code/.azuredevops/config/${{ parameters.environment }} -name 'weblogic*')
+          echo "##[debug] Config file path: $weblogicConfigFile"
+          if [ -z $weblogicConfigFile ]; then
+            echo "##[error] weblogic.(yml,yaml) not found at $weblogicConfigFile. Aborting..."
+            exit 1
+          fi
+
+          set_config_variable() {
+            local configKey=$1
+            local defaultValue=$2
+            local folderName=$3
+            local configValue=$(grep "$configKey:" $weblogicConfigFile | grep -v '^#' | awk '{print $2}' | tr -d '\r\n')
+
+            # Special handling for WEBLOGIC_APPLICATIONS_SERVER_PATH and WEBLOGIC_SCRIPTS_SERVER_PATH
+            if [ "$configKey" == "WEBLOGIC_APPLICATIONS_SERVER_PATH" ] || [ "$configKey" == "WEBLOGIC_SCRIPTS_SERVER_PATH" ]; then
+              configValue+="$folderName"
+            fi
+
+            # Special handling for WEBLOGIC_PROPERTIES_SERVER_FILE
+            if [ "$configKey" == "WEBLOGIC_PROPERTIES_SERVER_FILE" ]; then
+              propertiesFileName=$configValue
+            fi
+
+            if [ -z "$configValue" ] && [ "$configKey" != "WEBLOGIC_PROPERTIES_SERVER_FILE" ]; then
+              echo "##[warning] $configKey not found at $weblogicConfigFile."
+              if [ -n "$defaultValue" ]; then
+                echo "##[warning] Using default value: $defaultValue"
+                configValue=$defaultValue
+              else
+                echo "##[error] No value found for $configKey and no default value provided. Exiting."
+                exit=true
+              fi
+            fi
+
+            echo "##[debug] $configKey: $configValue"
+            echo "##vso[task.setvariable variable=$configKey]$configValue"
+
+          }
+
+          ## -> VARIABLES FROM weblogic.yml
+          set_config_variable "WEBLOGIC_TIMEOUT" 300
+          set_config_variable "WEBLOGIC_ADMIN_SERVER_URL"
+          set_config_variable "WEBLOGIC_CLUSTER"
+          set_config_variable "WEBLOGIC_APPLICATIONS_SERVER_PATH" "" "$(ARTIFACT_ID)/oss_deployment_sanity_check"
+          set_config_variable "WEBLOGIC_SCRIPTS_SERVER_PATH" "" "$(ARTIFACT_ID)/oss_scripts_sanity_check"
+          set_config_variable "WEBLOGIC_PROPERTIES_SERVER_PATH"
+
+          propertiesFileName=""
+          set_config_variable "WEBLOGIC_PROPERTIES_SERVER_FILE"
+
+          if [ -n "$propertiesFileName" ]; then
+            propertiesPath="$(DEFAULT_WORKDIR_WEBLOGIC_CONFIG)/${{ parameters.environment }}/"
+
+            ## -> Normalize delimiters to commas
+            normalizedPropertiesFilePath=$(echo "$propertiesFileName" | tr ';' ',')
+
+            IFS=',' read -ra files <<< "$normalizedPropertiesFilePath"
+            allAvailableProperties=""
+            for propertiesName in "${files[@]}"; do
+              availableProperties=$(find $propertiesPath -name "$propertiesName")
+              if [ -z "$availableProperties" ]; then
+                echo "##[warning] Properties file $propertiesName not found at $propertiesPath."
+              else
+                allAvailableProperties+="$propertiesName,"
+              fi
+            done
+
+            ## -> Remove trailing comma
+            allAvailableProperties=${allAvailableProperties%,}
+            echo "##vso[task.setvariable variable=ALL_AVAILABLE_PROPERTIES]$allAvailableProperties"
+            echo "##[debug] ALL_AVAILABLE_PROPERTIES: $allAvailableProperties"
+          fi
+
+          if [ "$exit" == "true" ]; then
+            exit 1
+          fi
+
+    ## -> Check Properties File
+    - task: Bash@3
+      displayName: Check Properties Files
+      name: weblogic_properties_file
+      condition: and(
+        succeeded(),
+        ne(variables['ALL_AVAILABLE_PROPERTIES'], ''))
+      inputs:
+        targetType: inline
+        workingDirectory: $(Pipeline.Workspace)/source_code
+        script: |
+
+          echo "##[debug] Checking all properties files ..."
+
+          # Read the ALL_AVAILABLE_PROPERTIES variable
+          IFS=',' read -ra propertiesFiles <<< "$(ALL_AVAILABLE_PROPERTIES)"
+          for propertiesFile in "${propertiesFiles[@]}"; do
+            echo "##[debug] Checking file: $propertiesFile"
+
+            # Find the properties file
+            propertiesFilePath=$(find "$(DEFAULT_WORKDIR_WEBLOGIC_CONFIG)/${{ parameters.environment }}/" -name "$propertiesFile")
+            echo "##[debug] Properties file path: $propertiesFilePath"
+
+            # Validate if the file exists
+            if [ -z "$propertiesFilePath" ] || [ ! -f "$propertiesFilePath" ]; then
+              echo "##[error] Properties file $propertiesFile not found at expected path. Aborting..."
+              exit 1
+            else
+              echo "##[debug] Properties file $propertiesFile found: $propertiesFilePath"
+            fi
+          done
+
+    ## -> Replace tokens in properties file
+    - task: qetza.replacetokens.replacetokens-task.replacetokens@5
+      displayName: Check Configuring properties file
+      condition: and(
+        succeeded(),
+        ne(variables['ALL_AVAILABLE_PROPERTIES'], ''))
+      inputs:
+        targetFiles: '$(ALL_AVAILABLE_PROPERTIES)'
+        rootDirectory: '$(DEFAULT_WORKDIR_WEBLOGIC_CONFIG)/${{ parameters.environment }}/'
+        actionOnNoFiles: fail
+        keepToken: true
+        actionOnMissing: fail
+        verbosity: detailed
+      env:
+        NEXUS_DEPS_USR: $(NEXUS_DEPS_USR)
+
+    ## -> Set SSH Environment
+    - task: LegacySSH@0
+      displayName: Check Set SSH Environment
+      name: ssh_environment
+      condition: succeeded()
+      inputs:
+        sshEndpoint: weblogic_${{ parameters.environment }}
+        runOptions: 'inline'
+        readyTimeout: '20000'
+        inline: |
+
+          hostnameArray=($(hostname -i))
+          echo "##[debug] SSH is connected! IP: ${hostnameArray[0]}..."
+          echo "##vso[task.setvariable variable=WEBLOGIC_ADMIN_SERVER_IP]${hostnameArray[0]}"
+
+          echo "##[debug] Setting up folders..."
+          mkdir -p "$(WEBLOGIC_APPLICATIONS_SERVER_PATH)"
+          echo "##[debug] Folder $(WEBLOGIC_APPLICATIONS_SERVER_PATH) created!"
+
+          mkdir -p "$(WEBLOGIC_SCRIPTS_SERVER_PATH)"
+          echo "##[debug] Folder $(WEBLOGIC_SCRIPTS_SERVER_PATH) created!"
+
+          echo "##[debug] Create an empty file to add server addresses ... "
+          touch "$(WEBLOGIC_SCRIPTS_SERVER_PATH)/weblogic_machines_info.txt"
+          chmod 777 "$(WEBLOGIC_SCRIPTS_SERVER_PATH)/weblogic_machines_info.txt"
+          echo "##[debug] Folder $(WEBLOGIC_SCRIPTS_SERVER_PATH)/weblogic_machines_info.txt created!"
+
+    ## -> SSH TASK - Copy Scripts to Weblogic Admin Server
+    - task: LegacyCopyFilesOverSSH@0
+      displayName: Check Transfering Scripts - SSH
+      condition: succeeded()
+      inputs:
+        sshEndpoint: weblogic_${{ parameters.environment }}
+        sourceFolder: '$(Pipeline.Workspace)/weblogic/scripts/'
+        contents: '**'
+        overwrite: true
+        targetFolder: '$(WEBLOGIC_SCRIPTS_SERVER_PATH)'
+        readyTimeout: '20000'
+
+    ## -> BASH TASK - Copy Scripts to Weblogic Admin Server
+    - task: LegacySSH@0
+      displayName: Check Transfering Scripts - NEXUS
+      condition: succeeded()
+      inputs:
+        sshEndpoint: weblogic_${{ parameters.environment }}
+        runOptions: inline
+        failOnStdErr: true
+        inline: |
+
+          echo "##[debug] Download URL: $(DOWNLOAD_SCRIPTS_URL)"
+          TARGET_DIR=$(WEBLOGIC_SCRIPTS_SERVER_PATH)/
+          cd "$TARGET_DIR"
+          curl -s -u $(NEXUS_DEPS_USR):$(NEXUS_DEPS_PSW) $(DOWNLOAD_SCRIPTS_URL) -o "$TARGET_DIR/$(basename $(DOWNLOAD_SCRIPTS_URL))"
+          tar -xvf "$TARGET_DIR/$(basename $(DOWNLOAD_SCRIPTS_URL))" --strip-components=2 ./scripts/python
+
+    - task: LegacySSH@0
+      displayName: Check Get Weblogic Servers Info - ODD
+      condition: succeeded()
+      continueOnError: true
+      inputs:
+        sshEndpoint: 'weblogic_${{ parameters.environment }}'
+        runOptions: 'commands'
+        commands: >
+          sudo -u weblogic /opt/web/wl/current/oracle_common/common/bin/wlst.sh
+          $(WEBLOGIC_SCRIPTS_SERVER_PATH)/python/GetMachinesInfo.py
+          $(WEBLOGIC_USER)
+          $(WEBLOGIC_PASS)
+          $(WEBLOGIC_ADMIN_SERVER_URL)
+          $(WEBLOGIC_SCRIPTS_SERVER_PATH)
+          odd
+        readyTimeout: '40000'
+
+    - task: Bash@3
+      displayName: Check Capture and Process Output
+      inputs:
+        targetType: 'inline'
+        script: |
+          echo "##[debug] Capturing output from previous tasks..."
+
+          # Armazena o caminho em uma variável local para evitar problemas de expansão
+          scriptsPath="$(WEBLOGIC_SCRIPTS_SERVER_PATH)"
+          sshUser="$(WEBLOGIC_SSH_USER)"
+          sshPass="$(WEBLOGIC_SSH_PASS)"
+          adminIp="$(WEBLOGIC_ADMIN_SERVER_IP)"
+
+          # Usa aspas duplas para permitir expansão de variáveis
+          sshOutput=$(sshpass -p "${sshPass}" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=30 "${sshUser}@${adminIp}" "cat ${scriptsPath}/weblogic_machines_info.txt")
+
+          if [ $? -ne 0 ]; then
+            echo "##[error] Failed to capture output from SSH command."
+            echo "##[error] Check if WEBLOGIC_SSH_USER and WEBLOGIC_SSH_PASS are correctly added and filled in the library variables."
+            echo "##[error] WEBLOGIC_SSH_USER and WEBLOGIC_SSH_PASS must use the OS (Operating System) user."
+            echo "##[debug] SSH_USER: ${SSH_USER}"
+            echo "##[debug] ADMIN_IP: ${ADMIN_IP}"
+            echo "##[debug] SCRIPTS_PATH: ${SCRIPTS_PATH}"
+            exit 1
+          fi
+
+          if [ -z "$sshOutput" ]; then
+            echo "##[error] Captured output is empty or blank."
+            echo "##[error] Failed to capture output from SSH command."
+            echo "##[error] The last task probably failed to authenticate within the script or there is an internal problem in WebLogic Admin Server."
+            echo "##[error] Check if WEBLOGIC_USER and WEBLOGIC_PASS are correctly added and filled in the library variables."
+            echo "##[error] WEBLOGIC_USER and WEBLOGIC_PASS must use the WebLogic Console user."
+            exit 1
+          fi
+
+          echo "$sshOutput" > weblogic_machines_info.txt
+
+          echo "##[debug] Contents of weblogic_machines_info.txt"
+          cat weblogic_machines_info.txt
+
+    - task: Bash@3
+      displayName: Check Functions Properties - ODD
+      name: backup_properties
+      condition: and(
+          succeeded(),
+          ne(variables['ALL_AVAILABLE_PROPERTIES'], ''),
+          eq(variables['TRANSFER_FILE_DONE'], ''))
+      inputs:
+        targetType: 'inline'
+        script: |
+
+            exit=false
+
+            backup_properties() {
+              local server_ip=$1
+              local file_path=$2
+              local file_name=$3
+              local new_file_name=$4
+              echo "##[section] --> BACKUP CHECK"
+              echo "##[debug] Starting SSH to $server_ip ..."
+              sshpass -p $(WEBLOGIC_SSH_PASS) ssh -T -o StrictHostKeyChecking=no $(WEBLOGIC_SSH_USER)@$server_ip  <<- ENDSSH
+                cd $file_path
+
+                echo "##[warning] Contents of $file_path"
+                ls -lh
+                echo "##[warning] End of contents of $file_path"
+
+                if [ -f $file_name ]; then
+                  echo "##[debug] mv $file_name $new_file_name... "
+                  mv $file_name $new_file_name
+                  echo "##[debug] Revert mv $new_file_name $file_name... "
+                  mv $new_file_name $file_name
+                else
+                  echo "##[error] No properties file found on server $server_ip."
+                  exit=true
+                fi
+            ENDSSH
+            }
+
+            transfer_properties() {
+              local server_ip=$1
+              local file_path=$2
+              local fileToTransfer=$3
+              local targetFolder=$4
+              echo "##[section] --> TRANSFER CHECK"
+
+              echo "##[debug] Starting SCP to $server_ip ..."
+              sshpass -p $(WEBLOGIC_SSH_PASS) scp -o StrictHostKeyChecking=no -r $fileToTransfer $(WEBLOGIC_SSH_USER)@$server_ip:$targetFolder
+              if [ -f $file_name ]; then
+                echo "##[debug] File transfer was done correclty... "
+              else
+                echo "##[error] File transfer failed! "
+                echo "##[error] Check permissions for $(WEBLOGIC_SSH_USER) "
+                exit=true
+              fi
+
+              sshpass -p $(WEBLOGIC_SSH_PASS) ssh -T -o StrictHostKeyChecking=no $(WEBLOGIC_SSH_USER)@$server_ip  <<- ENDSSH
+              cd $file_path
+              echo "##[warning] Contents of $file_path"
+              ls -lh
+              echo "##[warning] End of contents of $file_path"
+
+            ENDSSH
+            }
+
+            remove_properties() {
+              local server_ip=$1
+              local file_path=$2
+              local file_name=$3
+              echo "##[section] --> REMOVE CHECK"
+              echo "##[debug] Starting SSH to $server_ip ..."
+              sshpass -p $(WEBLOGIC_SSH_PASS) ssh -T -o StrictHostKeyChecking=no $(WEBLOGIC_SSH_USER)@$server_ip  <<- ENDSSH
+                cd $file_path
+                if [ -f $file_name ]; then
+                  echo "##[warning] Contents of $file_path"
+                  ls -lh
+                  echo "##[warning] End of contents of $file_path"
+
+                  echo "##[debug] Removing $file_name ... "
+                  rm -rf $file_name
+                  echo "##[debug] File $file_name was removed correctly... "
+                else
+                  echo "##[error] No file found on server $server_ip."
+                  exit=true
+                fi
+
+                echo "##[warning] Contents of $file_path"
+                ls -lh
+                echo "##[warning] End of contents of $file_path"
+
+            ENDSSH
+            }
+
+            touch sanity_check.txt
+            fileSanity=sanity_check.txt
+            filePath=$(WEBLOGIC_PROPERTIES_SERVER_PATH)
+            fileName=$(WEBLOGIC_PROPERTIES_SERVER_FILE)
+            newFileName="$(WEBLOGIC_PROPERTIES_SERVER_FILE)_$(date +"%d%m%Y%H%M")"
+
+            echo "##[debug] Starting checking backup of properties file $(WEBLOGIC_PROPERTIES_SERVER_FILE) ..."
+
+            while IFS=';' read -r domain_name server_name server_alias server_ip; do
+              echo "##[section] Connecting to server $server_name (domain: $domain_name, IP: $server_ip)"
+              backup_properties $server_ip $filePath $fileName $newFileName
+              if [ $? -ne 0 ]; then
+                echo "##[error] Failed to backup file on server $server_name (domain: $domain_name, IP: $server_ip)."
+                exit=true
+              fi
+              transfer_properties $server_ip $filePath $fileSanity $filePath
+              if [ $? -ne 0 ]; then
+                echo "##[error] Failed to transfer file on server $server_name (domain: $domain_name, IP: $server_ip)."
+                exit=true
+              fi
+              remove_properties $server_ip $filePath $fileSanity
+              if [ $? -ne 0 ]; then
+                echo "##[error] Failed to remove file on server $server_name (domain: $domain_name, IP: $server_ip)."
+                exit=true
+              fi
+            done < weblogic_machines_info.txt
+
+            if [ "$exit" == "true" ]; then
+              exit 1
+            fi
+
+    - task: Bash@3
+      displayName: Check Clear Servers Cache - ODD
+      condition: succeeded()
+      inputs:
+        targetType: 'inline'
+        script: |
+
+          exit=false
+
+          clear_cache() {
+            local server_ip=$1
+            local domain_name=$2
+            local server_name=$3
+            echo "##[debug] Starting SSH to $server_ip ..."
+            output=$(sshpass -p $(WEBLOGIC_SSH_PASS) ssh -T -o StrictHostKeyChecking=no $WEBLOGIC_SSH_USER@$server_ip <<- ENDSSH
+              echo "##[warning] Executing /opt/web/scripts/jvm_cache_clean.sh"
+              echo "##[warning] This script is maintained by the Middleware team"
+              sudo -u weblogic /opt/web/scripts/jvm_cache_clean.sh
+          ENDSSH
+          )
+          echo "$output"
+          if echo "$output" | grep -q "Some argument is empty or null"; then
+            return 1
+          else
+            return 0
+          fi
+          }
+
+          echo "##[debug] Starting to clear weblogic's cache, stage and tmp folders..."
+          while IFS=';' read -r domain_name server_name server_alias server_ip; do
+            echo "##[section] Connecting to server $server_name (domain: $domain_name, IP: $server_ip)"
+            clear_cache $server_ip
+            status=$?
+            if [ $status -eq 1 ]; then
+              echo "##[debug] jvm_cache_clean.sh is accessible on $server_ip."
+            else
+              echo "##[debug] jvm_cache_clean.sh NOT is accessible on $server_ip."
+              exit=true
+            fi
+          done < weblogic_machines_info.txt
+
+          if [ "$exit" == "true" ]; then
+            exit 1
+          fi
+
+
+    ## -> Remove Folders from Weblogic Admin Server
+    - task: LegacySSH@0
+      displayName: Remove Folders
+      condition: always()
+      inputs:
+        sshEndpoint: weblogic_${{ parameters.environment }}
+        runOptions: 'inline'
+        readyTimeout: '20000'
+        inline: |
+
+          validate_and_remove() {
+            local path=$1
+            if [[ "$path" == /opt/web/applications/* && "$path" != /opt/web/applications/ && "$path" == *oss_* ]]; then
+              rm -r "$path"
+            else
+              echo "##[error] Path $path is not valid. It must start with /opt/web/applications/"
+              echo "##[error] Folder path must have additional subdirectories, and contain 'oss_' in some folder name."
+              exit 1
+            fi
+          }
+
+          validate_and_remove "$(WEBLOGIC_APPLICATIONS_SERVER_PATH)"
+          validate_and_remove "$(WEBLOGIC_SCRIPTS_SERVER_PATH)"

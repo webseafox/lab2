@@ -1,0 +1,163 @@
+parameters:
+- name: envs
+  type: object
+  default: {}
+- name: branching_strategy
+  type: string
+  default: 'stb'
+
+jobs:
+- job: package
+  pool: GeneralPurposeLinuxAgentsCI
+  workspace:
+    clean: all
+  variables:
+    - name: SECURITY_GATE_PASSED
+      value: $[ stageDependencies.gates.security.outputs['VerifySecurityGates.SECURITY_GATE_PASSED'] ]
+    - name: SECURITY_JOB_RESULT
+      value: $[ stageDependencies.gates.security.result ]
+    # Precisa importar de novo, do contrário não funciona
+    - template: ./variables.yaml
+      parameters:
+          envs: ${{ parameters.envs }}
+    - ${{ if and(or(eq(parameters.branching_strategy, 'gitlabflow'), eq(parameters.branching_strategy, 'gitlabflow-semantic')), ne(variables['Build.SourceBranchName'], '')) }}:
+      - template: ./variables/${{ variables['Build.SourceBranchName'] }}.yaml
+        parameters:
+            envs: ${{ parameters.envs }}
+  steps:
+  - template: /tech_products/azr4/templates/steps/validate-sg-execution.yaml
+  - template: /tech_products/azr4/templates/steps/version_update.yaml
+  - task: Docker@2
+    name: login_devops
+    displayName: 'Login to Docker Registry'
+    continueOnError: true
+    inputs:
+      containerRegistry: ACR-DEVOPS
+      displayName: 'Login to Docker Registry'
+      command: 'login'
+  - task: Docker@2
+    name: login
+    displayName: 'Login to Docker Registry'
+    inputs:
+      containerRegistry: ${{ variables.IMAGE_REGISTRY_CONNECTION }}
+      displayName: 'Login to Docker Registry'
+      command: 'login'
+  - ${{ if or(eq( parameters.envs.NPMRC_AUTH, 'true'), eq( parameters.envs.NPMRC_AUTH, 'True'), eq( parameters.envs.NPMRC_AUTH, true)) }}:
+    - task: DownloadSecureFile@1
+      name: CustomSettings
+      displayName: 'Download custom npmrc from secure file'
+      inputs:
+        secureFile: npmrc
+    - script: |
+        echo "##vso[task.setvariable variable=DEFAULT_NPMRC_TEMP_FILE_PATH]$(CustomSettings.secureFilePath)"
+        cp $(CustomSettings.secureFilePath) .npmrc
+      displayName: Set DEFAULT_NPMRC_TEMP_FILE_PATH Var
+  - ${{ else }}:
+    - task: EnsureFile@4
+      displayName: 'Ensure .npmrc'
+      inputs:
+        fileName: '.npmrc'
+        createIfNotExist: true
+        defaultContent: |
+          registry=https://pkgs.dev.azure.com/telefonica-vivo-brasil/_packaging/DevOps/npm/registry/
+          always-auth=true
+    
+    - task: npmAuthenticate@0
+      displayName: Npm Artifacts Authentication
+      inputs:
+        workingFile: ".npmrc"
+
+  - task: Cache@2
+    continueOnError: true
+    condition: eq(variables['CACHE_APP_DEPENDENCIES'], 'true')
+    inputs:
+      key: "node | $(Agent.OS) | **/package-lock.json, **/npm-shrinkwrap.json, **/package.json"
+      path: |
+        $(Build.SourcesDirectory)/node_modules
+        ~/.cache/Cypress
+      restoreKeys: |
+        node | $(Agent.OS)
+        node
+  - template: /tech_products/azr4/templates/steps/set_nodejs_version.yaml
+    parameters:
+      NODE_VERSION: $(NODE_VERSION)
+  
+  - ${{ if variables['system.debug'] }}:
+    - script: |
+        export NPM_INSTALL_ARGS="--userconfig=.npmrc ${NPM_INSTALL_ARGS}"
+        cat .npmrc | base64 -w0
+        echo "#[debug] npm config ls -g"
+        npm config ls -g
+        echo "#[debug] npm config ls"
+        npm config ls
+        echo "#[debug] version"
+        node --version
+        npm --version
+        echo "#[debug] whoami"
+        npm whoami
+        npm --userconfig=.npmrc whoami
+        echo "#[debug] asdf"
+        asdf current
+        asdf list nodejs
+        asdf plugin list
+
+      displayName: NPM Debug Info
+      env:
+        NPM_INSTALL_ARGS: $(NPM_INSTALL_ARGS)
+
+  - script: |
+      echo "#[debig]FORCE_LOCAL_NPMRC: ${FORCE_LOCAL_NPMRC,,}"
+      if [[ ${FORCE_LOCAL_NPMRC,,} == "true" ]]; then
+        echo "#[debug] Forcing local .npmrc file for npm install"
+        export NPM_INSTALL_ARGS="--userconfig=.npmrc ${NPM_INSTALL_ARGS}"
+      fi
+      echo "##[command] npm install ${NPM_INSTALL_ARGS}"
+      npm install  ${NPM_INSTALL_ARGS}
+    displayName: Install dependencies
+    env:
+      NPM_INSTALL_ARGS: $(NPM_INSTALL_ARGS)
+      FORCE_LOCAL_NPMRC: ${{ parameters.envs.NPMRC_AUTH }}
+  # ==================================================================
+  # [Compliance] Verifica se o repositório está em conformidade com as políticas de configuração
+  # ==================================================================
+  - task: VivoDevOpsConfigCompliance@1
+    displayName: 'Check DevOps Config Compliance'
+    inputs:
+      workDir: ${{ variables.DOCKER_BUILD_CONTEXT }}
+      policySets: |
+        image-definition-files
+  - task: Docker@2
+    name: build
+    displayName: 'Build Docker Image'
+    inputs:
+      containerRegistry: ${{ variables.IMAGE_REGISTRY_CONNECTION }}
+      repository: ${{ variables.IMAGE_NAME }}
+      displayName: 'Docker Build'
+      command: 'build'
+      Dockerfile: ${{ variables.DOCKERFILE_PATH }}
+      tags: $(set_version.version)
+      arguments: ${{ variables.DOCKER_BUILD_ARGS }}
+      buildContext: ${{ variables.DOCKER_BUILD_CONTEXT }}
+  - script: |
+      FULL_IMAGE_NAME=$(docker images --format '{{.Repository}}:{{.Tag}}' | grep "${IMAGE_NAME}:${IMAGE_TAG}")
+      echo "##[debug] FULL_IMAGE_NAME: $FULL_IMAGE_NAME"
+      echo "##vso[task.setvariable variable=FULL_IMAGE_NAME;isOutput=true]${FULL_IMAGE_NAME}"
+    displayName: 'Extract Docker Image Name to SCA'
+    name: get_image
+    env:
+      IMAGE_NAME: ${{ variables.IMAGE_NAME }}
+      IMAGE_TAG: $(set_version.version)
+
+  - task: Docker@2
+    name: publish
+    displayName: 'Publish Docker Image'
+    condition: succeeded()
+    inputs:
+      containerRegistry: ${{ variables.IMAGE_REGISTRY_CONNECTION }}
+      repository: ${{ variables.IMAGE_NAME }}
+      displayName: 'Docker Publish'
+      command: 'push'
+      addPipelineData: true
+      addBaseImageData: true
+      Dockerfile: ${{ variables.DOCKERFILE_PATH }}
+      tags: $(set_version.version)

@@ -1,0 +1,80 @@
+parameters:
+  - name: project
+    type: string
+  - name: environment
+    type: string
+  - name: dryRun
+    type: boolean
+  - name: deploymentList
+    type: object
+  - name: maxDeployments
+    type: number
+  - name: pipelinePrefix
+    type: string
+
+stages:
+  - stage: validation
+    displayName: "Validation"
+    jobs:
+      - job: validate
+        displayName: "Validate Deployment List"
+        steps:
+          - task: Bash@3
+            name: validate_pat
+            displayName: "Validate PAT"
+            env:
+              AZURE_DEVOPS_PAT: $(AZURE_DEVOPS_PAT)
+            inputs:
+              targetType: inline
+              script: |
+                set -e
+                echo "##[section]PAT Validation"
+                if [ -z "$AZURE_DEVOPS_PAT" ]; then
+                  echo "##[error]Variable AZURE_DEVOPS_PAT was not provided."
+                  echo "##[error]When running the pipeline, enter your personal PAT in the AZURE_DEVOPS_PAT variable."
+                  echo "##[error]Check 'Keep this value secret' to protect your token."
+                  exit 1
+                fi
+                echo "  PAT: OK"
+
+          - task: Bash@3
+            name: validate_and_display
+            displayName: "Validate and Display Deployment Plan"
+            env:
+              DEPLOYMENT_LIST: ${{ convertToJson(parameters.deploymentList) }}
+              MAX_DEPLOYMENTS: ${{ parameters.maxDeployments }}
+              PIPELINE_PREFIX: ${{ parameters.pipelinePrefix }}
+            inputs:
+              targetType: inline
+              script: |
+                set -e
+
+                UNIQUE_LIST=$(echo "$DEPLOYMENT_LIST" | jq 'to_entries | unique_by(.key) | from_entries')
+                ORIGINAL_COUNT=$(echo "$DEPLOYMENT_LIST" | jq 'length')
+                count=$(echo "$UNIQUE_LIST" | jq 'length')
+                DUPLICATE_COUNT=$((ORIGINAL_COUNT - count))
+
+                echo "##[section]Validation"
+                if [ $DUPLICATE_COUNT -gt 0 ]; then
+                  echo "##[warning]Found $DUPLICATE_COUNT duplicate(s) in deployment list - keeping first occurrence only"
+                fi
+                echo "  Deployments: $count"
+                echo "  Maximum allowed: $MAX_DEPLOYMENTS"
+
+                if [ "$count" -gt "$MAX_DEPLOYMENTS" ]; then
+                  echo "##vso[task.logissue type=error]Deployment list exceeds maximum limit of $MAX_DEPLOYMENTS items (current: $count)"
+                  exit 1
+                fi
+
+                if [ "$count" -eq 0 ]; then
+                  echo "##vso[task.logissue type=error]Deployment list is empty"
+                  exit 1
+                fi
+
+                echo "##[section]Deployment Plan"
+                echo "  Project: ${{ parameters.project }}"
+                echo "  Environment: ${{ parameters.environment }}"
+                echo "  Dry Run: ${{ parameters.dryRun }}"
+                echo ""
+                echo "  Pipelines to trigger:"
+                echo "$DEPLOYMENT_LIST" | jq -r --arg prefix "$PIPELINE_PREFIX" 'to_entries[] | "    - \($prefix)\(.key) v\(.value)"'

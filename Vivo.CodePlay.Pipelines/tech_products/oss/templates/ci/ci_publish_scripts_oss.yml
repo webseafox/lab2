@@ -1,0 +1,254 @@
+stages:
+- stage: ci_publish
+  displayName: "CI - Publish"
+  pool:
+    name: $(AGENT_POOL_CI)
+  dependsOn:
+  - environment_init
+  - ci_build
+  condition: and(
+    succeeded(),
+    or(
+      eq(variables['Build.SourceBranchName'],'master'),
+      eq(variables['Build.SourceBranchName'],'main'),
+      eq(variables['Build.SourceBranchName'],'dev'),      
+      startsWith(variables['Build.SourceBranchName'],'hotfix'),
+      and(
+        or(
+          eq('${{ parameters.infrastructureType }}', 'weblogic'),
+          eq(dependencies.environment_init.outputs['environment.multibranch_exclusions.ALLOW_MULTIBRANCH'], 'true')
+        ),
+        or(
+          eq(variables['Build.SourceBranchName'],'prodlike'),
+          eq(variables['Build.SourceBranchName'],'preprod'),
+          eq(variables['Build.SourceBranchName'],'esteira1'),
+          eq(variables['Build.SourceBranchName'],'esteira2')
+        )
+      )
+    ))
+
+  ## -> Loads variables from other stages.
+  variables:
+  - name: MAVEN_SETTINGS_LOCATION
+    value: $[ stageDependencies.environment_init.environment.outputs['settings_variables.MAVEN_SETTINGS_LOCATION'] ]
+  - name: MAVEN_CUSTOM_SETTINGS_CONTENT
+    value: $[ stageDependencies.environment_init.environment.outputs['custom_settings.MAVEN_CUSTOM_SETTINGS_CONTENT'] ]
+  - name: NEXUS_DEPS_USR
+    value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEPS_USR'] ]
+  - name: NEXUS_DEPS_PSW
+    value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEPS_PSW'] ]
+  - name: NEXUS_DEFAULT_USR
+    value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEFAULT_USR'] ]
+  - name: NEXUS_DEFAULT_PSW
+    value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEFAULT_PSW'] ]
+  - name: SAST_STATUS
+    value: $[ stageDependencies.ci_security.sast_scan.outputs['job_status.SAST_STATUS'] ]
+  - name: SCA_STATUS
+    value: $[ stageDependencies.ci_security.sca_scan.outputs['job_status.SCA_STATUS'] ]
+  - name: SONARQUBE_STATUS
+    value: $[ stageDependencies.ci_quality_gate.sonarqube.outputs['job_status.SONARQUBE_STATUS'] ]
+  - name: GOVERNANCE_STATUS
+    value: $[ stageDependencies.ci_quality_gate.governance.outputs['job_status.GOVERNANCE_STATUS'] ]
+
+  - template: /tech_products/oss/initialize/variables_source_data.yml
+
+  jobs:
+  ## -> Publish artifact to Nexus.
+  - job: publish
+    displayName: Publish Script
+    steps:
+
+        ## -> Skip Download
+        - download: none
+
+        ## -> Check if previous Gates stages were not failed as there is bug in AzDo that bypasses the condition
+        ## -> and the pipeline continues to the next stage.
+        ## -> This is a workaround to avoid the pipeline to continue if the gates failed.
+        - task: Bash@3
+          displayName: Gates Verification
+          condition: and(succeeded(),
+            or(
+              eq(variables.SAST_STATUS, 'Failed'),
+              eq(variables.SCA_STATUS, 'Failed'),
+              eq(variables.SONARQUBE_STATUS, 'Failed'),
+              eq(variables.GOVERNANCE_STATUS, 'Failed')))
+          inputs:
+            targetType: inline
+            script: |
+
+              echo "##[debug] SAST_STATUS       : ${SAST_STATUS:-Skipped}"
+              echo "##[debug] SCA_STATUS        : ${SCA_STATUS:-Skipped}"
+              echo "##[debug] SONARQUBE_STATUS  : ${SONARQUBE_STATUS:-Skipped}"
+              echo "##[debug] GOVERNANCE_STATUS : ${GOVERNANCE_STATUS:-Skipped}"
+
+              echo "##[error] Security or quality gate check(s) failed."
+              echo "##[error] Publication cannot proceed until all gates checks pass. Please address the issues reported in the respective scan results."
+              exit 1
+
+        ## -> Download the scripts form pipeline
+        - task: DownloadBuildArtifacts@1
+          displayName: 'Download Build Artifacts'
+          inputs:
+            artifactName: $(ARTIFACT_NAME)
+            cleanDestinationFolder: false
+            extractTars: false
+            parallelizationLimit: 8
+            downloadPath: $(System.ArtifactsDirectory)
+
+        ## -> Publish the artifact to Nexus
+        - task: Bash@3
+          displayName: 'Publish to Nexus'
+          name: publish_nexus
+          continueOnError: false
+          inputs:
+            targetType: inline
+            script: |
+
+              if command -v tree >/dev/null 2>&1; then
+                echo "##[group] Path tree"
+                echo "$(tree $(System.ArtifactsDirectory))"
+                echo "##[endgroup]"
+              fi
+
+              artifactId=$(ARTIFACT_ID)
+              echo "##[debug] Source ARTIFACT_ID: $artifactId"
+
+              groupId=$(GROUP_ID)
+              echo "##[debug] Source GROUP_ID: $groupId"
+
+              artifactName=$(ARTIFACT_NAME)
+              echo "##[debug] Artifact Name: ${artifactName}"
+
+              artifactVersion=$(NEW_VERSION)
+              echo "##[debug] Artifact Version: ${artifactVersion}"
+
+              # set var with path and file name to publish
+              scriptsTarFile=$(Build.ArtifactStagingDirectory)/${artifactName}/${artifactName}.tar
+
+              ## -> Function to publish
+              run_curl_deploy() {
+                output=$(curl -v -u "$(NEXUS_DEFAULT_USR):$(NEXUS_DEFAULT_PSW)" \
+                  "$(NEXUS_ENDPOINT_API_REPOSITORY)/components?repository=$(NEXUS_REPO_LIB_MVN)" \
+                  -F "maven2.groupId=${groupId}" \
+                  -F "maven2.artifactId=${artifactId}" \
+                  -F "maven2.version=${artifactVersion}" \
+                  -F "maven2.generate-pom=false" \
+                  -F "maven2.packaging=tar" \
+                  -F "maven2.asset1.extension=tar" \
+                  -F "maven2.asset1=@${scriptsTarFile};type=application/x-tar" 2>&1)
+
+                if [[ $? -ne 0 ]] ; then
+                  echo '##vso[task.logissue type=error] Error while executing curl command to push artifact to nexus.'
+                  exit 1
+                fi
+              }
+
+              ## -> Run publish function
+              run_curl_deploy
+
+              ## -> Log the result of the publish
+              echo "##[group] Publish output"
+              echo "$output"
+              echo "##[endgroup]"
+
+              ## -> Check if artifact and version is already published with the error *"does not allow updating"*
+              if [[ "$output" == *"does not allow updating"*  ]]; then
+                echo '##[error] ARTIFACT VERSION ALREADY EXISTS ON NEXUS...'
+                echo '##vso[task.logissue type=error] The version of the artifact you are trying to publish has already been published and cannot be updated.'
+                echo '##[error] If you want to publish a new version of the artifact, please update the package version and try again.'
+                exit 1
+              fi
+
+              ## -> Upload Summary to pipeline's dashboard
+              cd $(Build.SourcesDirectory)
+              nexus_report() {
+
+                  ## -> Swap "." for "/" of the groupId variable value
+                  groupId=${groupId//./\/}
+
+                  echo "\> **Published Artifact File**" > publishInfo.md
+                  echo "*${artifactName}.tar*" >> publishInfo.md
+                  echo "" >> publishInfo.md
+
+                  echo "\> **Published Artifact Version**" >> publishInfo.md
+                  echo "*${artifactVersion}*" >> publishInfo.md
+                  echo "" >> publishInfo.md
+
+                  echo "\> **Artifact Repository**" >> publishInfo.md
+                  echo "*$(NEXUS_REPO_LIB_MVN)*" >> publishInfo.md
+                  echo "" >> publishInfo.md
+
+                  echo "\> **Artifact Location**" >> publishInfo.md
+                  echo "*${groupId}*" >> publishInfo.md
+
+              }
+
+              nexus_report
+              echo "##vso[task.addattachment type=Distributedtask.Core.Summary;name=Nexus Publish Summary;]$(Build.SourcesDirectory)/publishInfo.md"
+
+  ## ->  Push/tag version bump
+  - job: push_repo_version_bump
+    displayName: "Push/tag version bump"
+    condition: not(eq(variables['Build.Reason'], 'Manual'))
+    dependsOn:
+    - publish
+    steps:
+
+    ## -> Clean the pipeline workspace and checkout the code.
+    ## -> 6d15af64-176c-496d-b583-fd2ae21d4df4 is the decorator for checkout.
+    - task: 6d15af64-176c-496d-b583-fd2ae21d4df4@1
+      condition: eq(variables.BUMP_VERSION_ENABLED, true)
+      inputs:
+        repository: self
+        persistCredentials: "true"
+        clean: true
+
+    ## -> Checkout the last commit that was pushed to the repository.
+    - task: Bash@3
+      displayName: Checkout Last Commit
+      name: checkout_last_commit
+      condition: eq(variables.BUMP_VERSION_ENABLED, true)
+      inputs:
+        targetType: inline
+        script: |
+          echo "##[debug] Checkout last commit from '$(Build.SourceBranchName)'"
+
+          git config pull.rebase true
+          git fetch -f --depth 1 origin $(Build.SourceBranchName):$(Build.SourceBranchName)
+          git checkout -f $(Build.SourceBranchName)
+
+    ## -> Bump version in code
+    - task: Bash@3
+      displayName: Update Source Version
+      condition: and(
+        succeeded(),
+        eq(variables.BUMP_VERSION_ENABLED, 'true'))
+      inputs:
+        targetType: inline
+        script: |
+
+          echo "##[debug] Pushing NEW_VERSION: $(NEW_VERSION)"
+          sed -i 's|<version>.*</version>|<version>$(NEW_VERSION)</version>|g' pom.xml
+          cat pom.xml
+
+    ## -> Push new version to git
+    - task: Bash@3
+      displayName: 'Commit Updated Version'
+      condition: and(
+        succeeded(),
+        eq(variables.BUMP_VERSION_ENABLED, 'true'))
+      env:
+        BRANCH_NAME: "$(Build.SourceBranchName)"
+        TAG_REPO: true
+      inputs:
+        targetType: inline
+        script: "TAG_PUSH_PARAM=\"\"\n\necho \"##[debug] TAG_REPO.....: ${TAG_REPO}\"\n\ngit add .\ngit commit -am \"[CI SKIP] Project version has been updated. Released version '${NEW_VERSION}'\" --author=\"$BUILD_REQUESTEDFOR <$BUILD_REQUESTEDFOREMAIL>\"\n\nif [[ \"${TAG_REPO}\" == \"true\" ]]; then\n  TAG_PUSH_PARAM=\"--tags\"\n\n  git tag ${NEW_VERSION}\nfi\n\ngit status\necho \"##[command] git push origin ${TAG_PUSH_PARAM} ${BRANCH_NAME}\"\ngit push origin ${TAG_PUSH_PARAM} ${BRANCH_NAME}\n\nif [ $? -ne 0 ]; then \n  echo \"##vso[task.logissue type=error;] Git push failed. Permission denied\"\n  echo \"##vso[task.complete result=Failed;]\"\n  exit 1\nfi  \n\necho \"Version updated to ${NEW_VERSION}\"\n"
+
+    - task: Bash@3
+      displayName: 'Tag Pipeline with Package Version'
+      condition: succeeded()
+      inputs:
+        targetType: inline
+        script: |
+          echo "##[debug] Adding pipeline tag with new version: $(NEW_VERSION)"
+          echo "##vso[build.addbuildtag]version=$(NEW_VERSION)"

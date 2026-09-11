@@ -1,0 +1,283 @@
+# ==================================================================
+# Pipeline: Build Helm Chart - Empacotamento e Publicação
+# -----------------------------------------------------
+# Pipeline para empacotar um Helm Chart e publicá-lo em um repositório OCI (ACR).
+# Executa lint, package e publicação via Helm OCI (ACR). Ideal para repositórios
+# que usam formato OCI para charts e integração com Azure Key Vault para segredos.
+# ==================================================================
+# Dependências:
+# -----------------------------------------------------
+# Esse pipeline é dependente das credenciais criadas e configuradas no Azure Key Vault.
+# Além da service connection `DevOpsSharedResources` para acesso ao Key Vault.
+# ==================================================================
+# TODO: Validação de branch dentro do Version Manager
+
+parameters:
+  # ==================================================================
+  # Infraestrutura
+  # ==================================================================
+  - name: agentPool
+    type: string
+    default: GeneralPurposeLinuxAgentsCI
+    displayName: 'Agent Pool para execução'
+  - name: prValidationOnly
+    type: boolean
+    default: false
+    displayName: 'Executa apenas a validação, não publica nem gera versão. Utilize para validação em PRs.'
+
+  # ==================================================================
+  # Versão de instalação do helm para packge e publish
+  # ==================================================================
+  - name: helmToolVersion
+    type: string
+    default: '3.19.2'
+    displayName: 'Versão do Helm para instalação'
+
+  # ==================================================================
+  # Informações sobre ACR (Habilita quando useACRToPublish = true)
+  # ==================================================================
+  - name: useACRToPublish
+    type: boolean
+    default: true
+    displayName: 'Usar ACR para publicar o Helm Chart'
+  - name: acrUrlChartRepository
+    type: string
+    default: oci://acrsharedservices01.azurecr.io/helm/$(SIGLA)
+    displayName: 'URL do repositório do Helm Chart (OCI Registry)'
+
+# ==================================================================
+# Informações sobre o Nexus (Habilita quando useNexusToPublish = true)
+# ==================================================================
+  - name: useNexusToPublish
+    type: boolean
+    default: true
+    displayName: 'Usar Nexus para publicar o Helm Chart'
+  - name: nexusUrlChartRepository
+    type: string
+    default: https://nexus.telefonica.com.br/repository
+    displayName: 'URL do repositório do Helm Chart (https Registry)'
+  - name: nexusRepositoryNamespace
+    type: string
+    default: devops-helm
+    displayName: 'Nexus Repository Namespace'
+
+  # ==================================================================
+  # Configuração do Helm Chart e Repositório
+  # ==================================================================
+  - name: helmChartName
+    type: string
+    default: $(Build.Repository.Name)
+    displayName: 'Nome do Helm Chart'
+  - name: helmChartPath
+    type: string
+    default: '$(Build.SourcesDirectory)'
+    displayName: 'Caminho do Helm Chart'
+
+  # ==================================================================
+  # Configurações de Versionamento
+  # ==================================================================
+  - name: versionFile
+    type: string
+    default: 'Chart.yaml'
+    displayName: 'Arquivo de versionamento (Chart.yaml)'
+
+  - name: branchingStrategy
+    type: string
+    default: 'trunkbased'
+    displayName: 'Estratégia de versionamento'
+    values:
+      - 'trunkbased'
+      - 'vivoflow'
+      - 'releaseflow'
+      - 'gitlabflow'
+      - 'gitlabflow-semantic'
+      - 'custom'
+      - 'monorepo'
+
+# ==================================================================
+# Variáveis Internas do Pipeline
+# ==================================================================
+variables:
+  - name: HELM_ARTIFACTS_DIR
+    value: $(Build.ArtifactStagingDirectory)/helm/package
+  - name: VERSION_FILE
+    value: ${{ parameters.helmChartPath }}/${{ parameters.versionFile }}
+  - name: SIGLA
+    value: $[ lower(split(variables['System.TeamProject'],' ')[0]) ]
+
+
+
+# ==================================================================
+# Estágios do Pipeline
+# ==================================================================
+stages:
+  # Stage 1: BuildAndPublish - Empacotamento e publicação do Helm Chart
+  - stage: BuildAndPublish
+    displayName: 'Build and Publish Helm Chart'
+    jobs:
+      # Job: BuildAndPublish - Lint, package e publicação no ACR (quando habilitado)
+      - job: BuildAndPublish
+        displayName: 'Build and Publish Helm Chart'
+        pool: ${{ parameters.agentPool }}
+        steps:
+        # [Configuração inicial] Checkout do repositório
+        - checkout: self
+          clean: true
+          persistCredentials: true
+          fetchDepth: 0
+
+        # [Configuração inicial] Calcula a próxima versão do Helm Chart
+        - task: VersionManagerVivo@8
+          displayName: 'Next version'
+          inputs:
+            command: 'nextVersion'
+            branchingStrategy: ${{ parameters.branchingStrategy }}
+            versionFile: '$(VERSION_FILE)'
+            bumpMethod: 'patch'
+            passthroughVersion: ${{ parameters.prValidationOnly }}
+          name: VersionManagerVivo
+
+        # [Configuração inicial] Instalação de ferramentas necessárias (Helm)
+        - task: HelmInstaller@1
+          inputs:
+            helmVersionToInstall: ${{ parameters.helmToolVersion }}
+          displayName: Install Helm 
+
+        # [Validação] Executa helm lint no chart
+        - task: CmdLine@2
+          displayName: 'Helm lint'
+          inputs:
+            script: |
+              helm lint ${{ parameters.helmChartPath }}
+            workingDirectory: $(Build.SourcesDirectory)
+
+        # [Empacotamento] Gera pacote .tgz do Helm Chart
+        - task: HelmDeploy@1
+          displayName: 'Helm package'
+          inputs:
+            command: package
+            chartPath: ${{ parameters.helmChartPath }}
+            destination: $(HELM_ARTIFACTS_DIR)
+            chartVersion: $(VersionManagerVivo.VERSION)
+        # ------------------------------------------------------------------
+        # Publicação do Helm Chart (condicional)
+        # Executa apenas se prValidationOnly = false (publica apenas em builds normais)
+        # ------------------------------------------------------------------
+        - ${{ if eq(parameters.prValidationOnly, false) }}:
+        # [Publicação condicional] Obtem segredos e publica no ACR quando habilitado
+          - ${{ if eq(parameters.useACRToPublish, true) }}:
+            # Recupera credenciais do Key Vault
+            - task: AzureKeyVault@2
+              displayName: '[Helm ACR] Getting AKV credentials'
+              timeoutInMinutes: 1
+              retryCountOnTaskFailure: 3
+              condition: or(eq(variables['Build.SourceBranch'], 'refs/heads/main'), eq(variables['Build.SourceBranch'], 'refs/heads/master'))
+              inputs:
+                azureSubscription: DevOpsSharedResources
+                KeyVaultName: kv-azdevops-shared
+                SecretsFilter: 'HELM-REGISTRY-ACR-PUBLISH-USERNAME, HELM-REGISTRY-ACR-PUBLISH-PASSWORD'
+
+            # Publica o pacote no ACR via helm push
+            - task: CmdLine@2
+              displayName: '[Helm ACR] Publish to ACR'
+              condition: or(eq(variables['Build.SourceBranch'], 'refs/heads/main'), eq(variables['Build.SourceBranch'], 'refs/heads/master'))
+              env:
+                ACR_USERNAME: $(HELM-REGISTRY-ACR-PUBLISH-USERNAME) #Valor vem do keyVault
+                ACR_PASSWORD: $(HELM-REGISTRY-ACR-PUBLISH-PASSWORD) #Valor vem do keyVault
+                REPOSITORY_URL: ${{ parameters.acrUrlChartRepository }}
+                CHART_NAME: ${{ parameters.helmChartName }}
+                VERSION: $(VersionManagerVivo.VERSION)
+              inputs:
+                script: |
+                  # [Preparação] Extrai host do REPOSITORY_URL removendo protocolo e caminho.
+                  # Suporta: oci://host/path, https://host/path, ou host/path
+                  tmp="${REPOSITORY_URL#*://}"
+                  ACR_HOST="${tmp%%/*}"
+
+                  # Caminho do pacote tar gerado pelo Helm
+                  CHART_ARCHIVE="${HELM_ARTIFACTS_DIR}/${CHART_NAME}-${VERSION}.tgz"
+
+                  echo 
+                  echo "##[debug] REPOSITORY_URL.......................: ${REPOSITORY_URL}"
+                  echo "##[debug] CHART_ARCHIVE........................: ${CHART_ARCHIVE}"
+                  echo "##[debug] ACR_HOST.............................: ${ACR_HOST}"
+                  echo "##[debug] CHART_NAME...........................: ${CHART_NAME}"
+                  echo "##[debug] VERSION..............................: ${VERSION}"
+
+                  # [Verificação] Confirma existência do pacote antes de publicar
+                  if [ -f "${CHART_ARCHIVE}" ]; then
+                    echo "##[debug] ${CHART_ARCHIVE} exists"
+                  else
+                    echo "##[error] ${CHART_ARCHIVE} does not exist"
+                    echo "##[debug] Listing files in ${HELM_ARTIFACTS_DIR}"
+                    ls ${HELM_ARTIFACTS_DIR}
+                    exit 1
+                  fi
+
+                  # [Autenticação] Login no registry OCI (ACR)
+                  echo "##[command] helm registry login ${ACR_HOST} --username ${ACR_USERNAME} --password ${ACR_PASSWORD}"
+                  helm registry login ${ACR_HOST} \
+                    --username ${ACR_USERNAME} \
+                    --password "${ACR_PASSWORD}"
+
+                  # [Publicação] Envia o chart para o repositório OCI
+                  echo "##[command] helm push ${CHART_ARCHIVE} ${REPOSITORY_URL}"
+                  helm push ${CHART_ARCHIVE} ${REPOSITORY_URL}
+
+          # [Publicação condicional] Obtem segredos e publica no Nexus quando habilitado
+          - ${{ if eq(parameters.useNexusToPublish, true) }}:
+            - task: AzureKeyVault@2
+              displayName: '[Helm Nexus] Getting AKV credentials'
+              timeoutInMinutes: 1
+              retryCountOnTaskFailure: 5
+              condition: or(eq(variables['Build.SourceBranch'], 'refs/heads/main'), eq(variables['Build.SourceBranch'], 'refs/heads/master'))
+              inputs:
+                azureSubscription: DevOpsSharedResources
+                KeyVaultName: kv-azdevops-shared
+                SecretsFilter: 'HELM-REGISTRY-NEXUS-USERNAME, HELM-REGISTRY-NEXUS-PASSWORD'
+
+            - task: CmdLine@2
+              displayName: '[Helm Nexus] Publish to Nexus'
+              condition: or(eq(variables['Build.SourceBranch'], 'refs/heads/main'), eq(variables['Build.SourceBranch'], 'refs/heads/master'))
+              env:
+                USERNAME: $(HELM-REGISTRY-NEXUS-USERNAME) #Valor vem do keyVault
+                PASSWORD: $(HELM-REGISTRY-NEXUS-PASSWORD) #Valor vem do keyVault
+                REPOSITORY_NAMESPACE: ${{ parameters.nexusRepositoryNamespace }}
+                REPOSITORY_URL: ${{ parameters.nexusUrlChartRepository }}
+                CHART_NAME: ${{ parameters.helmChartName }}
+                VERSION: $(VersionManagerVivo.VERSION)
+              inputs:
+                script: |
+                  # Definição do repositório de destino
+                  FULLY_QUALIFIED_TARGET_REPOSITORY="${REPOSITORY_URL}/${REPOSITORY_NAMESPACE}/"
+
+                  # Caminho do pacote tar gerado pelo Helm
+                  CHART_ARCHIVE="${HELM_ARTIFACTS_DIR}/${CHART_NAME}-${VERSION}.tgz"
+
+                  echo "##[debug] REPOSITORY_URL.......................: ${REPOSITORY_URL}"
+                  echo "##[debug] REPOSITORY_NAMESPACE.................: ${REPOSITORY_NAMESPACE}"
+                  echo "##[debug] FULLY_QUALIFIED_TARGET_REPOSITORY....: ${FULLY_QUALIFIED_TARGET_REPOSITORY}"
+                  echo "##[debug] CHART_ARCHIVE........................: ${CHART_ARCHIVE}"
+
+                  # [Verificação] Confirma existência do pacote antes de publicar
+                  if [ -f "${CHART_ARCHIVE}" ]; then
+                    echo "##[debug] ${CHART_ARCHIVE} exists"
+                  else
+                    echo "##[error] ${CHART_ARCHIVE} does not exist"
+                    echo "##[debug] Listing files in ${HELM_ARTIFACTS_DIR}"
+                    ls ${HELM_ARTIFACTS_DIR}
+                    exit 1
+                  fi
+
+                  echo "##[command] curl --fail -s -u ${USERNAME}:***** ${FULLY_QUALIFIED_TARGET_REPOSITORY} --upload-file ${CHART_ARCHIVE}"
+                  curl --fail -s -u ${USERNAME}:${PASSWORD} ${FULLY_QUALIFIED_TARGET_REPOSITORY} --upload-file ${CHART_ARCHIVE}
+
+          # [Versionamento] Atualiza o arquivo de versão
+          - task: VersionManagerVivo@8
+            displayName: 'Commit and Tag Version'
+            inputs:
+              command: 'commitVersion'
+              version: '$(VersionManagerVivo.VERSION)'
+              versionFile: $(VERSION_FILE)
+              createTag: true
+              pushChanges: true

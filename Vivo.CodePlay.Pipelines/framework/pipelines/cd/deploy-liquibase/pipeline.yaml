@@ -1,0 +1,550 @@
+# =====================================================================================================================
+# Pipeline: Deploy Liquibase Project — Execução Automatizada de BD via Pacote ZIP Versionado
+# =====================================================================================================================
+# PROPÓSITO
+# ---------
+# Executar operações de banco via Liquibase consumindo pacote ZIP versionado do Maven (Azure Artifacts).
+#
+# PILARES
+# -------
+# 1) Fail-fast: validar antes de tocar no banco.
+# 2) Reprodutibilidade: ZIP é a fonte da verdade do deploy/rollback.
+# 3) Governança: evidências e tags BEFORE.
+# 4) Segurança: URL por ServiceConnection/KeyVault; USER/PASS sempre secretos.
+# =====================================================================================================================
+
+parameters:
+  # ===================================================================================================================
+  # Projeto
+  # ===================================================================================================================
+  - name: projectDir
+    type: string
+    default: ''
+    displayName: 'Diretório do projeto Liquibase (ex: build-liquibase)'
+
+  - name: dbConfigFile
+    type: string
+    default: '.azuredevops/db-config.yaml'
+    displayName: 'Caminho do arquivo de configuração de banco (ex: .azuredevops/db-config.yaml)'
+
+  # ===================================================================================================================
+  # Parâmetros de Operação (deploy / rollback)
+  # ===================================================================================================================
+  - name: operation
+    type: string
+    default: deploy
+    values:
+      - deploy
+      - rollback
+    displayName: 'Operação'
+
+  - name: rollbackTag
+    type: string
+    default: ''
+    displayName: 'TAG para rollback (somente quando operation=rollback)'
+
+  - name: version
+    type: string
+    displayName: 'Versão do pacote (ex: 1.0.0, 5.0.1)'
+
+  # ===================================================================================================================
+  # Infra / Ambiente
+  # ===================================================================================================================
+  - name: agentPool
+    type: string
+    default: GeneralPurposeLinuxAgentsCD
+    displayName: 'Agent Pool'
+
+  - name: environment
+    type: string
+    default: ''
+    displayName: 'Ambiente lógico de destino (ex.: dev, esteira1, prod)'
+
+  # ===================================================================================================================
+  # Credenciais
+  # ===================================================================================================================
+  - name: serviceConnectionName
+    type: string
+    default: ''
+    displayName: 'Service Connection (credentialMode=serviceConnection)'
+
+  - name: azureSubscription
+    type: string
+    displayName: 'Azure Subscription (credentialMode=keyVault)'
+
+# =====================================================================================================================
+# Variáveis Internas
+# =====================================================================================================================
+variables:
+  - name: LQ_ROOT_DIR
+    value: '$(Pipeline.Workspace)/liquibase'
+
+  - name: PACKAGE_DIR
+    value: '$(LQ_ROOT_DIR)/package'
+
+  - name: WORKING_ROOT_DIR
+    value: '$(LQ_ROOT_DIR)/work'
+
+  - name: EVIDENCE_PRE_DIR
+    value: '$(LQ_ROOT_DIR)/evidence/pre'
+
+  - name: EVIDENCE_PRE_PRINT_DIR
+    value: '$(LQ_ROOT_DIR)/evidence/pre-print'
+
+  - name: EVIDENCE_POST_DIR
+    value: '$(LQ_ROOT_DIR)/evidence/post'
+
+  - name: EVIDENCE_POST_PRINT_DIR
+    value: '$(LQ_ROOT_DIR)/evidence/post-print'
+
+  - name: SETTINGS_REL_PATH
+    value: '.azuredevops/settings.xml'
+
+  - name: MAVEN_CACHE_FOLDER
+    value: '$(Pipeline.Workspace)/.m2/repository'
+
+  - name: MAVEN_REPO_LOCAL_OPTS
+    value: '-Dmaven.repo.local=$(MAVEN_CACHE_FOLDER)'
+
+  - name: MAVEN_OPTS
+    value: '-Xms256m -Xmx1024m -Dfile.encoding=UTF-8'
+
+# =====================================================================================================================
+# Stage
+# =====================================================================================================================
+stages:
+  - stage: Execution
+    displayName: 'Execution'
+    jobs:
+
+      # ===============================================================================================================
+      # DEPLOY
+      # ===============================================================================================================
+      - ${{ if eq(parameters.operation, 'deploy') }}:
+          - deployment: DeployLiquibase
+            displayName: '[Deploy] Run Deployment'
+            pool:
+              name: ${{ parameters.agentPool }}
+            environment:
+              name: ${{ format('deploy-{0}', replace(parameters.environment, 'deploy-', '')) }}
+            strategy:
+              runOnce:
+                deploy:
+                  steps:
+                    # ---------------------------------------------------------------------------------------------------
+                    # PHASE: CHECKOUT
+                    # ---------------------------------------------------------------------------------------------------
+                    - checkout: self
+                      displayName: '[Checkout] Repository'
+
+                    # ---------------------------------------------------------------------------------------------------
+                    # PHASE: VALIDATE
+                    # - Garante ambiente lógico válido antes da resolução de contexto
+                    # ---------------------------------------------------------------------------------------------------
+                    - task: Bash@3
+                      name: ValidateEnvironmentDeploy
+                      displayName: '[Validate] environment required'
+                      inputs:
+                        targetType: inline
+                        script: |
+                          set -euo pipefail
+
+                          RAW_ENV="${{ parameters.environment }}"
+                          NORMALIZED_ENV="$(printf '%s' "$RAW_ENV" | sed -E "s/^deploy-//" | xargs)"
+
+                          if [ -z "$NORMALIZED_ENV" ]; then
+                            echo "##[error]environment é obrigatório e não pode ser vazio."
+                            exit 1
+                          fi
+
+                          if ! [[ "$NORMALIZED_ENV" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+                            echo "##[error]environment inválido: '$RAW_ENV'. Use apenas letras, números, ponto, underscore e hífen."
+                            exit 1
+                          fi
+
+                    # ---------------------------------------------------------------------------------------------------
+                    # PHASE: SETUP
+                    # - Resolve contexto do projeto e coordenadas Maven no próprio deployment
+                    # ---------------------------------------------------------------------------------------------------
+                    - task: AzdoTaskLiquibase@2
+                      name: DiscoverSetupDeploy
+                      displayName: '[Setup] Discover Setup (deploy)'
+                      inputs:
+                        command: 'discoverSetup'
+                        dbConfigFile: '${{ parameters.dbConfigFile }}'
+                        mode: 'deploy'
+                        projectDir: '${{ parameters.projectDir }}'
+                        workingRootDir: '$(WORKING_ROOT_DIR)'
+                        settingsRelPath: '$(SETTINGS_REL_PATH)'
+                        packageVersion: '${{ parameters.version }}'
+                        environment: "${{ replace(parameters.environment, 'deploy-', '') }}"
+                        mavenRepoLocal: '$(MAVEN_CACHE_FOLDER)'
+                        validateParent: true
+                        serviceConnectionName: '${{ parameters.serviceConnectionName }}'
+                        azureSubscription: '${{ parameters.azureSubscription }}'
+                        operation: '${{ parameters.operation }}'
+                        rollbackTag: '${{ parameters.rollbackTag }}'
+
+                    # ---------------------------------------------------------------------------------------------------
+                    # PHASE: SECRETS
+                    # ---------------------------------------------------------------------------------------------------
+                    - task: AzdoTaskLiquibase@2
+                      name: PrepareKeyVaultCredentials
+                      displayName: '[Secrets] Resolve Key Vault Names'
+                      condition: and(succeeded(), eq(variables['LQ_CREDENTIAL_MODE'], 'keyVault'))
+                      inputs:
+                        command: 'prepareKeyVaultCredentials'
+                        dbConfigFile: '${{ parameters.dbConfigFile }}'
+                        credentialMode: 'keyVault'
+                        environment: '$(LQ_ENVIRONMENT_NAME)'
+                        secretEnvironment: '$(LQ_SECRET_ENVIRONMENT)'
+                        packageName: '$(PACKAGE_NAME)'
+                        mavenArtifactCoordinates: '$(MAVEN_ARTIFACT_COORDINATES)'
+                        keyVaultCredentialPrefix: '$(LQ_KEY_VAULT_CREDENTIAL_PREFIX)'
+                        failIfCredentialPrefixCannotBeDerived: true
+
+                    - task: AzureKeyVault@2
+                      name: FetchKeyVaultSecrets
+                      displayName: '[Secrets] Load Database Secrets'
+                      condition: and(succeeded(), eq(variables['LQ_CREDENTIAL_MODE'], 'keyVault'))
+                      inputs:
+                        azureSubscription: '${{ parameters.azureSubscription }}'
+                        KeyVaultName: '$(LQ_KEY_VAULT_NAME)'
+                        SecretsFilter: '$(PrepareKeyVaultCredentials.databaseSecretsFilter)'
+                        RunAsPreJob: false
+
+                    # ---------------------------------------------------------------------------------------------------
+                    # PHASE: REPORT PRE
+                    # ---------------------------------------------------------------------------------------------------
+                    - task: AzdoTaskLiquibase@2
+                      name: LiquibasePreDeployReport
+                      displayName: '[Report] Pre-Deploy'
+                      condition: and(succeeded(), eq(variables['LQ_ENABLE_REPORT'], 'true'))
+                      inputs:
+                        command: 'preDeployReport'
+                        dbConfigFile: '${{ parameters.dbConfigFile }}'
+                        projectDir: '$(PROJECT_DIR)'
+                        workingRootDir: '$(WORKING_ROOT_DIR)'
+                        packageDir: '$(PACKAGE_DIR)'
+                        settingsRelPath: '$(SETTINGS_REL_PATH)'
+                        guardrailsRuntime: '$(LQ_GUARDRAILS_RUNTIME)'
+                        environment: '$(LQ_ENVIRONMENT_NAME)'
+                        secretEnvironment: '$(LQ_SECRET_ENVIRONMENT)'
+                        packageVersion: '${{ parameters.version }}'
+                        packageName: '$(PACKAGE_NAME)'
+                        mavenArtifactCoordinates: '$(MAVEN_ARTIFACT_COORDINATES)'
+                        credentialMode: '$(LQ_CREDENTIAL_MODE)'
+                        serviceConnectionName: '${{ parameters.serviceConnectionName }}'
+                        azureSubscription: '$(LQ_AZURE_SUBSCRIPTION)'
+                        keyVaultName: '$(LQ_KEY_VAULT_NAME)'
+                        keyVaultCredentialPrefix: '$(LQ_KEY_VAULT_CREDENTIAL_PREFIX)'
+                        schemaName: '$(LQ_SCHEMA_NAME)'
+                        failIfCredentialPrefixCannotBeDerived: true
+                        failOnMissingBundleClassifier: true
+                        javaVersion: '$(LQ_JAVA_VERSION)'
+                        mavenDirectory: '$(LQ_MAVEN_DIRECTORY)'
+                        mavenXmx: '$(LQ_MAVEN_XMX)'
+                        mavenRepoLocal: '$(MAVEN_CACHE_FOLDER)'
+                        outputDir: '$(EVIDENCE_PRE_DIR)'
+                        maxPrintLines: '20000'
+                        reportPreGlob: '**/target/report/report-pre-deploy-*.txt'
+                        updateSqlGlob: '**/ci/ci-preview-update-*.sql'
+                        rollbackSqlGlob: '**/target/cd/cd-deploy-future-rollback-*.sql'
+                        publishEvidenceArtifact: true
+                        mavenDebug: $(LQ_MAVEN_DEBUG)
+                        printPreDeployEvidenceContent: $(LQ_PRINT_PRE_DEPLOY_EVIDENCE_CONTENT)
+                      env:
+                        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+                        AZURE_DEVOPS_PAT: $(System.AccessToken)
+                        DATABASE_SECRET_URL_NAME: $(DATABASE_SECRET_URL_NAME)
+                        DATABASE_SECRET_USR_NAME: $(DATABASE_SECRET_USR_NAME)
+                        DATABASE_SECRET_PWD_NAME: $(DATABASE_SECRET_PWD_NAME)
+
+                    - task: AzdoTaskLiquibase@2
+                      name: LiquibasePreDeployEvidence
+                      displayName: '[Evidence] Pre-Deploy'
+                      condition: and(succeeded(), eq(variables['LQ_ENABLE_REPORT'], 'true'))
+                      inputs:
+                        command: 'evidence'
+                        mode: 'preDeployReport'
+                        workingDirectory: '$(deployProjectDir)'
+                        outputDir: '$(EVIDENCE_PRE_PRINT_DIR)'
+                        maxPrintLines: '20000'
+
+                    # ---------------------------------------------------------------------------------------------------
+                    # PHASE: DEPLOY
+                    # ---------------------------------------------------------------------------------------------------
+                    - task: AzdoTaskLiquibase@2
+                      name: LiquibaseDeploy
+                      displayName: '[Deploy] Apply Changesets'
+                      inputs:
+                        command: 'deploy'
+                        dbConfigFile: '${{ parameters.dbConfigFile }}'
+                        projectDir: '$(PROJECT_DIR)'
+                        workingRootDir: '$(WORKING_ROOT_DIR)'
+                        settingsRelPath: '$(SETTINGS_REL_PATH)'
+                        guardrailsRuntime: '$(LQ_GUARDRAILS_RUNTIME)'
+                        environment: '$(LQ_ENVIRONMENT_NAME)'
+                        secretEnvironment: '$(LQ_SECRET_ENVIRONMENT)'
+                        packageVersion: '${{ parameters.version }}'
+                        packageName: '$(PACKAGE_NAME)'
+                        mavenArtifactCoordinates: '$(MAVEN_ARTIFACT_COORDINATES)'
+                        packageDir: '$(PACKAGE_DIR)'
+                        credentialMode: '$(LQ_CREDENTIAL_MODE)'
+                        serviceConnectionName: '${{ parameters.serviceConnectionName }}'
+                        azureSubscription: '$(LQ_AZURE_SUBSCRIPTION)'
+                        keyVaultName: '$(LQ_KEY_VAULT_NAME)'
+                        keyVaultCredentialPrefix: '$(LQ_KEY_VAULT_CREDENTIAL_PREFIX)'
+                        schemaName: '$(LQ_SCHEMA_NAME)'
+                        failIfCredentialPrefixCannotBeDerived: true
+                        enableReport: $(LQ_ENABLE_REPORT)
+                        enableAutoRollback: true
+                        failOnMissingBundleClassifier: true
+                        javaVersion: '$(LQ_JAVA_VERSION)'
+                        mavenDirectory: '$(LQ_MAVEN_DIRECTORY)'
+                        mavenXmx: '$(LQ_MAVEN_XMX)'
+                        mavenRepoLocal: '$(MAVEN_CACHE_FOLDER)'
+                        mavenDebug: $(LQ_MAVEN_DEBUG)
+                      env:
+                        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+                        AZURE_DEVOPS_PAT: $(System.AccessToken)
+                        DATABASE_SECRET_URL_NAME: $(DATABASE_SECRET_URL_NAME)
+                        DATABASE_SECRET_USR_NAME: $(DATABASE_SECRET_USR_NAME)
+                        DATABASE_SECRET_PWD_NAME: $(DATABASE_SECRET_PWD_NAME)
+
+                    # ---------------------------------------------------------------------------------------------------
+                    # PHASE: REPORT POST
+                    # ---------------------------------------------------------------------------------------------------
+                    - task: AzdoTaskLiquibase@2
+                      name: LiquibasePostDeployReport
+                      displayName: '[Report] Post-Deploy'
+                      condition: and(succeeded(), eq(variables['LQ_ENABLE_REPORT'], 'true'))
+                      inputs:
+                        command: 'postDeployReport'
+                        dbConfigFile: '${{ parameters.dbConfigFile }}'
+                        projectDir: '$(PROJECT_DIR)'
+                        workingRootDir: '$(WORKING_ROOT_DIR)'
+                        settingsRelPath: '$(SETTINGS_REL_PATH)'
+                        guardrailsRuntime: '$(LQ_GUARDRAILS_RUNTIME)'
+                        environment: '$(LQ_ENVIRONMENT_NAME)'
+                        secretEnvironment: '$(LQ_SECRET_ENVIRONMENT)'
+                        packageVersion: '${{ parameters.version }}'
+                        packageName: '$(PACKAGE_NAME)'
+                        mavenArtifactCoordinates: '$(MAVEN_ARTIFACT_COORDINATES)'
+                        packageDir: '$(PACKAGE_DIR)'
+                        credentialMode: '$(LQ_CREDENTIAL_MODE)'
+                        serviceConnectionName: '${{ parameters.serviceConnectionName }}'
+                        azureSubscription: '$(LQ_AZURE_SUBSCRIPTION)'
+                        keyVaultName: '$(LQ_KEY_VAULT_NAME)'
+                        keyVaultCredentialPrefix: '$(LQ_KEY_VAULT_CREDENTIAL_PREFIX)'
+                        schemaName: '$(LQ_SCHEMA_NAME)'
+                        failIfCredentialPrefixCannotBeDerived: true
+                        failOnMissingBundleClassifier: true
+                        javaVersion: '$(LQ_JAVA_VERSION)'
+                        mavenDirectory: '$(LQ_MAVEN_DIRECTORY)'
+                        mavenXmx: '$(LQ_MAVEN_XMX)'
+                        mavenRepoLocal: '$(MAVEN_CACHE_FOLDER)'
+                        outputDir: '$(EVIDENCE_POST_DIR)'
+                        maxPrintLines: '20000'
+                        reportPostGlob: '**/target/cd/cd-report-post-deploy-*.txt'
+                        publishEvidenceArtifact: true
+                        mavenDebug: $(LQ_MAVEN_DEBUG)
+                        printPostDeployEvidenceContent: $(LQ_PRINT_POST_DEPLOY_EVIDENCE_CONTENT)
+                      env:
+                        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+                        AZURE_DEVOPS_PAT: $(System.AccessToken)
+                        DATABASE_SECRET_URL_NAME: $(DATABASE_SECRET_URL_NAME)
+                        DATABASE_SECRET_USR_NAME: $(DATABASE_SECRET_USR_NAME)
+                        DATABASE_SECRET_PWD_NAME: $(DATABASE_SECRET_PWD_NAME)
+
+                    - task: AzdoTaskLiquibase@2
+                      name: LiquibasePostDeployEvidence
+                      displayName: '[Evidence] Post-Deploy'
+                      condition: and(succeeded(), eq(variables['LQ_ENABLE_REPORT'], 'true'))
+                      inputs:
+                        command: 'evidence'
+                        mode: 'postDeployReport'
+                        workingDirectory: '$(deployProjectDir)'
+                        outputDir: '$(EVIDENCE_POST_PRINT_DIR)'
+                        maxPrintLines: '20000'
+
+                    # ---------------------------------------------------------------------------------------------------
+                    # PHASE: TELEMETRY
+                    # ---------------------------------------------------------------------------------------------------
+                    - task: VivoEventHubTools@3
+                      name: TelemetryDeploy
+                      displayName: '[Telemetry] Send Event Hub record'
+                      condition: always()
+                      continueOnError: true
+                      inputs:
+                        command: 'deploy'
+                        eventHubConnection: 'EVHCodeProd'
+                        componentVersion: '${{ parameters.version }}'
+                        deployArtifactType: 'zip'
+                        deployEnvironmentType: 'database'
+                        deployEnvironmentName: '$(LQ_ENVIRONMENT_NAME)'
+                        pipelineType: 'framework/deploy-liquibase'
+                        annotations: 'liquibase-operation=${{ parameters.operation }},liquibase-runtime=$(LQ_GUARDRAILS_RUNTIME)'
+
+      # ===============================================================================================================
+      # ROLLBACK
+      # ===============================================================================================================
+      - ${{ if eq(parameters.operation, 'rollback') }}:
+          - deployment: RollbackLiquibase
+            displayName: '[Rollback] Run Rollback'
+            pool:
+              name: ${{ parameters.agentPool }}
+            environment:
+              name: ${{ format('deploy-{0}', replace(parameters.environment, 'deploy-', '')) }}
+            strategy:
+              runOnce:
+                deploy:
+                  steps:
+                    # ---------------------------------------------------------------------------------------------------
+                    # PHASE: CHECKOUT
+                    # ---------------------------------------------------------------------------------------------------
+                    - checkout: self
+                      displayName: '[Checkout] Repository'
+
+                    # ---------------------------------------------------------------------------------------------------
+                    # PHASE: VALIDATE
+                    # ---------------------------------------------------------------------------------------------------
+                    - task: Bash@3
+                      name: ValidateEnvironmentRollback
+                      displayName: '[Validate] environment required'
+                      inputs:
+                        targetType: inline
+                        script: |
+                          set -euo pipefail
+
+                          RAW_ENV="${{ parameters.environment }}"
+                          NORMALIZED_ENV="$(printf '%s' "$RAW_ENV" | sed -E "s/^deploy-//" | xargs)"
+
+                          if [ -z "$NORMALIZED_ENV" ]; then
+                            echo "##[error]environment é obrigatório e não pode ser vazio."
+                            exit 1
+                          fi
+
+                          if ! [[ "$NORMALIZED_ENV" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+                            echo "##[error]environment inválido: '$RAW_ENV'. Use apenas letras, números, ponto, underscore e hífen."
+                            exit 1
+                          fi
+
+                    - task: Bash@3
+                      name: ValidateRollbackTag
+                      displayName: '[Validate] rollbackTag required'
+                      inputs:
+                        targetType: inline
+                        script: |
+                          set -euo pipefail
+                          [ -n "${{ parameters.rollbackTag }}" ] || { echo "##[error]rollbackTag é obrigatório quando operation=rollback"; exit 1; }
+
+                    # ---------------------------------------------------------------------------------------------------
+                    # PHASE: SETUP
+                    # ---------------------------------------------------------------------------------------------------
+                    - task: AzdoTaskLiquibase@2
+                      name: DiscoverSetupRollback
+                      displayName: '[Setup] Discover Setup (rollback)'
+                      inputs:
+                        command: 'discoverSetup'
+                        dbConfigFile: '${{ parameters.dbConfigFile }}'
+                        mode: 'cd'
+                        projectDir: '${{ parameters.projectDir }}'
+                        workingRootDir: '$(WORKING_ROOT_DIR)'
+                        settingsRelPath: '$(SETTINGS_REL_PATH)'
+                        packageVersion: '${{ parameters.version }}'
+                        environment: "${{ replace(parameters.environment, 'deploy-', '') }}"
+                        mavenRepoLocal: '$(MAVEN_CACHE_FOLDER)'
+                        validateParent: true
+                        serviceConnectionName: '${{ parameters.serviceConnectionName }}'
+                        azureSubscription: '${{ parameters.azureSubscription }}'
+                        operation: '${{ parameters.operation }}'
+                        rollbackTag: '${{ parameters.rollbackTag }}'
+
+                    # ---------------------------------------------------------------------------------------------------
+                    # PHASE: SECRETS
+                    # ---------------------------------------------------------------------------------------------------
+                    - task: AzdoTaskLiquibase@2
+                      name: PrepareKeyVaultCredentialsRollback
+                      displayName: '[Secrets] Resolve Key Vault Names'
+                      condition: and(succeeded(), eq(variables['LQ_CREDENTIAL_MODE'], 'keyVault'))
+                      inputs:
+                        command: 'prepareKeyVaultCredentials'
+                        dbConfigFile: '${{ parameters.dbConfigFile }}'
+                        credentialMode: 'keyVault'
+                        environment: '$(LQ_ENVIRONMENT_NAME)'
+                        secretEnvironment: '$(LQ_SECRET_ENVIRONMENT)'
+                        packageName: '$(PACKAGE_NAME)'
+                        mavenArtifactCoordinates: '$(MAVEN_ARTIFACT_COORDINATES)'
+                        keyVaultCredentialPrefix: '$(LQ_KEY_VAULT_CREDENTIAL_PREFIX)'
+                        failIfCredentialPrefixCannotBeDerived: true
+
+                    - task: AzureKeyVault@2
+                      name: FetchKeyVaultSecretsRollback
+                      displayName: '[Secrets] Load Database Secrets'
+                      condition: and(succeeded(), eq(variables['LQ_CREDENTIAL_MODE'], 'keyVault'))
+                      inputs:
+                        azureSubscription: '${{ parameters.azureSubscription }}'
+                        KeyVaultName: '$(LQ_KEY_VAULT_NAME)'
+                        SecretsFilter: '$(PrepareKeyVaultCredentialsRollback.databaseSecretsFilter)'
+                        RunAsPreJob: false
+
+                    # ---------------------------------------------------------------------------------------------------
+                    # PHASE: ROLLBACK
+                    # ---------------------------------------------------------------------------------------------------
+                    - task: AzdoTaskLiquibase@2
+                      name: LiquibaseRollback
+                      displayName: '[Rollback] Revert by Tag'
+                      inputs:
+                        command: 'rollback'
+                        dbConfigFile: '${{ parameters.dbConfigFile }}'
+                        projectDir: '$(PROJECT_DIR)'
+                        workingRootDir: '$(WORKING_ROOT_DIR)'
+                        settingsRelPath: '$(SETTINGS_REL_PATH)'
+                        guardrailsRuntime: '$(LQ_GUARDRAILS_RUNTIME)'
+                        environment: '$(LQ_ENVIRONMENT_NAME)'
+                        secretEnvironment: '$(LQ_SECRET_ENVIRONMENT)'
+                        packageVersion: '${{ parameters.version }}'
+                        packageName: '$(PACKAGE_NAME)'
+                        mavenArtifactCoordinates: '$(MAVEN_ARTIFACT_COORDINATES)'
+                        packageDir: '$(PACKAGE_DIR)'
+                        credentialMode: '$(LQ_CREDENTIAL_MODE)'
+                        serviceConnectionName: '${{ parameters.serviceConnectionName }}'
+                        azureSubscription: '$(LQ_AZURE_SUBSCRIPTION)'
+                        keyVaultName: '$(LQ_KEY_VAULT_NAME)'
+                        keyVaultCredentialPrefix: '$(LQ_KEY_VAULT_CREDENTIAL_PREFIX)'
+                        schemaName: '$(LQ_SCHEMA_NAME)'
+                        failIfCredentialPrefixCannotBeDerived: true
+                        rollbackTag: '${{ parameters.rollbackTag }}'
+                        enableReport: false
+                        enableAutoRollback: false
+                        failOnMissingBundleClassifier: true
+                        javaVersion: '$(LQ_JAVA_VERSION)'
+                        mavenDirectory: '$(LQ_MAVEN_DIRECTORY)'
+                        mavenXmx: '$(LQ_MAVEN_XMX)'
+                        mavenRepoLocal: '$(MAVEN_CACHE_FOLDER)'
+                        mavenDebug: $(LQ_MAVEN_DEBUG)
+                      env:
+                        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+                        AZURE_DEVOPS_PAT: $(System.AccessToken)
+                        DATABASE_SECRET_URL_NAME: $(DATABASE_SECRET_URL_NAME)
+                        DATABASE_SECRET_USR_NAME: $(DATABASE_SECRET_USR_NAME)
+                        DATABASE_SECRET_PWD_NAME: $(DATABASE_SECRET_PWD_NAME)
+
+                    # ---------------------------------------------------------------------------------------------------
+                    # PHASE: TELEMETRY
+                    # ---------------------------------------------------------------------------------------------------
+                    - task: VivoEventHubTools@3
+                      name: TelemetryRollback
+                      displayName: '[Telemetry] Send Event Hub Record'
+                      condition: always()
+                      continueOnError: true
+                      inputs:
+                        command: 'deploy'
+                        eventHubConnection: 'EVHCodeProd'
+                        componentVersion: '${{ parameters.version }}'
+                        deployArtifactType: 'zip'
+                        deployEnvironmentType: 'database'
+                        deployEnvironmentName: '$(LQ_ENVIRONMENT_NAME)'
+                        pipelineType: 'framework/deploy-liquibase'
+                        annotations: 'liquibase-operation=${{ parameters.operation }},liquibase-runtime=$(LQ_GUARDRAILS_RUNTIME),liquibase-rollback-tag=${{ parameters.rollbackTag }}'

@@ -1,0 +1,121 @@
+# ==================================================================
+# Pipeline: Deploy Chrome Extension - Publicação de Extensões
+# -----------------------------------------------------
+# Pipeline para empacotamento e publicação de extensões do Chrome
+# na Chrome Web Store. Realiza cópia seletiva de arquivos, criação
+# de ZIP e publicação com aprovação em environment de produção.
+# ==================================================================
+
+parameters:
+  # ==================================================================
+  # Configuração da Extensão Chrome
+  # ==================================================================
+  - name: extensionId
+    type: string
+    displayName: 'ID único da extensão no Chrome Web Store'
+  
+  - name: serverEndpoint
+    type: string
+    displayName: 'Service Connection configurada para acesso à Chrome Web Store'
+
+  - name: filesToInclude
+    type: string
+    displayName: 'Arquivos a incluir no ZIP da extensão'
+    default: |
+      **/*
+      !.azuredevops/**
+      !.git/**
+      !node_modules/**
+      !.env*
+      !secrets/**
+      !README.md
+      !azure-pipelines.yml
+      !*.zip
+
+# ==================================================================
+# Variáveis Internas do Pipeline
+# ==================================================================
+variables:
+  zipFileName: 'chrome-extension.zip'
+  extensionArtifactName: 'chrome-extension-package'
+
+# ==================================================================
+# Estágios do Pipeline
+# ==================================================================
+stages:
+  # Stage 1: Build e empacotamento da extensão Chrome
+  - stage: BuildAndPackage
+    displayName: 'Build & Package Chrome Extension'
+    pool: GeneralPurposeLinuxAgentsCI
+    jobs:
+
+    # Job: Construção e empacotamento da extensão
+    - job: buildExtension
+      displayName: 'Build & Package Extension'
+      steps:
+
+      # Configuração inicial do ambiente
+      - checkout: self
+        displayName: 'Checkout do repositório'
+
+      # Preparação: cópia seletiva com includes explícitos
+      # Inclui apenas arquivos necessários para evitar vazamento de sensíveis
+      # e manter determinismo no empacotamento (parametrizável por projeto)
+      - task: CopyFiles@2
+        displayName: 'Copiar arquivos da extensão'
+        inputs:
+          SourceFolder: '$(Build.SourcesDirectory)'
+          Contents: |
+            ${{ parameters.filesToInclude }}
+          TargetFolder: '$(Build.ArtifactStagingDirectory)/extension'
+
+      # Empacotamento: criação do arquivo ZIP para distribuição
+      - task: ArchiveFiles@2
+        displayName: 'Criar arquivo ZIP da extensão'
+        inputs:
+          rootFolderOrFile: '$(Build.ArtifactStagingDirectory)/extension'
+          includeRootFolder: false
+          archiveType: 'zip'
+          archiveFile: '$(Build.ArtifactStagingDirectory)/$(zipFileName)'
+          replaceExistingArchive: true
+
+      # Publicação de artefatos: armazena ZIP para download e rastreabilidade
+      # Usa PublishPipelineArtifact para melhor integração com multi-stage pipelines
+      - task: PublishPipelineArtifact@1
+        displayName: 'Publicar artefato ZIP'
+        inputs:
+          targetPath: '$(Build.ArtifactStagingDirectory)/$(zipFileName)'
+          artifact: '$(extensionArtifactName)'
+          publishLocation: 'pipeline'
+
+  # Stage 2: Publicação da extensão Chrome Web Store
+  - stage: PublishExtension
+    displayName: 'Publish Chrome Extension'
+    dependsOn: BuildAndPackage
+    pool: GeneralPurposeLinuxAgentsCD
+    jobs:
+
+    # Deployment Job: Publicação em produção na Chrome Web Store
+    - deployment: publishExtensionWebStore
+      displayName: 'Publicar na Chrome Web Store'
+      environment: 'deploy-producao'
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+
+            # Download de artefatos: obtém o ZIP gerado no build
+            # Usa DownloadPipelineArtifact para melhor integração com multi-stage pipelines
+            - task: DownloadPipelineArtifact@2
+              displayName: 'Download artefato ZIP'
+              inputs:
+                artifact: '$(extensionArtifactName)'
+                path: '$(Pipeline.Workspace)/$(extensionArtifactName)'
+
+            # Publicação em produção: envia para Chrome Web Store
+            - task: cws-publish@1
+              displayName: 'Publicar na Chrome Web Store'
+              inputs:
+                serverEndpoint: '${{ parameters.serverEndpoint }}'
+                zipPath: '$(Pipeline.Workspace)/$(extensionArtifactName)/$(zipFileName)'
+                extensionId: '${{ parameters.extensionId }}'

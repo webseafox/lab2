@@ -1,0 +1,266 @@
+
+parameters:
+- name: environment
+  displayName: 'Escolha o ambiente para publicar'
+  type: string
+  default: dev
+  values:
+  - dev
+  - preprod
+  - prod
+
+
+stages:
+- stage:
+  displayName: 'Build'
+  pool: GeneralPurposeLinuxAgentsCI
+  variables:
+  - name: System.debug
+    value: "true"
+  jobs:
+  - job:
+    displayName: 'Build, Unit Test and Pack'
+    variables:
+    - name: ASDF_JDK_8
+      value: "adoptopenjdk-8.0.352+8"
+    - name: ASDF_JDK_11
+      value: "openjdk-11.0.2"
+    - name: ASDF_JDK_17
+      value: "openjdk-17.0.2"
+    - name: ASDF_JDK_21
+      value: "adoptopenjdk-21.0.4+7.0.LTS"
+
+    - name: ASDF_JDK_SAP17
+      value: "sapmachine-17.0.10"
+
+    - name: SONARQUBE_PROJECT_NAME
+      value: "$(System.TeamProject)-$(Build.Repository.Name)"
+
+    steps:
+    - checkout: self
+      fetchDepth: 1
+      persistCredentials: true
+
+    - task: AzureKeyVault@2
+      displayName: 'Secrets from AKV'
+      inputs:
+        RunAsPreJob: true
+        azureSubscription: "DevOpsSharedResources"
+        KeyVaultName: "kv-azdevops-shared"
+        SecretsFilter: >-
+          NEXUS-DEPS-USR,
+          NEXUS-DEPS-PSW,
+          SONARQUBE-TOKEN
+
+    - task: XmlParseFromVivo@4
+      displayName: 'Get pom.xml info'
+      inputs:
+        type: 'file'
+        origin: $(Build.SourcesDirectory)/pom.xml
+        jpaths: |
+          var POM_XML_VERSION = .project.version._text
+          var POM_XML_ARTIFACT_ID = .project.artifactId._text
+          var POM_XML_GROUP_ID = .project.groupId._text
+
+    - task: YamlParseFromVivo@4
+      displayName: 'Get Metadata Info'
+      inputs:
+        type: 'file'
+        origin: $(Build.SourcesDirectory)/catalog-info.yaml
+        jpaths: |
+          var CATALOG_YAML_ACRONYM = .metadata.annotations['techarch.governance-app.acronym']
+          var CATALOG_YAML_MODULE = .metadata.annotations['techarch.governance-app.module']
+          var CATALOG_YAML_SONAR_PROJECT_KEY = .metadata.annotations['sonarqube.org/project-key']
+          var CATALOG_YAML_JAVA_LANGUAGE_VERSION = .metadata.annotations['arqtech.telefonica.com.br/language-version']
+
+    - task: NunjucksInline@4
+      displayName: 'Bind "ASDF_JAVA_VERSION"'
+      inputs:
+        sourceType: 'text'
+        source: |
+          var ASDF_JAVA_VERSION = {{ ASDF_JDK_$(CATALOG_YAML_JAVA_LANGUAGE_VERSION) }}
+
+    - script: |-
+        echo "##vso[build.addbuildtag]ci"
+        echo "##vso[build.addbuildtag]helm"
+        echo "##vso[build.addbuildtag]kubernetes"
+        echo "##vso[build.addbuildtag]vcr"
+        echo "##vso[build.addbuildtag]kube-config"
+        echo "##vso[build.addbuildtag]java-$(CATALOG_YAML_JAVA_LANGUAGE_VERSION)"
+        echo "##vso[build.addbuildtag]maven"
+        echo "##vso[build.addbuildtag]nexus"
+        echo "##vso[build.addbuildtag]$(CATALOG_YAML_ACRONYM)"
+        echo "##vso[build.addbuildtag]$(CATALOG_YAML_MODULE)"
+
+      displayName: 'Set tags'
+
+    - script: asdf install java $(ASDF_JAVA_VERSION)
+      displayName: 'Ensure Project Java Version'
+
+    - task: SemverIncrementCustomFromVivo@5
+      displayName: 'Semver Increment "patch"'
+      name: new_version
+      continueOnError: false
+      inputs:
+        currentversion: $(POM_XML_VERSION)
+        outputVariableName: "NEW_VERSION"
+        releaseType: "patch"
+        template: "${NEW_COERCED_VERSION}"
+
+    - task: Maven@4
+      displayName: "Maven versions:set"
+      env:
+        ASDF_JAVA_VERSION: $(ASDF_JAVA_VERSION)
+        NEXUS_DEPS_USR: $(NEXUS-DEPS-USR)
+        NEXUS_DEPS_PSW: $(NEXUS-DEPS-PSW)
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+
+      inputs:
+        options: >
+          -s /home/svc_devopscorp/.m2/settings.xml
+          -Dmaven.test.skip=true 
+          -DnewVersion=$(new_version.NEW_VERSION)
+          -DprocessAllModules
+          -DgenerateBackupPoms=false
+          -N versions:update-child-modules
+        mavenPomFile: $(Build.SourcesDirectory)/pom.xml
+        mavenOptions: "-Xmx3072m"
+        javaHomeOption: "JDKVersion"
+        goals: "versions:set"
+
+    - task: XmlParseFromVivo@4
+      displayName: 'Get New pom.xml info'
+      inputs:
+        type: 'file'
+        origin: $(Build.SourcesDirectory)/pom.xml
+        jpaths: |
+          var POM_XML_VERSION = .project.version._text
+
+    - task: Maven@4
+      displayName: 'Maven Build, Test & Package'
+      continueOnError: False
+      env:
+        ASDF_JAVA_VERSION: $(ASDF_JAVA_VERSION)
+        NEXUS_DEPS_USR: $(NEXUS-DEPS-USR)
+        NEXUS_DEPS_PSW: $(NEXUS-DEPS-PSW)
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+      inputs:
+        options: >-
+          -s /home/svc_devopscorp/.m2/settings.xml
+          -Dmaven.repo.local=/home/svc_devopscorp/.m2/repository
+        mavenPomFile: $(Build.SourcesDirectory)/pom.xml
+        mavenOptions: "-Xmx3072m"
+        javaHomeOption: "JDKVersion"
+        publishJUnitResults: false
+        testResultsFiles: $(Build.SourcesDirectory)/**/surefire-reports/TEST-*.xml
+        goals: "clean dependency:purge-local-repository install test"
+
+    - task: PublishTestResults@2
+      inputs:
+        testResultsFormat: "JUnit"
+        testResultsFiles: "**/surefire-reports/TEST-*.xml"
+        mergeTestResults: true
+
+    - task: CopyFiles@2
+      displayName: "Staging Artifacts"
+      condition: succeeded()
+      continueOnError: false
+      inputs:
+        SourceFolder: "$(build.sourcesdirectory)"
+        TargetFolder: "$(Build.ArtifactStagingDirectory)"
+        Contents: |
+          **/target/classes/**
+          **/target/*.*ar
+          **/target/*.ejb
+          **/surefire-reports/TEST-*.xml
+          **/pom.xml
+          .azuredevops/**/*
+          .azuredevops/*
+          catalog-info.y*ml
+          pom.xml
+        CleanTargetFolder: true
+        OverWrite: true
+        flattenFolders: false
+
+    - task: PublishBuildArtifacts@1
+      displayName: "Push Artifacts"
+      condition: succeeded()
+      continueOnError: false
+      inputs:
+        ArtifactName: bin
+
+    - task: ListFilesAndFolders@4
+      displayName: 'Find "sonar.java.binaries"'
+      inputs:
+        scriptSource: 'text'
+        separator: ','
+        script: |
+          var://BINARIES_DIRECTORIES = **/target/classes
+
+    - task: SonarQubePrepare@5
+      displayName: 'Config Sonar'
+      inputs:
+        SonarQube: VIVO_SONARQUBE
+        scannerMode: "CLI"
+        # configFile Não funciona no scannerMode Other, apenas CLI (https://learn.microsoft.com/pt-br/azure/devops/pipelines/tasks/reference/sonar-qube-prepare-v5?view=azure-pipelines)
+        configFile: $(Build.SourcesDirectory)/sonar-project.properties
+        extraProperties: |
+          sonar.scm.disabled=True
+          sonar.projectBaseDir=$(Build.SourcesDirectory)
+          sonar.projectKey=$(CATALOG_YAML_SONAR_PROJECT_KEY)
+          sonar.projectName=$(SONARQUBE_PROJECT_NAME)
+          sonar.projectVersion=$(new_version.NEW_VERSION)
+          sonar.analysis.repositoryName=$(Build.Repository.Name)
+          sonar.analysis.buildId=$(Build.BuildId)
+          sonar.analysis.repositoryId=$(Build.Repository.ID)
+          sonar.analysis.projectName=$(System.TeamProject)
+          sonar.analysis.projectId=$(System.TeamProjectId)
+          sonar.links.homepage=$(System.TeamFoundationCollectionUri)$(System.TeamProject)
+          sonar.links.ci=$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)&_a=summary
+          sonar.links.issue=$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_workitems
+          sonar.links.scm=$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_git/$(Build.Repository.Name)
+          sonar.scanner.metadataFilePath=$(Agent.TempDirectory)/sonar/$(Build.BuildId)/report-task.txt
+          sonar.qualitygate.wait=true
+          sonar.qualitygate.timeout=300
+          sonar.sources=.
+          sonar.inclusions=**/src/main/java/**/*
+          sonar.java.binaries=$(BINARIES_DIRECTORIES)
+
+    - script: asdf install java $(ASDF_JDK_11)
+      displayName: 'Ensure Sonarqube'
+
+    - task: SonarQubeAnalyze@5
+      displayName: 'Sonar Scan'
+      continueOnError: true
+      env:
+        ASDF_JAVA_VERSION: $(ASDF_JDK_11)
+
+    - task: Bash@3
+      displayName: 'Commit new version'
+      continueOnError: false
+      inputs:
+        targetType: inline
+        script: |-
+          git stash save pom.xml
+          git clean -fdX
+
+          # export TAG="${POM_XML_VERSION:4}+$(date -u +"%Y%m%d%H%M")-${BUILD_SOURCEBRANCHNAME}-${BUILD_BUILDID}"
+
+          export TAG="${POM_XML_VERSION}"
+
+          echo "##[command] git checkout ${BUILD_SOURCEBRANCHNAME} --"
+          git fetch
+          git checkout ${BUILD_SOURCEBRANCHNAME} --
+          git pull --rebase origin ${BUILD_SOURCEBRANCHNAME}
+          git stash pop
+
+          echo "##[command] git commit"
+          git add pom.xml
+          git commit -m "[skip ci] CodePlay bump version ${TAG}"
+
+          echo "##[command]git tag ${TAG}"
+          git tag ${TAG} -m "Version has been updated to ${TAG}"
+
+          echo "##[command] git push origin ${BUILD_SOURCEBRANCHNAME}"
+          git push origin --tags ${BUILD_SOURCEBRANCHNAME}
+

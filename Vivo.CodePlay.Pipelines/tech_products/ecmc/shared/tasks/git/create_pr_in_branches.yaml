@@ -1,0 +1,133 @@
+﻿parameters:
+- name: targetRepo
+  type: string
+  default: "self"
+- name: branchSourceRef
+  type: string
+- name: sourceCommit
+  type: string
+- name: prBranches
+  type: string
+- name: useSubModules
+  type: boolean
+  default: false
+- name: repositoriesSubModules
+  type: object
+  default:
+  - name: src-sap-commerce-core-customize-java
+    path: "core-customize"
+  - name: src-sap-commerce-js-store-front-ng
+    path: "js-storefront"
+
+steps:
+- checkout: git://$(System.TeamProject)/${{ parameters.targetRepo }}
+  clean: true
+  persistCredentials: true
+  fetchDepth: 0
+  condition: succeeded()
+
+
+- bash: |
+    cd "${MAIN_REPO}"
+    BRANCH_SOURCE_REF="${BRANCH_SOURCE_REF#refs/heads/}"
+
+    git config --replace-all user.name "Azure DevOps" && git config --replace-all user.email "azuredevops@telefonicati.onmicrosoft.com"
+
+    git checkout $BRANCH_SOURCE_REF
+
+    echo "[section]Checkout realizado. Branch: $BRANCH_SOURCE_REF, Commit: $SOURCE_COMMIT"
+
+    NEW_BRANCH_NAME="${PR_BRANCH_NAME_TOMBAMENTO_PREFIXO}"
+    SOURCE_COMMIT_FULL=$(git rev-parse "${SOURCE_COMMIT}")
+
+    echo "##vso[task.setvariable variable=NEW_BRANCH_NAME]${NEW_BRANCH_NAME}"
+    echo "##vso[task.setvariable variable=SOURCE_COMMIT_FULL]${SOURCE_COMMIT_FULL}"
+
+
+    echo "[section]NEW_BRANCH_NAME: ........ ${NEW_BRANCH_NAME}"
+    echo "[section]SOURCE_COMMIT_FULL: ..... ${SOURCE_COMMIT_FULL}"
+
+    git reset --hard "${SOURCE_COMMIT_FULL}"
+    if [ $? -ne 0 ]; then
+      echo "❌ O commit ${SOURCE_COMMIT} não foi encontrado na branch ${BRANCH_SOURCE_REF} ❌"
+      exit 1
+    fi
+
+    echo "[section]Branch ${BRANCH_SOURCE_REF} resetada para o commit ${SOURCE_COMMIT_FULL}."
+    echo "[section]Seguindo para criar nova branch ${NEW_BRANCH_NAME} a partir deste commit."
+  displayName: "Getting hash branch to PR creation"
+  condition: succeeded()
+  env:
+    BRANCH_SOURCE_REF: ${{ parameters.branchSourceRef }}
+    SOURCE_COMMIT: ${{ parameters.sourceCommit }}
+    MAIN_REPO: ${{ parameters.targetRepo }}
+    PR_BRANCH_NAME_TOMBAMENTO_PREFIXO: $(PR_BRANCH_NAME_TOMBAMENTO_PREFIXO)
+
+- ${{ if eq(parameters.useSubModules, true) }}:
+
+  - ${{ each repoItem in parameters.repositoriesSubModules }}:
+
+    - checkout: git://$(System.TeamProject)/${{ repoItem.name }}
+      clean: true
+      persistCredentials: true
+      fetchDepth: 0
+      fetchTags: false
+      condition: succeeded()
+
+    - bash: |
+        cd "${REPO_PATH}"
+        # A opção --object-only requer Git 2.36+ e no momento dos testes o agente estava com a versão 2.31.1
+        # Se um dia a versão do git ser  2.36+ ou superior use >> git ls-tree --object-only HEAD "${SUBMODULE_PATH}"
+        git checkout ${BRANCH_SOURCE_REF}
+        git reset --hard "${SOURCE_COMMIT}"
+
+        # Utilizando com awk
+        SUBMODULE_COMMIT=$(git ls-tree HEAD "${SUBMODULE_PATH}" | awk '{print $3}')
+
+        echo "[section]Submodule ${SUBMODULE_PATH} commit hash: ${SUBMODULE_COMMIT}"
+        VARIABLE_NAME_FOR_SUBMODULE="SUBMODULE_HASH_${SUBMODULE_PATH_AS_VARIABLE_NAME}"
+        echo "##vso[task.setvariable variable=${VARIABLE_NAME_FOR_SUBMODULE}]${SUBMODULE_COMMIT}"
+      displayName: "Setting commit hash to PR creation - ${{ repoItem.name }}"
+      env:
+        REPO_PATH: ${{ parameters.targetRepo }}
+        BRANCH_SOURCE_REF: ${{ parameters.branchSourceRef }}
+        SOURCE_COMMIT: ${{ parameters.sourceCommit }}
+        SUBMODULE_PATH: ${{ repoItem.path }}
+        SUBMODULE_PATH_AS_VARIABLE_NAME: ${{ upper(replace(repoItem.path, '-', '_')) }}
+      condition: succeeded()
+
+    - template: /tech_products/ecmc/shared/tasks/git/open_pr.yaml
+      parameters:
+        repoName: ${{ repoItem.name }}
+        branchSourceRef: ${{ parameters.branchSourceRef }}
+        newBranchName: $(NEW_BRANCH_NAME)
+        selfCommitHash: $(SUBMODULE_HASH_${{ upper(replace(repoItem.path, '-', '_')) }})
+        prBranches: ${{ parameters.prBranches }}
+        workingDirectory: $(Build.SourcesDirectory)/${{ repoItem.name }}
+        displayName: "PRs tombamento esteiras ${{ repoItem.name }}"
+
+    - template: /tech_products/ecmc/shared/tasks/git/merge_forced.yaml
+      parameters:
+        repoName: ${{ repoItem.name }}
+        branchSourceRef: ${{ parameters.branchSourceRef }}
+        mergeBranches: ${{ parameters.prBranches }}
+        workingDirectory: $(Build.SourcesDirectory)/${{ repoItem.name }}
+        displayName: "Merge tombamento esteiras ${{ repoItem.name }}"
+
+- ${{ else }}:
+    - template: /tech_products/ecmc/shared/tasks/git/open_pr.yaml
+      parameters:
+        repoName: ${{ parameters.targetRepo }}
+        branchSourceRef: ${{ parameters.branchSourceRef }}
+        newBranchName: $(NEW_BRANCH_NAME)
+        selfCommitHash: $(SOURCE_COMMIT_FULL)
+        prBranches: ${{ parameters.prBranches }}
+        workingDirectory: $(Build.SourcesDirectory)
+
+    - template: /tech_products/ecmc/shared/tasks/git/merge_forced.yaml
+      parameters:
+        repoName: ${{ parameters.targetRepo }}
+        branchSourceRef: ${{ parameters.branchSourceRef }}
+        mergeBranches: ${{ parameters.prBranches }}
+        workingDirectory: $(Build.SourcesDirectory)/${{ parameters.targetRepo }}
+        displayName: "Merge tombamento esteiras ${{ parameters.targetRepo }}"

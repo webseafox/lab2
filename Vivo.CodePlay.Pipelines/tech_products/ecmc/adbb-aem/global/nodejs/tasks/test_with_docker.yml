@@ -1,0 +1,60 @@
+parameters:
+- name: dockerWorkDir
+  type: string
+  default: $(DOCKER_WORKDIR)
+- name: cmdNodeTest
+  type: string
+- name: dockerfileLocation
+  type: string
+  default: ".azuredevops/nodejs/tester.Dockerfile"
+
+steps:
+# ==================================================================
+# [Compliance] Verifica se o repositório está em conformidade com as políticas de configuração
+# ==================================================================
+- task: VivoDevOpsConfigCompliance@1
+  displayName: 'Check DevOps Config Compliance'
+  inputs:
+    policySets: |
+      image-definition-files
+
+- bash: |
+    echo "##[debug] HTTPS_PROXY...........................: ${HTTPS_PROXY}"
+    echo "##[debug] HTTP_PROXY............................: ${HTTP_PROXY}"
+    echo "##[debug] NO_PROXY..............................: ${NO_PROXY}"
+    echo "##[debug] NPM_TEMP_FILE_PATH....................: ${NPM_TEMP_FILE_PATH}"
+    echo "##[debug] dockerWorkDir.........................: ${{ parameters.dockerWorkDir }}"
+    echo "##[debug] cmdNodeTest...........................: ${CMD_NODE_TEST}"
+
+    TESTER_IMAGE_NAME="tester/node"
+    docker build -t $TESTER_IMAGE_NAME -f ${{ parameters.dockerfileLocation }} .
+    
+    # Verifica se o .npmrc autenticado existe
+    if [ ! -f "${NPM_TEMP_FILE_PATH}" ]; then
+      echo "##vso[task.logissue type=warning]Arquivo .npmrc autenticado não encontrado em ${NPM_TEMP_FILE_PATH}"
+      echo "##[warning]Continuando sem autenticação Nexus"
+      NPM_AUTH_MOUNT=""
+    else
+      echo "##[debug]Arquivo .npmrc autenticado encontrado, montando no container"
+      NPM_AUTH_MOUNT="-e NPM_CONFIG_USERCONFIG='/tmp/.npmrc' -v ${NPM_TEMP_FILE_PATH}:/tmp/.npmrc"
+    fi
+
+    docker run --rm \
+      --user="$(DOCKER_CMD_USERNAME):$(DOCKER_CMD_GROUP)" \
+      --network host \
+      --log-driver none \
+      -e HTTPS_PROXY="$HTTPS_PROXY" \
+      -e HTTP_PROXY="$HTTP_PROXY" \
+      -e NO_PROXY="$NO_PROXY" \
+      ${NPM_AUTH_MOUNT} \
+      -v $(pwd):/app \
+      -w ${{ parameters.dockerWorkDir }} \
+      $TESTER_IMAGE_NAME sh -c "${CMD_NODE_TEST}"
+      
+  displayName: Test & Coverage with Nexus Auth
+  env:
+    CMD_NODE_TEST: ${{ parameters.cmdNodeTest }}
+    NPM_TEMP_FILE_PATH: $(DEFAULT_NPMRC_TEMP_FILE_PATH)
+    HTTPS_PROXY: $(PROXY_AGENT_HTTPS)
+    HTTP_PROXY: $(PROXY_AGENT_HTTP)
+    NO_PROXY: $(PROXY_AGENT_NO_PROXY)

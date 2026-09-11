@@ -1,0 +1,66 @@
+parameters:
+  - name: minNodeVersion
+    type: number
+
+steps:
+  - task: Bash@3
+    displayName: "Clone Repository & Validate Node Version"
+    env:
+      SYSTEM_ACCESSTOKEN: $(AZURE_TOKEN)
+      MIN_VERSION: "${{ parameters.minNodeVersion }}"
+    inputs:
+      targetType: inline
+      script: |
+        echo "##[section]#################### CLONE REPOSITORY ####################"
+        echo "##[debug] Repository Name: $(REPO_NAME)"
+
+        REPO_NAME_CLEAN="$(REPO_NAME)"
+        REPO_NAME_CLEAN="${REPO_NAME_CLEAN%\'}"
+
+        PROJECT_ENCODED="${SYSTEM_TEAMPROJECT// /%20}"
+        CLONE_URL="${SYSTEM_COLLECTIONURI}${PROJECT_ENCODED}/_git/${REPO_NAME_CLEAN}"
+        CLONE_URL_AUTH="${CLONE_URL//https:\/\//https:\/\/$SYSTEM_ACCESSTOKEN@}"
+
+        echo "##[debug] Clone URL: ${CLONE_URL}"
+
+        echo "##[group]Git Clone Execution"
+        git clone "$CLONE_URL_AUTH" "$REPO_NAME_CLEAN"
+        if [ $? -ne 0 ]; then
+          echo "##vso[task.logissue type=error]Failed to clone repository $(REPO_NAME)."
+          exit 1
+        fi
+        echo "##[endgroup]"
+
+        cd "$REPO_NAME_CLEAN"
+
+        echo "##[section]#################### NODE VERSION CHECK (runtime.Dockerfile) ####################"
+        DOCKERFILE=".azuredevops/runtime.Dockerfile"
+
+        echo "##[debug] Min Node version required: ${MIN_VERSION}"
+        echo "##[debug] Dockerfile path: ${DOCKERFILE}"
+
+        if [ ! -f "$DOCKERFILE" ]; then
+          echo "##vso[task.logissue type=warning]runtime.Dockerfile not found at ${DOCKERFILE}. Skipping Code-Healer SCA."
+          echo "##vso[task.setvariable variable=VERSION_OK]false"
+          exit 0
+        fi
+
+        FROM_LINE=$(grep -i "^FROM" "$DOCKERFILE" | head -1)
+        NODE_VERSION_FULL=$(echo "$FROM_LINE" | grep -oP 'node[:/]\K[0-9]+(\.[0-9]+)*' | head -1)
+
+        if [ -z "$NODE_VERSION_FULL" ]; then
+          echo "##vso[task.logissue type=warning]Could not extract Node.js version. Skipping Code-Healer SCA."
+          echo "##vso[task.setvariable variable=VERSION_OK]false"
+          exit 0
+        fi
+
+        PROJECT_MAJOR=$(echo "$NODE_VERSION_FULL" | cut -d'.' -f1)
+        MIN_MAJOR=$(echo "$MIN_VERSION" | sed 's/^v//' | cut -d'.' -f1)
+
+        if [ "$PROJECT_MAJOR" -ge "$MIN_MAJOR" ] 2>/dev/null; then
+          echo "##[section]Node.js version check PASSED (${PROJECT_MAJOR} >= ${MIN_MAJOR})"
+          echo "##vso[task.setvariable variable=VERSION_OK]true"
+        else
+          echo "##vso[task.logissue type=warning]Node.js version below required. Skipping Code-Healer SCA."
+          echo "##vso[task.setvariable variable=VERSION_OK]false"
+        fi

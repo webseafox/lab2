@@ -1,0 +1,83 @@
+parameters:
+  - name: NODE_VERSION
+    type: string
+    default: ''
+steps:
+  - script: |
+      check_node_version_asdf() {
+        local version="$1"
+        if [[ -z "$version" ]]; then
+          echo "##[error] Nenhuma versão do Node.js informada. Crie um arquivo .tool-versions para selecionar versão do Node.js via asdf."
+          return 1
+        fi
+        if asdf list nodejs | grep -q "^\(  \| \*\)$version$"; then
+          echo "##[debug] Versão $version encontrada no asdf e será utilizada."
+          return 0
+        else
+          asdf install nodejs "$version"
+          asdf reshim nodejs
+          if asdf list nodejs | grep -q "^\(  \| \*\)$version$"; then
+            echo "##[debug] Versão $version instalada com sucesso no asdf."
+            return 0
+          fi
+          echo "##[error] Versão $version não encontrada no asdf. Acione DevSupport no VivoNow e solicite disponibilização da versão nos agentes do Azure DevOps."
+          return 1
+        fi
+      }
+
+      # 1. Busca versão do Node.js definida no arquivo .tool-versions
+      if [[ -f .tool-versions ]]; then
+        echo "##[debug] Arquivo .tool-versions encontrado"
+        NODE_VERSION_TOOL=$(grep -E '^nodejs ' .tool-versions | awk '{print $2}')
+        if [[ -n "$NODE_VERSION_TOOL" ]]; then
+          echo "##[debug] Versão do Node.js definida no .tool-versions: $NODE_VERSION_TOOL"
+        fi
+      fi
+
+      # 2. Se não encontrou versão no .tool-versions, tenta .nvmrc
+      if [[ -z "$NODE_VERSION_TOOL" ]]; then
+        if [[ -f .nvmrc ]]; then
+          echo "##[debug] .nvmrc detectado. Usando versão do Node.js no .nvmrc"
+          NODE_VERSION_TOOL=$(cat .nvmrc)
+          echo "##[debug] Verificar se está utilizando semantic version"
+          if [[ ! $NODE_VERSION_TOOL =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "##[warning] Formato inválido de NODE_VERSION. Tentando a melhor conversão, por favor considere usar versionamento semântico."
+            if [[ $NODE_VERSION_TOOL =~ ^v[0-9]+\.[0-9]+$ ]]; then
+              NODE_VERSION_TOOL="${NODE_VERSION_TOOL//v}.0"
+            fi
+          fi
+        else
+          echo "##[warning] Não foi definida versão do Node.js em .tool-versions nem .nvmrc. Defina a versão do Node.js a ser utilizada em pelo menos um dos arquivos."
+        fi
+      fi
+
+      NODE_VERSION="${NODE_VERSION_TOOL:-$NODE_VERSION}"
+      echo "##[debug] NODE_VERSION: $NODE_VERSION"
+
+      # 3. Verifica se a versão selecionada existe no asdf local
+      if ! check_node_version_asdf "$NODE_VERSION"; then
+        echo "##vso[task.logissue type=error;] Erro ao determinar versão do Node.js a ser utilizada."
+        echo "##vso[task.complete result=Failed;]"
+        exit
+      fi
+
+      # Atualiza .tool-versions se necessário
+      if [[ ! -f .tool-versions ]]; then
+        echo "##[debug] Criando .tool-versions com Node.js $NODE_VERSION"
+      echo "nodejs $NODE_VERSION" > .tool-versions
+      elif [[ ! -s .tool-versions ]]; then
+        echo "##[debug] Arquivo .tool-versions existe, mas está vazio. Adicionando Node.js $NODE_VERSION"
+        echo "nodejs $NODE_VERSION" > .tool-versions
+      elif ! grep -q "^nodejs " .tool-versions; then
+        echo "##[debug] Adicionando Node.js $NODE_VERSION ao .tool-versions"
+        sed -i "\$a\\nodejs $NODE_VERSION" .tool-versions
+      elif ! grep -q "^nodejs $NODE_VERSION$" .tool-versions; then
+        echo "##[debug] Atualizando versão do Node.js no .tool-versions para $NODE_VERSION"
+        sed -i "s/^nodejs .*/nodejs $NODE_VERSION/" .tool-versions
+      fi
+
+      echo "Versão Node.js: $(node --version)"
+      echo "Versão npm: $(npm --version)"
+    displayName: 'Set Node.js version'
+    env:
+      NODE_VERSION: $(NODE_VERSION)

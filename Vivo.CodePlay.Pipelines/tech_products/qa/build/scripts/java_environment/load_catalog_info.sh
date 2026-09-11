@@ -1,0 +1,63 @@
+#!/bin/bash
+
+# Diretório onde o arquivo catalog-info.yaml está localizado
+#TARGET_DIR=${BUILD_REPOSITORYNAME}
+
+# Verifica se o arquivo catalog-info existe no diretório alvo
+if ! [[ -f "$TARGET_DIR/catalog-info.yml" || -f "$TARGET_DIR/catalog-info.yaml" ]]; then
+  echo "##vso[task.logissue type=warning] Unable to find catalog-info file in $TARGET_DIR (path=$(pwd))."
+else
+  # Encontra o arquivo catalog-info
+  catalogInfo=$(find $TARGET_DIR -type f -name "catalog-info.*" -print -quit)
+
+  # Extrai informações do arquivo catalog-info
+  GOV_APP_ACRONYM=$(yq -r '.metadata.annotations."techarch.governance-app.acronym" | select (.!=null) | downcase' "$catalogInfo")
+  APP_SYSTEM=$(yq -r 'select(documentIndex == 0) | .spec.system | select (.!=null)' "$catalogInfo")
+  APP_NAME=$(yq -r 'select(documentIndex == 0) | .metadata.name | select (.!=null)' "$catalogInfo")
+  APP_DESCRIPTION=$(yq -r 'select(documentIndex == 0) | .metadata.description | select (.!=null)' "$catalogInfo")
+  SONAR_PROJECT_KEY=$(yq -r 'select(documentIndex == 0) | .metadata.annotations."sonarqube.org/project-key" | select (.!=null)' "$catalogInfo")
+  K8S_CONFIG=$(yq -r '.metadata.annotations."vivo.io/kubernetes-config" | select (.!=null)' "$catalogInfo")
+  HELM_RELEASE=$(yq -r '.metadata.annotations."backstage.io/kubernetes-id" | select (.!=null)' "$catalogInfo")
+  K8S_NAMESPACE=$(yq -r '.metadata.annotations."backstage.io/kubernetes-namespace" | select (.!=null)' "$catalogInfo")
+  K8S_NAMESPACE_DEV=$(yq -r '.metadata.annotations."vivo.io/kubernetes-k8s-namespace-dev" | select (.!=null)' "$catalogInfo")
+  K8S_NAMESPACE_ESTEIRA1=$(yq -r '.metadata.annotations."vivo.io/kubernetes-k8s-namespace-esteira1" | select (.!=null)' "$catalogInfo")
+  K8S_NAMESPACE_ESTEIRA2=$(yq -r '.metadata.annotations."vivo.io/kubernetes-k8s-namespace-esteira2" | select (.!=null)' "$catalogInfo")
+  K8S_NAMESPACE_PREPROD=$(yq -r '.metadata.annotations."vivo.io/kubernetes-k8s-namespace-preprod" | select (.!=null)' "$catalogInfo")
+  K8S_NAMESPACE_PRODLIKE=$(yq -r '.metadata.annotations."vivo.io/kubernetes-k8s-namespace-prodlike" | select (.!=null)' "$catalogInfo")
+  K8S_NAMESPACE_PRODUCAO=$(yq -r '.metadata.annotations."vivo.io/kubernetes-k8s-namespace-producao" | select (.!=null)' "$catalogInfo")
+fi
+
+# Exibe as variáveis extraídas
+echo "##[group] catalog-info Variables"
+echo "##[debug] GOV_APP_ACRONYM............: ${GOV_APP_ACRONYM}"
+echo "##[debug] APP_SYSTEM.................: ${APP_SYSTEM}"
+echo "##[debug] APP_NAME...................: ${APP_NAME}"
+echo "##[debug] APP_DESCRIPTION............: ${APP_DESCRIPTION}"
+echo "##[debug] SONAR_PROJECT_KEY..........: ${SONAR_PROJECT_KEY}"
+echo "##[debug] K8S_CONFIG.................: ${K8S_CONFIG}"
+echo "##[debug] HELM_RELEASE...............: ${HELM_RELEASE}"
+echo "##[debug] K8S_NAMESPACE..............: ${K8S_NAMESPACE}"
+echo "##[debug] K8S_NAMESPACE_DEV..........: ${K8S_NAMESPACE_DEV}"
+echo "##[debug] K8S_NAMESPACE_ESTEIRA1.....: ${K8S_NAMESPACE_ESTEIRA1}"
+echo "##[debug] K8S_NAMESPACE_ESTEIRA2.....: ${K8S_NAMESPACE_ESTEIRA2}"
+echo "##[debug] K8S_NAMESPACE_PREPROD......: ${K8S_NAMESPACE_PREPROD}"
+echo "##[debug] K8S_NAMESPACE_PRODLIKE.....: ${K8S_NAMESPACE_PRODLIKE}"
+echo "##[debug] K8S_NAMESPACE_PRODUCAO.....: ${K8S_NAMESPACE_PRODUCAO}"
+echo "##[endgroup]"
+
+# Define as variáveis extraídas
+echo "##vso[task.setvariable variable=GOV_APP_ACRONYM;isOutput=true]${GOV_APP_ACRONYM}"
+echo "##vso[task.setvariable variable=APP_SYSTEM;isOutput=true]${APP_SYSTEM}"
+echo "##vso[task.setvariable variable=APP_NAME;isOutput=true]${APP_NAME}"
+echo "##vso[task.setvariable variable=APP_DESCRIPTION;isOutput=true]${APP_DESCRIPTION}"
+echo "##vso[task.setvariable variable=SONAR_PROJECT_KEY;isOutput=true]${SONAR_PROJECT_KEY}"
+echo "##vso[task.setvariable variable=K8S_CONFIG;isOutput=true]${K8S_CONFIG}"
+echo "##vso[task.setvariable variable=HELM_RELEASE;isOutput=true]${HELM_RELEASE}"
+echo "##vso[task.setvariable variable=K8S_NAMESPACE;isOutput=true]${K8S_NAMESPACE}"
+echo "##vso[task.setvariable variable=K8S_NAMESPACE_DEV;isOutput=true]${K8S_NAMESPACE_DEV}"
+echo "##vso[task.setvariable variable=K8S_NAMESPACE_ESTEIRA1;isOutput=true]${K8S_NAMESPACE_ESTEIRA1}"
+echo "##vso[task.setvariable variable=K8S_NAMESPACE_ESTEIRA2;isOutput=true]${K8S_NAMESPACE_ESTEIRA2}"
+echo "##vso[task.setvariable variable=K8S_NAMESPACE_PREPROD;isOutput=true]${K8S_NAMESPACE_PREPROD}"
+echo "##vso[task.setvariable variable=K8S_NAMESPACE_PRODLIKE;isOutput=true]${K8S_NAMESPACE_PRODLIKE}"
+echo "##vso[task.setvariable variable=K8S_NAMESPACE_PRODUCAO;isOutput=true]${K8S_NAMESPACE_PRODUCAO}"
+echo "##[debug] To open and check the information above, click the arrows on the left."

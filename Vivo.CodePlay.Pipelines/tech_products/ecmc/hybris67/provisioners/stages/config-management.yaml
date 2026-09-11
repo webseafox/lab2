@@ -1,0 +1,185 @@
+﻿parameters:
+- name: qaEnvironment
+  type: string
+  default: 'preprod'
+- name: environment
+  type: string
+  default: 'preprod'
+- name: argocdEnabled
+  type: boolean
+  default: true
+- name: privateAgentPool
+  type: string
+  default: $(PRIVATE_AGENT_DEFAULT)
+- name: helmReleaseNamePrefix
+  type: string
+  default: ""
+
+stages:
+- stage: deploy
+  dependsOn:
+  - pipeline_init
+  - ${{ if and(not(startsWith(variables['Build.SourceBranch'], 'refs/tags/')), ne(variables['Build.Reason'], 'Manual')) }}:
+    - validation
+  pool: ${{ parameters.privateAgentPool }}
+  displayName: "Config-management ${{ parameters.environment }}"
+  jobs:
+  - job: "config_management_validation"
+    displayName: "Start config management"
+    workspace:
+      clean: all
+    steps:
+      - ${{ if eq(parameters.argocdEnabled, 'true') }}:
+        - checkout: CorePipelinesScripts
+          persistCredentials: true
+          fetchDepth: 1
+        - checkout: ArgoCD
+          persistCredentials: true
+          fetchDepth: 1
+        - checkout: ArgoCD-Production
+          persistCredentials: true
+          fetchDepth: 1
+        - checkout: self
+          persistCredentials: true
+          fetchDepth: 1
+
+      - bash: |
+          if [ "$(CONFIG_MANAGEMENT)" == "true" ]; then
+              echo "##[debug] Variável CONFIG_MANAGEMENT está com o valor = true"
+          else
+              echo "##[debug] Variável CONFIG_MANAGEMENT está com o valor = false"
+          fi
+        displayName: "About job - Config Management Enabled"
+
+      # - template: /tasks/catalog_info/extract_variables.yml
+      - bash: |
+          echo "##[debug] Executando script de configuração de gerenciamento"
+          cd $(Build.SourcesDirectory)/$(Build.Repository.Name)
+          namespaces=($ARGOCD_NAMESPACES)
+
+          echo "Gerando Config Map para $(HYBRIS_ENV_FILES)"
+
+          if [[ "${ARGOCD_ALLNAMESPACES_HML}" == "true" && ! ( "${ENVIRONMENT_CONFIG}" == "producao" || "${ENVIRONMENT_CONFIG}" == "prod" || "${ENVIRONMENT_CONFIG}" == "production" || "${ENVIRONMENT_CONFIG}" == "ms" ) ]]; then
+            echo "##[debug] Executando argocd em homologacao"
+            for env_config in "${namespaces[@]}"; do
+              for file_env in $(HYBRIS_ENV_FILES); do
+                mkdir -p ${env_config}
+                echo "##[command] Criando $file_env"
+                echo "##[command] -cm -cmf envfile=env/$file_env.yaml -cmn APPNAME=$(HYBRIS_ENV_FILES) -cms env_config=${env_config} -cmda env_config=./${env_config}"
+                python $(Build.SourcesDirectory)/Vivo.Core.Pipelines.Scripts/app.py -cm -cmf env/$file_env.yaml -cmn $file_env -cms ${env_config} -cmda ./${env_config}
+                if [[ $? != 0 ]]; then
+                  exit 1
+                fi
+                echo "##[command]env_config tem o valor ${env_config}"
+
+                mv ./${env_config}/configmap${env_config}.yaml ./${env_config}/$file_env-ConfigMap.yaml
+                cd $(Build.SourcesDirectory)/argocd
+                git config --replace-all user.name "Azure DevOps"
+                git config --replace-all user.email "azuredevops@telefonicati.onmicrosoft.com"
+                git fetch
+                git pull origin master
+                git checkout master
+                git reset --hard origin/master
+                cp -f $(Build.SourcesDirectory)/$(Build.Repository.Name)/${env_config}/$file_env-ConfigMap.yaml ${env_config}
+                git add ${env_config}/
+                git commit -m "Nova versão de Configmap do $file_env-ConfigMap no namespace ${env_config} "
+                git push origin master
+                cd $(Build.SourcesDirectory)/$(Build.Repository.Name)
+              done
+            done
+          elif [[ "${ENVIRONMENT_CONFIG}" == "production" || "${ENVIRONMENT_CONFIG}" == "prod" || "${ENVIRONMENT_CONFIG}" == "producao" || "${ENVIRONMENT_CONFIG}" == "ms" ]]; then
+            echo "##[debug] Executando argocd em producao"
+            mkdir -p ${ENVIRONMENT_CONF}
+            for file_env in $(HYBRIS_ENV_FILES); do
+              echo "##[command] Criando $file_env"
+              echo "Caindo no cenario 2"
+              python $(Build.SourcesDirectory)/Vivo.Core.Pipelines.Scripts/app.py -cm -cmf env/$file_env.yaml -cmn $file_env -cms ${ENVIRONMENT_CONF} -cmda ./${ENVIRONMENT_CONF}/
+              if [[ $? != 0 ]]; then
+                exit 1
+              fi
+              mv ${ENVIRONMENT_CONF}/configmap${ENVIRONMENT_CONF}.yaml ./${ENVIRONMENT_CONF}/$file_env-ConfigMap.yaml
+              ls -la ../
+              cp ./${ENVIRONMENT_CONF}/$file_env-ConfigMap.yaml $(Build.SourcesDirectory)/argocd-production/${ENVIRONMENT_CONF}
+              cd $(Build.SourcesDirectory)/argocd-production/
+              git config --replace-all user.name "Azure DevOps"
+              git config --replace-all user.email "azuredevops@telefonicati.onmicrosoft.com"
+              git fetch
+              git pull origin master
+              git checkout master
+              git reset --hard origin/master
+              cp -f $(Build.SourcesDirectory)/$(Build.Repository.Name)/${ENVIRONMENT_CONF}/$file_env-ConfigMap.yaml ${ENVIRONMENT_CONF}
+              git add ${ENVIRONMENT_CONF}/
+              git commit -m "Nova versão de Configmap do $file_env-ConfigMap no namespace ${ENVIRONMENT_CONF} "
+              git push origin master
+              cd $(Build.SourcesDirectory)/$(Build.Repository.Name)
+            done
+          elif [[ "${CONFIG_MANAGEMENT_DEV}" == "true" ]]; then
+            echo "##[debug] Executando argocd em ambiente de desenvolvimento"
+            mkdir -p ${ENVIRONMENT_CONFIG}
+            for file_env in $(HYBRIS_ENV_FILES); do
+              echo "##[command] Criando $file_env"
+              python $(Build.SourcesDirectory)/Vivo.Core.Pipelines.Scripts/app.py -cm -cmf env/env.yaml -cmn $(HYBRIS_ENV_FILES) -cms prodlike -cmda ./${ENVIRONMENT_CONFIG}
+              if [[ $? != 0 ]]; then
+                exit 1
+              fi
+              mv ./${ENVIRONMENT_CONFIG}/configmapdev.yaml ./${ENVIRONMENT_CONFIG}/configmap${ENVIRONMENT_CONFIG}.yaml
+              mv ${ENVIRONMENT_CONFIG}/configmap${ENVIRONMENT_CONFIG}.yaml ./${ENVIRONMENT_CONFIG}/$file_env-ConfigMap.yaml
+              sed -i "s/namespace: dev/namespace: ${ENVIRONMENT_CONFIG}/g" ./${ENVIRONMENT_CONFIG}/$file_env-ConfigMap.yaml
+              ls -la ../
+              cp ./${ENVIRONMENT_CONFIG}/$file_env-ConfigMap.yaml $(Build.SourcesDirectory)/argocd/${ENVIRONMENT_CONFIG}
+              cd $(Build.SourcesDirectory)/argocd/
+              git config --replace-all user.name "Azure DevOps"
+              git config --replace-all user.email "azuredevops@telefonicati.onmicrosoft.com"
+              git fetch
+              git pull origin master
+              git checkout master
+              git reset --hard origin/master
+              cp -f $(Build.SourcesDirectory)/$(Build.Repository.Name)/${ENVIRONMENT_CONFIG}/$file_env-ConfigMap.yaml ${ENVIRONMENT_CONFIG}
+              git add ${ENVIRONMENT_CONFIG}/
+              git commit -m "Nova versão de Configmap do $file_env-ConfigMap no namespace ${ENVIRONMENT_CONFIG} "
+              git push origin master
+              cd $(Build.SourcesDirectory)/$(Build.Repository.Name)
+            done
+          else
+            echo "##[debug] Executando argocd em homologacao linha 183"
+            mkdir -p ${ENVIRONMENT_CONFIG}
+            for file_env in $(HYBRIS_ENV_FILES); do
+              echo "##[command] Criando $file_env"
+              echo "##[command] -cm -cmf envfile=env/$file_env.yaml -cmn APPNAME=$(HYBRIS_ENV_FILES) -cms env_config=${env_config} -cmda env_config=./${env_config}"
+              python $(Build.SourcesDirectory)/Vivo.Core.Pipelines.Scripts/app.py -cm -cmf env/$file_env.yaml -cmn $(HYBRIS_ENV_FILES) -cms ${ENVIRONMENT_CONF} -cmda ./${ENVIRONMENT_CONF}/
+              if [[ $? != 0 ]]; then
+                exit 1
+              fi
+              mv ${ENVIRONMENT_CONF}/configmap${ENVIRONMENT_CONF}.yaml ./${ENVIRONMENT_CONF}/$file_env-ConfigMap.yaml
+              ls -la ../
+              cp ./${ENVIRONMENT_CONF}/$file_env-ConfigMap.yaml $(Build.SourcesDirectory)/argocd-production/${ENVIRONMENT_CONF}
+              cd $(Build.SourcesDirectory)/argocd-production/
+              git config --replace-all user.name "Azure DevOps"
+              git config --replace-all user.email "azuredevops@telefonicati.onmicrosoft.com"
+              git fetch
+              git pull origin master
+              git checkout master
+              git reset --hard origin/master
+              cp -f $(Build.SourcesDirectory)/$(Build.Repository.Name)/${ENVIRONMENT_CONF}/$file_env-ConfigMap.yaml ${ENVIRONMENT_CONF}
+              git add ${ENVIRONMENT_CONF}/
+              git commit -m "Nova versão de Configmap do $file_env-ConfigMap no namespace ${ENVIRONMENT_CONF} "
+              git push origin master
+              cd $(Build.SourcesDirectory)/$(Build.Repository.Name)
+            done
+          fi
+
+          echo $(Build.SourcesDirectory)
+          echo $(Build.Repository.Name)
+          echo $(HYBRIS_ENV_FILES)
+          echo ${ENVIRONMENT_CONFIG}
+          ls -la
+
+        condition: and(
+                    succeeded(),
+                    eq(variables.CONFIG_MANAGEMENT, true)
+                  )
+        displayName: "Config management validations"
+        env:
+          ENVIRONMENT_CONFIG: ${{ parameters.environment }}
+          helmReleaseNamePrefix: ${{ parameters.helmReleaseNamePrefix }}
+          ENVIRONMENT: ${{ parameters.qaEnvironment }}

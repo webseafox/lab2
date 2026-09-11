@@ -1,0 +1,112 @@
+﻿parameters:
+- name: catalogPath
+
+steps:
+- script: |
+    TOPIC_VERSION=$(yq -r '.spec.version' catalog-info.yaml)
+    echo "##[debug] TOPIC_VERSION..: ${TOPIC_VERSION}"
+
+    if [ -z "${TOPIC_VERSION}" ]; then
+      echo "##vso[task.logissue type=error] Current version not found in catalog-info.yaml file."
+      exit 1
+    fi
+
+    echo "##vso[task.setvariable variable=CURRENT_TOPIC_VERSION]${TOPIC_VERSION}"
+    echo "##vso[task.setvariable variable=NEXT_TOPIC_VERSION]${TOPIC_VERSION}"
+  displayName: Getting Current Version
+  workingDirectory: ${{ parameters.catalogPath }}
+
+- task: semver-bump@1
+  displayName: Bump Version
+  condition: and(succeeded(), eq(variables.BUMP_TOPIC_VERSION_ENABLED, true))
+  inputs:
+    VersionVariable: 'NEXT_TOPIC_VERSION'
+    IncrementLevel: 'patch'
+
+- script: |
+    set -e
+ 
+    echo "##[debug] CURRENT_TOPIC_VERSION.........: ${CURRENT_TOPIC_VERSION}"
+    echo "##[debug] NEXT_TOPIC_VERSION.........: ${NEXT_TOPIC_VERSION}"
+    echo "##[debug] BUILD_SOURCEBRANCHNAME...: ${BUILD_SOURCEBRANCHNAME}"
+ 
+    git config --replace-all user.name "Azure DevOps"
+    git config --replace-all user.email "devops-automation@telefonicati.onmicrosoft.com"
+ 
+    git fetch
+    git checkout -b ${BUILD_BUILDID}
+
+    echo "##[command] Updating catalog-info.yaml"
+    yq e '.spec.version = env(NEXT_TOPIC_VERSION)' -i catalog-info.yaml
+    
+    git add catalog-info.yaml
+    git status
+    git commit -m "Bump VERSION to ${NEXT_TOPIC_VERSION} [skip ci]"
+ 
+    git checkout ${BUILD_SOURCEBRANCHNAME}
+    git pull --rebase
+    git merge ${BUILD_BUILDID}
+    git branch -d ${BUILD_BUILDID}
+   
+    git status
+    git push origin ${BUILD_SOURCEBRANCHNAME}
+
+    echo "##vso[task.logissue type=warning;] Updated Topic Version from '${CURRENT_TOPIC_VERSION}' to '${NEXT_TOPIC_VERSION}'"
+  displayName: Updating Version
+  condition: and(succeeded(), eq(variables.BUMP_TOPIC_VERSION_ENABLED, true))
+  continueOnError: false
+  workingDirectory: ${{ parameters.catalogPath }}
+  name: push_bump_version_file
+  env:
+    NEXT_TOPIC_VERSION: $(NEXT_TOPIC_VERSION)
+    CURRENT_TOPIC_VERSION: $(CURRENT_TOPIC_VERSION)
+
+- script: |
+    set -e
+ 
+    echo "##[debug] CURRENT_TOPIC_VERSION.........: ${CURRENT_TOPIC_VERSION}"
+    echo "##[debug] NEXT_TOPIC_VERSION.........: ${NEXT_TOPIC_VERSION}"
+ 
+    git config --replace-all user.name "Azure DevOps"
+    git config --replace-all user.email "devops-automation@telefonicati.onmicrosoft.com"
+
+    echo "##[command] Tagging Version ${NEXT_TOPIC_VERSION}"
+    git fetch --prune --tags --force
+    if git rev-parse -q --verify "refs/tags/${NEXT_TOPIC_VERSION}" >/dev/null; then
+      git tag -d ${NEXT_TOPIC_VERSION}
+    fi
+
+    git tag -a ${NEXT_TOPIC_VERSION} -m "Setting Tag ${NEXT_TOPIC_VERSION}"
+    git push -f origin ${NEXT_TOPIC_VERSION}
+
+    echo "##[command] Tagging Latest"
+    git fetch --prune --tags --force
+    if git rev-parse -q --verify "refs/tags/latest" >/dev/null; then
+      echo "Latest tag found. Moving it."
+      git tag -d latest
+    else
+      echo "Latest tag not found. Creating it."
+    fi
+
+    git tag -a latest -m "Setting Tag Latest"
+    git push -f origin latest
+  displayName: Tagging Version
+  condition: succeeded()
+  continueOnError: false
+  workingDirectory: ${{ parameters.catalogPath }}
+  name: tagging_version
+  env:
+    NEXT_TOPIC_VERSION: $(NEXT_TOPIC_VERSION)
+    CURRENT_TOPIC_VERSION: $(CURRENT_TOPIC_VERSION)
+
+- script: |
+    echo "##[debug] NEXT_TOPIC_VERSION.....: ${NEXT_TOPIC_VERSION}"
+    echo "##[debug] CURRENT_TOPIC_VERSION.....: ${CURRENT_TOPIC_VERSION}"
+    echo "##vso[task.setvariable variable=NEXT_TOPIC_VERSION;isoutput=true]${NEXT_TOPIC_VERSION}"
+    echo "##vso[task.setvariable variable=CURRENT_TOPIC_VERSION;isoutput=true]${CURRENT_TOPIC_VERSION}"
+  displayName: Exposing Version Variables
+  condition: succeeded()
+  name: set_version
+  env:
+    NEXT_TOPIC_VERSION: $(NEXT_TOPIC_VERSION)
+    CURRENT_TOPIC_VERSION: $(CURRENT_TOPIC_VERSION)

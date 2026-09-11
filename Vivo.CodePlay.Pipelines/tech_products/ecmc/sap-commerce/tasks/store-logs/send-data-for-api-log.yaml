@@ -1,0 +1,81 @@
+parameters:
+- name: condition
+  type: object
+  default: failed()
+- name: msg
+  type: string
+- name: coverage
+  type: string
+
+steps:
+  - bash: |
+      echo "##[debug]Parâmetro JACOCO_EXEC: $(JACOCO_EXEC)"
+
+      if [[ "$(JACOCO_EXEC)" != "True" ]]; then
+        echo "⚠️  ATENÇÃO: A execução dos testes foi pulada, portanto a validação de testes não será aplicada."
+        exit 0
+      fi
+
+      if [[ "$SONAR_API_FAILED" == "true" ]]; then
+        echo "##[section]A API do Sonar falhou, não será possível gravar os dados de cobertura de código"
+        echo "##[error]Encerrando a pipeline"
+        exit 1
+      fi
+
+      if [[ $(Build.Reason) == "PullRequest" ]]; then
+        BRANCH_FOR_STORE_IN_DATABASE=$(echo "$(System.PullRequest.SourceBranch)" | sed 's/refs\/heads\///g')
+        PULL_REQUEST_ID="$(System.PullRequest.PullRequestId)"
+        PULL_REQUEST_URL="$(PROJECT_PULL_REQUEST_URL)"
+      else
+        BRANCH_FOR_STORE_IN_DATABASE=$(PROJECT_SOURCE_BRANCH)
+        PULL_REQUEST_ID="0"
+        PULL_REQUEST_URL="${BRANCH_FOR_STORE_IN_DATABASE}"
+      fi
+
+      BODY='{
+        "component": "'"${PROJECT_NAME}"'",
+        "summary": "'"${SET_MSG}"'",
+        "status": "failed",
+        "coverage": "'"${ACTUAL_COVERAGE}"'",
+        "branch_name": "'"${BRANCH_FOR_STORE_IN_DATABASE}"'",
+        "pull_request_url": "'"${PULL_REQUEST_URL}"'",
+        "pull_request_id": '"${PULL_REQUEST_ID}"'
+      }'
+      echo "##[section]Iniciando gravação dos dados de cobertura de código"
+      echo "##[group]##[section]Conteúdo a ser enviado na requisição (clique para expandir)"
+      echo "${BODY} "
+      echo "##[endgroup]"
+
+      for i in 1 2 3
+      do
+        echo "##[section]Gravando log. Tentativa $i de 3"
+        RESPONSE_CODE=$(curl -s -H "X-API-KEY:${STORE_LOG_X_API_KEY}" -H 'Content-Type: application/json' -X POST "${STORE_LOG_URL}" -w "%{http_code}" -d "$BODY" -o response.json)
+
+        if [ "${RESPONSE_CODE}" == 201 ]; then
+          echo "##[section]Dados de cobertura de código inseridos com sucesso no banco de dados via api (${STORE_LOG_URL})"
+          echo "##[error]Encerrando a pipeline"
+          exit 1
+        fi
+
+        jq -r . response.json
+
+        echo "##[error]Erro ao inserir dados no banco de dados via api (${STORE_LOG_URL})"
+        echo "##[error]RESPONSE_CODE ......... (${RESPONSE_CODE})"
+
+        if [ "$i" == "3" ]; then
+          echo "##[section]Não foi possível gravar os dados de cobertura de código"
+          echo "##[error]Encerrando a pipeline"
+          exit 1
+        fi
+        echo "##[section]Tentando novamente em 5 segundos..."
+        sleep 5
+      done
+    displayName: "Store data errors"
+    condition: ${{ parameters.condition }}
+    env:
+      STORE_LOG_URL: $(API_PIPELINE_STORE_LOG_URL)
+      STORE_LOG_X_API_KEY: $(API_PIPELINE_STORE_LOG_X_API_KEY)
+      PROJECT_NAME: $(Build.Repository.Name)
+      SET_MSG: ${{ parameters.msg }}
+      ACTUAL_COVERAGE: ${{ parameters.coverage }}
+      SONAR_API_FAILED: "$(SONAR_CODE_COVERAGE_FAILED)"

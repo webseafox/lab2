@@ -1,0 +1,87 @@
+﻿parameters:
+- name: environment
+- name: project
+- name: credential_ref
+- name: userVersion
+- name: srcPath
+- name: patchesPath
+
+steps:
+- script: |
+    echo "Starting Deploy Phase"
+  displayName: Starting Deploy Phase
+
+- task: DownloadSecureFile@1
+  name: adminUserCrt
+  displayName: 'Download CA Certificate'
+  inputs:
+    secureFile: "admin-user-crt-${{ parameters.credential_ref }}.crt"
+
+- task: DownloadSecureFile@1
+  name: adadminUserKey
+  displayName: 'Download User Key'
+  inputs:
+    secureFile: "admin-user-key-${{ parameters.credential_ref }}.key"
+
+- task: DownloadSecureFile@1
+  name: kubeApiServerCa
+  displayName: 'Download API Server Certificate'
+  inputs:
+    secureFile: "kube-apiserver-ca-${{ parameters.credential_ref }}.crt"
+
+- script: |
+    set -e
+ 
+    echo "##[debug] USER_VERSION.........: ${USER_VERSION}"
+ 
+    git config --replace-all user.name "Azure DevOps"
+    git config --replace-all user.email "devops-automation@telefonicati.onmicrosoft.com"
+ 
+    git fetch
+    git checkout tags/${USER_VERSION}
+  displayName: Preparing Version
+  continueOnError: false
+  workingDirectory: ${{ parameters.srcPath }}
+  name: preparing_version
+  env:
+    USER_VERSION: ${{ parameters.userVersion }}
+
+- script: |
+    set -e
+    echo Setting Up Kubernetes Development Context
+    kubectl config set-cluster kafka-cluster --server=${KUBE_API_SERVER_ENDPOINT} --certificate-authority=$(kubeApiServerCa.secureFilePath) --embed-certs=true
+    kubectl config set-credentials kafka-admin --client-certificate=$(adminUserCrt.secureFilePath) --client-key=$(adadminUserKey.secureFilePath) --embed-certs=true
+    kubectl config set-context kafka-admin@kafka-cluster --cluster=kafka-cluster --user=kafka-admin
+    kubectl config use-context kafka-admin@kafka-cluster
+    kubectl get ns
+    echo Dev Context Successfully Set!
+  condition: succeeded()
+  continueOnError: false
+  displayName: Kubernetes Context Setup
+  env:
+    KUBE_API_SERVER_ENDPOINT: $(KUBE_API_SERVER_ENDPOINT)
+
+- script: |
+    set -e
+    echo Patching user manifest with the environment data...
+    kubectl patch --filename ${{ parameters.srcPath }}/${USER_DEFAULT_FILE_NAME} --patch-file ${{ parameters.patchesPath }}/${{ parameters.environment }}/strimzi-metadata.yml --local=true --type merge --output yaml > ${{ parameters.srcPath }}/patched-user.yaml
+    echo Done!
+  condition: succeeded()
+  displayName: Patching User
+
+- script: |
+    set -e
+    echo Deploying patched user manifest to environment '${{ parameters.project }}'
+    kubectl apply --filename ${{ parameters.srcPath }}/patched-user.yaml --namespace ${{ parameters.project }}
+    echo Done!
+  condition: succeeded()
+  continueOnError: false
+  displayName: Deploying Patched User
+
+- script: |
+    set -e
+    echo Listing All Users
+    kubectl get KafkaUser -n ${{ parameters.project }} -n ${{ parameters.project }}
+    echo Done!
+  condition: succeeded()
+  displayName: Listing Users

@@ -1,0 +1,165 @@
+stages:
+
+- stage: ci_component_test
+  displayName: "CI - Component Test"
+  pool:
+    name: GeneralPurposeLinuxAgentsCI
+  dependsOn:
+  - environment_init
+
+  ## -> Loads variables from other stages.
+  variables:
+  - name: MAVEN_SETTINGS_LOCATION
+    value: $[ stageDependencies.environment_init.environment.outputs['settings_variables.MAVEN_SETTINGS_LOCATION'] ]
+  - name: MAVEN_CUSTOM_SETTINGS_CONTENT
+    value: $[ stageDependencies.environment_init.environment.outputs['custom_settings.MAVEN_CUSTOM_SETTINGS_CONTENT'] ]
+  - name: NEXUS_DEPS_USR
+    value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEPS_USR'] ]    
+  - name: NEXUS_DEPS_PSW
+    value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEPS_PSW'] ]   
+  
+  jobs:      
+  - job: component_test
+    displayName: Component Test    
+    steps:
+
+    ## -> Clean the pipeline workspace and checkout the code.
+    ## -> 6d15af64-176c-496d-b583-fd2ae21d4df4 is the decorator for checkout.
+    - task: 6d15af64-176c-496d-b583-fd2ae21d4df4@1
+      displayName: Checkout Code
+      name: checkout_code 
+      inputs:
+        repository: self
+        persistCredentials: "true"
+        clean: true
+
+    ## -> Checkout the last commit that was pushed to the repository. 
+    ## -> Set last commit HASH to a variable. 
+    - task: Bash@3
+      displayName: Checkout Last Commit
+      name: checkout_last_commit     
+      condition: succeeded()
+      continueOnError: false
+      inputs:
+        targetType: inline
+        script: |
+          echo "##[debug] Checkout last commit from '$(Build.SourceBranchName)'"
+
+          git config pull.rebase true
+          git fetch -f --depth 1 origin $(Build.SourceBranchName):$(Build.SourceBranchName)
+          git checkout -f $(Build.SourceBranchName)
+          lastCommitHash=$(git rev-parse --short=6 HEAD)
+
+          echo "##[debug] Last commit short hash '$lastCommitHash'"          
+          echo "##vso[task.setvariable variable=SHORT_HASH]$lastCommitHash"
+
+    ## -> Load Custom Settings
+    - task: Bash@3
+      displayName: 'Load Custom Settings'
+      name: load_custom_settings
+      condition: and(
+        succeeded(),
+        ne(variables['MAVEN_CUSTOM_SETTINGS_CONTENT'], ''))
+      continueOnError: true
+      inputs:
+        targetType: inline
+        script: |
+          echo "##[debug] Loading custom settings: $(MAVEN_CUSTOM_SETTINGS_CONTENT)"
+          echo "##[debug] Location: $(MAVEN_SETTINGS_LOCATION)"
+          base64 -d <<< "$(MAVEN_CUSTOM_SETTINGS_CONTENT)" > $(MAVEN_SETTINGS_LOCATION)
+
+    # ==================================================================
+    # [Compliance] Verifica se o repositório está em conformidade com as políticas de configuração
+    # ==================================================================
+    - task: VivoDevOpsConfigCompliance@1
+      displayName: 'Check DevOps Config Compliance'
+      inputs:
+        policySets: |
+          image-definition-files
+
+    ## -> Run component tests.
+    - task: Bash@3
+      displayName: Component Test Run
+      name: component_run
+      condition: succeeded()
+      continueOnError: false
+      inputs:
+        targetType: inline
+        script: >
+          BUILDER_IMAGE_NAME="builder/java"
+
+          docker build -t $BUILDER_IMAGE_NAME -f .azuredevops/builder.Dockerfile .
+
+          run_docker() {
+            docker run --rm \
+              --user="$(DOCKER_CMD_USERNAME):$(DOCKER_CMD_GROUP)" \
+              --network host \
+              --log-driver none \
+              -e JAVA_OPTS_MEMORY_MAX="$(DEFAULT_MAX_MEMORY_BUILD)" \
+              -e TZ="America/Sao_Paulo" \
+              -e SYSTEM_ACCESSTOKEN="$(System.AccessToken)" \
+              -e NEXUS_DEPS_USR="$(NEXUS_DEPS_USR)" \
+              -e NEXUS_DEPS_PSW="$(NEXUS_DEPS_PSW)" \
+              -v $(pwd):/app \
+              -v $HOME/.m2:/.m2 \
+              -v $(MAVEN_SETTINGS_LOCATION):/.m2/settings.xml \
+              -w $(DOCKER_WORKDIR) \
+              "$BUILDER_IMAGE_NAME" sh -c "$1"
+          }
+
+          echo "##[debug] mvn command: $(JAVA_CMD_COMPONENT_TEST)"
+
+          run_docker "mvn $(JAVA_CMD_COMPONENT_TEST) -Dmaven.test.failure.ignore=false -s /.m2/settings.xml -Dmaven.repo.local=/.m2/repository"
+
+    - task: PublishPipelineArtifact@1
+      continueOnError: true
+      inputs:
+        targetPath: '$(System.DefaultWorkingDirectory)/$(COVERAGE_REPORT_COMPONENT_TEST_FILE_LOCATION)'
+        artifact: 'ComponentReport'
+        publishLocation: 'pipeline'
+
+    ## -> Validate cucumber report.
+    - task: Bash@3
+      displayName: Validate Report
+      name: validate_report
+      condition: succeeded()
+      continueOnError: false
+      inputs:
+        targetType: inline
+        script: |
+
+          report_file="$(System.DefaultWorkingDirectory)/$(COVERAGE_REPORT_COMPONENT_TEST_FILE_LOCATION)"
+          
+          echo "##[debug] Reading report file: ${report_file}"
+
+          reportData=$(cat $report_file | jq '[.[] | .elements[] | .steps[] | {status: .result.status, name: .name, error_message: .result.error_message}]')
+
+          passedCount=$(echo $reportData | jq '[.[] | select(.status == "passed")] | length')
+          failedCount=$(echo $reportData | jq '[.[] | select(.status == "failed")] | length')
+
+          # If the variables are empty, set them to 0
+          passedCount=${passedCount:-0}
+          failedCount=${failedCount:-0}
+
+          echo ""
+          echo "##[section]## Steps Status ##"
+
+          echo "##[debug]    Passed..............: $passedCount"
+          echo "##[error]    Failed..............: $failedCount"
+          
+          if (( failedCount > 0 )); then
+            failedReportData=$(echo $reportData | jq '[.[] | select(.status == "failed") | {name: .name, error: .error_message}]')
+
+            echo ""
+            echo "##[section]## The following step have failed ##"
+
+            echo "$failedReportData" | jq -c '.[]' | while read -r obj; do
+              name=$(echo "$obj" | jq -r '.name')
+              error=$(echo "$obj" | jq -r '.error')
+              echo "##[error] Name: $name"
+              echo "##[error] Error: $error"
+              echo ""
+            done
+
+            exit 1;
+          fi

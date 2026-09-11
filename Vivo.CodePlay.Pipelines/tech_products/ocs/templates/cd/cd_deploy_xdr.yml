@@ -1,0 +1,396 @@
+parameters:
+  - name: qa_environment
+  - name: skip_deploy
+
+stages:
+  - stage: DeployStage
+    condition: eq('${{ parameters.skip_deploy }}', 'false')
+    pool: 'GeneralPurposeLinuxAgentsCD'
+    displayName: "Deploy ${{ parameters.qa_environment }} ${{ variables.SE_DEPLOY_ENVIRONMENT }}"
+    jobs:
+      - deployment:
+        condition: eq('${{ parameters.skip_deploy }}', 'false')
+        variables:
+          - template: /.azuredevops/config/${{ parameters.qa_environment }}/environments_variables.yml@self
+          - template: /.azuredevops/config/${{ parameters.qa_environment }}/server01_variables.yml@self
+        workspace:
+          clean: all
+        displayName: Deploy ${{ variables.SERVICE_CONNECTION }}
+        ${{ if or(contains(variables.SERVICE_CONNECTION, 'int'), contains(variables.SERVICE_CONNECTION, 'lab')) }}:
+          environment:
+            name: "deploy-xdr_lab"
+            resourceType: VirtualMachine
+        ${{ else }}:
+          environment:
+            name: ${{ variables.XDR_DEPLOY_ENVIRONMENT }}
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - ${{ if startsWith(variables['Build.SourceBranch'], 'refs/tags') }}:
+                  - bash: |
+                      echo "Branch/tag selecionado: $(Build.SourceBranch)"
+                      # Extrair só o nome da tag
+                      build_id=$(echo "$(Build.SourceBranch)" | sed 's#refs/tags/##')
+                      echo "Tag extraída: $build_id"
+                      echo "##vso[task.setvariable variable=BUILD_ID]$build_id"
+                    name: export_build_id
+                    displayName: Extract Build ID 
+
+                  - task: DownloadBuildArtifacts@1
+                    displayName: 'Download Specific Build Artifact'
+                    inputs:
+                      buildType: specific
+                      project: '$(PROJECT_NAME)' 
+                      pipeline: '$(PIPELINE_NAME)' 
+                      buildVersionToDownload: specific
+                      buildId: '$(BUILD_ID)' 
+                      artifactName: 'bundles' 
+                      downloadPath: '$(System.ArtifactsDirectory)'
+                  ## ARTIFACTS CURRENT BUILD ID
+                - ${{ else }}:
+                  - task: DownloadBuildArtifacts@1
+                    displayName: 'Download Pipeline Artifact'
+                    inputs:
+                      buildType: current
+                      artifactName: 'bundles'
+                      downloadPath: '$(System.ArtifactsDirectory)'
+
+                - ${{if or(or(contains(parameters.qa_environment, 'esteira1'), contains(parameters.qa_environment, 'esteira2')), or (contains(parameters.qa_environment, 'prodlike'), contains(parameters.qa_environment, 'preprod'))) }}:
+                  - task: GetCredentialsSenhaSegura@1
+                    displayName: 'Get Credentials Senha Segura'
+                    name: get_credentials
+                    inputs:
+                      clientId: ${{variables.CLIENT_ID}}
+                      clientSecret: ${{variables.CLIENT_SECRET}}
+                      credentialId: ${{variables.CREDENTIAL_ID}}
+                      SenhaSeguraEndpoint: 'https://10.238.69.35'
+                      #SenhaSeguraEndpoint: 'https://10.128.62.35'
+                      #SenhaSeguraEndpoint: 'https://10.243.17.35'
+                      #SenhaSeguraEndpoint: 'https://urano.redecorp.br'
+                      usernameVariable: 'SENHA_SEGURA_USERNAME'
+                      passwordVariable: 'SENHA_SEGURA_PASSWORD'
+                    env:
+                      NODE_EXTRA_CA_CERTS: $(CACORP_LOCATION)
+                      #HTTPS_PROXY: "http://10.240.58.39:3128"
+
+                  - task: DownloadSecureFile@1
+                    name: senhaSeguraKey
+                    displayName: Download Smart Key
+                    inputs:
+                      secureFile: ${{variables.SMART_KEY}}
+
+                  - task: Bash@3
+                    displayName: 'Decrypt Password'
+                    name: get_token
+                    continueOnError: true
+                    inputs:
+                      targetType: inline
+                      script: |
+                        echo "Username: $(get_credentials.SENHA_SEGURA_USERNAME)"
+                        DECRYPTED_PASSWORD=$(echo -n $(get_credentials.SENHA_SEGURA_PASSWORD) | base64 -d --ignore-garbage | openssl rsautl -decrypt -inkey $(senhaSeguraKey.secureFilePath) -oaep)
+                        echo "##vso[task.setvariable variable=DECRYPTED_PASSWORD;]$DECRYPTED_PASSWORD"
+
+                  - task: Bash@3
+                    displayName: 'Show Password'
+                    name: show_password
+                    continueOnError: true
+                    inputs:
+                      targetType: inline
+                      script: |
+                        echo "Decrypted password: $(DECRYPTED_PASSWORD)"
+                  
+                  - task: Bash@3
+                    displayName: "Debug: Exibir variáveis de credenciais"
+                    inputs:
+                      targetType: inline
+                      script: |
+                        echo "Valor de get_credentials.SENHA_SEGURA_USERNAME: '$(get_credentials.SENHA_SEGURA_USERNAME)'"
+                        echo "Valor de DECRYPTED_PASSWORD: '$(DECRYPTED_PASSWORD)'"
+                        echo "Valor de CACORP_LOCATION: '$(CACORP_LOCATION)'"
+                        echo "Valor de SERVICE_CONNECTION: '$(SERVICE_CONNECTION)'"
+                        # Opcional: mascarar senha no log, se preferir
+                        if [ -n "$(DECRYPTED_PASSWORD)" ]; then
+                          echo "Senha decriptada NÃO está vazia."
+                        else
+                          echo "Senha decriptada está VAZIA!"
+                        fi
+
+                  - task: UpdateCredentialsEndpointSshFromVivo@4
+                    displayName: "Update Service Connection"
+                    inputs:
+                      sshEndpoint: ${{ variables.SERVICE_CONNECTION }}
+                      username: $(get_credentials.SENHA_SEGURA_USERNAME)
+                      password: $(DECRYPTED_PASSWORD)
+                    env:
+                      HTTPS_PROXY: "http://10.240.58.39:3128"
+                      PAT: $(AZURE_DEVOPS_PAT)
+            
+            
+                  - task: Bash@3
+                    displayName: 'Delay for 5 seconds'    
+                    inputs:
+                      targetType: inline
+                      script: |
+                        echo "Waiting for 5 seconds..."
+                        sleep 5               
+              
+                - task: Bash@3
+                  name: package_bundles
+                  displayName: 'Package Bundles'
+                  inputs:
+                    targetType: inline
+                    script: |
+                      mkdir selected_bundles
+                      tar -xmf $(System.ArtifactsDirectory)/bundles/bundles.tar -C selected_bundles
+
+                - task: CopyFiles@2
+                  displayName: Copy Bundles Files Staging Directory
+                  inputs:
+                    SourceFolder: '$(System.DefaultWorkingDirectory)/selected_bundles'
+                    Contents: |
+                      *.jar
+                    TargetFolder:  $(System.DefaultWorkingDirectory)/jar
+                    CleanTargetFolder: true
+                    OverWrite: true
+                    flattenFolders: true
+
+                - ${{ if contains(parameters.qa_environment, 'producao') }}:
+                  - ${{ each service_connection in split(variables.SERVICE_CONNECTION,',') }}:
+                    - task: SSH@0
+                      displayName: "Stopping Application"
+                      condition: eq('${{ parameters.skip_deploy }}', false)
+                      inputs:
+                        sshEndpoint: ${{ service_connection }}
+                        runOptions: 'commands'
+                        #failOnStdErr: false
+                        #continueOnError: true
+                        commands: |
+                          sh ${{ variables.XDR_PATH }}/stop_todos_xdr.sh
+
+                    - task: SSH@0
+                      displayName: "Backup apllication"
+                      condition: eq('${{ parameters.skip_deploy }}', false)
+                      inputs:
+                        sshEndpoint: ${{ service_connection }}
+                        runOptions: 'commands'
+                        #failOnStdErr: false
+                        commands: |
+                          sh ${{ variables.XDR_PATH }}/backup_xdr.sh
+                    
+                    - ${{ if or(contains(service_connection, 'brtlvlts1203pl'), contains(service_connection, 'brtlvlts1204pl')) }}:
+                      - task: CopyFilesOverSSH@0
+                        displayName: 'Coping Jar (Payments)'
+                        condition: eq('${{ parameters.skip_deploy }}', false)
+                        inputs:
+                          sshEndpoint: ${{ service_connection }}
+                          sourceFolder: $(System.DefaultWorkingDirectory)/jar
+                          contents: |
+                            xdr-publisher-*.jar
+                          targetFolder: ${{ variables.XDR_PATH }}/xdr-publisher-payments/bin
+                          cleanTargetFolder: false
+                          overwrite: true
+                      - task: CopyFilesOverSSH@0
+                        displayName: 'Coping Jar (Finance)'
+                        condition: eq('${{ parameters.skip_deploy }}', false)
+                        inputs:
+                          sshEndpoint: ${{ service_connection }}
+                          sourceFolder: $(System.DefaultWorkingDirectory)/jar
+                          contents: |
+                            xdr-publisher-*.jar
+                          targetFolder: ${{ variables.XDR_PATH }}/xdr-publisher-finance/bin
+                          cleanTargetFolder: false
+                          overwrite: true
+                
+                    - ${{ if or(contains(service_connection, 'brtlvlts1205pl'), contains(service_connection, 'brtlvlts1206pl')) }}:
+                      - task: CopyFilesOverSSH@0
+                        displayName: 'Coping Jar (Messaging)'
+                        condition: eq('${{ parameters.skip_deploy }}', false)
+                        inputs:
+                          sshEndpoint: ${{ service_connection }}
+                          sourceFolder: $(System.DefaultWorkingDirectory)/jar
+                          contents: |
+                            xdr-publisher-*.jar
+                          targetFolder: ${{ variables.XDR_PATH }}/xdr-publisher-messaging/bin
+                          cleanTargetFolder: false
+                          overwrite: true
+                      - task: CopyFilesOverSSH@0
+                        displayName: 'Coping Jar (Finance)'
+                        condition: eq('${{ parameters.skip_deploy }}', false)
+                        inputs:
+                          sshEndpoint: ${{ service_connection }}
+                          sourceFolder: $(System.DefaultWorkingDirectory)/jar
+                          contents: |
+                            xdr-publisher-*.jar
+                          targetFolder: ${{ variables.XDR_PATH }}/xdr-publisher-finance/bin
+                          cleanTargetFolder: false
+                          overwrite: true
+
+                    - ${{ else }}:
+                      - task: CopyFilesOverSSH@0
+                        displayName: 'Coping Jar (Offers)'
+                        condition: eq('${{ parameters.skip_deploy }}', false)
+                        inputs:
+                          sshEndpoint: ${{ service_connection }}
+                          sourceFolder: $(System.DefaultWorkingDirectory)/jar
+                          contents: |
+                            xdr-publisher-*.jar
+                          targetFolder: ${{ variables.XDR_PATH }}/xdr-publisher-offers/bin
+                          cleanTargetFolder: false
+                          overwrite: true
+                
+                    - task: SSH@0
+                      displayName: "Starting Application"
+                      condition: eq('${{ parameters.skip_deploy }}', false)
+                      inputs:
+                        sshEndpoint: ${{ service_connection }}
+                        runOptions: 'commands'
+                        #failOnStdErr: false
+                        commands: |
+                          sh ${{ variables.XDR_PATH }}/start_todos_xdr.sh
+
+                - ${{ else }}:
+                  - task: SSH@0
+                    displayName: "Stopping Application"
+                    condition: eq('${{ parameters.skip_deploy }}', false)
+                    inputs:
+                      sshEndpoint: ${{ variables.SERVICE_CONNECTION }}
+                      runOptions: 'commands'
+                      #failOnStdErr: false
+                      #continueOnError: true
+                      commands: |
+                        sh ${{ variables.XDR_PATH }}/stop_todos_xdr.sh
+
+                  - task: SSH@0
+                    displayName: "Backup apllication"
+                    condition: eq('${{ parameters.skip_deploy }}', false)
+                    inputs:
+                      sshEndpoint: ${{ variables.SERVICE_CONNECTION }}
+                      runOptions: 'commands'
+                      #failOnStdErr: false
+                      commands: |
+                        sh ${{ variables.XDR_PATH }}/backup_xdr.sh
+
+                  - task: CopyFilesOverSSH@0
+                    name: payments
+                    displayName: 'Coping Jar (Payments)'
+                    condition: eq('${{ parameters.skip_deploy }}', false)
+                    inputs:
+                      sshEndpoint: ${{ variables.SERVICE_CONNECTION }}
+                      sourceFolder: $(System.DefaultWorkingDirectory)/jar
+                      contents: |
+                        xdr-publisher-*.jar
+                      targetFolder: ${{ variables.XDR_PATH }}/xdr-publisher-payments/bin
+                      cleanTargetFolder: false
+                      overwrite: true
+              
+                  - task: CopyFilesOverSSH@0
+                    name: offers
+                    displayName: 'Coping Jar (Offers)'
+                    condition: eq('${{ parameters.skip_deploy }}', false)
+                    inputs:
+                      sshEndpoint: ${{ variables.SERVICE_CONNECTION }}
+                      sourceFolder: $(System.DefaultWorkingDirectory)/jar
+                      contents: |
+                        xdr-publisher-*.jar
+                      targetFolder: ${{ variables.XDR_PATH }}/xdr-publisher-offers/bin
+                      cleanTargetFolder: false
+                      overwrite: true
+              
+                  - task: CopyFilesOverSSH@0
+                    name: messaging
+                    displayName: 'Coping Jar (Messaging)'
+                    condition: eq('${{ parameters.skip_deploy }}', false)
+                    inputs:
+                      sshEndpoint: ${{ variables.SERVICE_CONNECTION }}
+                      sourceFolder: $(System.DefaultWorkingDirectory)/jar
+                      contents: |
+                        xdr-publisher-*.jar
+                      targetFolder: ${{ variables.XDR_PATH }}/xdr-publisher-messaging/bin
+                      cleanTargetFolder: false
+                      overwrite: true
+              
+                  - task: CopyFilesOverSSH@0
+                    name: finance
+                    displayName: 'Coping Jar (Finance)'
+                    condition: eq('${{ parameters.skip_deploy }}', false)
+                    inputs:
+                      sshEndpoint: ${{ variables.SERVICE_CONNECTION }}
+                      sourceFolder: $(System.DefaultWorkingDirectory)/jar
+                      contents: |
+                        xdr-publisher-*.jar
+                      targetFolder: ${{ variables.XDR_PATH }}/xdr-publisher-finance/bin
+                      cleanTargetFolder: false
+                      overwrite: true
+
+                  - task: SSH@0
+                    displayName: "Starting Application"
+                    condition: eq('${{ parameters.skip_deploy }}', false)
+                    inputs:
+                      sshEndpoint: ${{ variables.SERVICE_CONNECTION }}
+                      runOptions: 'commands'
+                      failOnStdErr: false
+                      commands: |
+                        sh ${{ variables.XDR_PATH }}/start_todos_xdr.sh
+                      
+  - stage: RollbackStage
+    displayName: "Rollback Application"
+    dependsOn: DeployStage
+    condition: failed('DeployStage')
+    pool: GeneralPurposeLinuxAgentsCD
+    jobs:
+      - job: RollbackJob
+        displayName: "Rollback Job"
+        variables:
+          - template: /.azuredevops/config/${{ parameters.qa_environment }}/environments_variables.yml@self
+          - template: /.azuredevops/config/${{ parameters.qa_environment }}/server01_variables.yml@self
+        workspace:
+          clean: all
+        steps:
+          - task: UpdateCredentialsEndpointSshFromVivo@4
+            displayName: "Update Service Connection"
+            inputs:
+              sshEndpoint: ${{ variables.SERVICE_CONNECTION }}
+              username: $(get_credentials.SENHA_SEGURA_USERNAME)
+              password: $(DECRYPTED_PASSWORD)
+            env:
+              HTTPS_PROXY: "http://10.240.58.39:3128"
+              PAT: $(AZURE_DEVOPS_PAT)
+          - ${{ if contains(parameters.qa_environment, 'producao') }}:
+            - ${{ each service_connection in split(variables.SERVICE_CONNECTION,',') }}:
+              - ${{ if or(contains(service_connection, 'brtlvlts1203pl'), contains(service_connection, 'brtlvlts1204pl')) }}:
+                - task: SSH@0
+                  displayName: "Rollback Application"
+                  inputs:
+                    sshEndpoint: ${{ service_connection }}
+                    runOptions: 'commands'
+                    failOnStdErr: false
+                    commands: |
+                      sh ${{ variables.XDR_PATH }}/rollback_xdr.sh
+              - ${{ if or(contains(service_connection, 'brtlvlts1205pl'), contains(service_connection, 'brtlvlts1206pl')) }}:
+                - task: SSH@0
+                  displayName: "Rollback Application"
+                  inputs:
+                    sshEndpoint: ${{ service_connection }}
+                    runOptions: 'commands'
+                    failOnStdErr: false
+                    commands: |
+                      sh ${{ variables.XDR_PATH }}/rollback_xdr.sh
+              - ${{ else }}:
+                - task: SSH@0
+                  displayName: "Rollback Application"
+                  inputs:
+                    sshEndpoint: ${{ service_connection }}
+                    runOptions: 'commands'
+                    failOnStdErr: false
+                    commands: |
+                      sh ${{ variables.XDR_PATH }}/rollback_xdr.sh
+          - ${{ else }}:
+              - task: SSH@0
+                displayName: "Rollback Application"
+                inputs:
+                  sshEndpoint: ${{ variables.SERVICE_CONNECTION }}
+                  runOptions: 'commands'
+                  failOnStdErr: false
+                  commands: |
+                    sh ${{ variables.XDR_PATH }}/rollback_xdr.sh

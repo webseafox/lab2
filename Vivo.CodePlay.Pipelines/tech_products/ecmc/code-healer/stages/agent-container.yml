@@ -1,0 +1,157 @@
+parameters:
+  - name: image
+    type: string
+
+steps:
+  - bash: |
+      echo "##[section]#################### INSTALAR UV ####################"
+      if ! command -v uv >/dev/null 2>&1; then
+        python -m pip install --upgrade pip
+        echo "##[debug] Instalando uv==$(UV_VERSION)..."
+        pip install uv==$(UV_VERSION)
+      fi
+    displayName: "Instalar uv"
+    env:
+      UV_VERSION: $(UV_VERSION)
+      http_proxy: $(PROXY_AGENT_HTTP)
+      https_proxy: $(PROXY_AGENT_HTTPS)
+      no_proxy: $(PROXY_AGENT_NO_PROXY)
+
+  - task: PipAuthenticate@1
+    displayName: "Pip Authenticate (feed interno DevOps)"
+    inputs:
+      artifactFeeds: DevOps
+    env:
+      http_proxy: $(PROXY_AGENT_HTTP)
+      https_proxy: $(PROXY_AGENT_HTTPS)
+      no_proxy: $(PROXY_AGENT_NO_PROXY)
+
+  - bash: |
+      echo "##[section]#################### INSTALAR DEPENDÊNCIAS DO AGENTE DE CONTAINER ####################"
+      echo "##[command] uv sync --no-dev --no-cache"
+      uv sync --no-dev --no-cache
+    displayName: "Instalar dependências do agente de container"
+    workingDirectory: "$(CONTAINER_AGENT_PATH)"
+    condition: and(succeeded(), eq(variables['IMAGE_EXISTS'], 'true'))
+
+  - bash: |
+      echo "##[section]#################### INSTALAR TRIVY ####################"
+      TRIVY_BIN_DIR="$(Agent.ToolsDirectory)/trivy/${TRIVY_VERSION}"
+      if [ ! -x "${TRIVY_BIN_DIR}/trivy" ]; then
+        echo "##[debug] Instalando trivy ${TRIVY_VERSION}..."
+        mkdir -p "${TRIVY_BIN_DIR}"
+        curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b "${TRIVY_BIN_DIR}" "${TRIVY_VERSION}"
+      fi
+      echo "##vso[task.prependpath]${TRIVY_BIN_DIR}"
+      "${TRIVY_BIN_DIR}/trivy" --version
+    displayName: "Instalar Trivy"
+    condition: and(succeeded(), eq(variables['IMAGE_EXISTS'], 'true'))
+    env:
+      TRIVY_VERSION: $(TRIVY_VERSION)
+      http_proxy: $(PROXY_AGENT_HTTP)
+      https_proxy: $(PROXY_AGENT_HTTPS)
+      no_proxy: $(PROXY_AGENT_NO_PROXY)
+
+  - bash: |
+      echo "##[section]#################### ESCANEAR VERSÃO CORRIGIDA EXISTENTE NO ACR ####################"
+
+      if [ "$HAS_CORRECTED_IN_ACR" != "true" ] || [ -z "$LATEST_CORRECTED_IMAGE" ]; then
+        echo "##[debug] Nenhuma versão corrigida preexistente no ACR. Prosseguindo com novo ciclo de correção."
+        echo "##vso[task.setvariable variable=ALREADY_FIXED_AND_CLEAN]false"
+        exit 0
+      fi
+
+      echo "##[debug] Versão corrigida encontrada: $LATEST_CORRECTED_IMAGE"
+      echo "##[debug] Realizando pull para scan Trivy..."
+
+      if ! docker pull "$LATEST_CORRECTED_IMAGE" 2>/dev/null; then
+        echo "##vso[task.logissue type=warning]Não foi possível baixar a imagem corrigida existente ($LATEST_CORRECTED_IMAGE). Prosseguindo com novo ciclo de correção."
+        echo "##vso[task.setvariable variable=ALREADY_FIXED_AND_CLEAN]false"
+        exit 0
+      fi
+
+      echo "##[debug] Executando Trivy na imagem corrigida existente..."
+      trivy_output=$(trivy image "$LATEST_CORRECTED_IMAGE" \
+        --format table --severity HIGH,CRITICAL --no-progress --quiet 2>/dev/null || true)
+
+      if echo "$trivy_output" | grep -qE "(HIGH|CRITICAL)"; then
+        echo "##vso[task.logissue type=warning]⚠️  A versão corrigida existente no ACR ($LATEST_CORRECTED_IMAGE) ainda contém vulnerabilidades HIGH/CRITICAL. Um novo ciclo de correção será executado."
+        echo "##[group]Vulnerabilidades detectadas na versão corrigida existente"
+        echo "$trivy_output"
+        echo "##[endgroup]"
+        echo "##vso[task.setvariable variable=ALREADY_FIXED_AND_CLEAN]false"
+      else
+        echo "##[debug] ✅ Versão corrigida existente está limpa: $LATEST_CORRECTED_IMAGE"
+        echo "##vso[task.logissue type=warning]✅ Uma versão corrigida SEM vulnerabilidades já existe no ACR: $LATEST_CORRECTED_IMAGE. Nenhuma nova correção é necessária. Os passos de build, push e create-pr serão ignorados."
+        echo "##vso[task.setvariable variable=ALREADY_FIXED_AND_CLEAN]true"
+      fi
+    displayName: "Escanear versão corrigida existente no ACR (Trivy)"
+    condition: and(succeeded(), eq(variables['IMAGE_EXISTS'], 'true'))
+    env:
+      HAS_CORRECTED_IN_ACR: $(HAS_CORRECTED_IN_ACR)
+      LATEST_CORRECTED_IMAGE: $(LATEST_CORRECTED_IMAGE)
+
+  - bash: |
+      echo "##[section]#################### EXECUTAR CORREÇÃO ####################"
+      set +e
+      echo "##[command] uv run python -m src.main fix --image $IMAGE"
+      uv run python -m src.main fix --image "$IMAGE"
+      fix_exit=$?
+      set -e
+
+      fix_status="error"
+      if [ -f fix.json ]; then
+        fix_status=$(jq -r '.status // "error"' fix.json)
+      fi
+      echo "##[debug] Status da correção: $fix_status (exit code: $fix_exit)"
+      echo "##vso[task.setvariable variable=FIX_STATUS]$fix_status"
+
+      if [ "$fix_status" = "no_changes" ]; then
+        echo "##[debug] Imagem já está limpa; nenhuma correção necessária. Push e create-pr serão ignorados."
+      elif [ "$fix_status" != "success" ]; then
+        echo "##vso[task.logissue type=warning]A correção da imagem não foi concluída; push e create-pr serão ignorados."
+      fi
+
+      if [ "$fix_exit" -ne 0 ]; then
+        echo "##vso[task.logissue type=error]Script de correção falhou (exit code: $fix_exit)."
+        exit "$fix_exit"
+      fi
+    displayName: "Executar correção da imagem"
+    workingDirectory: "$(CONTAINER_AGENT_PATH)"
+    condition: and(succeeded(), eq(variables['IMAGE_EXISTS'], 'true'), ne(variables['ALREADY_FIXED_AND_CLEAN'], 'true'))
+    env:
+      IMAGE: ${{ parameters.image }}
+      COPILOT_API_KEY: $(COPILOT_API_KEY)
+      ARCANE_TEAMS_URL: $(ARCANE_TEAMS_URL)
+      CHAT_ID_TEAMS: $(TEAMS_CHAT_CONTAINER_ID)
+      AZURE_PAT: $(AZURE_TOKEN)
+      AZURE_PROJECT: $(System.TeamProject)
+      MODEL_NAME: $(MODEL_NAME)
+      ENVIRONMENT: production
+      HTTP_PROXY: $(PROXY_AGENT_HTTP)
+      HTTPS_PROXY: $(PROXY_AGENT_HTTPS)
+      NO_PROXY: $(PROXY_AGENT_NO_PROXY)
+
+  - bash: |
+      echo "##[section]#################### Exibir JSON Gerado ####################"
+      if [ -f fix.json ]; then
+        echo "##[debug] Conteúdo do fix.json:"
+        cat fix.json
+      else
+        echo "##[debug] Arquivo fix.json não encontrado."
+      fi
+    displayName: "Exibir JSON gerado"
+    workingDirectory: "$(CONTAINER_AGENT_PATH)"
+    condition: always()
+
+  - bash: |
+      echo "##[section]#################### Exibir Dockerfile Gerado ####################"
+      if [ -f fix.Dockerfile ]; then
+        echo "##[debug] Conteúdo do fix.Dockerfile:"
+        cat fix.Dockerfile
+      else
+        echo "##[debug] Arquivo fix.Dockerfile não encontrado."
+      fi
+    displayName: "Exibir Dockerfile gerado"
+    workingDirectory: "$(CONTAINER_AGENT_PATH)"
+    condition: always()

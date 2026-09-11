@@ -1,0 +1,130 @@
+parameters:
+  - name: qa_environment
+
+stages:
+
+- stage: tag
+  displayName: "TAG"
+  dependsOn:
+  - publish
+  pool: $(PRIVATE_AGENT_SHARED)
+  jobs:
+
+  - job: Tag
+    displayName: "Update Version & TAG"
+    condition: | 
+                and(
+                  always(), 
+                  or (
+                    in(variables['Build.SourceBranch'], 'refs/heads/master', 'refs/heads/release'),
+                    startsWith(variables['Build.SourceBranch'], 'refs/tags/PRE-'),
+                    startsWith(variables['Build.SourceBranch'], 'refs/tags/RELEASE-PRE-')
+                  ),
+                  in('${{ parameters.qa_environment }}', 'preprod', 'release', 'producao')
+                ) 
+    steps:
+    - checkout: self
+      persistCredentials: true
+
+    - task: Bash@3
+      name: tag
+      displayName: 'Tag'
+      condition: succeeded()
+      inputs:
+        targetType: inline
+        script: |
+          # Set Git Config 
+          # Usa System.CollectionUri para extrair a organização
+          COLLECTION_URI="$(System.CollectionUri)"
+          # Remove 'https://' e trailing '/'
+          ORG_PATH=${COLLECTION_URI#https://}
+          ORG_PATH=${ORG_PATH%/}
+          
+          # Extrai apenas o nome da organização
+          ORG_NAME=$(echo "$ORG_PATH" | cut -d'/' -f2)
+          
+          echo "##[debug]Collection: $COLLECTION_URI"
+          echo "##[debug]Organização: $ORG_NAME"
+          
+          # Configura Git com autenticação via System Access Token
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0="url.https://$(System.AccessToken)@dev.azure.com/${ORG_NAME}/.insteadOf"
+          export GIT_CONFIG_VALUE_0="https://${ORG_NAME}@dev.azure.com/${ORG_NAME}/"
+          
+          current_branch=$(echo "$BUILD_SOURCEBRANCH" | awk -F/ '{print $NF}')
+          echo "##[debug]Current branch is: $current_branch"
+
+          # Extract the current version from build number
+          current_version='$(Build.BuildNumber)'
+          echo "##[debug]Current version is: $current_version"
+
+          if [ "$current_branch" == "master" ]; then
+
+            echo "##[debug]Creating Tag PRE."
+
+            new_tag="PRE-"$current_version
+
+            echo "##[debug]Publishing Tag $new_tag"
+            git tag -a $new_tag -m "New PRE tag"
+            
+            if git push origin $new_tag; then
+              echo "##[debug]Published Tag $new_tag"
+            else
+              echo "##[error]Tag pushed with error"
+              echo "##vso[task.complete result=Failed;]"
+            fi
+
+          elif [[ "$current_branch" == "release" ]]; then
+
+            echo "##[debug]Creating Tag RELEASE-PRE."
+
+            new_tag="RELEASE-PRE-"$current_version
+
+            echo "##[debug]Publishing Tag $new_tag"
+            git tag -a $new_tag -m "New RELEASE-PRE tag"
+            
+            if git push origin $new_tag; then
+              echo "##[debug]Published Tag $new_tag"
+            else
+              echo "##[error]Tag pushed with error"
+              echo "##vso[task.complete result=Failed;]"
+            fi
+
+          elif [[ "$current_branch" == RELEASE-PRE-* ]]; then 
+
+            echo "##[debug]Creating Tag RELEASE."
+
+            new_tag="RELEASE-"$current_version
+
+            echo "##[debug]Publishing Tag $new_tag"
+            git tag -a $new_tag -m "New RELEASE tag"
+            
+            if git push origin $new_tag; then
+              echo "##[debug]Published Tag $new_tag"
+            else
+              echo "##[error]Tag pushed with error"
+              echo "##vso[task.complete result=Failed;]"
+            fi          
+
+
+          elif [[ "$current_branch" == PRE-* ]]; then 
+
+            echo "##[debug]Creating Tag PRD."
+
+            new_tag="PRD-"$current_version
+
+            echo "##[debug]Publishing Tag $new_tag"
+            git tag -a $new_tag -m "New PRD tag"
+            
+            if git push origin $new_tag; then
+              echo "##[debug]Published Tag $new_tag"
+            else
+              echo "##[error]Tag pushed with error"
+              echo "##vso[task.complete result=Failed;]"
+            fi          
+          
+          else
+            echo "##[debug]Skipping TAG."
+    
+          fi
+      

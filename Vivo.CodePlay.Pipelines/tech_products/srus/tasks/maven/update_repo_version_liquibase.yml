@@ -1,0 +1,78 @@
+parameters:
+- name: newVersion
+  type: string
+- name: condition
+  type: object
+- name: dockerWorkDir
+  type: string
+  default: $(DOCKER_WORKDIR)
+- name: createGitTag
+  type: boolean
+  default: true
+- name: usePullRequest
+  type: boolean
+  default: false
+
+steps:
+
+- checkout: self
+
+- template: /tech_products/srus/tasks/maven/custom_settings_setup_liquibase.yml
+  parameters:
+    mavenSettingsLocationOutputVarName: "MAVEN_SETTINGS_LOCATION"
+
+- task: AzureKeyVault@2  
+  displayName: 'Getting AKV credentials'
+  timeoutInMinutes: 1
+  retryCountOnTaskFailure: 5  
+  inputs:    
+    azureSubscription: DevOpsSharedResources    
+    KeyVaultName: $(AKV_DEVOPS_NAME)
+    SecretsFilter: 'NEXUS-DEPS-USR, NEXUS-DEPS-PSW'
+  condition: ${{ parameters.condition }}
+
+# ==================================================================
+# [Compliance] Verifica se o repositório está em conformidade com as políticas de configuração
+# ==================================================================
+- task: VivoDevOpsConfigCompliance@1
+  displayName: 'Check DevOps Config Compliance'
+  inputs:
+    workDir: $(Build.SourcesDirectory)/$(Build.Repository.Name)
+    policySets: |
+      image-definition-files
+
+- template: /tech_products/srus/tasks/versioning/update_repo_version_liquibase.yml
+  parameters:
+
+    condition: ${{ parameters.condition }}
+    componentNewVersion: ${{ parameters.newVersion }}
+    createGitTag: ${{ parameters.createGitTag }}
+    bashScript: 
+      content: |   
+        cd $(Build.SourcesDirectory)/$(Build.Repository.Name)
+
+        BUILDER_IMAGE_NAME="builder/java"
+        docker build -t $BUILDER_IMAGE_NAME -f .azuredevops/builder.Dockerfile .
+
+        echo "##[debug] Atualizando versão da library através de container"
+        echo "##[debug] Maven's settings.xml location...: $(MAVEN_SETTINGS_LOCATION)"
+        echo "##[debug] NEW_VERSION...................... :$NEW_VERSION"
+
+        docker run --rm \
+        --user="$(DOCKER_CMD_USERNAME):$(DOCKER_CMD_GROUP)" \
+        --network host \
+        --log-driver none \
+        -e SYSTEM_ACCESSTOKEN="$SYSTEM_ACCESSTOKEN" \
+        -e NEXUS_DEPS_USR="$NEXUS_DEPS_USR" \
+        -e NEXUS_DEPS_PSW="$NEXUS_DEPS_PSW" \
+        -v $(pwd):/app \
+        -v $HOME/.m2:/.m2 \
+        -v $(MAVEN_SETTINGS_LOCATION):/.m2/settings.xml \
+        -w $DOCKER_WORKDIR \
+        $BUILDER_IMAGE_NAME sh -c "mvn -e -X $MAVEN_OPTS versions:set -DnewVersion=${NEW_VERSION} -s /.m2/settings.xml -Dmaven.repo.local=/.m2/repository"
+      envs:
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+        NEXUS_DEPS_USR: $(NEXUS-DEPS-USR)
+        NEXUS_DEPS_PSW: $(NEXUS-DEPS-PSW)
+        NEW_VERSION: ${{ parameters.newVersion }}
+        DOCKER_WORKDIR: ${{ parameters.dockerWorkDir }}

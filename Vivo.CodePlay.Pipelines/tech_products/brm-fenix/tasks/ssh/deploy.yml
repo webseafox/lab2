@@ -1,0 +1,70 @@
+parameters:
+  - name: deployCommandsFile # The name of the file containing the deployment commands.
+  - name: deployLogFile # The name of the log file to store the deployment logs.
+  - name: sshEndpoint # The SSH endpoint to connect to for deployment.
+  - name: displayName
+    default: "Deploy"
+  - name: markerFile # Caminho do arquivo marcador no servidor remoto. Computado antes do SSH para estar disponivel na interpolacao.
+
+steps:
+  - task: SSH@0
+    name: run_deploy
+    displayName: ${{ parameters.displayName }}
+    inputs:
+      sshEndpoint: ${{ parameters.sshEndpoint }} # The SSH endpoint to connect to for deployment.
+      runOptions: "inline" # Specifies that the SSH command will be provided inline.
+      inline: |
+        set -euo pipefail
+
+        # 1. Permissao de leitura/escrita em /tmp para viabilizar limpeza posterior
+        chmod -R a+rw /tmp/ 2>/dev/null || true
+
+        # 2. Arquivo marcador recebido como parametro (computado antes do SSH para interpolacao)
+        MARKER_FILE="${{ parameters.markerFile }}"
+        touch "$MARKER_FILE"
+
+        # 3. Trap: remover comandos e marcador obrigatoriamente ao sair (sucesso ou falha)
+        trap 'rm -frv "$MARKER_FILE" "${{ parameters.deployCommandsFile }}"' EXIT
+
+        echo "##[debug] DEPLOY COMMANDS FILE................: ${{ parameters.deployCommandsFile }}"
+        echo "##[debug] DEPLOY MARKER FILE..................: $MARKER_FILE"
+
+        # Executes the deployment commands from the 'deployCommandsFile' and saves the logs to the 'deployLogFile'.
+        echo "##[command]cat ${{ parameters.deployCommandsFile }} | bash |& tee ${{ parameters.deployLogFile }}.txt"
+        cat ${{ parameters.deployCommandsFile }} | bash |& tee ${{ parameters.deployLogFile }}.txt
+
+        # Reads the deployment logs from the 'deployLogFile' and stores them in the 'DEPLOY_LOGS' variable.
+        DEPLOY_LOGS=""
+        while IFS= read -r line || [[ -n "$line" ]]; do
+          read -r line <<<"${line//[$'\t\r\n']}"
+
+          trim () {
+            local str ellipsis_utf8
+            local -i maxlen
+
+            # use explaining variables; avoid magic numbers
+            str="$*"
+            maxlen="2000"
+            ellipsis_utf8=$'\u2026'
+
+            # only truncate $str when longer than $maxlen
+            if (( "${#str}" > "$maxlen" )); then
+              printf "%s%s\n" "${str:0:$maxlen}" " ${ellipsis_utf8}"
+            else
+              printf "%s\n" "$str"
+            fi
+          }
+
+          line=$(trim $line)
+
+          if [ "${#DEPLOY_LOGS}" -gt 0 ]; then
+            DEPLOY_LOGS+=";$line"
+          else
+            DEPLOY_LOGS+="$line"
+          fi
+        done < ${{ parameters.deployLogFile }}.txt
+
+        # Sets the 'DEPLOY_LOGS' variable as a pipeline variable.
+        echo "##vso[task.setvariable variable=DEPLOY_LOGS;]$DEPLOY_LOGS"
+      readyTimeout: "20000" # The timeout for the SSH connection readiness.
+      failOnStdErr: false # Specifies whether to fail the task if there is an error in the standard error output.

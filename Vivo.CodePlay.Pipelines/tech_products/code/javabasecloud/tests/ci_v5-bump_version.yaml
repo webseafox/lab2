@@ -1,0 +1,135 @@
+
+variables:
+- name: System.debug
+  value: "true"
+
+stages:
+- stage: stage_build
+  displayName: Build
+  # pool: VivoAzureCloudSharedAgents
+  pool: 
+    name: DefaultDevopsAgents
+    demands:
+    - Agent.Name -equals BRTAZLTS0085CO.azagent004
+  jobs:
+  - job: job_build
+    displayName: Build, Unit Test and Pack
+    variables:
+    - name: ASDF_JDK_8
+      value: "adoptopenjdk-8.0.352+8"
+    - name: ASDF_JDK_11
+      value: "openjdk-11.0.2"
+    - name: ASDF_JDK_17
+      value: "openjdk-17.0.2"
+    - name: ASDF_JDK_SAP17
+      value: "sapmachine-17.0.10"
+
+    steps:
+    - checkout: self
+      fetchDepth: 1
+      persistCredentials: true
+
+    - task: AzureKeyVault@2
+      displayName: Secrets from AKV
+      inputs:
+        azureSubscription: 'DevOpsSharedResources'
+        KeyVaultName: 'kv-azdevops-shared'
+        SecretsFilter: 'NEXUS-DEPS-USR, NEXUS-DEPS-PSW, SONARQUBE-TOKEN'
+        RunAsPreJob: true
+
+    - task: XmlParseFromVivo@4
+      displayName: Get pom.xml info
+      name: pom_info
+      inputs:
+        type: 'file'
+        origin: $(Build.SourcesDirectory)/pom.xml
+        jpaths: |
+          var POM_XML_VERSION = .project.version._text
+          var POM_XML_ARTIFACT_ID = .project.artifactId._text
+          var POM_XML_GROUP_ID = .project.groupId._text
+
+    - task: YamlParseFromVivo@4
+      displayName: Get Metadata Info
+      name: catalog_info
+      inputs:
+        type: 'file'
+        origin: $(Build.SourcesDirectory)/catalog-info.yaml
+        jpaths: |
+          var CATALOG_YAML_ACRONYM = .metadata.annotations['techarch.governance-app.acronym']
+          var CATALOG_YAML_MODULE = .metadata.annotations['techarch.governance-app.module']
+          var CATALOG_YAML_SONAR_PROJECT_KEY = .metadata.annotations['sonarqube.org/project-key']
+          var CATALOG_YAML_JAVA_LANGUAGE_VERSION = .metadata.annotations['arqtech.telefonica.com.br/language-version']
+
+    - task: NunjucksInline@4
+      displayName: Bind 'ASDF_JAVA_VERSION'
+      inputs:
+        sourceType: 'text'
+        source: |
+          var ASDF_JAVA_VERSION = {{ ASDF_JDK_$(CATALOG_YAML_JAVA_LANGUAGE_VERSION) }}
+
+    - task: SemverIncrementCustomFromVivo@5
+      displayName: Semver Increment 'patch'
+      name: new_version
+      continueOnError: false
+      inputs:
+        currentversion: $(POM_XML_VERSION)
+        outputVariableName: "NEW_VERSION"
+        releaseType: "patch"
+        template: "${NEW_COERCED_VERSION}"
+    
+    - task: Maven@3
+      displayName: "Maven versions:set"
+      env:
+        ASDF_JAVA_VERSION: $(ASDF_JAVA_VERSION)
+        NEXUS_DEPS_USR: $(NEXUS-DEPS-USR)
+        NEXUS_DEPS_PSW: $(NEXUS-DEPS-PSW)
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+        
+      inputs:
+          options: >
+            -s /home/svc_devopscorp/.m2/settings.xml
+            -Dmaven.test.skip=true 
+            -DnewVersion=$(new_version.NEW_VERSION)
+          mavenPomFile: $(Build.SourcesDirectory)/pom.xml
+          mavenOptions: '-Xmx3072m'
+          javaHomeOption: 'JDKVersion'
+          goals: 'versions:set'
+
+    - task: XmlParseFromVivo@4
+      displayName: Get New pom.xml info
+      name: pom_info_new
+      inputs:
+        type: 'file'
+        origin: $(Build.SourcesDirectory)/pom.xml
+        jpaths: |
+          var POM_XML_VERSION      =  .project.version._text
+
+    - task: Bash@3
+      displayName: Commit new version
+      name: commit_new_version
+      continueOnError: false
+      inputs:
+        targetType: inline
+        script: |-
+          git stash save pom.xml
+          git clean -fdX
+          
+          # export TAG="${POM_XML_VERSION:4}+$(date -u +"%Y%m%d%H%M")-${BUILD_SOURCEBRANCHNAME}-${BUILD_BUILDID}"
+
+          export TAG="${POM_XML_VERSION}"
+
+          echo "##[command] git checkout ${BUILD_SOURCEBRANCHNAME} --"
+          git fetch
+          git checkout ${BUILD_SOURCEBRANCHNAME} --
+          git pull --rebase origin ${BUILD_SOURCEBRANCHNAME}
+          git stash pop
+
+          echo "##[command] git commit"
+          git add pom.xml
+          git commit -m "[skip ci] CodePlay bump version ${TAG}"
+
+          echo "##[command]git tag ${TAG}"
+          git tag ${TAG} -m "Version has been updated to ${TAG}"
+
+          echo "##[command] git push origin ${BUILD_SOURCEBRANCHNAME}"
+          git push origin --tags ${BUILD_SOURCEBRANCHNAME}

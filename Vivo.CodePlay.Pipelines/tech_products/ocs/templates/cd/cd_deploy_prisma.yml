@@ -1,0 +1,323 @@
+parameters:
+  - name: components_to_install
+  - name: qa_environment
+  - name: skip_deploy
+  - name: version_to_install
+
+stages:
+  - stage: deploy
+    displayName: "Deploy ${{ parameters.qa_environment }}"
+    dependsOn:
+      - package
+    pool: $(PRIVATE_AGENT_DEFAULT)
+    jobs:
+      - job: bundles_to_install
+        displayName: Select Bundles
+        condition: eq('${{ parameters.skip_deploy }}', false)
+        steps:
+          - download: none
+          - checkout: self
+
+          ## ARTIFACTS ANOTHER BUILD ID
+          - ${{ if startsWith(variables['Build.SourceBranch'], 'refs/tags') }}:
+              - bash: |
+                  build_id=$(yq '.buildId' $(Build.SourcesDirectory)/.azuredevops/build.yaml)
+                  echo "##vso[task.setvariable variable=BUILD_ID]$build_id"
+                  echo "##[debug] Exporting variable 'BUILD_ID': $build_id"
+                name: export_build_id
+                displayName: Extract Build ID
+
+              - task: DownloadBuildArtifacts@1
+                displayName: "Download Specific Build Artifact"
+                inputs:
+                  buildType: specific
+                  project: "$(PROJECT_NAME)"
+                  pipeline: "$(PIPELINE_NAME)"
+                  buildVersionToDownload: specific
+                  buildId: "$(BUILD_ID)"
+                  artifactName: "bundles"
+                  downloadPath: "$(System.ArtifactsDirectory)"
+
+          ## ARTIFACTS CURRENT BUILD ID
+          - ${{ else }}:
+              - task: DownloadBuildArtifacts@1
+                displayName: "Download Pipeline Artifact"
+                inputs:
+                  buildType: current
+                  artifactName: "bundles"
+                  downloadPath: "$(System.ArtifactsDirectory)"
+
+          - task: Bash@3
+            name: package_bundles
+            displayName: "Package Bundles"
+            inputs:
+              targetType: inline
+              script: |
+                mkdir bundles_temp_dir
+                tar -xmf $(System.ArtifactsDirectory)/bundles/bundles.tar -C bundles_temp_dir
+                mkdir selected_bundles
+                for file in $(echo ${{parameters.components_to_install}} | tr "," "\n")
+                do
+                  cp bundles_temp_dir/$file-${{parameters.version_to_install}}.* selected_bundles/    
+                  
+                  if [ -f selected_bundles/$file-${{parameters.version_to_install}}.* ]; then
+                    echo "##[debug] The copy of the $file file was successful."
+                  else
+                    echo "##[error] Error: The copy of the $file file failed."
+                    echo "##vso[task.complete result=Failed;]"
+                    echo "##vso[task.setvariable variable=INVALID_COMPONENT_TO_INSTALL;isOutput=true;]true"
+                    echo "##[debug] Exporting variable 'INVALID_COMPONENT_TO_INSTALL': true"                                            
+
+                    exit 1
+                  fi                 
+                done
+
+                echo "##[debug] Copy new_component"
+                cp new_component selected_bundles
+                echo "##[debug] List selected bundles:"
+                ls -la selected_bundles
+
+                echo "##vso[task.setvariable variable=INVALID_COMPONENT_TO_INSTALL;isOutput=true;]false"
+                echo "##[debug] Exporting variable 'INVALID_COMPONENT_TO_INSTALL': false"
+
+          - task: CopyFiles@2
+            displayName: Copy Bundles Files Staging Directory
+            inputs:
+              SourceFolder: "$(System.DefaultWorkingDirectory)/selected_bundles"
+              Contents: |
+                new_component
+                *.zip
+              TargetFolder: "$(Build.ArtifactStagingDirectory)"
+              CleanTargetFolder: true
+              OverWrite: true
+              flattenFolders: true
+
+          - task: PublishBuildArtifacts@1
+            displayName: Publish Bundles Artifacts
+            inputs:
+              PathtoPublish: "$(Build.ArtifactStagingDirectory)"
+              ArtifactName: bundles
+              StoreAsTar: true
+
+      - deployment: ${{ parameters.qa_environment }}
+        displayName: Deploy Bundles
+        dependsOn:
+          - bundles_to_install
+
+        variables:
+          - template: /.azuredevops/config/${{ parameters.qa_environment }}/server_variables.yml@self
+          - name: deploy_app_folder
+            value: "/home/prisma/deploy_app"
+          - name: current_date
+            value: $[ format('{0:yyyy}.{0:MM}.{0:dd}', pipeline.startTime) ]
+          - name: backup_datetime
+            value: $[ format('{0:yyyy}{0:MM}{0:dd}{0:HH}{0:mm}{0:ss}', pipeline.startTime) ]
+        condition: and(
+          succeeded(),
+          eq('${{ parameters.skip_deploy }}', false)
+          )
+        workspace:
+          clean: all
+        ${{ if or(contains(parameters.qa_environment, 'teste'), contains(parameters.qa_environment, 'lab')) }}:
+          environment:
+            name: "deploy-prisma-${{ parameters.qa_environment }}"
+            resourceType: VirtualMachine
+        ${{ else }}:
+          environment: "deploy-${{ parameters.qa_environment }}"
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: none
+                - checkout: none
+
+                - task: DownloadBuildArtifacts@1
+                  displayName: "Download Pipeline Artifact"
+                  inputs:
+                    buildType: current
+                    artifactName: "bundles"
+                    downloadPath: "$(System.ArtifactsDirectory)"
+
+                - template: /tech_products/ocs/templates/cd/prisma/cd_create_backup.yml
+                  parameters:
+                    service_connection: ${{ variables.SERVICE_CONNECTION }}
+                    backup_datetime: ${{ variables.backup_datetime }}
+                    deploy_app_folder: ${{ variables.deploy_app_folder }}
+
+                - template: /tech_products/ocs/templates/cd/prisma/cd_stop_application.yml
+                  parameters:
+                    qa_environment: ${{ parameters.qa_environment }}
+                    service_connection: ${{ variables.SERVICE_CONNECTION }}
+                    deploy_app_folder: ${{ variables.deploy_app_folder }}
+
+                - template: /tech_products/ocs/templates/cd/prisma/cd_install_bundles.yml
+                  parameters:
+                    version_to_install: ${{ parameters.version_to_install }}
+                    service_connection: ${{ variables.SERVICE_CONNECTION }}
+                    deploy_app_folder: ${{ variables.deploy_app_folder }}
+
+                - template: /tech_products/ocs/templates/cd/prisma/cd_start_application.yml
+                  parameters:
+                    qa_environment: ${{ parameters.qa_environment }}
+                    service_connection: ${{ variables.SERVICE_CONNECTION }}
+                    deploy_app_folder: ${{ variables.deploy_app_folder }}
+
+                - task: SSH@0
+                  displayName: "Load Configs"
+                  inputs:
+                    sshEndpoint: ${{ variables.SERVICE_CONNECTION }}
+                    runOptions: inline
+                    failOnStdErr: false
+                    inline: |
+                      ${{ variables.deploy_app_folder }}/prisma_azuredevops_load_configs.sh
+                      sleep 60    
+
+      - deployment: rollback_${{ parameters.qa_environment }}
+        displayName: Rollback Bundles
+
+        dependsOn:
+          - bundles_to_install
+          - ${{ parameters.qa_environment }}
+
+        variables:
+          - template: /.azuredevops/config/${{ parameters.qa_environment }}/server_variables.yml@self
+          - name: deploy_app_folder
+            value: "/home/prisma/deploy_app"
+          - name: INVALID_COMPONENT_TO_INSTALL
+            value: $[ dependencies.bundles_to_install.outputs['package_bundles.INVALID_COMPONENT_TO_INSTALL'] ]
+          - name: current_date
+            value: $[ format('{0:yyyy}.{0:MM}.{0:dd}', pipeline.startTime) ]
+          - name: backup_datetime
+            value: $[ dependencies.${{ parameters.qa_environment }}.outputs['set_backup_datetime.backup_datetime'] ]
+
+        condition: and(failed(), eq(variables.INVALID_COMPONENT_TO_INSTALL, false), eq('${{ parameters.skip_deploy }}', false))
+
+        ${{ if or(contains(parameters.qa_environment, 'teste'), contains(parameters.qa_environment, 'lab')) }}:
+          environment:
+            name: "deploy-prisma-${{ parameters.qa_environment }}"
+            resourceType: VirtualMachine
+        ${{ else }}:
+          environment: "deploy-${{ parameters.qa_environment }}"
+
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: none
+                - checkout: none
+
+                - task: DownloadBuildArtifacts@1
+                  displayName: "Download Pipeline Artifact"
+                  inputs:
+                    buildType: current
+                    artifactName: "bundles"
+                    downloadPath: "$(System.ArtifactsDirectory)"
+
+                - template: /tech_products/ocs/templates/cd/prisma/cd_stop_application.yml
+                  parameters:
+                    qa_environment: ${{ parameters.qa_environment }}
+                    service_connection: ${{ variables.SERVICE_CONNECTION }}
+                    deploy_app_folder: ${{ variables.deploy_app_folder }}
+
+                - template: /tech_products/ocs/templates/cd/prisma/cd_rollback.yml
+                  parameters:
+                    backup_datetime: ${{ variables.backup_datetime }}
+                    service_connection: ${{ variables.SERVICE_CONNECTION }}
+                    deploy_app_folder: ${{ variables.deploy_app_folder }}
+
+                - template: /tech_products/ocs/templates/cd/prisma/cd_start_application.yml
+                  parameters:
+                    qa_environment: ${{ parameters.qa_environment }}
+                    service_connection: ${{ variables.SERVICE_CONNECTION }}
+                    deploy_app_folder: ${{ variables.deploy_app_folder }}
+
+                - task: SSH@0
+                  displayName: "Load Configs"
+                  inputs:
+                    sshEndpoint: ${{ variables.SERVICE_CONNECTION }}
+                    runOptions: inline
+                    failOnStdErr: false
+                    inline: |
+                      ${{ variables.deploy_app_folder }}/prisma_azuredevops_load_configs.sh
+                      sleep 60    
+
+      - job: manual_rollback_${{ parameters.qa_environment }}
+        displayName: Manual Rollback Bundles
+        pool: server
+        variables:
+          - template: /.azuredevops/config/${{ parameters.qa_environment }}/server_variables.yml@self
+        dependsOn:
+          - bundles_to_install
+          - rollback_${{ parameters.qa_environment }}
+        condition: and(
+          failed('rollbacks'),
+          eq('${{ parameters.skip_deploy }}', false)
+          )
+        steps:
+          - task: ManualValidation@0
+            inputs:
+              notifyUsers: "vinicius.silva1@telefonica.com"
+              instructions: "Instruções: service conn - ${{ variables.SERVICE_CONNECTION }}"
+              onTimeout: "resume"
+
+      - job: governance_deploy
+        displayName: Governance Deploy
+        pool: $(PRIVATE_AGENT_DEFAULT)
+
+        dependsOn:
+        - ${{ parameters.qa_environment }}
+        condition: and(succeeded(), eq('${{ parameters.skip_deploy }}', false))
+        steps:
+          - download: none
+          - checkout: self
+
+          - script: |
+              if [ ! -f "catalog-info.yaml" ]; then
+                echo "##vso[task.logissue type=error] Unable to find catalog-info.yaml file (path=$(pwd))."
+              fi
+
+              COMPONENT_NAME="$(yq -r 'select(documentIndex == 0) | .metadata.name | select (.!=null)' catalog-info.yaml)"
+              echo "##vso[task.setvariable variable=COMPONENT_NAME]${COMPONENT_NAME}"
+              echo "##vso[task.setvariable variable=CATALOG_INFO_FILE_CONTENT]$(cat catalog-info.yaml)"
+            name: export_catalog_info
+            displayName: Reading Catalog Info File
+
+          - bash: |
+              version=$(grep version il-gtw/pom.xml | grep -v '<?xml' | grep '<version>'|head -n 1|awk '{print $1}'| cut -d'>' -f 2 | cut -d'<' -f 1)
+              echo "##vso[task.setvariable variable=APP_VERSION]$version"
+              echo "##[debug] Exporting variable 'APP_VERSION': $version"
+            name: export_current_version
+            displayName: Extract App Version
+
+          ## DEPLOY TO PROD
+          - ${{ if startsWith(parameters.qa_environment, 'producao') }}:
+              - task: VivoGovernance@1
+                inputs:
+                  breakglass: $(GOVAPP_BREAK_GLASS)
+                  cluster: "$(GOVAPP_CLUSTER)"
+                  component: "$(COMPONENT_NAME)"
+                  deployment: "$(COMPONENT_NAME)"
+                  environment: "producao"
+                  namespace: "$(GOVAPP_NAMESPACE)"
+                  operation: "deploy"
+                  serverEndpoint: $(GOVAPP_SERVICE_CONNECTION_NAME)
+                  version: "$(APP_VERSION)"
+                  catalogInfo: $(CATALOG_INFO_FILE_CONTENT)
+                continueOnError: true
+                condition: eq(lower(variables.GOVAPP_INTEGRATION_ENABLED), 'true')
+
+          - ${{ else }}:
+              - task: VivoGovernance@1
+                inputs:
+                  breakglass: $(GOVAPP_BREAK_GLASS)
+                  cluster: "$(GOVAPP_CLUSTER)"
+                  component: "$(COMPONENT_NAME)"
+                  deployment: "$(COMPONENT_NAME)"
+                  environment: "${{ parameters.qa_environment }}"
+                  namespace: "$(GOVAPP_NAMESPACE)"
+                  operation: "deploy"
+                  serverEndpoint: $(GOVAPP_SERVICE_CONNECTION_NAME)
+                  version: "$(APP_VERSION)"
+                  catalogInfo: $(CATALOG_INFO_FILE_CONTENT)
+                continueOnError: true
+                condition: eq(lower(variables.GOVAPP_INTEGRATION_ENABLED), 'true')

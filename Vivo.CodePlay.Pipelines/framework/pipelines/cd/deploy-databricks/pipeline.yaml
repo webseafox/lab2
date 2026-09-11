@@ -1,0 +1,353 @@
+# ==================================================================
+# Pipeline: Deploy Databricks Data Products - CD de Data Assets e Bundles
+# -----------------------------------------------------
+# Pipeline de CD para deploy automatizado de produtos de dados em Databricks,
+# utilizando Data Assets Engine e Databricks CLI para validação e deploy de bundles.
+# Organizado em estágios modulares para facilitar troubleshooting e rastreabilidade.
+# ==================================================================
+
+parameters:
+  # ==================================================================
+  # Infraestrutura e Ambiente
+  # ==================================================================
+  - name: agentPool
+    type: string
+    default: GeneralPurposeLinuxAgentsCD
+    displayName: 'Agent Pool para execução'
+
+  - name: environment
+    type: string
+    default: dev
+    displayName: 'Ambiente de destino para deployment'
+    values:
+      - dev
+      - prod
+
+  - name: timeoutInMinutes
+    type: number
+    default: 60
+    displayName: 'Timeout em minutos para deployment'
+  # ==================================================================
+  # Configuração de Python e Feed
+  # ==================================================================
+  - name: feedName
+    type: string
+    default: ''
+    displayName: 'Nome do feed do Azure Artifacts'
+
+  - name: projectScopedFeed
+    type: boolean
+    default: true
+    displayName: 'Usar feed com escopo do projeto (true) ou organização (false)'
+
+  # ==================================================================
+  # Versionamento / Fonte
+  # ==================================================================
+  - name: version
+    type: string
+    displayName: 'Versão/Tag para deployment'
+    default: ''
+
+  # ==================================================================
+  # Configurações Databricks
+  # ==================================================================
+  - name: databricksToken
+    type: string
+    default: ''
+    displayName: 'Token Databricks (parameters.databricksToken).'
+
+  # ==================================================================
+  # Configurações de contratos de dados
+  # ==================================================================
+  - name: runDataContracts
+    type: boolean
+    default: true
+    displayName: 'Executar a aplicação de contratos de dados via Data Assets Engine'
+    
+# ==================================================================
+# Estágios do Pipeline
+# ==================================================================
+stages:
+  # ----------------------------------------------------------------
+  # Stage 1: Preparation - Descobrir versão
+  # ----------------------------------------------------------------
+  - stage: Preparation
+    displayName: 'Preparação do Ambiente'
+    pool: ${{ parameters.agentPool }}
+    jobs:
+      - job: PreparationAndValidation
+        displayName: 'Setup e Definição da Versão'
+        steps:
+          # Exibe parâmetros do pipeline se debug ativado
+          - ${{ if eq(variables['System.Debug'], 'true') }}:
+              - task: VivoUtilsFromVivo@1
+                displayName: 'Show Pipeline Parameters'
+                inputs:
+                  command: 'show-pipeline-parameters'
+                  parameters: '${{ convertToJson(parameters) }}'
+
+          # Adiciona tags para rastreio de deploy
+          - script: |
+              echo "##vso[build.addbuildtag]databricks"
+              echo "##vso[build.addbuildtag]deploy-databricks"
+              echo "##vso[build.addbuildtag]${{ parameters.environment }}"
+            displayName: 'Set Pipeline Execution Tags'
+
+          # Descobre última versão disponível
+          - task: VersionManagerVivo@8
+            inputs:
+              command: 'getLatestVersion'
+            displayName: 'Get Latest Version'
+
+          # Determina versão a usar (param vs latest)
+          - script: |
+              echo "##[section]Determinando versão para deployment..."
+              echo "Versão do parâmetro: ${VERSION_PARAM}"
+              echo "Última versão disponível: ${LATEST_VERSION}"
+
+              if [ "${VERSION_PARAM}" = "getLatestVersion()" ] || [ -z "${VERSION_PARAM}" ]; then
+                VERSION_TO_USE="${LATEST_VERSION}"
+                echo "##[section]Usando última versão: ${VERSION_TO_USE}"
+              else
+                VERSION_TO_USE="${VERSION_PARAM}"
+                echo "##[section]Usando versão especificada: ${VERSION_TO_USE}"
+              fi
+
+              echo "##vso[task.setvariable variable=DEPLOY_VERSION]${VERSION_TO_USE}"
+              echo "##vso[task.setvariable variable=DEPLOY_VERSION;isOutput=true]${VERSION_TO_USE}"
+              echo "##vso[build.updatebuildnumber]deploy-dbx-${VERSION_TO_USE}-${{ parameters.environment }}"
+            displayName: 'Determine Version to Deploy'
+            name: setDeployVersion
+            env:
+              LATEST_VERSION: $(VersionManagerVivo.LATEST_VERSION)
+              VERSION_PARAM: ${{ parameters.version }}
+
+  # ----------------------------------------------------------------
+  # Stage 2: Deploy Databricks
+  # ----------------------------------------------------------------
+  - stage: DeployDatabricks
+    displayName: 'Deploy SDKs Databricks (${{ parameters.environment }})'
+    dependsOn: Preparation
+    condition: succeeded()
+    jobs:
+    - deployment: DatabricksDeployment
+      timeoutInMinutes: ${{ parameters.timeoutInMinutes }}
+      displayName: 'Deploy Databricks to ${{ parameters.environment }}'
+      environment:
+        name: deploy-${{ parameters.environment }}
+      pool: ${{ parameters.agentPool }}
+      variables:
+        DEPLOY_VERSION: $[ stageDependencies.Preparation.PreparationAndValidation.outputs['setDeployVersion.DEPLOY_VERSION'] ]
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+              - checkout: none
+              
+              - script: |
+                  echo "##[section]Configuração do ambiente Databricks:"
+                  echo "Ambiente lógico: ${{ parameters.environment }}"
+                  echo "Versão: ${DEPLOY_VERSION}"
+                displayName: 'Environment Settings Information'
+
+              # Baixa e prepara artefato
+              # Nota: O uso do curl foi adotado conforme orientação do time de DevOps, pois é necessário obter o pacote .tar.gz,
+              # descompactá-lo e manipular seu conteúdo para o processo de deploy no Databricks.
+              # Esta abordagem é provisória e será revisada em versões futuras para adoção de métodos mais seguros e padronizados (ex: PipAuthenticate/pip download).
+              - script: | #shell
+                  SIGLA=$(echo "$(System.TeamProject)" | awk '{print tolower($1)}')
+                  FEED_NAME=$(echo "$SIGLA" | tr '[:lower:]' '[:upper:]')
+                  echo "##[section]Baixando artefato do feed PyPI do Azure Artifacts"
+                  echo "##[debug] Nome do artefato: ${REPOSITORY_NAME}"
+                  echo "##[debug] Versão do deploy: ${DEPLOY_VERSION}"
+                  echo "##[debug] Projeto com escopo de feed: ${PROJECT_SCOPED_FEED}"
+                  echo "##[debug] Nome do feed: ${FEED_NAME}"
+                  echo "##[debug] Project ID: ${PROJECT_ID}"
+                  REPOSITORY_NAME_SANITIZED=$(echo "${REPOSITORY_NAME}" | sed -E 's/[^a-zA-Z0-9_]+/_/g')
+                  
+                  echo "##vso[task.setvariable variable=REPOSITORY_NAME_SANITIZED]$REPOSITORY_NAME_SANITIZED"
+
+                  echo "##[debug] Configurando feed com escopo do projeto"
+                  FEED_URL="https://pkgs.dev.azure.com/telefonica-vivo-brasil/${PROJECT_ID}/_packaging/${FEED_NAME}/pypi"
+
+                  echo "##[debug] FEED_URL: ${FEED_URL}"
+                  
+                  curl -X GET -u "AzureDevOps:$(System.AccessToken)" \
+                    "${FEED_URL}/download/${REPOSITORY_NAME}/${DEPLOY_VERSION}/${REPOSITORY_NAME_SANITIZED}-${DEPLOY_VERSION}.tar.gz" \
+                    -H "Cache-Control: no-cache, no-store" \
+                    -L -o ${REPOSITORY_NAME_SANITIZED}-${DEPLOY_VERSION}.tar.gz
+
+                  curl -X GET -u "AzureDevOps:$(System.AccessToken)" \
+                    "${FEED_URL}/download/${REPOSITORY_NAME}/${DEPLOY_VERSION}/${REPOSITORY_NAME_SANITIZED}-${DEPLOY_VERSION}-py3-none-any.whl" \
+                    -H "Cache-Control: no-cache, no-store" \
+                    -L -o ${REPOSITORY_NAME_SANITIZED}-${DEPLOY_VERSION}-py3-none-any.whl
+
+                  echo "##[section]Descompactando artefato ${REPOSITORY_NAME_SANITIZED}-${DEPLOY_VERSION}.tar.gz"
+                  tar -xzvf ${REPOSITORY_NAME_SANITIZED}-${DEPLOY_VERSION}.tar.gz
+                  echo "Conteúdo do diretório após descompactação:"
+                  ls -lha ./
+                  echo "##[debug] diretório atual:"
+                  pwd
+
+                  echo "##[section]Movendo artefato .whl para $(System.DefaultWorkingDirectory)/${REPOSITORY_NAME_SANITIZED}-${DEPLOY_VERSION}/dist/"
+                  mkdir -p ${REPOSITORY_NAME_SANITIZED}-${DEPLOY_VERSION}/dist
+                  mv $(System.DefaultWorkingDirectory)/${REPOSITORY_NAME_SANITIZED}-${DEPLOY_VERSION}-py3-none-any.whl $(System.DefaultWorkingDirectory)/${REPOSITORY_NAME_SANITIZED}-${DEPLOY_VERSION}/dist/
+                  ls -lha ${REPOSITORY_NAME_SANITIZED}-${DEPLOY_VERSION}/dist
+                  cd $(System.DefaultWorkingDirectory)/${REPOSITORY_NAME_SANITIZED}-${DEPLOY_VERSION}
+                  # Corrigindo as datas do arquivo para a data atual (anteriormente sendo preechida como 31/12/1969)
+                  find . -type f -exec touch {} +
+                  echo "##[debug] Verificando arquivos que serão utilizados no deploy do Bundle:"
+                  ls -lha ./
+                displayName: 'Download from feed'
+                env:
+                  SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+                  PROJECT_SCOPED_FEED: ${{ parameters.projectScopedFeed }}
+                  PROJECT_ID: $(System.TeamProjectId)
+                  REPOSITORY_NAME: $(Build.Repository.Name)
+
+              # -----------------------------------------------------
+              # Instala python + projeto para validação e deploy do bundle
+              # -----------------------------------------------------
+              # Valida a instalação do Databricks CLI (deve ser >=0.17.0 para suporte a bundles)
+              - script: |
+                  cd $(System.DefaultWorkingDirectory)/${REPOSITORY_NAME_SANITIZED}-${DEPLOY_VERSION}
+                  databricks version || databricks -v || true
+                displayName: 'Validação da versão do Databricks CLI'
+
+              # Instala pip, poetry e dependências do projeto            
+              - script: |
+                  SIGLA=$(echo "$(System.TeamProject)" | awk '{print tolower($1)}')
+                  DEFAULT_FEED_NAME=$(echo "$SIGLA" | tr '[:lower:]' '[:upper:]')
+
+                  export POETRY_HTTP_BASIC_${DEFAULT_FEED_NAME}_USERNAME='AzureDevOps' # Nome de usuário fixo para Azure Artifacts
+                  export POETRY_HTTP_BASIC_${DEFAULT_FEED_NAME}_PASSWORD="${AZDO_FEED_PASSWORD}"
+                  # Para libs no feed compartilhado do DevOps
+                  export POETRY_HTTP_BASIC_DEVOPS_USERNAME='AzureDevOps' # Nome de usuário fixo para Azure Artifacts
+                  export POETRY_HTTP_BASIC_DEVOPS_PASSWORD="${AZDO_FEED_PASSWORD}"
+                  export PIP_INDEX_URL="https://AzureDevOps:${AZDO_FEED_PASSWORD}@pkgs.dev.azure.com/telefonica-vivo-brasil/_packaging/DevOps/pypi/simple/"
+
+                  cd $(System.DefaultWorkingDirectory)/${REPOSITORY_NAME_SANITIZED}-${DEPLOY_VERSION}
+                  pwd
+                  echo "##[section]Instalando pip e poetry"
+                  python -m pip install --upgrade pip
+                  pip install poetry keyring artifacts-keyring
+
+                  echo "##[section]Instalando dependências do projeto"
+                  poetry install
+                env:
+                  TMPDIR: $(Agent.TempDirectory)
+                  POETRY_CACHE_DIR: $(Agent.TempDirectory)/.cache/pypoetry
+                  POETRY_VIRTUALENVS_PATH: $(Agent.TempDirectory)/.venvs
+                  AZDO_FEED_PASSWORD: $(System.AccessToken) # Token do sistema para autenticação no Azure Artifacts
+                displayName: 'Instalando dependências do projeto'
+
+              - script: |
+                  if [[ -n "$DATABRICKS_CLIENT_SECRET" ]]; then
+                    unset DATABRICKS_TOKEN
+                  else 
+                    unset DATABRICKS_CLIENT_ID
+                    unset DATABRICKS_CLIENT_SECRET
+                  fi
+
+                  if [[ -f "$(Build.SourcesDirectory)/.databrickscfg" ]]; then
+                    rm -rf "$(Build.SourcesDirectory)/.databrickscfg"
+                  fi
+
+                  if [[ -f "$HOME/.databrickscfg" ]]; then
+                    rm -rf "$HOME/.databrickscfg"
+                  fi
+                  
+                  ARTIFACT_DIR="$(System.DefaultWorkingDirectory)/${REPOSITORY_NAME_SANITIZED}-$(DEPLOY_VERSION)"
+                  export DATABRICKS_HOST=$(yq ".targets.${ENVIRONMENT}.workspace.host" "${ARTIFACT_DIR}/databricks.yml")
+                  databricks --profile ${ENVIRONMENT} auth describe
+                displayName: 'Verificando a forma de autenticação'
+                env:
+                  DATABRICKS_TOKEN: $(databricksToken)
+                  DATABRICKS_CLIENT_ID: $(client_id)
+                  DATABRICKS_CLIENT_SECRET: $(secret)
+                  DATABRICKS_BUNDLE_TARGET: ${{ parameters.environment }}
+                  ENVIRONMENT: ${{ parameters.environment }}
+
+              # -----------------------------------------------------
+              # Aplicação de contratos de dados via Data Assets Engine
+              # -----------------------------------------------------
+              # Executa Data Assets Engine para contratos de dados
+              - ${{ if eq(parameters.runDataContracts, true) }}:
+                - script: |
+                    if [[ -n "$DATABRICKS_CLIENT_SECRET" ]]; then
+                      unset DATABRICKS_TOKEN
+                    else 
+                      unset DATABRICKS_CLIENT_ID
+                      unset DATABRICKS_CLIENT_SECRET
+                    fi
+
+                    export PATH="$(Build.SourcesDirectory)/bin:${PATH}"
+                    cd $(System.DefaultWorkingDirectory)/${REPOSITORY_NAME_SANITIZED}-${DEPLOY_VERSION}
+                    echo "##[section]Executando Data Assets Engine para contratos de dados"
+                    DATA_CONTRACTS=$(find data_contracts -type f -name "*.yml" 2>/dev/null || true)
+
+                    # python -m pip install --upgrade pip
+                    # python -m pip install poetry
+
+                    if [ -z "${DATA_CONTRACTS}" ]; then
+                      echo "##[warning]Nenhum contrato de dados encontrado em data_contracts/**/*.yml"
+                    else
+                      for DATA_CONTRACT in ${DATA_CONTRACTS}; do
+                        echo "Aplicando contrato de dados: ${DATA_CONTRACT}"
+                        poetry run da-engine run-flow-datacontract \
+                          --contract "${DATA_CONTRACT}" \
+                          --environment "${ENVIRONMENT}"
+                      done
+                    fi
+                  displayName: 'Apply Data Contracts with Data Assets Engine'
+                  env:
+                    TMPDIR: $(Agent.TempDirectory)
+                    POETRY_CACHE_DIR: $(Agent.TempDirectory)/.cache/pypoetry
+                    POETRY_VIRTUALENVS_PATH: $(Agent.TempDirectory)/.venvs
+                    DATABRICKS_TOKEN: $(databricksToken)
+                    DATABRICKS_CLIENT_ID: $(client_id)
+                    DATABRICKS_CLIENT_SECRET: $(secret)
+                    DATABRICKS_BUNDLE_TARGET: ${{ parameters.environment }}
+                    ENVIRONMENT: ${{ parameters.environment }}
+
+
+              # -----------------------------------------------------
+              # 2) Databricks Bundle
+              # -----------------------------------------------------
+              - script: |
+                  if [[ -n "$DATABRICKS_CLIENT_SECRET" ]]; then
+                    unset DATABRICKS_TOKEN
+                  else 
+                    unset DATABRICKS_CLIENT_ID
+                    unset DATABRICKS_CLIENT_SECRET
+                  fi
+
+                  echo "##[section]Validando e deployando Databricks Bundle"
+                  cd $(System.DefaultWorkingDirectory)/${REPOSITORY_NAME_SANITIZED}-${DEPLOY_VERSION}
+                  echo "##[debug] databricks bundle validate"
+                  databricks bundle validate --target "${ENVIRONMENT}"
+
+                  echo "##[debug] databricks bundle deploy"
+                  if [ "${SYSTEM_DEBUG,,}" == "true" ]; then
+                    databricks bundle deploy --target "${ENVIRONMENT}" --debug
+                  else
+                    databricks bundle deploy --target "${ENVIRONMENT}"
+                  fi
+                displayName: 'Deploy Databricks Bundle'
+                workingDirectory: $(System.DefaultWorkingDirectory)/$(REPOSITORY_NAME_SANITIZED)-$(DEPLOY_VERSION)
+                env:
+                  DATABRICKS_TOKEN: $(databricksToken)
+                  DATABRICKS_CLIENT_ID: $(client_id)
+                  DATABRICKS_CLIENT_SECRET: $(secret)
+                  DATABRICKS_BUNDLE_TARGET: ${{ parameters.environment }}
+                  ENVIRONMENT: ${{ parameters.environment }}
+                  REPOSITORY_NAME: $(Build.Repository.Name)
+
+              - script: |
+                  echo "##[section]Registrando deploy no ambiente: ${ENVIRONMENT} na versão ${REPOSITORY_NAME_SANITIZED}-${DEPLOY_VERSION}"
+                  echo "Deploy realizado em $(date) para o ambiente: ${ENVIRONMENT}"
+                displayName: 'Registrar Deploy'
+                env:
+                  ENVIRONMENT: ${{ parameters.environment }}
+                  REPOSITORY_NAME: $(Build.Repository.Name)
+

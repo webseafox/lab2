@@ -1,0 +1,121 @@
+parameters:
+- name: fortifyExclusionRepository
+
+stages:
+- stage: security
+  displayName: "Security"
+  condition: not(or(failed(), canceled()))
+  pool: $(PRIVATE_AGENT_DEFAULT)
+  jobs:
+  - job: app_config_keys
+    displayName: "Get AppSec Config Keys"
+    steps:
+    - template: /tasks/bash/welcome.yml@CorePipelines
+    - template: /task_groups/security/get_appconfig_keys.yml@CorePipelines
+#
+#  - job: sca_scan
+#    dependsOn: app_config_keys
+#    displayName: "SCA Scan"
+#    variables: 
+#      USE_DEPENDENCY_TRACK: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_DEPENDENCY_TRACK'] ]
+#      USE_DT_DOCKER: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_DT_DOCKER'] ]
+#      USE_CONVISO: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_CONVISO'] ]
+#      SKIP_SECURITY_GATE_SCA: $[ dependencies.app_config_keys.outputs['evaluate_flags.SKIP_SECURITY_GATE_SCA'] ]
+#    condition: and(
+#                  succeeded(),
+#                  eq(variables.USE_DEPENDENCY_TRACK, true),
+#                  eq(variables.USE_DT_DOCKER, false)
+#                )
+#    steps:
+#    #Esta task é responsável por baixar o artefato Java, enquanto o artefato Node é baixado dentro do template.
+#      - task: DownloadBuildArtifacts@1
+#        displayName: 'Download Build Artifacts'
+#        inputs:
+#          artifactName: $(AEM_JAVA_BUNDLE_FOLDER_NAME)
+#          cleanDestinationFolder: false
+#          extractTars: true
+#          parallelizationLimit: 8
+#          downloadPath: $(Build.SourcesDirectory)
+#      - template: /tech_products/adbb-aem/provisioners/aem/tasks/define_app_version.yml
+#      - template: /security/run_sca_scan.yml
+#        parameters:
+#          buildArtifactName: $(AEM_FRONTEND_FOLDER_NAME)
+#          appVersion: "$(FORTIFY_APP_VERSION)"
+#          vivoFlow: "develop,develop-equipments,develop-meu-vivo,develop-rocket,develop-speed-racer,develop-star-telco,develop-the-killers,develop-vivo-tech"
+
+  - job: fortify_scan
+    dependsOn: app_config_keys
+    variables:
+      USE_FORTIFY: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_FORTIFY'] ]
+      USE_CONVISO: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_CONVISO'] ]
+      SKIP_SECURITY_GATE: $[ dependencies.app_config_keys.outputs['evaluate_flags.SKIP_SECURITY_GATE'] ]
+    condition: and(
+                    succeeded(),
+                    and(
+                      eq(variables.USE_FORTIFY, 'true'),
+                      eq(variables.flowIsToReview, true),
+                      not(startsWith(variables['Build.SourceBranch'], 'refs/tags/'))
+                    )
+                  )
+    displayName: "Fortify Scan"
+    steps:
+    - template: /tech_products/salesforce-automation/provisioners/salesforce/tasks/define_app_version.yml
+    - template: /security/run_fortify_scan.yml
+      parameters:
+        fortifyExclusionRepository: ${{ parameters.fortifyExclusionRepository }}
+        appVersion: $(FORTIFY_APP_VERSION)
+        #vivoFlow: "develop,develop-equipments,develop-meu-vivo,develop-rocket,develop-speed-racer,develop-star-telco,develop-the-killers,develop-vivo-tech"
+    - template: /tasks/telemetry/telemetry.yml@CorePipelines
+
+#  - job: get_additional_conviso_config
+#    dependsOn: 
+#      - fortify_scan
+#      - app_config_keys
+#    displayName: 'Get Additional Conviso Config'
+#    variables:
+#      USE_CONVISO: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_CONVISO'] ]
+#      ADDITIONAL_BRANCHES: $(ADDITIONAL_CONVISO_BRANCHES) #pipeline_library
+#    condition: and(
+#                    succeeded(),
+#                    eq(variables.USE_CONVISO, 'true')
+#                  )
+#    steps:
+#    - template: /tasks/conviso/get_additional_branches.yml@CorePipelines
+
+#  - job: conviso_sync
+#    dependsOn:
+#    - fortify_scan
+#    - app_config_keys
+#    - get_additional_conviso_config
+#    variables:
+#      USE_CONVISO: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_CONVISO'] ]
+#      SKIP_SECURITY_GATE: $[ dependencies.app_config_keys.outputs['evaluate_flags.SKIP_SECURITY_GATE'] ]
+#      CONVISO_ENABLED_BRANCH: $[ dependencies.get_additional_conviso_config.outputs['evaluate_flags.CONVISO_ENABLED_BRANCH'] ]
+#    condition: and(
+#                    succeeded(),
+#                    eq(variables.USE_CONVISO, 'true'),
+#                    eq(variables.CONVISO_ENABLED_BRANCH, 'true')
+#                  )
+#    displayName: "Conviso Sync"
+#    steps:
+#    - template: /task_groups/security/run_conviso_integration.yml@CorePipelines
+#      parameters:
+#        isGitFlow: true
+#        skipSecurityGate: $(SKIP_SECURITY_GATE)
+
+  - job: checkmarx_scan
+    dependsOn: app_config_keys
+    variables:
+      USE_CHECKMARX: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_CHECKMARX'] ]
+      SKIP_SECURITY_GATE: $[ or(eq(dependencies.app_config_keys.outputs['evaluate_flags.SKIP_SECURITY_GATE'], 'true'), eq(variables.CHECKMARX_IGNORE_SECURITY_GATE, 'true')) ]
+    condition: and(
+                succeeded(),
+                eq(variables.USE_CHECKMARX, 'true'),
+                eq(variables.flowIsToReview, true),
+                not(startsWith(variables['Build.SourceBranch'], 'refs/tags/'))
+              )
+    displayName: "Checkmarx Scan"
+    steps:
+    - template: /task_groups/security/run_checkmarx_scan.yml@CorePipelines
+      parameters:
+        skipSecurityGate: $(SKIP_SECURITY_GATE)

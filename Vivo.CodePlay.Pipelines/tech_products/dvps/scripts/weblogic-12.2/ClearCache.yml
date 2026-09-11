@@ -1,0 +1,173 @@
+#########################################
+##  Script: ClearCache.yml             ##
+##  Weblogic 12.2                      ##
+#########################################
+
+parameters:  
+  - name: WEBLOGIC_USER
+    default: ''
+  - name: WEBLOGIC_PASS
+    default: ''
+  - name: WEBLOGIC_ADMIN_SERVER_URL
+    default: ''
+  - name: WEBLOGIC_TIMEOUT
+    default: ''
+  - name: EVEN_OR_ODD
+    default: ''
+
+steps:
+  - task: Bash@3
+    displayName: ClearCache JVM - Weblogic
+    name: clearcache_jvm_weblogic
+    condition: succeeded()
+    inputs:
+      targetType: inline
+      workingDirectory: $(Pipeline.Workspace)
+      script: |
+
+        # Cores para mensagens
+        CYAN='\033[96m'
+        RESET='\033[0m'
+        RED='\033[91m'
+        GREEN='\033[92m'
+
+        echo -e "${CYAN}==========================================="
+        echo -e "         Starting ClearCache JVM          "
+        echo -e "===========================================${RESET}"
+
+
+        # Configurações iniciais
+
+        wlsAdmin=${{ parameters.WEBLOGIC_USER }}
+        wlsPassword=${{ parameters.WEBLOGIC_PASS }}
+        wlsUrl=${{ parameters.WEBLOGIC_ADMIN_SERVER_URL }}
+        wlsTimeOut=${{ parameters.WEBLOGIC_TIMEOUT }}
+        evenOrodd=${{ parameters.EVEN_OR_ODD }}
+
+        echo -e "wlsAdmin: $wlsAdmin \n wlsPassword: $wlsPassword \n wlsUrl: $wlsUrl \n wlsTimeOut: $wlsTimeOut \n evenOrodd: $evenOrodd"
+
+        if [ -z "$wlsAdmin" ] || [ -z "$wlsPassword" ] || [ -z "$wlsUrl" ] || [ -z "$wlsTimeOut" ] || [ -z "$evenOrodd" ]; then
+            echo -e "${RED} Um dos parametros wlsAdmin, wlsPassword, wlsUrl, wlsTimeOut ou evenOrodd não estão definidos!${RESET}"
+                exit 1  # Sair com erro
+        fi
+
+        #evenOrodd=$(echo "$5" | tr '[:upper:]' '[:lower:]')
+
+        # Verificar se o último argumento é 'even' ou 'odd'
+        if [ "$evenOrodd" != "even" ] && [ "$evenOrodd" != "odd" ]; then
+            echo "Error: The last argument must be 'even' or 'odd'."
+            exit 1
+        fi
+
+
+        # Função para fazer chamadas REST (autenticação básica)
+        function call_rest_api() {
+            local url=$1
+            local method=$2
+            local data=$3
+
+            if [[ -n "$data" ]]; then
+                # Se houver dados, incluí-los na chamada curl
+                curl -s -u "$wlsAdmin:$wlsPassword" -X "$method" -H "X-Requested-By: curl" -H "Accept: application/json" -H "Content-Type: application/json" -d "$data" "$url"
+            else
+                # Se não houver dados, fazer chamada curl sem -d
+                curl -s -u "$wlsAdmin:$wlsPassword" -X "$method" -H "X-Requested-By: curl" -H "Accept: application/json" "$url"
+            fi
+        }
+
+        # Função para limpar o cache do servidor
+        function clean_cache() {
+            local serverName=$1
+            local machineName=$2
+
+            #Verifica se a JVM esta parada
+            server_state=$(call_rest_api "$wlsUrl/management/weblogic/latest/domainRuntime/serverLifeCycleRuntimes/${serverName}" "GET"| jq -r '.state')
+
+            #Se a JVM estiver num status diferente de SHUTDOWN o cache não será apagado.         
+            if [ "$server_state" != "SHUTDOWN" ]; then
+                echo -e "${RED}A JVM $serverName está RUNNING e o cache não será apagado.${RESET}"
+                return  
+            fi
+
+            echo "Invocando a API para rodar o Workflow de limpeza de cache na JVM: $serverName"
+
+            # Construir o corpo da requisição com JSON
+            local data="{
+                \"machineName\": \"$machineName\",
+                \"scriptName\": \"clearJVM-${serverName}.sh\",
+                \"timeoutMillis\": 60000
+            }"
+    
+            # Fazer chamada à API REST para executar o script de limpeza
+            workflow=$(call_rest_api "$wlsUrl/management/weblogic/latest/domainRuntime/rolloutService/execScript" "POST" "$data" | jq -r '.return[2]')
+
+            if [[ -z "$workflow" || "$workflow" == "null" ]]; then
+                echo -e "${RED}Erro ao iniciar o Workflow de limpeza de cache para $serverName${RESET}"
+                return 1
+            fi
+
+            sleep 20
+
+            echo "Workflow iniciado com ID: $workflow"
+
+            # Fazer chamada à API REST para obter o status do workflow
+            result=$(call_rest_api "$wlsUrl/management/weblogic/latest/domainRuntime/rolloutService/allWorkflows/$workflow?links" "GET" | jq -r '{statusHistory, taskStatus}')
+
+            # Extrair o status da tarefa e o histórico do status
+            taskStatus=$(echo "$result" | jq -r '.taskStatus')
+            statusHistory=$(echo "$result" | jq -r '.statusHistory')
+
+
+            # Verificar se o status da tarefa indica sucesso
+            if [[ "$taskStatus" == "SUCCESS" ]]; then
+                echo -e "${GREEN}O cache da JVM do servidor $serverName foi apagado com sucesso.${RESET}"
+            else
+                echo -e "${RED}Falha ao limpar o cache da JVM do servidor: $serverName. Status: $taskStatus${RESET}"
+                echo -e "${RED}Status History: \n $statusHistory${RESET}"
+                exit 1
+            fi    
+        }
+
+        #obtenção de informações dos servidores
+        function get_server() {
+
+            call_rest_api "$wlsUrl/management/weblogic/latest/edit/servers/" "GET" | jq -c '.items[] | {
+                name: .name,
+                machine: (.machine | if type == "array" then .[1] else . end)
+            }'
+        }
+
+        # Autenticação na API REST e obtenção de informações dos servidores
+        echo -e "${CYAN}Connecting to WebLogic AdminServer via REST API...${RESET}"
+        echo -e "${CYAN}Processing servers...${RESET}"
+        servers=$(get_server)
+        #secho "$servers"
+
+        if [ -z "$servers" ]; then
+            echo -e "${RED}Error while connecting to AdminServer!${RESET}"
+            exit 1
+        fi
+
+        for server in $servers; do
+            serverName=$(echo "$server" | jq -r '.name')
+            machineName=$(echo "$server" | jq -r '.machine')
+
+            if [[ $serverName =~ [0-9]$ ]]; then
+                isEven=$(( ${serverName: -1} % 2 == 0 ))
+
+                if { [ "$evenOrodd" == "even" ] && [ "$isEven" == "1" ]; } || { [ "$evenOrodd" == "odd" ] && [ "$isEven" == "0" ]; }; then
+                    echo ""
+                    echo -e "${CYAN}Processing server: $serverName on machine: $machineName${RESET}"
+
+                    clean_cache "$serverName" "$machineName" 
+                fi
+            fi
+        done
+
+        echo -e "${CYAN}Cache cleaning completed.${RESET}"
+
+        
+
+        
+
+          

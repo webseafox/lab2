@@ -1,0 +1,65 @@
+parameters:
+- name: pdcImportExportXMLCommandsSourceFile
+- name: pdcImportExportXMLCommandsTranspiledFileTargetFolder
+- name: exportXMLLogsFile
+- name: pricingConfigComponentsToDeploy
+
+steps:
+- template: ../../tasks/pdc/run_import_export.yml
+  parameters:
+    operation: export
+    pricingConfigComponentsToDeploy: ${{ parameters.pricingConfigComponentsToDeploy }}
+    xmlLogsFile: ${{ parameters.exportXMLLogsFile }}
+    xmlCommandsTranspiledFilePrefix: export_xml_commands_$(ENVIRONMENT)
+
+- template: ../../tasks/bash/create_logs_file.yml
+  parameters:
+    inputVariableLogs: $(LOGS)
+    logsFileOutput: $(Agent.BuildDirectory)/${{ parameters.exportXMLLogsFile }}.txt
+
+- template: ../../tasks/bash/check_errors_v2.yml
+  parameters:
+    step: 'Backup PDC XML File'
+    outputFile: $(Agent.BuildDirectory)/${{ parameters.exportXMLLogsFile }}.txt
+
+- task: SSH@0
+  displayName: "Validate Export XML Files"
+  inputs:    
+    sshEndpoint: BRM_BASTION_$(ENVIRONMENT)
+    runOptions: 'inline'
+    inline: |
+      echo "##[command]kubectl get pod | grep pdc-bre | awk '{print $1}'"
+      PDC_BRE_DEPLOYMENT_POD=$(kubectl get pod | grep pdc-bre | awk '{print $1}')
+      echo "##[debug] PDC-BRE-DEPLOYMENT-* POD...................: $PDC_BRE_DEPLOYMENT_POD"
+
+      echo "##[debug] PDC_EXPORT_FILE_NAME_PREFIX................: $(PDC_EXPORT_FILE_NAME_PREFIX)"
+
+      IFS=',' read -ra ADDR <<< "${{ parameters.pricingConfigComponentsToDeploy }}"
+      for component in "${ADDR[@]}"; do
+        arrIN=(${component//_/ })
+        export COMPONENT=${arrIN[1]}
+
+        PDC_EXPORT_FILE_NAME=$(PDC_EXPORT_FILE_NAME_PREFIX)_$COMPONENT.xml
+
+        echo ">>>>> $COMPONENT >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>"
+
+        echo "##[debug] PDC_EXPORT_FILE_NAME................: $PDC_EXPORT_FILE_NAME"
+
+        echo "##[command]kubectl exec -i $PDC_BRE_DEPLOYMENT_POD bash -- ls -la /u01/PDC_BRM_SHARE/ | grep $PDC_EXPORT_FILE_NAME | awk '{print $9}'"
+        VALIDATE=$(kubectl exec -i $PDC_BRE_DEPLOYMENT_POD bash -- ls -la /u01/PDC_BRM_SHARE/ | grep $PDC_EXPORT_FILE_NAME | awk '{print $9}')
+
+        unset COMPONENT
+
+        if [[ $VALIDATE == "$PDC_EXPORT_FILE_NAME" ]]; then
+          echo ">>>>> [$VALIDATE] Export Successfully Completed <<<<<"
+        else
+          echo "##vso[task.logissue type=error;]Export not executed !!!"
+          echo "##vso[task.complete result=Failed;]"
+
+          exit 1
+        fi
+      done
+
+      echo "##vso[task.setvariable variable=PDC_BRE_DEPLOYMENT_POD;]$PDC_BRE_DEPLOYMENT_POD"
+    readyTimeout: '20000'
+    failOnStdErr: false

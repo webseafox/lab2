@@ -1,0 +1,423 @@
+parameters:
+  - name: environment
+  - name: buildEnvironment
+
+stages:
+  - stage: ci_build
+    displayName: "CI - Build"
+    pool:
+      name: $(AGENT_POOL_CI)
+    dependsOn:
+      - environment_init
+
+    ## -> Loads variables from other stages.
+    variables:
+      - name: NEXUS_DEPS_USR
+        value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEPS_USR'] ]
+      - name: NEXUS_DEPS_PSW
+        value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEPS_PSW'] ]
+      - name: NEXUS_DEFAULT_USR
+        value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEFAULT_USR'] ]
+      - name: NEXUS_DEFAULT_PSW
+        value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEFAULT_PSW'] ]
+      ## -> Catalog Info Variables
+      - template: /tech_products/oss/initialize/variables_catalog_info.yml
+      - template: /tech_products/oss/initialize/variables_source_data.yml
+
+    jobs:
+
+      - job: build
+        displayName: Build
+        timeoutInMinutes: $[ variables['BUILD_JOB_TIMEOUT'] ]
+        steps:
+
+          ## -> Checkout the code
+          - checkout: self
+            displayName: Checkout Code
+            name: checkout_code
+            submodules: true
+            path: source_code
+            persistCredentials: true
+
+          ## -> Checkout the last commit that was pushed to the repository.
+          ## -> Set last commit HASH to a variable.
+          - task: Bash@3
+            displayName: Checkout Last Commit
+            name: checkout_last_commit
+            condition: succeeded()
+            continueOnError: false
+            inputs:
+              targetType: inline
+              workingDirectory: $(Pipeline.Workspace)/source_code
+              script: |
+                echo "##[debug] Checkout last commit from '$(Build.SourceBranchName)'"
+                
+                git config pull.rebase true
+                git fetch -f --depth 50 origin $(Build.SourceBranchName):$(Build.SourceBranchName)
+                git checkout -f $(Build.SourceBranchName)
+                
+                ## -> Ignore commits that only change .azuredevops/ content
+                lastCommit=$(git log --format=%H -- . ':!'".azuredevops/" | head -n 1)
+                lastCommitHash=$(git rev-parse --short=6 $lastCommit)
+                
+                echo "##[debug] Last commit short hash '$lastCommitHash'"
+                echo "##vso[task.setvariable variable=SHORT_HASH]$lastCommitHash"
+
+          - checkout: OSSDevOpsHosts
+            displayName: Checkout Hosts OSS
+            name: checkout_hosts_oss
+            path: hosts_oss
+
+          ## -> Replace variables in the build.gradle to the correct values.
+          - task: qetza.replacetokens.replacetokens-task.replacetokens@5
+            displayName: 'Configuring build.gradle Maven Repositories credentials'
+            condition: succeeded()
+            continueOnError: false
+            inputs:
+              targetFiles: $(GRADLE_BUILD_FILE)
+              tokenPattern: 'azpipelines'
+              enableTelemetry: false
+            env:
+              NEXUS_DEPS_USR: $(NEXUS_DEPS_USR)
+              NEXUS_DEPS_PSW: $(NEXUS_DEPS_PSW)
+              NEXUS_DEFAULT_USR: $(NEXUS_DEFAULT_USR)
+              NEXUS_DEFAULT_PSW: $(NEXUS_DEFAULT_PSW)
+              SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+
+          ## -> Start of Bump Version section
+          ## -> If branch is master, use numeric system. e.g: 0.0.1, 2.0.0;
+          ## -> If branch is NOT master, use branch name + last commit hash. e.g: dev-1a2b;
+
+          ## -> Get current version and set to variables.
+          ## -> For master, set a variable to increment version further on.
+          - task: CmdLine@2
+            displayName: Get Current Version
+            name: current_version
+            condition: succeeded()
+            continueOnError: false
+            inputs:
+              targetType: inline
+              workingDirectory: $(Pipeline.Workspace)/source_code
+              script: |
+                currentVersion=$(GRADLE_PIPELINE_BUILD_VERSION)
+                echo "##[debug] Source CURRENT_VERSION: '$currentVersion' "
+                echo "##vso[task.setvariable variable=CURRENT_VERSION;]$currentVersion"
+                
+                incrementVersion=$(echo $currentVersion | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+                if [[ -n $incrementVersion ]]; then
+                  echo "##vso[task.setvariable variable=INCREMENT_VERSION;]$incrementVersion"
+                else
+                  echo "##[error] Version in the $(GRADLE_BUILD_FILE) is not following semantic versioning."
+                  echo "##[error] Verify if the version contains the pattern: <major>.<minor>.<patch>; e.g: 0.0.1, 1.0.0-branch, 1.1.0-branch+hash, 0.0.1-SNAPSHOT; "
+                  exit 1
+                fi
+
+          ## -> Bump/Increment version and update increment variable.
+          ## -> To disable set BUMP_VERSION_ENABLED in pipeline's library.
+          - task: semver-bump@1
+            displayName: Bump Version Master
+            name: bump_version
+            condition: and(
+              succeeded(),
+              and(eq(variables.BUMP_VERSION_ENABLED, 'true'), ne(variables['Build.Reason'], 'Manual')))
+            continueOnError: false
+            inputs:
+              VersionVariable: 'INCREMENT_VERSION'
+              IncrementLevel: 'patch'
+              targetType: inline
+
+          ## -> Set the new version to a variable. This allows it to be used in other stages, jobs or tasks.
+          - task: Bash@3
+            displayName: 'Set New Version'
+            name: new_version
+            condition: succeeded()
+            continueOnError: false
+            inputs:
+              targetType: inline
+              workingDirectory: $(Pipeline.Workspace)/source_code
+              script: |
+                echo "##[debug] Set New Version"
+
+                echo "##[group] Current Folder"
+                echo "$(ls -lah)"
+                echo "$(tree -L 3)"
+                echo "##[endgroup]"
+
+                echo "##[debug] Source CURRENT_VERSION: '$(CURRENT_VERSION)'"
+                if [ '$(Build.SourceBranchName)' == 'master' ]; then
+                  newVersion=$(INCREMENT_VERSION)
+                else
+                  newVersion=$(INCREMENT_VERSION)-$(Build.SourceBranchName).$(SHORT_HASH)
+                fi
+                echo "##[debug] Source NEW_VERSION: $newVersion"
+                echo "##vso[task.setvariable variable=NEW_VERSION;isOutput=true]$newVersion"
+
+                bump_gradle_code_version() {
+                  docker run --rm \
+                  --log-driver none \
+                  --volume $(pwd)/pipeline/:$(pwd)/pipeline/ \
+                  --workdir $(pwd) \
+                  "vcr-group.nexus.telefonica.com.br/linuxserver/yq" sh -c "yq -i -y .artifacts.VERSION=\\\"$newVersion\\\" $(pwd)/pipeline/properties.yaml"
+                }
+
+                ## -> Bump Gradle Code Version
+                if [[ ("${BUMP_VERSION_ENABLED}" == 'true') ]]; then
+                  echo "##[debug] Bumping Gradle Code Version to $newVersion..."
+                  bump_gradle_code_version
+                  cat $(pwd)/pipeline/properties.yaml
+                fi
+
+          #### -> Bump Gradle Code Version
+          ##- task: Bash@3
+          ##  displayName: Bump Gradle Code Version
+          ##  name: bump_gradle_code_version
+          ##  condition: succeeded()
+          ##  continueOnError: false
+          ##  inputs:
+          ##    targetType: inline
+          ##    script: |
+          ##      echo "##[debug] Bumping Gradle Code Version to $(new_version.NEW_VERSION)..."
+          ##      yq -i .artifacts.VERSION=\"$(new_version.NEW_VERSION)\" $(pwd)/pipeline/properties.yaml
+          ##      cat $(pwd)/pipeline/properties.yaml
+
+          ## -> Generate HOSTS
+          - task: Bash@3
+            displayName: Generate HOSTS
+            name: generate_hosts
+            condition: succeeded()
+            continueOnError: false
+            inputs:
+              targetType: inline
+              script: |
+                echo "##[debug] Generate HOSTS $(environment)"
+                
+                addHostsArgs=""
+                
+                dos2unix $(Pipeline.Workspace)/hosts_oss/${{ parameters.environment }}/hosts
+                while IFS= read -r line || [[ -n "$line" ]]; do
+                  if [[ $line != \#* ]]; then
+                    IP=$(echo $line | awk '{print $1}')
+                    HOST=$(echo $line | awk '{print $2}')
+                    echo $HOST":"$IP
+                    addHostsArgs+="--add-host=$HOST:$IP "
+                  fi
+                done < $(Pipeline.Workspace)/hosts_oss/${{ parameters.environment }}/hosts
+                
+                addHostsArgs=$(echo $addHostsArgs | sed 's/ *$//')
+                echo "##vso[task.setvariable variable=ADD_HOST_ARGS;isOutput=true]$addHostsArgs"
+
+          ## -> Build Version
+          - task: Bash@3
+            displayName: Build Version
+            name: build_version
+            condition: succeeded()
+            continueOnError: false
+            inputs:
+              targetType: inline
+              workingDirectory: $(Pipeline.Workspace)/source_code
+              script: |
+                
+                echo "##[debug] Environment to deploy: ${{ parameters.environment }}"
+                echo "##[debug] Add hosts to docker: $(generate_hosts.ADD_HOST_ARGS)"
+                echo "##[debug] Build with version: $(NEW_VERSION)"
+                echo "##[debug] GRADLE_CMD_BUILD: $(GRADLE_CMD_BUILD)"
+                echo "##[debug] GRADLE_CMD_TEST: $(GRADLE_CMD_TEST)"
+                echo "##[debug] GRADLE_CMD_TEST_OPTIONAL: $(GRADLE_CMD_TEST_OPTIONAL)"
+                
+                ## -> Setting Exclusive Gradle Option for ENVIRONMENT Build
+                if [[ "$(GRADLE_ENVIRONMENT_ENABLED)" == "true" ]]; then
+                  if [[ -n "${{ parameters.buildEnvironment }}" && "${{ parameters.buildEnvironment }}" != "none" ]]; then
+                    echo "##[debug] Build Environment: ${{ parameters.buildEnvironment }}"
+                    buildEnvironmentOption="${{ parameters.buildEnvironment }}"
+                  else
+                    echo "##[debug] Build Environment not set. Using environment based on the branch."
+                    case "$(Build.SourceBranchName)" in
+                      "dev") buildEnvironmentOption="-Dgrails.env=dev" ;;
+                      "esteira1"|"esteira2"|"preprod"|"prodlike") buildEnvironmentOption="-Dgrails.env=homolog" ;;
+                      *) buildEnvironmentOption="-Dgrails.env=prod" ;;
+                    esac
+                  fi
+                  echo "##[debug] Gradle build environment option: $buildEnvironmentOption"
+                  buildOptions="$(GRADLE_CMD_TEST_OPTIONAL) $buildEnvironmentOption"
+                  echo "##[debug] Gradle full build option: $buildOptions"
+                else
+                  echo "##[debug] Adding gradle build environment option is DISABLED ..."
+                  buildOptions="$(GRADLE_CMD_TEST_OPTIONAL)"
+                fi
+                
+                BUILDER_IMAGE_NAME="builder/$(Build.BuildId)"
+                docker build --no-cache --build-arg USER_ID=$(DOCKER_CMD_USERNAME) --build-arg GROUP_ID=$(DOCKER_CMD_GROUP) -t $BUILDER_IMAGE_NAME -f .azuredevops/builder.Dockerfile .
+                
+                run_docker() {
+                  docker run --rm \
+                    --user="$(DOCKER_CMD_USERNAME):$(DOCKER_CMD_GROUP)" \
+                    --network host \
+                    --log-driver none \
+                    -e JAVA_OPTS_MEMORY_MAX="$(DEFAULT_MAX_MEMORY_BUILD)" \
+                    -e TZ="America/Sao_Paulo" \
+                    -e SYSTEM_ACCESSTOKEN="$(System.AccessToken)" \
+                    -e NEXUS_DEPS_USR="$(NEXUS_DEPS_USR)" \
+                    -e NEXUS_DEPS_PSW="$(NEXUS_DEPS_PSW)" \
+                    -e NEXUS_DEFAULT_USR="$(NEXUS_DEFAULT_USR)" \
+                    -e NEXUS_DEFAULT_PSW="$(NEXUS_DEFAULT_PSW)" \
+                    $(generate_hosts.ADD_HOST_ARGS) \
+                    -v $(pwd):/app \
+                    -w $(DOCKER_WORKDIR) \
+                    "$BUILDER_IMAGE_NAME" sh -c "$1"
+                }
+
+                ## -> Bump Gradle Code Version
+                if [[ ("${BUMP_VERSION_ENABLED}" == 'true') ]]; then
+                  echo "##[debug] Bump version to NEW_VERSION: $(new_version.NEW_VERSION)"
+                  yq -i .artifacts.VERSION=\"$(new_version.NEW_VERSION)\" $(pwd)/pipeline/properties.yaml
+                  cat $(pwd)/pipeline/properties.yaml
+                fi
+                
+                run_docker "$(GRADLE_CMD_BUILD) $buildOptions"
+
+          ## -> Run Gradle Tests
+          - task: Bash@3
+            displayName: Run Gradle Tests
+            name: run_gradle_tests
+            condition: succeeded()
+            continueOnError: false
+            inputs:
+              targetType: inline
+              workingDirectory: $(Pipeline.Workspace)/source_code
+              script: |
+                echo "##[debug] Environment to deploy: ${{ parameters.environment }}"
+                echo "##[debug] Add hosts to docker: $(generate_hosts.ADD_HOST_ARGS)"
+                echo "##[debug] Run tests within version: $(new_version.NEW_VERSION)"
+                echo "##[debug] GRADLE_CMD_TEST: $(GRADLE_CMD_TEST)"
+                echo "##[debug] GRADLE_CMD_TEST_OPTIONAL: $(GRADLE_CMD_TEST_OPTIONAL)"
+                
+                BUILDER_IMAGE_NAME="builder/$(Build.BuildId)"
+                docker build --no-cache --build-arg USER_ID=$(DOCKER_CMD_USERNAME) --build-arg GROUP_ID=$(DOCKER_CMD_GROUP) -t $BUILDER_IMAGE_NAME -f .azuredevops/builder.Dockerfile .
+                
+                run_docker() {
+                  docker run --rm \
+                    --user="$(DOCKER_CMD_USERNAME):$(DOCKER_CMD_GROUP)" \
+                    --network host \
+                    --log-driver none \
+                    -e JAVA_OPTS_MEMORY_MAX="$(DEFAULT_MAX_MEMORY_BUILD)" \
+                    -e TZ="America/Sao_Paulo" \
+                    -e SYSTEM_ACCESSTOKEN="$(System.AccessToken)" \
+                    -e NEXUS_DEPS_USR="$(NEXUS_DEPS_USR)" \
+                    -e NEXUS_DEPS_PSW="$(NEXUS_DEPS_PSW)" \
+                    -e NEXUS_DEFAULT_USR="$(NEXUS_DEFAULT_USR)" \
+                    -e NEXUS_DEFAULT_PSW="$(NEXUS_DEFAULT_PSW)" \
+                    $(generate_hosts.ADD_HOST_ARGS) \
+                    -v $(pwd):/app \
+                    -w $(DOCKER_WORKDIR) \
+                    "$BUILDER_IMAGE_NAME" sh -c "$1"
+                }
+                
+                run_docker "$(GRADLE_CMD_TEST) $(GRADLE_CMD_TEST_OPTIONAL)"
+
+          ## -> Copy files for staging area
+          - task: CopyFiles@2
+            name: t_copy_file
+            displayName: 'Copy to Staging Directory'
+            condition: succeeded()
+            continueOnError: false
+            inputs:
+              SourceFolder: '$(Pipeline.Workspace)/source_code'
+              TargetFolder: '$(Build.ArtifactStagingDirectory)'
+              OverWrite: true
+              CleanTargetFolder: true
+              Contents: >
+                **/*
+                
+                !.git/**/*
+                
+                !?/**/*
+                
+                !**/*.log
+
+          ## -> Set artifact information to variables. This allows it to be used in other stages, jobs or tasks.
+          - task: CmdLine@2
+            name: artifact_name
+            displayName: 'Set Artifact Name'
+            inputs:
+              targetType: inline
+              workingDirectory: $(Pipeline.Workspace)/source_code
+              script: |
+                function getArtifactInfo() {
+                  argArtifact=$1
+                
+                  artifactName=$(basename $argArtifact | sed 's/\.[^.]*$//')
+                  echo "##[debug] Artifact Name: $artifactName"
+                
+                  artifactFile=$(basename $argArtifact)
+                  echo "##[debug] Artifact File: $artifactFile"
+                
+                  artifactPath=$(echo $argArtifact | sed "s|^$(Build.ArtifactStagingDirectory)\/||" | sed "s|$artifactFile||")
+                  echo "##[debug] Artifact Path: $artifactPath"
+                
+                  echo "$(ls -lah $artifactPath)"
+                
+                  if [[ $argArtifact != *"$(new_version.NEW_VERSION)"* ]]; then
+                    echo "##[error] The artifact generated is not from version $(new_version.NEW_VERSION)."
+                    echo "##[error] Possible causes may include:"
+                    echo "##[error] - Build cache enabled and the build generated the artifact with the previous version, as code has no change."
+                    echo "##[error] - A variable forcing the name in the pom.xml, e.g: <finalName> attribute inside the pom.xml"
+                    exit 1
+                  fi
+                }
+                
+                echo "PATH: $(pwd)"
+                
+                targetDirectory=$(echo "$(Build.ArtifactStagingDirectory)/build/libs")
+                echo "##[group] Project Target Directory"
+                echo "##[debug] $targetDirectory"
+                echo "$(ls -lah $targetDirectory)"
+                echo "##[endgroup]"
+                
+                artifact=$(echo $targetDirectory/$(ls -1 "$targetDirectory" | grep -E "\.jar$|\.war$|\.ear$" | sort | head -n 1))
+                echo "##[debug] Found the artifact: $artifact"
+                
+                getArtifactInfo $artifact
+                
+                echo "##vso[task.setvariable variable=ARTIFACT_PATH;isOutput=true]$artifactPath"
+                echo "##vso[task.setvariable variable=ARTIFACT_FILE;isOutput=true]$artifactFile"
+                echo "##vso[task.setvariable variable=ARTIFACT_NAME;isOutput=true]$artifactName"
+                
+                echo "##[group] Project File Structure"
+                echo "$(ls -lah)"
+                echo "$(tree)"
+                echo "##[endgroup]"
+
+          ## -> Compress artifacts into tar. This allows to use less space and to be used in other stages, jobs or tasks.
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish Artifact'
+            condition: succeeded()
+            continueOnError: false
+            inputs:
+              ArtifactName: $(artifact_name.ARTIFACT_NAME)
+              StoreAsTar: true
+
+          ## -> Publish results for JUnit tests
+          - task: PublishTestResults@2
+            name: t_publish_test_result
+            displayName: Publish Test Results
+            inputs:
+              mergeTestResults: true
+              searchFolder: $(Build.ArtifactStagingDirectory)
+              testResultsFiles: '**/TEST-*.xml'
+              testResultsFormat: JUnit
+              testRunTitle: Test Results
+              failTaskOnFailedTests: true
+              publishRunAttachments: false
+            continueOnError: true
+
+          ## -> Publish results for Code Coverage
+          - task: PublishCodeCoverageResults@1
+            name: t_publish_code_coverage_result
+            displayName: 'Publish Code Coverage Result'
+            inputs:
+              codeCoverageTool: JaCoCo
+              summaryFileLocation: $(Build.SourcesDirectory)/$(COVERAGE_REPORT_SUMMARY_FILE_LOCATION)
+              pathToSources: $(Build.SourcesDirectory)/$(COVERAGE_REPORT_PATH_TO_SOURCE)
+              reportDirectory: $(Build.SourcesDirectory)/$(COVERAGE_REPORT_REPORT_DIRECTORY)
+              additionalCodeCoverageFiles: $(Build.SourcesDirectory)/$(COVERAGE_REPORT_ADDITIONAL_FILE)
+            continueOnError: true

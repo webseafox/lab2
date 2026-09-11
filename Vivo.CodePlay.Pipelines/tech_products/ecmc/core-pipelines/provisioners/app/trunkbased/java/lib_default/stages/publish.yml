@@ -1,0 +1,83 @@
+parameters:
+- name: publish_to_nexus
+  type: boolean
+  default: True
+- name: generate_documentation
+  type: boolean
+  default: True
+
+stages:
+- stage: publish
+  displayName: "Package & Publish Library"
+  dependsOn:
+    - build_test
+    - gate
+    - security
+  pool: $(PRIVATE_AGENT_DEFAULT)
+  jobs:
+    - job: maven_package
+      displayName: "Package Library"
+      steps:
+      - template: /tech_products/ecmc/core-pipelines/tasks/catalog_info/extract_variables.yml
+        parameters:
+            skipDownload: true
+            workingDirectory: $(Build.SourcesDirectory)
+      - template: /tech_products/ecmc/core-pipelines/tasks/maven/custom_settings_setup.yml
+        parameters:
+          mavenSettingsLocationOutputVarName: "MAVEN_SETTINGS_LOCATION"
+      - template: /tech_products/ecmc/core-pipelines/tasks/maven/cache_dependencies.yml
+        parameters:
+          appDependenciesCachePathOutputVarName: "APP_DEPENDENCIES_CACHE_PATH"
+          appDependenciesCacheFolderOutputVarName: "APP_DEPENDENCIES_CACHE_FOLDER"
+          condition: eq(variables.CACHE_APP_DEPENDENCIES, true)
+      - script: |
+          mvn -s $(MAVEN_SETTINGS_LOCATION) package -DskipTests
+        displayName: "Package JAR artifacts"
+      - ${{ if eq(parameters.generate_documentation, True) }}:
+        - script: |
+            mvn -s $(MAVEN_SETTINGS_LOCATION) javadoc:jar
+          displayName: "Generate Javadoc"
+      - script: |
+          mvn -s $(MAVEN_SETTINGS_LOCATION) source:jar
+        displayName: "Generate Sources JAR"
+      - task: PublishBuildArtifacts@1
+        displayName: 'Publish Library Artifacts'
+        inputs:
+          ArtifactName: 'lib-artifacts'
+          PathtoPublish: 'target/'
+
+    - ${{ if eq(parameters.publish_to_nexus, True) }}:
+      - deployment: publish_nexus
+        condition: succeeded()
+        dependsOn:
+          - maven_package
+        workspace:
+          clean: all     
+        environment: "lib-publish"
+        displayName: "Publish to Nexus"
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: current
+                - template: /tech_products/ecmc/core-pipelines/tasks/catalog_info/extract_variables.yml
+                  parameters:
+                      skipDownload: true
+                      workingDirectory: $(Build.SourcesDirectory)
+                - template: /tech_products/ecmc/core-pipelines/tasks/maven/custom_settings_setup.yml
+                  parameters:
+                    mavenSettingsLocationOutputVarName: "MAVEN_SETTINGS_LOCATION"
+                - template: /tech_products/ecmc/core-pipelines/tasks/maven/publish_to_nexus.yml
+                  parameters:
+                    mavenSettingsLocation: $(MAVEN_SETTINGS_LOCATION)
+            on:
+              success:
+                steps:
+                  - script: echo "Library published successfully to Nexus"
+                    displayName: "Publish Success"
+                  - template: /tech_products/ecmc/core-pipelines/tasks/telemetry/telemetry.yml
+              failure:
+                steps:
+                  - script: echo "Failed to publish library to Nexus"
+                    displayName: "Publish Failed"
+                  - template: /tech_products/ecmc/core-pipelines/tasks/telemetry/telemetry.yml

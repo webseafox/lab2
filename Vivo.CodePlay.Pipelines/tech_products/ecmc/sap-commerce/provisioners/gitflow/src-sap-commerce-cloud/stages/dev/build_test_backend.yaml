@@ -1,0 +1,191 @@
+parameters:
+- name: branchName
+  type: string
+- name: isUpgradeSap
+  type: boolean
+  default: False
+
+stages:
+- stage: build_test_backend_part_1
+  dependsOn: pipeline_pre_init
+  displayName: "Prepare Build local (Backend)"
+  variables:
+  - group: lojaonline-sap-commerce-core-customize-java-dev
+  pool:
+    name: $(PRIVATE_AGENT_SHARED)
+  jobs:
+  - job: "prepare_build"
+    workspace:
+      clean: all
+    displayName: "Pre Build and Test Core Customize"
+    condition: and(
+                  succeeded(),
+                  not(
+                    or(
+                      ${{ in(parameters.branchName, 'refs/heads/master', 'master') }},
+                      ${{ startsWith(parameters.branchName, 'project/') }},
+                      ${{ startsWith(parameters.branchName, 'stage/') }}
+                    )
+                  )
+                )
+    steps:
+    - checkout: CoreCustomize
+      clean: true
+      fetchDepth: 1
+      fetchTags: false
+      persistCredentials: true
+
+    - bash: |
+        cd $(Build.SourcesDirectory)
+        echo "##[section]Stage para preparação do build do Core Customize"
+        git fetch --no-tags origin "$BRANCH_NAME:$BRANCH_NAME" -f --depth 1
+        git checkout "$BRANCH_NAME"
+        git log
+      displayName: "Reset branch Core Customize to ${{parameters.branchName }} (DEV)"
+      env:
+        BRANCH_NAME: ${{parameters.branchName}}
+
+
+    - template: /tech_products/ecmc/sap-commerce/task_groups/pre_build/hybris_essentials.yaml
+      parameters:
+        artifactName: "app-backend"
+
+    - bash: echo "##[section]Skipping Backend Prepare Build because variable RUN_SECURITY_DEV_BACKEND is not true"
+      displayName: "Skip Pre Build"
+
+- stage: build_test_backend_part_2
+  dependsOn: pipeline_pre_init
+  displayName: "Build local (Backend)"
+  pool:
+    name: $(PRIVATE_AGENT_SHARED)
+  variables:
+  - group: lojaonline-sap-commerce-core-customize-java-dev
+  jobs:
+  - job: "start_build"
+    workspace:
+      clean: all
+    displayName: "Build Core Customize"
+    condition: and(
+                  succeeded(),
+                  not(
+                    or(
+                      ${{ in(parameters.branchName, 'refs/heads/master', 'master') }},
+                      ${{ startsWith(parameters.branchName, 'project/') }},
+                      ${{ startsWith(parameters.branchName, 'stage/') }}
+                    )
+                  )
+                )
+    timeoutInMinutes: 600
+    steps:
+    - checkout: CoreCustomize
+      clean: true
+      fetchDepth: 1
+      fetchTags: false
+      persistCredentials: true
+
+    - bash: |
+        cd $(Build.SourcesDirectory)
+        echo "##[section]Stage para preparação do build do Core Customize"
+        git fetch --no-tags origin "$BRANCH_NAME:$BRANCH_NAME" -f --depth 1
+        git checkout "$BRANCH_NAME"
+        git log -n 2
+      displayName: "Reset branch Core Customize ${{parameters.branchName }}"
+      env:
+        BRANCH_NAME: ${{parameters.branchName}}
+
+    - bash: |
+        echo "##[section]Stage para execução de build e testes do Core Customize"
+      displayName: "Job information"
+
+    - template: /tech_products/ecmc/sap-commerce/provisioners/gitflow/src-sap-commerce-cloud/stages/dev/download_cxcom.yaml
+      parameters:
+        isUpgradeSap: ${{parameters.isUpgradeSap}}
+
+    - script: |
+        cd $(Build.SourcesDirectory)
+        cat $(System.DefaultWorkingDirectory)/hybris/bin/platform/build.number
+      displayName: "Validate Hybris Directory"
+
+    - script: |
+        cd $(System.DefaultWorkingDirectory)/hybris
+        mv -v config config_old
+      displayName: "Renaming config folder"
+
+    - script: |
+        cd $(System.DefaultWorkingDirectory)/hybris/bin/platform
+        source ./setantenv.sh
+        echo | ant
+      displayName: "Recreating config folder"
+
+    - script: |
+        cp -r $(System.DefaultWorkingDirectory)/hybris/config_old/environments/pipeextensions.xml $(System.DefaultWorkingDirectory)/hybris/config/localextensions.xml
+        cp -r $(System.DefaultWorkingDirectory)/hybris/config_old/local.properties $(System.DefaultWorkingDirectory)/hybris/config/
+        cp -rf $(System.DefaultWorkingDirectory)/hybris/config_old/customize/ $(System.DefaultWorkingDirectory)/hybris/config/
+        cp -rf $(System.DefaultWorkingDirectory)/hybris/config_old/ant/ $(System.DefaultWorkingDirectory)/hybris/config/
+      displayName: "Updating config files"
+
+    - script: |
+        echo "##[section] ####### localextensions.xml #######"
+        cat $(System.DefaultWorkingDirectory)/hybris/config/localextensions.xml
+        echo
+
+        echo "##[section] ####### local.properties #######"
+        cat $(System.DefaultWorkingDirectory)/hybris/config/local.properties
+        echo
+
+        echo "##[section] ####### Pasta hybris/config #######"
+        ls -la $(System.DefaultWorkingDirectory)/hybris/config/
+        echo
+
+        echo "##[section] ####### Pasta hybris/config/customize #######"
+        ls -la $(System.DefaultWorkingDirectory)/hybris/config/customize
+        echo
+
+        echo "##[section] ####### Pasta hybris/config/ant #######"
+        ls -la $(System.DefaultWorkingDirectory)/hybris/config/ant
+      displayName: "Validate config files"
+
+    - script: |
+        cd $(System.DefaultWorkingDirectory)/hybris/bin/platform
+        sed -i "2i export ANT_MEM_OPTS=\"$(BUILD_ANT_MEM_OPTS)\"" ./setantenv.sh
+        export ANT_MEM_OPTS="$(BUILD_ANT_MEM_OPTS)"
+        source ./setantenv.sh
+
+        ant customize
+      displayName: "ant customize"
+
+    - script: |
+        cd $(System.DefaultWorkingDirectory)/hybris/bin/platform
+        sed -i "2i export ANT_MEM_OPTS=\"$(BUILD_ANT_MEM_OPTS)\"" ./setantenv.sh
+        export ANT_MEM_OPTS="$(BUILD_ANT_MEM_OPTS)"
+        source ./setantenv.sh
+
+        ant clean
+      displayName: "ant clean"
+
+    - script: |
+        git log -n 2
+        cd $(System.DefaultWorkingDirectory)/hybris/bin/platform
+        sed -i "2i export ANT_MEM_OPTS=\"$(BUILD_ANT_MEM_OPTS)\"" ./setantenv.sh
+        export ANT_MEM_OPTS="$(BUILD_ANT_MEM_OPTS)"
+        source ./setantenv.sh
+
+        ant all
+      displayName: "ant all"
+
+  - job:
+    workspace:
+      clean: all
+    displayName: "About Pre Build and Build Core Customize"
+    condition: and(
+                succeeded(),
+                or(
+                  ${{ in(parameters.branchName, 'refs/heads/master', 'master') }},
+                  ${{ startsWith(parameters.branchName, 'project/') }},
+                  ${{ startsWith(parameters.branchName, 'stage/') }}
+                )
+              )
+    steps:
+    - checkout: none
+    - bash: echo "##[section]Skipping Backend Prepare Build and Build because variable RUN_SECURITY_DEV_BACKEND is not true"
+      displayName: "Skip Pre Build"

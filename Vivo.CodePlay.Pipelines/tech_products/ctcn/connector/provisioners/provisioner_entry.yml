@@ -1,0 +1,108 @@
+parameters:
+- name: ear
+  type: string
+- name: version
+  type: string
+- name: qa_environment
+  type: string
+
+stages:
+- stage:
+  pool: $(PRIVATE_AGENT_DEFAULT)
+  displayName: Deploy ${{ upper(parameters.qa_environment) }}
+  jobs:
+    - job:
+      displayName: Deploy ${{ upper(parameters.qa_environment) }}
+      steps:
+      - checkout: none
+
+      - task: Docker@2
+        displayName: "Login ACR"
+        inputs:
+          containerRegistry: 'ACR-DEVOPS'
+          command: 'login'
+        
+      - task: DownloadPackage@1
+        displayName: "Download EAR Package"
+        inputs:
+          packageType: 'upack'
+          feed: 'a373df5a-2777-4d9a-a4d3-eda1f9cfecdd/d6b1c6d8-6c8a-40ac-91e1-b38dacbde3a9'
+          view:
+          definition: $(EAR_PACKAGE)
+          version: '${{parameters.version}}'
+          downloadPath: '$(Build.SourcesDirectory)'
+
+      - task: DownloadPackage@1
+        displayName: "Download Python script"
+        inputs:
+          packageType: 'upack'
+          feed: 'a373df5a-2777-4d9a-a4d3-eda1f9cfecdd/d6b1c6d8-6c8a-40ac-91e1-b38dacbde3a9'
+          view: 
+          definition: 'b4bf4ace-3419-4be0-acb2-abafc9327827'
+          version: '1.0.5'
+          downloadPath: '$(Build.SourcesDirectory)'
+
+      - bash: |
+          docker run --rm --entrypoint bash\
+            -v $(Build.SourcesDirectory):/ctcn \
+            -w /ctcn \
+            --hostname azdevops-daet \
+            --dns=$(PRIMARY_DNS) \
+            --dns=$(SECONDARY_DNS) \
+            --dns-search=redecorp.br \
+            $(DOCKER_IMAGE) \
+            -c "$(WLST_COMMAND) application_manager.py \
+                  $(QA_DEPLOYER_USER) \
+                  $(QA_DEPLOYER_PASS) \
+                  $HOST:$PORT \
+                  ${PACKAGE}.ear \
+                  $PACKAGE \
+                  $TARGET > log.txt
+          cat log.txt
+          if grep -H 'NoAccessRuntimeException' log.txt; then echo '##vso[task.complete result=Failed;]'; fi"
+        displayName: "Deploy package EAR"
+        env:
+          HOST: $(QA_${{ upper(parameters.qa_environment) }}_DEPLOY_HOST)
+          PORT: $(QA_${{ upper(parameters.qa_environment) }}_DEPLOY_PORT)
+          TARGET: $(QA_${{ upper(parameters.qa_environment) }}_TARGET)
+          PACKAGE: ${{parameters.ear}}
+        
+      - bash: |
+          docker run --rm --entrypoint bash\
+            -v $(Build.SourcesDirectory):/ctcn \
+            -w /ctcn \
+            --hostname azdevops-daet \
+            --dns=$(PRIMARY_DNS) \
+            --dns=$(SECONDARY_DNS) \
+            --dns-search=redecorp.br \
+            $(DOCKER_IMAGE) \
+            -c "$(WLST_COMMAND) shutdown_servers.py \
+                  $(QA_DEPLOYER_USER) \
+                  $(QA_DEPLOYER_PASS) \
+                  $HOST:$PORT > log.txt
+          cat log.txt
+          if grep -H 'Exception' log.txt; then echo '##vso[task.complete result=Failed;]'; fi"
+        displayName: "Shutdown Servers"
+        env:
+          HOST: $(QA_${{ upper(parameters.qa_environment) }}_DEPLOY_HOST)
+          PORT: $(QA_${{ upper(parameters.qa_environment) }}_DEPLOY_PORT)
+
+      - bash: |
+          docker run --rm --entrypoint bash\
+            -v $(Build.SourcesDirectory):/ctcn \
+            -w /ctcn \
+            --hostname azdevops-daet \
+            --dns=$(PRIMARY_DNS) \
+            --dns=$(SECONDARY_DNS) \
+            --dns-search=redecorp.br \
+            $(DOCKER_IMAGE) \
+            -c "$(WLST_COMMAND) start_servers.py \
+                  $(QA_DEPLOYER_USER) \
+                  $(QA_DEPLOYER_PASS) \
+                  $HOST:$PORT > log.txt
+          cat log.txt
+          if grep -H 'Exception' log.txt; then echo '##vso[task.complete result=Failed;]'; fi"
+        displayName: "Starting Servers"
+        env:
+          HOST: $(QA_${{ upper(parameters.qa_environment) }}_DEPLOY_HOST)
+          PORT: $(QA_${{ upper(parameters.qa_environment) }}_DEPLOY_PORT)

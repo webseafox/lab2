@@ -1,0 +1,168 @@
+parameters:
+- name: environment
+- name: kubeconfig
+- name: helmReleaseNamePrefix
+- name: workDir
+  default: $(DEFAULT_WORKDIR_ARTIFACTS)
+- name: k8sNamespace
+  default: $(K8S_NAMESPACE)
+- name: dockerRegistry
+  default: $(HELM_IMAGE_PULL_SECRET)
+- name: dockerServer
+  default: $(DOCKER_DEFAULT_REGISTRY)
+- name: dockerEmail
+  default: $(DOCKER_REGISTRY_EMAIL)
+- name: helmRepoUrl
+  default: $(HELM_REGISTRY_NEXUS_URL)
+- name: helmRepoName
+  default: $(HELM_REGISTRY_NEXUS_REPO_NAME)
+- name: helmReleaseName
+  default: $(HELM_RELEASE_NAME)
+- name: helmChartName
+  default: $(DEFAULT_GENERIC_JAVA_CHART_NAME)
+- name: helmChartVersion
+  default: $(DEFAULT_GENERIC_JAVA_CHART_VERSION)
+- name: helmTimeout
+  default: $(HELM_UPGRADE_TIMEOUT)
+- name: helmHistoryMax
+  default: $(HELM_UPGRADE_HISTORY_MAX)
+- name: helmImageRepository
+  default: $(HELM_IMAGE_REPOSITORY)
+- name: helmImageTag
+  default: $(HELM_IMAGE_TAG)
+- name: helmOciResgitryEnabled
+  default: $(HELM_REGISTRY_ACR_ENABLED)
+- name: helmOciRegistryUrl
+  default: $(HELM_REGISTRY_ACR_NAME)
+- name: helmOciChartBaseUrl
+  default: $(HELM_REGISTRY_ACR_CHART_BASE_URL)
+- name: useExternalEnv
+  type: boolean
+  default: False
+- name: argocd_enabled
+  type: boolean
+  default: 'false'
+
+steps:
+- template: /tech_products/ecvv/templates/tasks/azure_key_vault/docker_credentials.yml
+
+- task: AzureKeyVault@2  
+  displayName: '[Helm Nexus] Getting AKV credentials'
+  timeoutInMinutes: 1
+  retryCountOnTaskFailure: 5  
+  inputs:    
+    azureSubscription: DevOpsSharedResources    
+    KeyVaultName: $(AKV_DEVOPS_NAME)
+    SecretsFilter: 'HELM-REGISTRY-NEXUS-USERNAME, HELM-REGISTRY-NEXUS-PASSWORD'
+  condition: not(eq(variables['HELM_REGISTRY_ACR_ENABLED'], 'true'))
+
+- task: AzureKeyVault@2  
+  displayName: '[Helm ACR] Getting AKV credentials'
+  timeoutInMinutes: 1
+  retryCountOnTaskFailure: 5  
+  inputs:    
+    azureSubscription: DevOpsSharedResources    
+    KeyVaultName: $(AKV_DEVOPS_NAME)
+    SecretsFilter: 'HELM-REGISTRY-ACR-USERNAME, HELM-REGISTRY-ACR-PASSWORD'
+  condition: and(eq(variables['HELM_REGISTRY_ACR_ENABLED'], 'true'), eq(variables['HELM-REGISTRY-ACR-USERNAME'], ''), eq(variables['HELM-REGISTRY-ACR-PASSWORD'], ''))
+
+- ${{ if eq(parameters.useExternalEnv, true) }}:
+  - template: /tech_products/ecvv/templates/tasks/git/checkout_env_repo.yml
+    parameters:
+      workDir: ${{parameters.workDir}}
+- ${{ else }}:
+  - checkout: self
+    persistCredentials: true
+    fetchDepth: 1
+
+- template: /tech_products/ecvv/templates/tasks/artifacts/download_docker.yml
+
+- template: /tech_products/ecvv/templates/tasks/artifacts/download_secure_files.yml
+  parameters:
+    secureFile: '${{parameters.kubeconfig}}'
+
+- template: /tech_products/ecvv/templates/tasks/helm/init.yml
+  parameters:
+    environment: ${{parameters.environment}}
+    workDir: ${{parameters.workDir}}
+
+- template: /tech_products/ecvv/templates/tasks/helm/utils.yml
+  parameters:
+    environment: ${{parameters.environment}}
+
+- template: /tech_products/ecvv/templates/tasks/helm/registry.yml
+  parameters:
+    environment: ${{parameters.environment}}
+    workDir: ${{parameters.workDir}}
+    k8sKubeconfig: $(secureFile.secureFilePath)
+    k8sNamespace: ${{parameters.k8sNamespace}}
+    dockerRegistry: ${{parameters.dockerRegistry}}
+    dockerServer: ${{parameters.dockerServer}}
+    dockerUsername: $(DOCKER-REGISTRY-USERNAME)
+    dockerPassword: $(DOCKER-REGISTRY-PASSWORD)
+    dockerEmail: ${{parameters.dockerEmail}}
+    argocd_enabled: ${{ parameters.argocd_enabled }}
+
+- template: /tech_products/ecvv/templates/tasks/helm/repo.yml
+  parameters:
+    environment: ${{parameters.environment}}
+    workDir: ${{parameters.workDir}}
+    k8sKubeconfig: $(secureFile.secureFilePath)
+    helmRepoUrl: '${{parameters.helmRepoUrl}}/${{parameters.helmRepoName}}/'
+    helmRepoName: ${{parameters.helmRepoName}}
+    helmRepoUsername: $(HELM-REGISTRY-NEXUS-USERNAME)
+    helmRepoPassword: $(HELM-REGISTRY-NEXUS-PASSWORD)
+
+- template: /tech_products/ecvv/templates/tasks/helm/replace.yml
+  parameters:
+    environment: ${{parameters.environment}}
+    workDir: ${{parameters.workDir}}
+
+- ${{ if ne(parameters.argocd_enabled, 'true') }}:
+  - template: /tech_products/ecvv/templates/tasks/helm/upgrade.yml
+    parameters:
+      environment: ${{parameters.environment}}
+      workDir: ${{parameters.workDir}}
+      k8sKubeconfig: $(secureFile.secureFilePath)
+      helmReleaseName: ${{parameters.helmReleaseName}}
+      helmReleaseNamespace: ${{parameters.k8sNamespace}}
+      helmChartName: ${{parameters.helmChartName}}
+      helmChartVersion: ${{parameters.helmChartVersion}}
+      helmRepoName: ${{parameters.helmRepoName}}
+      helmTimeout: ${{parameters.helmTimeout}}
+      helmHistoryMax: ${{parameters.helmHistoryMax}}
+      helmImageRepository: "${{parameters.helmImageRepository}}"
+      helmImageTag: "${{parameters.helmImageTag}}"
+      helmImagePullSecret: ${{parameters.dockerRegistry}}
+      helmOciResgitryEnabled: ${{parameters.helmOciResgitryEnabled}}
+      helmOciRegistryUrl: ${{parameters.helmOciRegistryUrl}}
+      helmOciUsername: $(HELM-REGISTRY-ACR-USERNAME)
+      helmOciPassword: $(HELM-REGISTRY-ACR-PASSWORD)}
+      helmOciChartBaseUrl: ${{parameters.helmOciChartBaseUrl}}
+      helmReleaseNamePrefix: ${{parameters.helmReleaseNamePrefix}}
+- ${{ elseif eq(parameters.argocd_enabled, 'true') }}:
+  - template: /tech_products/ecvv/templates/tasks/helm/template.yml
+    parameters:
+      environment: ${{parameters.environment}}
+      workDir: ${{parameters.workDir}}
+      k8sKubeconfig: $(secureFile.secureFilePath)
+      helmReleaseName: ${{parameters.helmReleaseName}}
+      helmReleaseNamespace: ${{parameters.k8sNamespace}}
+      helmChartName: ${{parameters.helmChartName}}
+      helmChartVersion: ${{parameters.helmChartVersion}}
+      helmRepoName: ${{parameters.helmRepoName}}
+      helmTimeout: ${{parameters.helmTimeout}}
+      helmHistoryMax: ${{parameters.helmHistoryMax}}
+      helmImageRepository: "${{parameters.helmImageRepository}}"
+      helmImageTag: "${{parameters.helmImageTag}}"
+      helmImagePullSecret: ${{parameters.dockerRegistry}}
+      helmOciResgitryEnabled: ${{parameters.helmOciResgitryEnabled}}
+      helmOciRegistryUrl: ${{parameters.helmOciRegistryUrl}}
+      helmOciUsername: $(HELM-REGISTRY-ACR-USERNAME)
+      helmOciPassword: $(HELM-REGISTRY-ACR-PASSWORD)}
+      helmOciChartBaseUrl: ${{parameters.helmOciChartBaseUrl}}
+      helmReleaseNamePrefix: ${{parameters.helmReleaseNamePrefix}}
+      argocd_enabled: ${{ parameters.argocd_enabled }}
+
+## UPDATE ACR REGISTRY WITH NEW TAG
+- template: /tech_products/ecvv/templates/tasks/acr/update_image_tag.yml

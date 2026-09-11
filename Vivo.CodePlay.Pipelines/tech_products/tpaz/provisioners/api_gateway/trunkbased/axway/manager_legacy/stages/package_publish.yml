@@ -1,0 +1,185 @@
+parameters:
+- name: gateway
+- name: environment
+
+stages:
+- stage: stage_package_publish
+  pool: $(PRIVATE_AGENT_DEFAULT)
+  displayName: Package & Publish
+  dependsOn:
+  - stage_build
+  variables:
+    APP_VERSION: $[ stageDependencies.stage_build.job_set_version.outputs['set_version.APP_VERSION'] ]
+    FED_FILE: "manager-${{ parameters.environment }}-$(APP_VERSION).fed"
+    GROUP_NAME: "grp-manager-${{ parameters.environment }}"
+    PARENT_IMAGE: "$(IMAGE_REGISTRY_MICROSSERVICOS)/apigw-base:7.7.2"
+    OUT_IMAGE: "$(IMAGE_REGISTRY_MICROSSERVICOS)/$(IMAGE_NAME):$(APP_VERSION)"
+  jobs:
+  - job: job_package_publish_${{ parameters.environment }}
+    displayName: ${{ parameters.environment }}
+    steps:
+    - checkout: none
+    - template: /tasks/nexus/download_files.yml
+      parameters:
+        displayName: Download zip & emt-scripts
+        repository: integracao-libfiles
+        remoteFileLocation:
+        - files/libs/zip/zip-3.0-11.el7.x86_64.rpm
+        - files/apigateway/emt-scripts/$(EMT_SCRIPT_VERION)/emt-scripts-$(EMT_SCRIPT_VERION).tar.gz
+        - files/apigateway/dynatrace/aspectjweaver-1.9.6.jar
+        - files/apigateway/dynatrace/oneagent-sdk-1.8.0.jar
+        - files/apigateway/dynatrace/dynatrace-aspectj-1.0.6.jar
+        localFileLocation: $(Agent.TempDirectory)
+    - task: ExtractFiles@1
+      displayName: Extract emt-scripts
+      inputs:
+        archiveFilePatterns: "$(Agent.TempDirectory)/emt-scripts-$(EMT_SCRIPT_VERION).tar.gz"
+        destinationFolder: $(Agent.TempDirectory)/emt-scripts
+        cleanDestinationFolder: false
+    - template: /tasks/nexus/download_files.yml
+      parameters:
+        displayName: Download manager files from Nexus
+        repository: $(NEXUS_REPOSITORY)
+        credentialsEnabled: false
+        remoteFileLocation:
+        - br/com/vivo/gateway/manager-${{ parameters.environment }}/$(APP_VERSION)/$(FED_FILE)
+        - br/com/vivo/gateway/manager-${{ parameters.environment }}/$(APP_VERSION)/envSettings.props
+        - br/com/vivo/gateway/manager-${{ parameters.environment }}/$(APP_VERSION)/jvm.xml
+        localFileLocation: $(Agent.TempDirectory)
+    - task: DownloadSecureFile@1
+      name: certFile_${{ parameters.environment }}
+      displayName: "DefaultDomain-cert-${{ parameters.gateway }}-${{ parameters.environment }}.pem"
+      inputs:
+        secureFile: "DefaultDomain-cert-${{ parameters.gateway }}-${{ parameters.environment }}.pem"
+    - task: DownloadSecureFile@1
+      name: keyFile_${{ parameters.environment }}
+      displayName: "DefaultDomain-key-${{ parameters.gateway }}-${{ parameters.environment }}.pem"
+      inputs:
+        secureFile: "DefaultDomain-key-${{ parameters.gateway }}-${{ parameters.environment }}.pem"
+    - task: DownloadSecureFile@1
+      name: license
+      displayName: license
+      inputs:
+        secureFile: license
+    - script: |
+        echo "##[group] Show directory"
+        ls -la
+        echo "##[endgroup]"
+
+        echo "##[group] Create certs/DefaultDomain/"
+        mkdir -p ./certs/DefaultDomain/
+        cp "DefaultDomain-cert-${{ parameters.gateway }}-${{ parameters.environment }}.pem" certs/DefaultDomain/DefaultDomain-cert.pem
+        cp "DefaultDomain-key-${{ parameters.gateway }}-${{ parameters.environment }}.pem" certs/DefaultDomain/DefaultDomain-key.pem
+        ls -la certs/DefaultDomain/
+        echo "##[endgroup]"
+
+        echo "##[group] Create license.lic"
+        cat license > license.lic
+        ls -la
+        echo "##[endgroup]"
+      displayName: certs & license
+      workingDirectory: $(Agent.TempDirectory)
+    - script: |
+        mkdir -p ./tmp/apigateway/conf
+        cp jvm.xml tmp/apigateway/conf/jvm.xml
+        ls -la tmp/apigateway/conf
+      displayName: jvm.xml
+      workingDirectory: $(Agent.TempDirectory)
+    - ${{ if in(parameters.environment, 'dev', 'esteira1', 'esteira2', 'preprod', 'prodlike') }}:
+      - script: |
+          mkdir -p ./tmp/apigateway/groups/emt-group/emt-service/conf
+          awk '/^env.CASSANDRA.KEYSPACE=/ {sub(/$/, "_emt")}1' envSettings.props > tmp/apigateway/groups/emt-group/emt-service/conf/envSettings.props
+          
+          ls -la tmp/apigateway/groups/emt-group/emt-service/conf
+          echo "##[group] Show envSettings.props"
+          cat tmp/apigateway/groups/emt-group/emt-service/conf/envSettings.props
+          echo "##[endgroup]"
+        displayName: '[NO-PROD] envSettings.props'
+        workingDirectory: $(Agent.TempDirectory)
+    - ${{ if eq(parameters.environment, 'prod') }}:
+      - script: |
+          mkdir -p ./tmp/apigateway/groups/emt-group/emt-service/conf
+          sed -r -i 's/CASSANDRA.HOST1=([0-9]{1,3}\.){3}[0-9]{1,3}/CASSANDRA.HOST1=cassandra1/' envSettings.props
+          sed -r -i 's/CASSANDRA.HOST2=([0-9]{1,3}\.){3}[0-9]{1,3}/CASSANDRA.HOST2=cassandra2/' envSettings.props
+          sed -r -i 's/CASSANDRA.HOST3=([0-9]{1,3}\.){3}[0-9]{1,3}/CASSANDRA.HOST3=cassandra3/' envSettings.props
+          awk '/^env.CASSANDRA.KEYSPACE=/ {sub(/$/, "_emt")}1' envSettings.props > tmp/apigateway/groups/emt-group/emt-service/conf/envSettings.props
+          
+          ls -la tmp/apigateway/groups/emt-group/emt-service/conf
+          echo "##[group] Show envSettings.props"
+          cat tmp/apigateway/groups/emt-group/emt-service/conf/envSettings.props
+          echo "##[endgroup]"
+        displayName: '[PROD] envSettings.props'
+        workingDirectory: $(Agent.TempDirectory)
+    - ${{ if eq(parameters.environment, 'preprod') }}:
+      - script: |
+          mkdir -p ./tmp/apigateway/ext/lib
+          mkdir -p ./tmp/apigateway/groups/emt-group/emt-service/ext/lib
+          mkdir -p ./tmp/apigateway/groups/emt-group/emt-service/conf
+          
+          cp jvm.xml tmp/apigateway/groups/emt-group/emt-service/conf/jvm.xml
+
+          cp oneagent-sdk-1.8.0.jar tmp/apigateway/ext/lib/oneagent-sdk-1.8.0.jar
+          cp aspectjweaver-1.9.6.jar tmp/apigateway/ext/lib/aspectjweaver-1.9.6.jar
+          cp dynatrace-aspectj-1.0.6.jar tmp/apigateway/ext/lib/dynatrace-aspectj-1.0.6.jar
+
+          cp dynatrace-aspectj-1.0.6.jar tmp/apigateway/groups/emt-group/emt-service/ext/lib/dynatrace-aspectj-1.0.6.jar
+          cp oneagent-sdk-1.8.0.jar tmp/apigateway/groups/emt-group/emt-service/ext/lib/oneagent-sdk-1.8.0.jar
+          cp aspectjweaver-1.9.6.jar tmp/apigateway/groups/emt-group/emt-service/ext/lib/aspectjweaver-1.9.6.jar
+        displayName: '[PREPROD] dynatrace'
+        workingDirectory: $(Agent.TempDirectory)
+    - script: |
+        echo "##[debug] LICENSE............: ${LICENSE}"
+        echo "##[debug] FED_FILE...........: ${FED_FILE}"
+        echo "##[debug] GROUP_NAME.........: ${GROUP_NAME}"
+        echo "##[debug] PARENT_IMAGE.......: ${PARENT_IMAGE}"
+        echo "##[debug] OUT_IMAGE..........: ${OUT_IMAGE}"
+        echo "##[debug] MERGE_DIR..........: ${MERGE_DIR}"
+
+        python3 emt-scripts/build_gw_image.py \
+        --license=${LICENSE} \
+        --default-cert \
+        --fed=${FED_FILE} \
+        --group-id=${GROUP_NAME} \
+        --merge-dir=${MERGE_DIR} \
+        --parent-image=${PARENT_IMAGE} \
+        --out-image=${OUT_IMAGE}
+      displayName: Build
+      workingDirectory: $(Agent.TempDirectory)
+      env:
+        GROUP_NAME: $(GROUP_NAME
+        FED_FILE: $(FED_FILE)
+        PARENT_IMAGE: $(PARENT_IMAGE)
+        OUT_IMAGE: $(OUT_IMAGE)
+        MERGE_DIR: $(Agent.TempDirectory)/tmp/apigateway
+        LICENSE: $(Agent.TempDirectory)/license.lic
+    - task: Docker@2
+      displayName: Docker login
+      inputs:
+        containerRegistry: $(DOCKER_REGISTRY_SERVICE_CONNECTION_NAME)
+        command: login
+    - script: |
+        echo "##[debug] DOCKER_IMAGE.......: ${DOCKER_IMAGE}"
+        echo "##[debug] IMAGE_NAME.........: ${IMAGE_NAME}"
+
+        echo "##[command] docker images | grep ${IMAGE_NAME}"
+        docker images | grep ${IMAGE_NAME}
+
+        echo "##[command] docker push ${DOCKER_IMAGE}"
+        docker push ${DOCKER_IMAGE}
+
+        if [ $? -ne 0 ]; then
+          echo "##[error] Docker push failed. Exiting with error."
+          exit 1
+        fi
+      displayName: Docker push
+      env:
+        DOCKER_IMAGE: $(OUT_IMAGE)
+        IMAGE_NAME: $(IMAGE_NAME)
+    - script: |
+        echo "##[command] docker rmi ${DOCKER_IMAGE}"
+        docker rmi ${DOCKER_IMAGE}
+      displayName: Docker clean up
+      condition: always()
+      continueOnError: true
+      env:
+        DOCKER_IMAGE: $(OUT_IMAGE)

@@ -1,0 +1,75 @@
+parameters:
+  environment: ''
+
+jobs:
+- deployment: deployment
+  pool: GeneralPurposeLinuxAgents4P
+  environment: 
+    name: deploy-${{ parameters.environment }}
+  strategy:
+    runOnce:   
+      deploy:
+        steps:
+        - checkout: self
+          persistCredentials: true
+        - template: /tech_products/hdop/templates/steps/get_latest_version.yaml
+        - template: /tech_products/hdop/templates/steps/execute_in_docker.yaml
+          parameters:
+            image: 'registry.telefonicabigdata.com/jenkins-slaves/ml-python:1.0.9'
+            envs:
+            - key: 'VERSION'
+              value: $(get_version.VERSION)
+            - key: 'PROJECT_NAME'
+              value: $(PROJECT_NAME)
+            - key: 'FLYTE_HOST'
+              value: $(FLYTE_HOST)
+            - key: 'MAIN_FILE_PATH'
+              value: $(MAIN_FILE_PATH)
+            - key: 'PYINSTALLER_ARGS'
+              value: $(PYINSTALLER_ARGS)
+            - key: 'MLFLOW_ADMIN_TOOLS_DIR'
+              value: $(MLFLOW_ADMIN_TOOLS_DIR)
+            - key: 'SHOULD_NOT_EXECUTE_TRANSITION_MODEL'
+              value: $(SHOULD_NOT_EXECUTE_TRANSITION_MODEL)
+            script: |
+              echo ===== ${FLYTE_HOST}
+              echo ${FLYTE_HOST} flytealias >> /etc/hosts
+              mkdir -p ~/.flyte/
+              echo "admin:" > ~/.flyte/config.yaml
+              echo "    endpoint: flytealias:8089" >> ~/.flyte/config.yaml
+              echo "    authType: Pkce" >> ~/.flyte/config.yaml
+              echo "    insecure: true" >> ~/.flyte/config.yaml
+              echo "logger:" >> ~/.flyte/config.yaml
+              echo "    show-source: true" >> ~/.flyte/config.yaml
+              echo "    level: 0" >> ~/.flyte/config.yaml
+              cat ~/.flyte/config.yaml
+              curl -sL https://ctl.flyte.org/install | bash
+              sed -i "s/{{VERSION}}/${VERSION}/g" lib/workflow.py
+              sed -i "s/{{PROJECT_NAME}}/${PROJECT_NAME}/g" lib/workflow.py
+              pyflyte register --project nbx --domain development --service-account flyte-backend-flyte-binary lib/workflow.py
+              pyinstaller ${PYINSTALLER_ARGS} \
+              --onefile ${MAIN_FILE_PATH}
+
+              yum install jq -y
+              cat ~/.flyte/config.yaml
+              export CFLAGS="-std=c99"
+              pip install -r requirements.txt
+              pip install flytekit==1.9.0
+              curl -sL https://ctl.flyte.org/install | bash
+              sed -i "s/{{VERSION}}/${VERSION}/g" lib/schedule.py
+              sed -i "s/{{PROJECT_NAME}}/${PROJECT_NAME}/g" lib/schedule.py
+              pyflyte register --project nbx --domain development --service-account flyte-backend-flyte-binary lib/schedule.py
+              lp_version=\$(bin/flytectl get launchplan -p nbx -d development ${PROJECT_NAME}_predict --output json | python3 -c "import sys, json; print(json.load(sys.stdin)[0]['id']['version'])")
+      
+              echo \$lp_version
+              echo yes | bin/flytectl update launchplan -p nbx -d development ${PROJECT_NAME}_predict --version \$lp_version --activate
+              if [[ "$SHOULD_NOT_EXECUTE_TRANSITION_MODEL" == "true" ]]; then
+                echo "##[debug] Transition model execution is disabled"
+              else
+                cd ${MLFLOW_ADMIN_TOOLS_DIR}
+                echo "##[debug] Transition model execution is enabled"
+                pip install poetry==1.5.1
+                export POETRY_VIRTUALENVS_IN_PROJECT=true
+                poetry install
+                ./.venv/bin/python -m mlflow_admin_tools set-stage --model-name ${PROJECT_NAME} --from-stage Staging --to-stage Production
+              fi

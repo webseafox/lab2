@@ -1,0 +1,823 @@
+parameters:
+- name: infrastructureType
+
+stages:
+- stage: ci_publish
+  displayName: "CI - Publish"
+  pool:
+    name: $(AGENT_POOL_CI)
+  dependsOn:
+  - environment_init
+  - ci_build
+  - ci_security
+  condition: and(
+    succeeded(),
+    or(
+      eq(variables['Build.SourceBranchName'],'master'),
+      eq(variables['Build.SourceBranchName'],'main'),
+      eq(variables['Build.SourceBranchName'],'dev'),      
+      startsWith(variables['Build.SourceBranchName'],'hotfix'),
+      and(
+        or(
+          eq('${{ parameters.infrastructureType }}', 'weblogic'),
+          eq(dependencies.environment_init.outputs['environment.multibranch_exclusions.ALLOW_MULTIBRANCH'], 'true')
+        ),
+        or(
+          eq(variables['Build.SourceBranchName'],'prodlike'),
+          eq(variables['Build.SourceBranchName'],'preprod'),
+          eq(variables['Build.SourceBranchName'],'esteira1'),
+          eq(variables['Build.SourceBranchName'],'esteira2'),
+          and(
+            eq(variables.ALLOW_PUBLISH_PROD, 'true'),
+            eq(variables['Build.SourceBranchName'],'producao')
+          )
+        )
+      )
+    ))
+
+  ## -> Loads variables from other stages.
+  variables:
+  - name: NEXUS_DEPS_USR
+    value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEPS_USR'] ]
+  - name: NEXUS_DEPS_PSW
+    value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEPS_PSW'] ]
+  - name: NEXUS_DEFAULT_USR
+    value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEFAULT_USR'] ]
+  - name: NEXUS_DEFAULT_PSW
+    value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEFAULT_PSW'] ]
+  - name: APP_COMPONENT_TYPE
+    value: $[ stageDependencies.environment_init.environment.outputs['catalog_info.APP_COMPONENT_TYPE'] ]
+  - name: SAST_STATUS
+    value: $[ stageDependencies.ci_security.sast_scan.outputs['job_status.SAST_STATUS'] ]
+  - name: SCA_STATUS
+    value: $[ stageDependencies.ci_security.sca_scan.outputs['job_status.SCA_STATUS'] ]
+  - name: SONARQUBE_STATUS
+    value: $[ stageDependencies.ci_quality_gate.sonarqube.outputs['job_status.SONARQUBE_STATUS'] ]
+  - name: GOVERNANCE_STATUS
+    value: $[ stageDependencies.ci_quality_gate.governance.outputs['job_status.GOVERNANCE_STATUS'] ]
+
+  # -> Catalog Info Variables
+  - template: /tech_products/oss/initialize/variables_catalog_info.yml
+  - template: /tech_products/oss/initialize/variables_source_data.yml
+
+  jobs:
+  - job: publish
+    displayName: "Publish"
+
+    steps:
+
+    ## -> Download Artifacts
+    - download: none
+
+    ## -> Check if previous Gates stages were not failed as there is bug in AzDo that bypasses the condition.
+    ## -> and the pipeline continues to the next stage.
+    ## -> This is a workaround to avoid the pipeline to continue if the gates failed.
+    - task: Bash@3
+      displayName: Gates Verification
+      condition: and(succeeded(),
+        or(
+          eq(variables.SAST_STATUS, 'Failed'),
+          eq(variables.SCA_STATUS, 'Failed'),
+          eq(variables.SONARQUBE_STATUS, 'Failed'),
+          eq(variables.GOVERNANCE_STATUS, 'Failed')))
+      inputs:
+        targetType: inline
+        script: |
+
+          echo "##[debug] SAST_STATUS       : ${SAST_STATUS:-Skipped}"
+          echo "##[debug] SCA_STATUS        : ${SCA_STATUS:-Skipped}"
+          echo "##[debug] SONARQUBE_STATUS  : ${SONARQUBE_STATUS:-Skipped}"
+          echo "##[debug] GOVERNANCE_STATUS : ${GOVERNANCE_STATUS:-Skipped}"
+
+          echo "##[error] Security or quality gate check(s) failed."
+          echo "##[error] Publication cannot proceed until all gates checks pass. Please address the issues reported in the respective scan results."
+          exit 1
+
+    ## -> Download and uncompress the downloaded artifact.
+    ## -> 30f35852-3f7e-4c0c-9a88-e127b4f97211 is the decorator for download artifact.
+    - task: DownloadBuildArtifacts@1
+      displayName: 'Download Build Artifacts'
+      inputs:
+        artifactName: $(ARTIFACT_NAME)
+        cleanDestinationFolder: false
+        extractTars: true
+        parallelizationLimit: 8
+        downloadPath: $(System.ArtifactsDirectory)
+
+    ## -> Set artifact information to variables.
+    - task: Bash@3
+      displayName: Publish to Nexus
+      condition: succeeded()
+      inputs:
+        workingDirectory: $(DEFAULT_WORKDIR_ARTIFACTS)
+        targetType: inline
+        script: |
+          ## -> Function to publish artifact to nexus
+          run_curl_publish() {
+            local argArtId="$1"
+            local argArtExt="$2"
+            local argArtFile="$3"
+            local argPubType="$4"
+            local generatePom="${5:-true}"
+            local argArtExt2="$6"
+            local argArtFile2="$7"
+            local argPubType2="$8"
+
+            ## -> Validate required parameters
+            if [[ -z "$argArtId" || -z "$argArtExt" || -z "$argArtFile" || -z "$argPubType" ]]; then
+              echo "##[error] Missing required parameters for publish function"
+              return 1
+            fi
+
+            ## -> Check if primary artifact file exists
+            if [[ ! -f "$argArtFile" ]]; then
+              echo "##[error] Artifact file not found: $argArtFile"
+              return 1
+            fi
+
+            ## -> Write the publish summary to a file and display on terminal
+            echo "**Published Artifact $argArtId info:**" >> $(Build.SourcesDirectory)/publishInfo.md
+            {
+            echo "##[debug] GroupId            : $GROUP_ID"
+            echo "##[debug] ArtifactId         : $argArtId"
+            echo "##[debug] Artifact Version   : $NEW_VERSION"
+            echo "##[debug] Artifact File      : $(basename $argArtFile)"
+            echo "##[debug] Artifact Extension : $argArtExt"
+            echo "##[debug] Artifact Type      : $argPubType"
+            echo "##[debug] Generate Pom       : $generatePom"
+            echo "##[debug] Publish Pom Type   : ${POM_PUBLISH_TYPE:-null}"
+            echo "##[debug] Artifact Path      : $(dirname ${argArtFile#$DEFAULT_WORKDIR_ARTIFACTS/})/."
+            } | tee -a $(Build.SourcesDirectory)/publishInfo.md
+
+            ## -> Build curl command parameters array
+            local curl_params=(
+              -v -u "$(NEXUS_DEFAULT_USR):$(NEXUS_DEFAULT_PSW)"
+              "$(NEXUS_ENDPOINT_API_REPOSITORY)/components?repository=$(NEXUS_REPO_LIB_MVN)"
+              -F "maven2.groupId=$(GROUP_ID)"
+              -F "maven2.artifactId=$argArtId"
+              -F "maven2.version=$(NEW_VERSION)"
+              -F "maven2.packaging=$argArtExt"
+              -F "maven2.asset1.extension=$argArtExt"
+              -F "maven2.asset1=@$argArtFile;type=$argPubType"
+            )
+
+            ## -> Add generate-pom parameter only if not publishing with pom
+            if [[ -z "$argArtFile2" ]]; then
+              curl_params+=(-F "maven2.generate-pom=$generatePom")
+            fi
+
+            ## -> Handle second asset, effective or original pom, if provided
+            if [[ -n "$argArtFile2" ]]; then
+              if [[ ! -f "$argArtFile2" ]]; then
+                echo "##[error] Second artifact file not found: $argArtFile2"
+                return 1
+              fi
+
+              ## -> Write the second asset publish summary to a file and display on terminal
+              {
+              echo ""
+              echo "##[debug] Pom File     : $(basename $argArtFile2)"
+              echo "##[debug] Pom Extension: $argArtExt2"
+              echo "##[debug] Pom Type     : ${argPubType2:-application/xml}"
+              echo "##[debug] Pom Path     : $(dirname ${argArtFile2#$DEFAULT_WORKDIR_ARTIFACTS})/."
+              } | tee -a $(Build.SourcesDirectory)/publishInfo.md
+
+              curl_params+=(
+                -F "maven2.asset2.extension=$argArtExt2"
+                -F "maven2.asset2=@$argArtFile2;type=${argPubType2:-application/xml}"
+              )
+            fi
+
+            ## -> Publish to Nexus using curl
+            output=$(curl "${curl_params[@]}" 2>&1)
+
+            if [[ $? -ne 0 ]] ; then
+              echo "##[error] Error while executing curl command to push artifact to nexus."
+              echo "##[debug] $output"
+              exit 1
+            fi
+
+            echo "##[group] $1 Publish Output"
+            echo "$output"
+            echo "##[endgroup]"
+
+            ## -> check if artifact and version is already published by error *"does not allow updating"*
+            if [[ "$output" == *"does not allow updating"*  ]]; then
+              echo '##[error] Artifact version already exists on nexus!'
+              echo '##vso[task.logissue type=error] The version of the artifact you are trying to publish has already been published and cannot be updated.'
+              echo '##[error] If you want to publish a new version of the artifact, please update the package version and try again.'
+              exit 1
+            fi
+
+            ## -> check for general errors while publishing
+            if [[ "$output" == *"HTTP error before end of send"*  ]]; then
+              echo '##vso[task.logissue type=error] A problem has occured while trying to publish to nexus.'
+              echo '##[error] Please verify the curl output for more information. Search for the error in the final lines.'
+              exit 1
+            fi
+
+            ## -> Log the artifact URL
+            NexusArtPath="${GROUP_ID//./%2F}"
+            artifactUrl="https://nexus.telefonica.com.br/#browse/browse:$(NEXUS_REPO_LIB_MVN):${NexusArtPath}%2F$argArtId%2F$(NEW_VERSION)"
+
+            echo "##[debug] [See Artifact on Nexus]($artifactUrl)" | tee -a $(Build.SourcesDirectory)/publishInfo.md
+            echo "##[section]Successfully published $argArtId"
+            echo "" | tee -a $(Build.SourcesDirectory)/publishInfo.md
+          }
+
+          echo "##[debug] Working Directory path: $(pwd)"
+
+          modulesArray=($ARTIFACT_MODULES)
+
+          ## -> Tree if pipeline was run with debug enabled
+          if [ "$SYSTEM_DEBUG" == "True" ]; then
+            echo "##[group] Path tree"
+            echo "$(tree)"
+            echo "##[endgroup]"
+          fi
+
+          if { [ ! -z "$ARTIFACT_MODULES" ] && [ "$APP_COMPONENT_TYPE" == "lib" ]; } || [ "$PUBLISH_MULTIMODULES" == "true" ]; then
+            publishAllModules="true"
+          else
+            publishAllModules="false"
+          fi
+
+          ## -> Publish the main artifact or all modules artifacts and the parent pom.xml
+          if [ "$publishAllModules" == "false" ]; then
+            echo "##[section]Publishing the artifact of $(ARTIFACT_ID) as:"
+
+            artifactExtension=$(echo "$(basename "$(ARTIFACT_FILE)")" | awk -F . '{if (NF>1) {print $NF}}')
+
+            targetDirectory="$(DEFAULT_WORKDIR_ARTIFACTS)/$(ARTIFACT_NAME)/$(ARTIFACT_PATH)"
+            echo "##[group] Target directory and content"
+            ls -la $targetDirectory
+            tree $targetDirectory
+            echo "##[endgroup]"
+
+            ## -> Publish the artifact
+            if [ "$POM_PUBLISH_TYPE" == "effective" ]; then
+              effectivePomFile="$targetDirectory/effective-pom/pom.xml"
+              mvn -f $(ARTIFACT_NAME)/pom.xml help:effective-pom -Doutput=$effectivePomFile
+
+              run_curl_publish \
+                "$(ARTIFACT_ID)" \
+                "$artifactExtension" \
+                "$targetDirectory/$(ARTIFACT_FILE)" \
+                "application/java-archive" \
+                "false" \
+                "pom" \
+                "$effectivePomFile" \
+                "application/xml"
+
+            elif [ "$POM_PUBLISH_TYPE" == "generate" ]; then
+              run_curl_publish "$(ARTIFACT_ID)" \
+                "$artifactExtension" \
+                "$targetDirectory/$(ARTIFACT_FILE)" \
+                "application/java-archive"
+            else
+              ## -> If multimodules then publish the pom.xml of the last module
+              if [ ! -z "$ARTIFACT_MODULES" ]; then
+                lastModule=${modulesArray[-1]}
+                pomFile="$(DEFAULT_WORKDIR_ARTIFACTS)/$(ARTIFACT_NAME)/$lastModule/pom.xml"
+              else
+                pomFile="$(DEFAULT_WORKDIR_ARTIFACTS)/$(ARTIFACT_NAME)/pom.xml"
+              fi
+
+              run_curl_publish \
+                "$(ARTIFACT_ID)" \
+                "$artifactExtension" \
+                "$targetDirectory/$(ARTIFACT_FILE)" \
+                "application/java-archive" \
+                "false" \
+                "pom" \
+                "$pomFile" \
+                "application/xml"
+            fi
+
+          else
+            ## -> Publish all modules artifacts and the parent pom.xml
+
+            echo "##[debug] Publishing each module artifact and the parent pom.xml because its component type is 'lib' or PUBLISH_MULTIMODULES variable is set to 'true'."
+            echo "##[debug] Publishing Modules: ${modulesArray[@]}"
+
+            echo "##[section]Publishing the parent pom.xml as:"
+            cd $(DEFAULT_WORKDIR_ARTIFACTS)/$(ARTIFACT_NAME)
+
+            pomParentArtifactid=$(DOCKER_CMD_EXTRACT_ARTIFACT_ID)
+            pomParentArtifactFile=$(DEFAULT_WORKDIR_ARTIFACTS)/$(ARTIFACT_NAME)/pom.xml
+
+            run_curl_publish \
+              "$pomParentArtifactid" \
+              "pom" \
+              "$pomParentArtifactFile" \
+              "application/xml" \
+              "false"
+
+            ## -> Publish all modules artifacts
+            for module in "${modulesArray[@]}"; do
+              echo "##[section]Publishing the artifact of $module module as:"
+
+              moduleDir=$(DEFAULT_WORKDIR_ARTIFACTS)/$(ARTIFACT_NAME)/$module
+
+              cd $moduleDir
+
+              echo "##[debug] Searching for artifacts in target directory (priority order: EAR → WAR → JAR)"
+
+              targetDir=$moduleDir/target
+
+              echo "##[group] $module Target directory and content"
+              ls -la $targetDir
+              tree $targetDir
+              echo "##[endgroup]"
+
+              if [ "$(ls -1 $targetDir/*.ear 2>/dev/null)" ]; then
+                moduleArtifactFile=$(echo $targetDir/$(ls -1 "$targetDir" | grep -E "\.ear$" | sort | head -n 1))
+              elif [ "$(ls -1 $targetDir/*.war 2>/dev/null)" ]; then
+                echo "##[debug] No EAR artifact was found in the target directory."
+                moduleArtifactFile=$(echo $targetDir/$(ls -1 "$targetDir" | grep -E "\.war$" | sort | head -n 1))
+              elif [ "$(ls -1 $targetDir/*.jar 2>/dev/null)" ]; then
+                echo "##[debug] No EAR or WAR artifact was found in the target directory."
+                moduleArtifactFile=$(echo $targetDir/$(ls -1 "$targetDir" | grep -E "\.jar$" | sort | head -n 1))
+              else
+                echo "##[debug] No EAR, WAR, or JAR artifacts were found in the target directory."
+                exit 1
+              fi
+
+              echo "##[debug] Found module artifact file: $moduleArtifactFile"
+
+              moduleArtifactfilename=$(basename "$moduleArtifactFile")
+              moduleArtifactExtension="${moduleArtifactfilename##*.}"
+              moduleArtifactid=$(DOCKER_CMD_EXTRACT_ARTIFACT_ID)
+              pomModuleArtifactFile=$(DEFAULT_WORKDIR_ARTIFACTS)/$(ARTIFACT_NAME)/$module/pom.xml
+
+              ## -> Publish the module artifact
+              run_curl_publish \
+                "$moduleArtifactid" \
+                "$moduleArtifactExtension" \
+                "$moduleArtifactFile" \
+                "application/java-archive" \
+                "false" \
+                "pom" \
+                "$pomModuleArtifactFile" \
+                "application/xml"
+            done
+          fi
+
+    ## -> Upload Publish Summary
+    - task: Bash@3
+      displayName: Upload Publish Summary
+      continueOnError: true
+      inputs:
+        targetType: inline
+        script: |
+          ## -> Remove all ##[debug] ender from summary file
+          sed -i 's/##\[debug\] *//g' $(Build.SourcesDirectory)/publishInfo.md
+
+          cat $(Build.SourcesDirectory)/publishInfo.md
+
+          echo "##vso[task.addattachment type=Distributedtask.Core.Summary;name="Nexus Publish Summary";]$(Build.SourcesDirectory)/publishInfo.md"
+
+  - job: commit_version_bump
+    displayName: "Commit Version Bump"
+    dependsOn: publish
+    steps:
+
+    ########################################
+    ########################################
+    ########################################
+    - checkout: OSSDevOpsSettings
+      displayName: 'Checkout Maven Settings Repository'
+      name: checkout_settings_oss
+      path: settings_oss
+
+    ## -> Resolve Maven Settings (Custom → SIGLA → Default)
+    - task: Bash@3
+      displayName: 'Resolve Maven Settings'
+      name: resolve_settings
+      condition: succeeded()
+      continueOnError: false
+      inputs:
+        targetType: 'inline'
+        script: |
+          set -euo pipefail                
+          
+          SETTINGS_REPO_DIR="$(Pipeline.Workspace)/settings_oss"
+          APP_NAME="$(APP_NAME)"
+          AGENT_TEMP_DIR="$(Agent.TempDirectory)/maven-settings"
+
+          SIGLA=$(echo "$(GOV_APP_ACRONYM)" | tr '[:lower:]' '[:upper:]')
+          
+          mkdir -p "$AGENT_TEMP_DIR"
+          
+          echo "##[debug] Application Name: $APP_NAME"
+          echo "##[debug] Project Acronym: $SIGLA"
+          echo "##[debug] Settings Repository: $SETTINGS_REPO_DIR"
+          
+          echo "##[group] Files in settings repository:"
+          tree -a "$SETTINGS_REPO_DIR" 2>/dev/null | grep -E "\.xml$" || echo "##[debug]   (no XML files found in root)"
+          echo "##[endgroup]"
+          
+          ## -> Custom Settings (Application-Specific)
+          echo "##[section]────────────────────────────────────────"
+          echo "##[section] Searching for Custom Settings"
+          echo "##[section]────────────────────────────────────────"
+          
+          CUSTOM_SETTINGS_FILE="custom/${APP_NAME}-Settings.xml"
+          CUSTOM_SETTINGS_PATH="$SETTINGS_REPO_DIR/$CUSTOM_SETTINGS_FILE"
+          
+          echo "##[debug] Expected filename: ${APP_NAME}-Settings.xml"
+          echo "##[debug] Expected path: $CUSTOM_SETTINGS_FILE"
+          echo "##[debug] looking for the custom settings"
+          if [ -f "$CUSTOM_SETTINGS_PATH" ]; then
+            echo "##[debug] CUSTOM SETTINGS FOUND!"
+            echo "##[debug] Source: custom-application"
+            echo "##[debug] File: $CUSTOM_SETTINGS_FILE"
+            echo "##[debug] Application: $APP_NAME"
+            
+            cp "$CUSTOM_SETTINGS_PATH" "$AGENT_TEMP_DIR/settings.xml"
+            
+            # -> Export variables
+            echo "##vso[task.setvariable variable=MAVEN_SETTINGS_LOCATION]$AGENT_TEMP_DIR/settings.xml"
+            echo "##vso[task.setvariable variable=MAVEN_SETTINGS_SOURCE]custom-application"
+            
+            echo "##[section]════════════════════════════════════════"
+            echo "##[section] Resolution Summary"
+            echo "##[section]════════════════════════════════════════"
+            echo "##[section] File: $CUSTOM_SETTINGS_FILE"
+            echo "##[section] Location: $AGENT_TEMP_DIR/settings.xml"
+            echo "##[section]════════════════════════════════════════"
+            
+            exit 0
+          fi
+          
+          echo "##[debug] Custom settings NOT found"
+          echo "##[debug] Will try project acronym settings..."
+        
+          ## -> Project Acronym Settings (Team-Specific)
+          echo "##[section]────────────────────────────────────────"
+          echo "##[section] Searching for Project Acronym Settings"
+          echo "##[section]────────────────────────────────────────"
+          
+          SIGLA_SETTINGS="$SETTINGS_REPO_DIR/${SIGLA}-Settings.xml"
+          
+          echo "##[debug] Expected filename: ${SIGLA}-Settings.xml"
+          echo "##[debug] Expected path: $SIGLA_SETTINGS"
+          
+          echo "##[debug] Project Acronym: $SIGLA"
+          
+          if [ -f "$SIGLA_SETTINGS" ]; then
+            echo "##[section]PROJECT ACRONYM SETTINGS FOUND!"
+            echo "##[debug] File: ${SIGLA}-Settings.xml"
+            
+            cp "$SIGLA_SETTINGS" "$AGENT_TEMP_DIR/settings.xml"
+            
+            ## -> Export variables
+            echo "##vso[task.setvariable variable=MAVEN_SETTINGS_LOCATION]$AGENT_TEMP_DIR/settings.xml"
+            echo "##vso[task.setvariable variable=MAVEN_SETTINGS_SOURCE]Project Acronym"
+            
+            echo "##[section]════════════════════════════════════════"
+            echo "##[section] Resolution Summary"
+            echo "##[section]════════════════════════════════════════"
+            echo "##[section] File: ${SIGLA}-Settings.xml"
+            echo "##[section] Location: $AGENT_TEMP_DIR/settings.xml"
+            echo "##[section]════════════════════════════════════════"
+            
+            exit 0
+          fi
+          
+          echo "Project Acronym settings NOT found"
+          echo "Will try default settings..."
+          echo ""
+          
+          ## -> Default Settings (OSS)
+          echo "##[section]────────────────────────────────────────"
+          echo "##[section] Searching for Default Settings"
+          echo "##[section]────────────────────────────────────────"
+          
+          DEFAULT_SETTINGS="$SETTINGS_REPO_DIR/Settings-Default.xml"
+          
+          echo "##[debug] Expected filename: Settings-Default.xml"
+          echo "##[debug] Expected path: $DEFAULT_SETTINGS"
+
+          echo "##[debug] File exists? $([ -f "$DEFAULT_SETTINGS" ] && echo 'YES' || echo 'NO')"
+          
+          if [ -f "$DEFAULT_SETTINGS" ]; then
+            echo "##[section] DEFAULT SETTINGS FOUND!"
+            echo "File: Settings-Default.xml"
+            
+            cp "$DEFAULT_SETTINGS" "$AGENT_TEMP_DIR/settings.xml"
+            
+            ## -> Export variables
+            echo "##vso[task.setvariable variable=MAVEN_SETTINGS_LOCATION]$AGENT_TEMP_DIR/settings.xml"
+            echo "##vso[task.setvariable variable=MAVEN_SETTINGS_SOURCE]oss-default"
+            
+            echo "##[section]════════════════════════════════════════"
+            echo "##[section] Resolution Summary"
+            echo "##[section]════════════════════════════════════════"
+            echo "##[section] File: Settings-Default.xml"
+            echo "##[section] Location: $AGENT_TEMP_DIR/settings.xml"
+            echo "##[section]════════════════════════════════════════"
+            
+            exit 0
+          fi
+          
+          ## -> NO SETTINGS FOUND - FAIL PIPELINE
+          echo ""
+          echo "##[error]════════════════════════════════════════"
+          echo "##[error]  NO MAVEN SETTINGS FOUND"
+          echo "##[error]════════════════════════════════════════"
+          echo "##[error]"
+          echo "##[error] Tried the following locations (in order):"
+          echo "##[error]   1. custom/${APP_NAME}-Settings.xml (application-specific)"
+          echo "##[error]   2. ${SIGLA}-Settings.xml (Project Acronym specific)"
+          echo "##[error]   3. Settings-Default.xml (OSS default)"
+          echo "##[error]"
+          echo "##[error] Repository: $SETTINGS_REPO_DIR"
+          echo "##[error]"
+          echo "##[error]────────────────────────────────────────"
+          echo "##[error] Available Files in Repository"
+          echo "##[error]────────────────────────────────────────"
+          
+          echo "##[error] Root directory:"
+          ls -lah "$SETTINGS_REPO_DIR" 2>/dev/null | grep -E "\.xml$" || echo "##[error]   (no XML files found)"
+          echo "##[error]"
+          
+          if [ -d "$SETTINGS_REPO_DIR/custom" ]; then
+            echo "##[error] Custom directory:"
+            ls -lah "$SETTINGS_REPO_DIR/custom" 2>/dev/null | grep -E "\.xml$" || echo "##[error]   (no XML files found)"
+          else
+            echo "##[error] Custom directory: DOES NOT EXIST"
+          fi
+          
+          exit 1
+
+    ## -> Replace variables in settings.xml
+    - task: qetza.replacetokens.replacetokens-task.replacetokens@5
+      displayName: 'Configure Maven Settings'
+      condition: succeeded()
+      continueOnError: false
+      inputs:
+        targetFiles: $(MAVEN_SETTINGS_LOCATION)
+        tokenPattern: 'azpipelines'
+        enableTelemetry: false
+      env:
+        NEXUS_DEPS_USR: $(NEXUS_DEPS_USR)
+        NEXUS_DEPS_PSW: $(NEXUS_DEPS_PSW)
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+    
+    - task: Bash@3
+      displayName: 'Validate Maven Settings (Post-Tokens)'
+      condition: succeeded()
+      inputs:
+        targetType: 'inline'
+        script: |
+          set -euo pipefail
+          
+          SETTINGS_FILE="$(MAVEN_SETTINGS_LOCATION)"  
+          SETTINGS_SOURCE="$(MAVEN_SETTINGS_SOURCE)"  
+          
+          echo ""
+          echo "Settings Source: $SETTINGS_SOURCE"
+          echo "Settings Location: $SETTINGS_FILE"
+          echo ""
+          
+          if [ ! -f "$SETTINGS_FILE" ]; then
+            echo "##[error] Settings file not found: $SETTINGS_FILE"
+            exit 1
+          fi
+          
+          echo "##[debug] Checking for unreplaced tokens..."
+          
+          if grep -q '#{.*}#' "$SETTINGS_FILE"; then
+            echo "##[error] Found unreplaced tokens in settings.xml:"
+            grep -o '#{[^}]*}#' "$SETTINGS_FILE" | sort | uniq
+            echo ""
+            echo "##[error] Possible causes:"
+            echo "##[error]   - Variable not defined in 'env:' section of replacetokens task"
+            echo "##[error]   - Variable not propagated from Library Group"
+            exit 1
+          fi
+          
+          echo "##[debug] ✓ All tokens successfully replaced"
+          
+          # Settings.xml preview
+          echo ""
+          echo "##[section] Settings.xml Preview (first 30 lines, passwords masked):"
+          echo "##[section]────────────────────────────────────────"
+          
+          head -n 30 "$SETTINGS_FILE" | \
+            sed 's/<password>.*<\/password>/<password>***MASKED***<\/password>/g' | \
+            sed 's/<username>\(.*\)<\/username>/<username>***MASKED***<\/username>/g'
+          
+          echo ""
+
+    ########################################
+    ########################################
+    ########################################
+
+    ## -> Checkout the code
+    - checkout: self
+      displayName: Checkout Code
+      condition: and(
+        succeeded(),
+        eq(variables.BUMP_VERSION_ENABLED, 'true'))
+      name: checkout_code
+      submodules: true
+      path: source_code
+      persistCredentials: true
+
+    ## -> Checkout the last commit that was pushed to the repository.
+    - task: Bash@3
+      displayName: Checkout Last Commit
+      name: checkout_last_commit
+      condition: and(
+        succeeded(),
+        eq(variables.BUMP_VERSION_ENABLED, 'true'))
+      inputs:
+        targetType: inline
+        workingDirectory: $(Pipeline.Workspace)/source_code
+        script: |
+          echo "##[debug] Checkout last commit from '$(Build.SourceBranchName)'"
+
+          git config pull.rebase true
+          git fetch -f --depth 1 origin $(Build.SourceBranchName):$(Build.SourceBranchName)
+          git checkout -f $(Build.SourceBranchName)
+
+    ## -> Bump version for Java <= 7
+    - task: Bash@3
+      displayName: Bump Version on Legacy Mode (Java <= 7)
+      name: bump_java_7_or_less
+      condition: and(
+        succeeded(),
+        eq(variables.LEGACY_MODE, 'true'),
+        eq(variables.BUMP_VERSION_ENABLED, 'true'))
+      continueOnError: false
+      inputs:
+        targetType: inline
+        workingDirectory: $(Pipeline.Workspace)/source_code
+        script: |
+
+          echo "##[debug] Bumping version on legacy mode..."
+
+          run_docker() {
+            docker run --rm \
+              --log-driver none \
+              --entrypoint xq \
+              -v $(pwd)/"$1":$(pwd)/"$1" \
+              -w $(pwd) vcr-group.nexus.telefonica.com.br/linuxserver/yq \
+              -x "$2" \
+              "$1" > pom_temp.xml
+          }
+
+          echo "##[debug] Build with version: $(NEW_VERSION)"
+
+          ## -> Try to collect an array of modules
+          modules=$(DOCKER_CMD_EXTRACT_POM_XML_MODULE)
+
+          if [ $? -gt 0 ]; then
+            echo "##[warning] No modules found or is not an array, switching to string..."
+            modules=$(DOCKER_CMD_EXTRACT_POM_XML_MODULES)
+            if [ $? -gt 0 ]; then
+              echo "##[warning] No modules found, proceeding to pom parent..."
+            fi
+            dependenciesExpression=".project.dependencies.dependency"
+          else
+            dependenciesExpression=".project.dependencies.dependency[]"
+          fi;
+
+          for module in $modules; do
+            echo "##[debug] Bumping version for module: $module"
+            if [ -f "$module/pom.xml" ]; then
+
+              for dependency in $modules; do
+                run_docker "$module/pom.xml" "(try "$dependenciesExpression" | select(.artifactId==\""$dependency"\")).version=\""$(NEW_VERSION)"\""
+                if [ -f "pom_temp.xml" ]; then
+                  mv pom_temp.xml $(pwd)/"$module/pom.xml"
+                fi
+              done
+
+              run_docker "$module/pom.xml" "(try .project.parent | select(.artifactId==\""$(ARTIFACT_ID)"\")).version=\""$(NEW_VERSION)"\""
+              mv pom_temp.xml $(pwd)/"$module/pom.xml"
+
+              run_docker "$module/pom.xml" ".project.version=\""$(NEW_VERSION)"\""
+              mv pom_temp.xml $(pwd)/"$module/pom.xml"
+
+              echo "##[group] /$module/pom.xml"
+              cat $(pwd)/$module/pom.xml
+              echo "##[endgroup]"
+
+            else
+              echo "##[warning] No pom.xml file found for module: $module"
+            fi
+
+          done
+
+          echo "##[debug] Bumping version for pom parent"
+
+          run_docker "pom.xml" ".project.version=\""$(NEW_VERSION)"\""
+          mv pom_temp.xml $(pwd)/pom.xml
+
+          echo "##[group] pom.xml"
+          cat $(pwd)/pom.xml
+          echo "##[endgroup]"
+
+    ## -> Bump version in code
+    - task: Bash@3
+      displayName: Update Source Version
+      condition: and(
+        succeeded(),
+        eq(variables.LEGACY_MODE, 'false'),
+        eq(variables.BUMP_VERSION_ENABLED, 'true'))
+      inputs:
+        targetType: inline
+        workingDirectory: $(Pipeline.Workspace)/source_code
+        script: |
+
+          echo $(MAVEN_SETTINGS_LOCATION)
+
+          BUILDER_IMAGE_NAME="builder/java"
+
+          docker build --no-cache --build-arg USER_ID=$(DOCKER_CMD_USERNAME) --build-arg GROUP_ID=$(DOCKER_CMD_GROUP) -t $BUILDER_IMAGE_NAME -f .azuredevops/builder.Dockerfile .
+
+          run_docker() {
+            docker run --rm \
+              --user=$(DOCKER_CMD_USERNAME):$(DOCKER_CMD_GROUP) \
+              --network host \
+              --log-driver none \
+              -e JAVA_OPTS_MEMORY_MAX=$(DEFAULT_MAX_MEMORY_BUILD) \
+              -e TZ="America/Sao_Paulo" \
+              -e SYSTEM_ACCESSTOKEN=$(System.AccessToken) \
+              -e NEXUS_DEPS_USR=$(NEXUS_DEPS_USR) \
+              -e NEXUS_DEPS_PSW=$(NEXUS_DEPS_PSW) \
+              -v $(pwd):/app \
+              -v $HOME/.m2:/.m2 \
+              -v $(MAVEN_SETTINGS_LOCATION):/.m2/settings.xml \
+              -w $(DOCKER_WORKDIR) \
+              "$BUILDER_IMAGE_NAME" sh -c "$1"
+          }
+
+          echo "##[debug] Pushing NEW_VERSION: $(NEW_VERSION)"
+
+          run_docker "mvn -e -X $MAVEN_OPTS versions:set -DnewVersion=$(NEW_VERSION) -s /.m2/settings.xml -Dmaven.repo.local=/.m2/repository"
+
+    ## -> Push new version to git
+    - task: Bash@3
+      displayName: 'Commit Updated Version'
+      condition: and(
+        succeeded(),
+        eq(variables.BUMP_VERSION_ENABLED, 'true'))
+      inputs:
+        targetType: inline
+        workingDirectory: $(Pipeline.Workspace)/source_code
+        script: |
+
+          ## -> Define variables
+          branchName=$(Build.SourceBranchName)
+          tagRepo=true
+
+          ## -> Set tagPushParam if tagRepo is true
+          tagPushParam=""
+          echo "##[debug] tagRepo.....: $tagRepo"
+
+          ## -> Add changes and commit
+          git add .
+          git commit -am "[CI SKIP] Project version has been updated. Released version '$(NEW_VERSION)'" --author="$BUILD_REQUESTEDFOR <$BUILD_REQUESTEDFOREMAIL>"
+
+          ## -> Tag the commit if tagRepo is true
+          if [[ "$tagRepo" == "true" ]]; then
+
+            if git rev-parse "$(NEW_VERSION)" >/dev/null 2>&1; then
+              echo "##vso[task.logissue type=warning;]Tag $(NEW_VERSION) already exists. Skipping tag creation and commit."
+            else
+              if [[ "$tagRepo" == "true" ]]; then
+                tagPushParam="--tags"
+                git tag $(NEW_VERSION)
+              fi
+            fi
+
+          fi
+
+          ## -> Show git status for debug purposes
+          git status
+
+          ## -> Attempt to push changes and tags
+          echo "##[command] git push origin $tagPushParam $branchName"
+          git push origin $tagPushParam $branchName
+
+          ## -> Check if git push succeeded
+          if [ $? -ne 0 ]; then
+            echo "##vso[task.logissue type=error;] Git push failed. Permission denied."
+            echo "##vso[task.complete result=Failed;]"
+            exit 1
+          fi
+
+          echo "##[debug] Version updated to $(NEW_VERSION)"
+
+    - task: Bash@3
+      displayName: 'Tag Pipeline with Package Version'
+      condition: succeeded()
+      inputs:
+        targetType: inline
+        script: |
+          echo "##[debug] Adding pipeline tag with new version: $(NEW_VERSION)"
+          echo "##vso[build.addbuildtag]version=$(NEW_VERSION)"

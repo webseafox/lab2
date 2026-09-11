@@ -1,0 +1,162 @@
+parameters:
+- name: environments
+  type: object
+
+stages:
+- stage: stage_build
+  pool: $(PRIVATE_AGENT_DEFAULT)
+  displayName: Build
+  jobs:
+  - job: job_set_version
+    displayName: Set Version
+    steps:
+    - checkout: self
+      persistCredentials: true
+      clean: true
+    - template: /provisioners/api_gateway/trunkbased/axway/instance_legacy/task_groups/bump_version.yml
+  
+  - job: build
+    displayName: Build
+    dependsOn:
+    - job_set_version
+    variables:
+      APP_VERSION: $[ dependencies.job_set_version.outputs['set_version.APP_VERSION'] ]
+    steps:
+    - template: /tasks/nexus/download_file.yml
+      parameters:
+        displayName: 'Download projpack'
+        repository: $(NEXUS_REPOSITORY)
+        remoteFileLocation: br/com/vivo/devops/projpack/$(PROJPACK_VERSION)/projpack-$(PROJPACK_VERSION).zip
+    
+    - task: ExtractFiles@1
+      displayName: Extract projpack
+      inputs:
+        archiveFilePatterns: "$(Agent.TempDirectory)/projpack-$(PROJPACK_VERSION).zip"
+        destinationFolder: $(Agent.TempDirectory)
+        cleanDestinationFolder: false
+
+    - ${{ if containsValue(parameters.environments, 'prod') }}:
+      - script: |
+          set -e
+
+          echo "##[debug] TOPOLOGY_FILE...............: ${TOPOLOGY_FILE}"
+          echo "##[debug] URL.........................: ${URL}"
+          echo "##[debug] REPOSITORY..................: ${REPOSITORY}"
+
+          projpack_params=""
+
+          while read -r api; do
+            name=$(echo "$api" | jq -r '.name' | tr -d ' ')
+            version=$(echo "$api" | jq -r '.version')
+            file_name="${name}-${version}.tar"
+
+            echo "##[group] Download API '${name}' version '${version}'"
+
+            NEXUS_URL="${URL}/${REPOSITORY}/br/com/vivo/api/${name}/${version}/${file_name}"
+            echo "##[debug] NEXUS_URL.......: ${NEXUS_URL}"
+
+            wget --content-on-error --user "${USERNAME}" --password "${PASSWORD}" "${NEXUS_URL}"
+
+            echo "##[command] tar xvf ${file_name} -C ${name}"
+            mkdir -p ${name}
+            tar xvf ${file_name} -C ${name}
+            rm ${file_name}
+
+            projpack_params+=" --add ${name}/src --projpass-none"
+
+            echo "##[endgroup]"
+          done < <(jq -c '.apis[]' "${TOPOLOGY_FILE}")
+
+          echo "##[debug] projpack_params.............: ${projpack_params}"
+          echo "##vso[task.setvariable variable=projpack_params;]${projpack_params}"
+        displayName: '[prod] Downloading dependencies'
+        workingDirectory: $(Agent.TempDirectory)
+        env:
+          TOPOLOGY_FILE: $(Build.SourcesDirectory)/$(TOPOLOGY_FILE_PATH)
+          URL: $(NEXUS_REPOSITORY_URL)
+          REPOSITORY: $(NEXUS_REPOSITORY)
+          USERNAME: $(NEXUS-DEFAULT-USR)
+          PASSWORD: $(NEXUS-DEFAULT-PSW)
+    - ${{ else }}:
+      - task: AzureKeyVault@2
+        displayName: Get PAT
+        inputs:
+          azureSubscription: DevOpsSharedResources
+          KeyVaultName: $(AKV_DEVOPS_NAME)
+          SecretsFilter: 'AZ-DEVOPS-PAT-TOKEN'
+      - script: |
+          set -e
+          echo "##[debug] TOPOLOGY_FILE...............: ${TOPOLOGY_FILE}"
+
+          projpack_params=""
+
+          while read -r api; do
+            name=$(echo "$api" | jq -r '.name' | tr -d ' ')
+            version=$(echo "$api" | jq -r '.version')
+            file_name="${name}-${version}.tar"
+            repo_name="src-77.${name}"
+
+            echo "##[group] Clone repo '${repo_name}' for version '${version}'"
+            HEADER_VALUE=$(printf "Authorization: Basic :%s" "${PAT}" | base64)
+            git clone https://${PAT}@dev.azure.com/telefonica-vivo-brasil/MIGR-Api-Management/_git/${repo_name} ${name}
+
+            projpack_params+=" --add ${name}/src --projpass-none"
+            echo "##[endgroup]"
+          done < <(jq -c '.apis[]' "${TOPOLOGY_FILE}")
+
+          ls -lh
+
+          echo "##[debug] projpack_params..............: ${projpack_params}"
+          echo "##vso[task.setvariable variable=projpack_params;]${projpack_params}"
+        displayName: '[esteiras] Downloading dependencies'
+        workingDirectory: $(Agent.TempDirectory)
+        env:
+          TOPOLOGY_FILE: $(Build.SourcesDirectory)/$(TOPOLOGY_FILE_PATH)
+          PAT: $(AZ-DEVOPS-PAT-TOKEN)
+          HTTPS_PROXY: $(PROXY_AGENT_HTTPS)
+          HTTP_PROXY: $(PROXY_AGENT_HTTP)
+          NO_PROXY: $(PROXY_AGENT_NO_PROXY)
+
+    - script: |
+        set -e
+        echo "##[debug] API_GATEWAY_PACKAGE_TYPE.................: ${API_GATEWAY_PACKAGE_TYPE}"
+        echo "##[command] projpack gtw-grp-instance"
+        
+        ${AGENT_TEMPDIRECTORY}/projpack-${PROJPACK_VERSION}/apigateway/posix/bin/projpack --create --replace --passphrase-none --name=gtw-grp-instance --type=${API_GATEWAY_PACKAGE_TYPE} ${PARAMS}
+        ls -lh | grep gtw-grp-instance
+      displayName: Generate package gtw-grp-instance
+      workingDirectory: $(Agent.TempDirectory)
+      env:
+        API_GATEWAY_PACKAGE_TYPE: $(API_GATEWAY_PACKAGE_TYPE)
+        PARAMS: $(projpack_params)
+
+    - ${{ each env in parameters.environments }}:
+      - script: |
+          set -e
+          echo "##[debug] API_GATEWAY_PACKAGE_TYPE.......: ${API_GATEWAY_PACKAGE_TYPE}"
+          echo "##[debug] ENV............................: ${ENV}"
+          echo "##[command] projpack gtw-grp-instance-${ENV}"
+          
+          ${AGENT_TEMPDIRECTORY}/projpack-${PROJPACK_VERSION}/apigateway/posix/bin/projpack --create --replace --passphrase-none --name=gtw-grp-instance-${ENV} --type=${API_GATEWAY_PACKAGE_TYPE} --add ${BUILD_SOURCESDIRECTORY}/env/instance-env-${ENV} --projpass-none
+          ls -lh | grep gtw-grp-instance-${ENV}
+        displayName: '[${{ env }}] Generate package'
+        workingDirectory: $(Agent.TempDirectory)
+        env:
+          API_GATEWAY_PACKAGE_TYPE: $(API_GATEWAY_PACKAGE_TYPE)
+          PARAMS: $(projpack_params)
+          ENV: ${{ env }}
+
+    - template: /tasks/nexus/upload_files.yml
+      parameters:
+        repository: $(NEXUS_REPOSITORY)
+        credentialsEnabled: false
+        files:
+        - localFileLocation: $(Agent.TempDirectory)/gtw-grp-instance.$(API_GATEWAY_PACKAGE_TYPE)
+          remoteFileLocation: br/com/vivo/gateway/$(VAR_COMPONENT_NAME_NEXUS)/$(APP_VERSION)/$(VAR_COMPONENT_NAME_NEXUS)-$(APP_VERSION).$(API_GATEWAY_PACKAGE_TYPE)
+        - localFileLocation: $(Build.SourcesDirectory)/conf/jvm.xml
+          remoteFileLocation: br/com/vivo/gateway/$(VAR_COMPONENT_NAME_NEXUS)/$(APP_VERSION)/jvm.xml
+        - ${{ each env in parameters.environments }}:
+          - localFileLocation: $(Agent.TempDirectory)/gtw-grp-instance-${{ env }}.env
+            remoteFileLocation: br/com/vivo/gateway/$(VAR_COMPONENT_NAME_NEXUS)/$(APP_VERSION)/$(VAR_COMPONENT_NAME_NEXUS)-$(APP_VERSION)-${{ env }}.env
+          - localFileLocation: $(Build.SourcesDirectory)/env-settings/envSettings-${{ env }}.props
+            remoteFileLocation: br/com/vivo/gateway/$(VAR_COMPONENT_NAME_NEXUS)/$(APP_VERSION)/$(VAR_COMPONENT_NAME_NEXUS)-$(APP_VERSION)-${{ env }}.props

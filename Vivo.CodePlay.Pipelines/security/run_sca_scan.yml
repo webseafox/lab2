@@ -1,0 +1,997 @@
+parameters:
+- name: buildArtifactName
+  default: app
+- name: convisoCompany
+  default: 430
+- name: appVersion
+  default: "DevSecOps"
+- name: vivoFlow
+  type: string
+  default: "master,main,develop,dev,preprod,homolog,staging,prodlike,release"
+- name: skipSecurityGate
+  default: false
+- name: repositoryName
+  type: string
+  default: "$(Build.Repository.Name)"
+
+steps:
+  - ${{ if or(eq(parameters.vivoFlow, 'none'),and(ne(parameters.vivoFlow, 'none'),or(eq(variables['Build.SourceBranchName'], 'master'),eq(variables['Build.SourceBranchName'], 'main'),startsWith(variables['Build.SourceBranchName'], 'release/'),contains(parameters.vivoFlow, variables['Build.SourceBranchName']),and(eq(variables['Build.Reason'], 'PullRequest'),contains(parameters.vivoFlow, replace(variables['System.PullRequest.TargetBranch'], 'refs/heads/', '')))))) }}:
+
+    - task: DownloadPipelineArtifact@2
+      displayName: 'Download AppSec Endpoints Artifact'
+      inputs:
+        buildType: 'current'
+        artifactName: 'AppSecEndpoints'
+        targetPath: '$(Pipeline.Workspace)/AppSecEndpoints'
+
+    - task: Bash@3
+      displayName: 'Set SCA Variables'
+      inputs:
+        targetType: inline
+        script: |
+          ENDPOINTS_FILE="$(Pipeline.Workspace)/AppSecEndpoints/appsec_endpoints.json"
+
+          if [ ! -f "$ENDPOINTS_FILE" ]; then
+            echo "##vso[task.logissue type=error]AppSec Endpoints artifact not found!"
+            echo "##[error]The required artifact 'AppSecEndpoints' containing the configuration JSON could not be found."
+            exit 1
+          fi
+
+          echo "##[debug] Parsing endpoints from artifact..."
+          USE_DT_SCA_ENDPOINT=$(jq -r '.DT_SCA_ENDPOINT // empty' "$ENDPOINTS_FILE")
+
+          if [ -z "$USE_DT_SCA_ENDPOINT" ]; then
+            echo "##vso[task.logissue type=error]Missing required DT_SCA_ENDPOINT variable in AppSec Endpoints artifact!"
+            exit 1
+          fi
+
+          echo "=================================================================="
+          echo "AppSec Endpoints Loaded:"
+          echo "DT_SCA_ENDPOINT.........................: $USE_DT_SCA_ENDPOINT"
+          echo "=================================================================="
+
+          echo "##vso[task.setvariable variable=DT_SCA_ENDPOINT]$USE_DT_SCA_ENDPOINT"
+          echo "##vso[task.setvariable variable=DT_APP_DEFAULT_NAME]$(System.TeamProject)-${{ parameters.repositoryName }}"
+          echo "##vso[task.setvariable variable=DT_APP_DEFAULT_VERSION]DevSecOps"
+
+          echo "Security variables for this job have been set."
+
+    - task: DownloadBuildArtifacts@1
+      displayName: 'Download Build Artifacts'
+      inputs:
+        artifactName: ${{ parameters.buildArtifactName }}
+        cleanDestinationFolder: false
+        extractTars: true
+        parallelizationLimit: 8
+        downloadPath: $(Build.SourcesDirectory)
+
+    ## -> Extração do arquivo TAR.GZ
+    ## -> Task responsável por extrair os arquivos compactados no app.tar.gz caso a variável EXTRACT_TAR_GZ
+    ## -> do projeto esteja 'true', arquivos esses que serão utilizados pelo scan para detecção de vulnerabilidades
+    - task: Bash@3
+      displayName: 'Extract TAR.GZ for SCA Scan'
+      condition: eq(variables['EXTRACT_TAR_GZ'], 'true')
+      inputs:
+        workingDirectory: '$(Build.SourcesDirectory)'
+        targetType: inline
+        script: |
+          echo "##[debug] EXTRACT_TAR_GZ esta setada como TRUE, extraindo conteúdo de app.tar.gz"
+
+          if [ -f "app.tar.gz" ]; then
+            echo "##[debug] Arquivo app.tar.gz encontrado, extraindo arquivos..."
+            tar -xzf app.tar.gz
+            echo "##[debug] Extração completa. Arquivos extraídos:"
+            ls -la *.jar 2>/dev/null || ls -la
+          else
+            echo "##[warning] Arquivo app.tar.gz não encontrado no diretório artifacts"
+            echo "##[debug] Arquivos disponíveis no diretório:"
+            ls -la
+          fi
+
+    ## -> Download Security Tokens
+    - task: AzureKeyVault@2
+      displayName: 'Getting AKV Security Credentials'
+      timeoutInMinutes: 1
+      retryCountOnTaskFailure: 5
+      inputs:
+        azureSubscription: DevOpsSharedResources
+        KeyVaultName: kv-azdevops-shared
+        SecretsFilter: 'CONVISO-API-KEY, DEPENDENCY-TRACK-TOKEN, ASPM-BASE-URL, ASPM-OAUTH-CLIENT-ID, ASPM-OAUTH-CLIENT-SECRET'
+      condition: and(eq(variables['DEPENDENCY-TRACK-TOKEN'], ''), eq(variables['CONVISO-API-KEY'], ''))
+
+
+    ## -> Taks the explain this job
+    - task: Bash@3
+      displayName: 'About the Job'
+      inputs:
+        targetType: inline
+        script: |
+          RED='\033[0;31m'
+          GREEN='\033[0;32m'
+          BLUE='\033[0;34m'
+          YELLOW='\033[1;33m'
+          BG_GREEN='\033[42;1;37m'
+          printf "
+          =================================================================================================================================
+          ${GREEN}                                                 ${SYSTEM_JOBDISPLAYNAME}
+          =================================================================================================================================
+          ${YELLOW}The objective of this stage is to evaluate if there are vulnerabilities in the dependencies and third-party libraries used in this application.
+          ${YELLOW}It is under the responsibility of the AppSec team
+          ${YELLOW}If you have any questions about this phase of the pipeline, please refer to the documentation at https://wikicorp.telefonica.com.br/pages/viewpage.action?pageId=524036659
+          ================================================================================================================================="
+    ## -> Generate the SBOM and upload it to Dependency-Track
+    ## -> Begin of SCA scan tasks
+    - task: SyftInstall@1
+      displayName: 'Install Syft (DT — 1.19, estável)'
+      inputs:
+        mode: custom
+        useCache: true
+        version: 1.19.0
+    ## -> Generates SBOM from source (mesmo comportamento de produção)
+    - task: GenerateSbomSyft@1
+      displayName: 'Generating SBOM with Syft (DT)'
+      inputs:
+        useDockerImage: false
+        reportPath: 'cyclonedx_report.json'
+    ## -> Validates whether the image scan occurred normally and the SBOM was generated
+    - task: Bash@3
+      displayName: 'Validating SCAN'
+      inputs:
+        workingDirectory: '$(Build.SourcesDirectory)'
+        targetType: inline
+        script: |
+          echo "##[debug] Project name: $(DT_APP_DEFAULT_NAME)"
+          echo "##[debug] Project version: ${{ parameters.appVersion }}"
+          echo "##[debug] Report Path: cyclonedx_report.json"
+          if [ -e "cyclonedx_report.json" ]; then
+            echo "##[debug] Scan completed."
+            echo "##[debug] CycloneDX size: $(wc -c < cyclonedx_report.json) bytes"
+          else
+            echo "##[debug] Scan fail."
+            exit 1
+          fi
+
+    - task: SyftInstall@1
+      displayName: 'Install Syft (ASPM Supply Chain — 1.50, em teste)'
+      continueOnError: true
+      inputs:
+        mode: custom
+        useCache: true
+        version: 1.50.0
+
+    - task: Bash@3
+      displayName: 'Generating native Syft SBOM (ASPM Supply Chain — em teste)'
+      continueOnError: true
+      inputs:
+        targetType: inline
+        workingDirectory: '$(Build.SourcesDirectory)'
+        script: |
+          set -euo pipefail
+          syft version
+          # Um unico scan, dois formatos:
+          #   - syft-json    (nativo)    -> ASPM Supply Chain
+          #   - cyclonedx-json (CycloneDX) -> Conviso Platform (formato exigido pela Conviso)
+          syft scan dir:. --verbose \
+            -o syft-json=syft_report.json \
+            -o cyclonedx-json=cyclonedx_conviso.json
+
+          test -s syft_report.json
+          jq -e '.schema.version != null and (.artifacts | type == "array") and (.artifactRelationships | type == "array")' syft_report.json > /dev/null
+
+          echo "##[debug] Syft artifacts: $(jq '.artifacts | length' syft_report.json)"
+          echo "##[debug] Syft relationships: $(jq '(.artifactRelationships // []) | length' syft_report.json)"
+
+          echo "##vso[task.setvariable variable=SYFT_NATIVE_OK]true"
+
+          # Valida o CycloneDX que ira para a Conviso.
+          if [ -s cyclonedx_conviso.json ]; then
+            DEP_COUNT=$(jq '(.dependencies // []) | length' cyclonedx_conviso.json)
+            COMP_COUNT=$(jq '(.components // []) | length' cyclonedx_conviso.json)
+            echo "##[debug] CycloneDX (Conviso) OK | componentes: ${COMP_COUNT} | dependencies[]: ${DEP_COUNT}"
+            if [ "$DEP_COUNT" -eq 0 ]; then
+              echo "##[warning] CycloneDX do Syft 1.50 sem dependencies[]. O grafo Direta/Transitiva pode nao aparecer na Conviso nesta run."
+            fi
+            echo "##vso[task.setvariable variable=SYFT_CDX_OK]true"
+          else
+            echo "##[warning] cyclonedx_conviso.json (Syft 1.50) nao gerado — o import para a Conviso usara fallback (Syft 1.19), se existir."
+          fi
+
+    - bash: |
+
+        echo "##[debug] Uploading BOM to DT..."
+
+        BOMCONTENT=$(cat cyclonedx_report.json | base64 -w 0)
+        ODTFILE="bom_payload.json"
+
+        echo "Nome do projeto: ${DT_APP_DEFAULT_NAME}"
+        echo "Versão: ${{ parameters.appVersion }}"
+
+        PAYLOAD='{ "projectName": "'${DT_APP_DEFAULT_NAME}'", "projectVersion": "'${{ parameters.appVersion }}'", "autoCreate": true, "bom": "'${BOMCONTENT}'" }'
+
+        echo -n $PAYLOAD > $ODTFILE
+
+        RESPONSE=$(curl -s \
+                    -X PUT "${DT_SCA_ENDPOINT}/v1/bom" \
+                    -H "X-API-Key: ${DT_TOKEN}" \
+                    -H 'Content-Type: application/json' \
+                    -d "@${ODTFILE}")
+
+        echo "##[debug]Uploaded! Response: ${RESPONSE}"
+
+        sbomToken=$(jq -r '.token // empty' <<< "$RESPONSE")
+        if [ -z "$sbomToken" ]; then
+          safe_response=$(printf '%s' "$RESPONSE" | jq -c . 2>/dev/null || printf 'resposta não-JSON: %.800s' "$RESPONSE")
+          echo "##vso[task.logissue type=error]Dependency-Track rejeitou o SBOM; nenhum token de processamento foi retornado: $safe_response"
+          exit 1
+        fi
+        echo "##vso[task.setvariable variable=SBOM_TOKEN]$sbomToken"
+
+        i="0"
+        retries="25"
+        echo "Aguardando Sincronização finalizar"
+        while [[ $i -lt $retries ]]
+        do
+
+        RESPONSE=$(curl -s \
+                    -X GET "${DT_SCA_ENDPOINT}/v1/event/token/${sbomToken}" \
+                    -H "X-API-Key: ${DT_TOKEN}" \
+                    -H 'Content-Type: application/json')
+
+        echo "##[debug]Status de processamento: ${RESPONSE}"
+
+        if [[ "$(jq -r '.processing' <<< "$RESPONSE")" == "false" ]]
+        then
+            echo "Sincronização finalizada com sucesso"
+
+            DT_APP_DEFAULT_NAME=$(echo -n "$DT_APP_DEFAULT_NAME" | jq -sRr @uri)
+
+            echo "Nome do projeto: ${DT_APP_DEFAULT_NAME}"
+
+            RESPONSE=$(curl -s \
+                        -X GET "${DT_SCA_ENDPOINT}/v1/project/lookup?name=${DT_APP_DEFAULT_NAME}&version=${{ parameters.appVersion }}" \
+                        -H "X-API-Key: ${DT_TOKEN}" \
+                        -H 'Content-Type: application/json')
+
+            echo "##[debug]Valor do Lookup: ${RESPONSE}"
+
+            DT_PROJECT_ID=$(jq -r '.uuid' <<< "$RESPONSE")
+
+            gateValidation=$(jq -r '.metrics.policyViolationsSecurityUnaudited' <<< "$RESPONSE")
+
+            echo "##[debug]Valor do UUID: ${DT_PROJECT_ID}"
+
+            echo "##[debug]Violações não auditadas: ${gateValidation}"
+
+            echo "##vso[task.setvariable variable=GATE_VALIDATION]$gateValidation"
+
+            echo "##vso[task.setvariable variable=PROJECT_ID]$DT_PROJECT_ID"
+
+            exit 0
+        fi
+        i=$[$i+1]
+        sleep 15s
+        done
+
+        echo "##vso[task.logissue type=error;]Tempo esgotado - A Sincronização não foi finalizada, tente rodar novamente."
+        echo "##vso[task.complete result=Failed;]"
+      displayName: Uploading SBOM to DT
+      env:
+        DT_SCA_ENDPOINT: $(DT_SCA_ENDPOINT)
+        CACORP_LOCATION: $(CACORP_LOCATION)
+        DT_TOKEN: $(DEPENDENCY-TRACK-TOKEN)
+        DT_PROJECT_ID: $(DT_PROJECT_ID)
+        PROXY_AGENT_HTTPS: "$(PROXY_AGENT_HTTPS)"
+
+    ## -> Apply project tag based on extracted sigla
+    - bash: |
+        # Extrair sigla e fazer tagging do projeto
+        PROJECT_NAME_CLEAN=$(echo "${DT_APP_DEFAULT_NAME}" | sed 's/%20/ /g')
+
+        # Extrair a sigla
+        if [[ "$PROJECT_NAME_CLEAN" == *" - "* ]]; then
+          PROJECT_SIGLA=$(echo "${PROJECT_NAME_CLEAN}" | cut -d'-' -f1 | xargs | tr '[:upper:]' '[:lower:]')
+        else
+          PROJECT_SIGLA=$(echo "${PROJECT_NAME_CLEAN}" | sed -E 's/[-.].*//' | cut -d' ' -f1 | tr '[:upper:]' '[:lower:]')
+        fi
+
+        # Fazer tagging se a sigla não estiver vazia
+        if [ ! -z "$PROJECT_SIGLA" ]; then
+          TAG_PAYLOAD='["$(PROJECT_ID)"]'
+
+          TAG_RESPONSE=$(curl -s -w "\nHTTP_STATUS:%{http_code}" \
+                -X POST "${DT_SCA_ENDPOINT}/v1/tag/${PROJECT_SIGLA}/project" \
+                -H "X-API-Key: ${DT_TOKEN}" \
+                -H "Content-Type: application/json" \
+                -d "${TAG_PAYLOAD}")
+
+          HTTP_STATUS=$(echo "$TAG_RESPONSE" | grep "HTTP_STATUS:" | cut -d':' -f2)
+
+          if [[ "$HTTP_STATUS" =~ ^(200|204)$ ]]; then
+            echo "##[section]Projeto taggeado com sucesso: ${PROJECT_SIGLA}"
+          else
+            echo "##[warning]Falha ao aplicar tag '${PROJECT_SIGLA}'. HTTP Status: ${HTTP_STATUS}"
+          fi
+        fi
+      displayName: Tagging Asset in Dependency-Track
+      continueOnError: true
+      env:
+        DT_SCA_ENDPOINT: $(DT_SCA_ENDPOINT)
+        CACORP_LOCATION: $(CACORP_LOCATION)
+        DT_TOKEN: $(DEPENDENCY-TRACK-TOKEN)
+        DT_APP_DEFAULT_NAME: $(DT_APP_DEFAULT_NAME)
+
+    ## -> Retriving SBOM Token and Moving SBOM to Artifacts Directory
+    - task: Bash@3
+      displayName: 'Moving SBOM to Artifacts Staging Directory'
+      inputs:
+        targetType: inline
+        script: |
+          echo "##[debug] SBOM token: $(SBOM_TOKEN)"
+          mv cyclonedx_report.json $(Build.ArtifactStagingDirectory)/
+          if [ "$(SYFT_NATIVE_OK)" = "true" ] && [ -f syft_report.json ]; then
+            mv syft_report.json $(Build.ArtifactStagingDirectory)/
+          else
+            echo "##[warning] syft_report.json (Syft 1.50, em teste) não disponível nesta run — pulando, o caminho do DT não é afetado."
+          fi
+          # CycloneDX do Syft 1.50 destinado a Conviso
+          if [ -f cyclonedx_conviso.json ]; then
+            mv cyclonedx_conviso.json $(Build.ArtifactStagingDirectory)/
+          else
+            echo "##[warning] cyclonedx_conviso.json (Syft 1.50) não disponível — import Conviso usará fallback (1.19), se existir."
+          fi
+    ## -> Publishing SBOM (Software Bill Of Materials)
+    - task: PublishBuildArtifacts@1
+      displayName: "Publishing SBOM"
+      inputs:
+        pathToPublish: "$(Build.ArtifactStagingDirectory)/cyclonedx_report.json"
+        artifactName: "sbom-docker"
+    ## -> APPSEC METRICS CALLBACK — unitary sync after Dependency-Track project lookup
+    - task: PublishBuildArtifacts@1
+      displayName: "Publishing native Syft SBOM"
+      condition: and(succeeded(), eq(variables['SYFT_NATIVE_OK'], 'true'))
+      continueOnError: true
+      inputs:
+        pathToPublish: "$(Build.ArtifactStagingDirectory)/syft_report.json"
+        artifactName: "sbom-syft"
+    - task: Bash@3
+      displayName: "APPSEC METRICS CALLBACK — Dependency-Track"
+      condition: succeeded()
+      continueOnError: true
+      env:
+        ASPM_BASE_URL: "$(ASPM-BASE-URL)"
+        ASPM_CLIENT_ID: "$(ASPM-OAUTH-CLIENT-ID)"
+        ASPM_CLIENT_SECRET: "$(ASPM-OAUTH-CLIENT-SECRET)"
+      inputs:
+        targetType: inline
+        script: |
+          set -euo pipefail
+          [ -n "${ASPM_BASE_URL:-}" ] || { echo "##vso[task.logissue type=error]ASPM_BASE_URL ausente"; exit 1; }
+          [ -n "${ASPM_CLIENT_ID:-}" ] || { echo "##vso[task.logissue type=error]ASPM_OAUTH_CLIENT_ID ausente"; exit 1; }
+          [ -n "${ASPM_CLIENT_SECRET:-}" ] || { echo "##vso[task.logissue type=error]ASPM_OAUTH_CLIENT_SECRET ausente"; exit 1; }
+          ASPM_BASE_URL="${ASPM_BASE_URL%/}"
+          echo "##[debug] ASPM callback: base_url=$ASPM_BASE_URL client_id_configurado=sim client_secret_configurado=sim"
+
+          token_raw=$(curl -sS -w "\n%{http_code}" -X POST "$ASPM_BASE_URL/api/v1/oauth/token" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -nc --arg id "$ASPM_CLIENT_ID" --arg secret "$ASPM_CLIENT_SECRET" '{grant_type:"client_credentials",client_id:$id,client_secret:$secret}')")
+          token_http="${token_raw##*$'\n'}"
+          token_body="${token_raw%$'\n'*}"
+          if [ "$token_http" != "200" ]; then
+            safe_body=$(printf '%s' "$token_body" | jq -c . 2>/dev/null || printf 'resposta nao-JSON: %.800s' "$token_body")
+            echo "##vso[task.logissue type=error]APPSEC METRICS CALLBACK OAuth falhou (HTTP $token_http): $safe_body"
+            exit 1
+          fi
+          token=$(printf '%s' "$token_body" | jq -er '.access_token') || {
+            echo "##vso[task.logissue type=error]ASPM OAuth respondeu 200 sem access_token"
+            exit 1
+          }
+
+          payload=$(jq -nc \
+            --arg event "dependency_track:$(Build.BuildId):$(PROJECT_ID)" \
+            --arg org "$(System.CollectionUri)" \
+            --arg projectId "$(System.TeamProjectId)" \
+            --arg project "$(System.TeamProject)" \
+            --arg repoId "$(Build.Repository.ID)" \
+            --arg repo "$(Build.Repository.Name)" \
+            --arg branch "$(Build.SourceBranch)" \
+            --arg commit "$(Build.SourceVersion)" \
+            --arg run "$(Build.BuildId)" \
+            --arg unit "$(PROJECT_ID)" \
+            --arg name "$(DT_APP_DEFAULT_NAME) ${{ parameters.appVersion }}" \
+            '{event_key:$event,source:"dependency_track",azure_org:$org,azure_project_id:$projectId,azure_project_name:$project,azure_repo_id:$repoId,azure_repo_name:$repo,branch:$branch,commit_sha:$commit,pipeline_run_id:$run,external_unit_id:$unit,external_unit_name:$name}')
+
+          callback_raw=$(curl -sS -w "\n%{http_code}" -X POST "$ASPM_BASE_URL/api/v1/aspm/pipeline/callback" \
+            -H "Authorization: Bearer $token" -H "Content-Type: application/json" -d "$payload")
+          callback_http="${callback_raw##*$'\n'}"
+          callback_body="${callback_raw%$'\n'*}"
+          if [ "$callback_http" != "202" ]; then
+            safe_body=$(printf '%s' "$callback_body" | jq -c . 2>/dev/null || printf 'resposta nao-JSON: %.800s' "$callback_body")
+            echo "##vso[task.logissue type=error]ASPM callback falhou (HTTP $callback_http): $safe_body"
+            exit 1
+          fi
+          echo "##[section]ASPM callback accepted"
+          printf '%s' "$callback_body" | jq '{event_key, run_id, status, duplicate}'
+
+    - task: Bash@3
+      displayName: "APPSEC Supply Chain — Syft"
+      condition: and(succeeded(), eq(variables['SYFT_NATIVE_OK'], 'true'))
+      continueOnError: true
+      env:
+        ASPM_BASE_URL: "$(ASPM-BASE-URL)"
+        ASPM_CLIENT_ID: "$(ASPM-OAUTH-CLIENT-ID)"
+        ASPM_CLIENT_SECRET: "$(ASPM-OAUTH-CLIENT-SECRET)"
+      inputs:
+        targetType: inline
+        script: |
+          set -euo pipefail
+          SBOM_PATH="$(Build.ArtifactStagingDirectory)/syft_report.json"
+          [ -s "$SBOM_PATH" ] || { echo "##vso[task.logissue type=error]syft_report.json ausente"; exit 1; }
+          SBOM_BYTES=$(wc -c < "$SBOM_PATH")
+          MAX_SBOM_BYTES=$((25 * 1024 * 1024))
+          [ "$SBOM_BYTES" -le "$MAX_SBOM_BYTES" ] || { echo "##vso[task.logissue type=error]syft_report.json excede o limite da plataforma: ${SBOM_BYTES} bytes (máximo: ${MAX_SBOM_BYTES})"; exit 1; }
+          jq -e '.schema.version != null and (.artifacts | type == "array") and (.artifactRelationships | type == "array")' "$SBOM_PATH" > /dev/null || { echo "##vso[task.logissue type=error]syft_report.json não está no formato nativo esperado"; exit 1; }
+          echo "##[debug] Syft SBOM: size=${SBOM_BYTES} artifacts=$(jq '.artifacts | length' "$SBOM_PATH") relationships=$(jq '.artifactRelationships | length' "$SBOM_PATH")"
+          [ -n "${ASPM_BASE_URL:-}" ] && [ -n "${ASPM_CLIENT_ID:-}" ] && [ -n "${ASPM_CLIENT_SECRET:-}" ] || { echo "##vso[task.logissue type=error]Credenciais ASPM ausentes"; exit 1; }
+          ASPM_BASE_URL="${ASPM_BASE_URL%/}"
+          token_raw=$(curl -sS --retry 2 --retry-delay 2 --connect-timeout 10 --max-time 30 -w "\n%{http_code}" -X POST "$ASPM_BASE_URL/api/v1/oauth/token" -H "Content-Type: application/json" -d "$(jq -nc --arg id "$ASPM_CLIENT_ID" --arg secret "$ASPM_CLIENT_SECRET" '{grant_type:"client_credentials",client_id:$id,client_secret:$secret}')")
+          token_http="${token_raw##*$'\n'}"; token_body="${token_raw%$'\n'*}"
+          [ "$token_http" = "200" ] || { echo "##vso[task.logissue type=error]ASPM OAuth falhou (HTTP $token_http)"; exit 1; }
+          token=$(printf '%s' "$token_body" | jq -er '.access_token')
+          upload_raw=$(curl -sS --retry 2 --retry-delay 2 --connect-timeout 10 --max-time 120 -w "\n%{http_code}" -X POST "$ASPM_BASE_URL/api/v1/aspm/pipeline/sbom" -H "Authorization: Bearer $token" \
+            -F "azure_org=$(System.CollectionUri)" -F "azure_project_id=$(System.TeamProjectId)" -F "azure_project_name=$(System.TeamProject)" \
+            -F "azure_repo_id=$(Build.Repository.ID)" -F "azure_repo_name=$(Build.Repository.Name)" -F "branch=$(Build.SourceBranch)" \
+            -F "commit_sha=$(Build.SourceVersion)" -F "pipeline_run_id=$(Build.BuildId)" \
+            -F "sbom=@${SBOM_PATH};type=application/json")
+          upload_http="${upload_raw##*$'\n'}"; upload_body="${upload_raw%$'\n'*}"
+          [ "$upload_http" = "202" ] || { safe_body=$(printf '%s' "$upload_body" | jq -c . 2>/dev/null || printf 'resposta nao-JSON'); echo "##vso[task.logissue type=error]ASPM Syft upload falhou (HTTP $upload_http): $safe_body"; exit 1; }
+          echo "##[section]ASPM Syft SBOM accepted"
+          printf '%s' "$upload_body" | jq '{repository_id,bom_id,duplicate,artifacts,relationships,direct_dependencies,transitive_dependencies,unknown_dependencies,artifacts_with_purl}'
+    ## -> Results Sync With Conviso Platform
+    - task: convisoAzureSyncTask@1
+      displayName: "Conviso Sync"
+      condition: ne(variables.USE_CONVISO, 'false')
+      continueOnError: true
+      inputs:
+        API_KEY: "$(CONVISO-API-KEY)"
+        PROJECT_ID: "$(PROJECT_ID)"
+        INTEGRATION: "DEPENDENCY_TRACK"
+        COMPANY_ID: ${{ parameters.convisoCompany }}
+    ## -> Import do SBOM (CycloneDX do Syft 1.50) para a Conviso Platform via GraphQL API.
+    ## -> Roda DEPOIS do Conviso Sync (que cria/associa o asset).
+    ## -> Prioriza o CycloneDX do Syft 1.50 (cyclonedx_conviso.json); fallback para o do Syft 1.19 (DT).
+    - task: Bash@3
+      displayName: 'Import SBOM to Conviso'
+      condition: ne(variables.USE_CONVISO, 'false')
+      continueOnError: true
+      env:
+        CONVISO_API_KEY: "$(CONVISO-API-KEY)"
+        CONVISO_COMPANY_ID: "${{ parameters.convisoCompany }}"
+        DT_APP_DEFAULT_NAME: "$(DT_APP_DEFAULT_NAME)"
+        APP_VERSION: "${{ parameters.appVersion }}"
+        BRANCH_NAME: "$(Build.SourceBranchName)"
+      inputs:
+        targetType: inline
+        script: |
+          set -e
+
+          CONVISO_IMPORT_ENDPOINT="https://app.convisoappsec.com/graphql"
+          CONVISO_LOOKUP_ENDPOINT="https://api.convisoappsec.com/graphql"
+
+          # Usa SOMENTE o CycloneDX do Syft 1.50 (cyclonedx_conviso.json). SEM fallback para o 1.19.
+          SBOM_FILE=""
+          for CANDIDATE in \
+            "$(Build.ArtifactStagingDirectory)/cyclonedx_conviso.json" \
+            "cyclonedx_conviso.json"; do
+            if [ -f "$CANDIDATE" ]; then SBOM_FILE="$CANDIDATE"; break; fi
+          done
+
+          if [ -z "$SBOM_FILE" ]; then
+            echo "##[warning] SBOM CycloneDX do Syft 1.50 (cyclonedx_conviso.json) nao encontrado."
+            echo "##[warning] O envio para a Conviso usa somente o SBOM da 1.50 — import PULADO (sem fallback para a 1.19)."
+            exit 0
+          fi
+          echo "##[debug] SBOM para a Conviso: $SBOM_FILE (Syft 1.50)"
+
+          # 1) Resolve o Asset ID na Conviso (asset criado pelo Conviso Sync; retry para propagar).
+          ASSET_NAME_SEARCH="${DT_APP_DEFAULT_NAME} ${APP_VERSION}"
+          echo "##[debug] Buscando asset na Conviso: $ASSET_NAME_SEARCH"
+          ASSET_QUERY="{ assets(companyId: \"${CONVISO_COMPANY_ID}\", page: 1, limit: 10, search: {name: \"$ASSET_NAME_SEARCH\"}) { collection { id name } } }"
+          ASSET_PAYLOAD=$(jq -n --arg q "$ASSET_QUERY" '{query: $q}')
+
+          CONVISO_ASSET_ID=""
+          for attempt in 1 2 3; do
+            CONVISO_ASSET_ID=$(curl -sS --retry 3 --retry-delay 2 --max-time 15 \
+              -X POST -H "x-api-key: ${CONVISO_API_KEY}" -H "Content-Type: application/json" \
+              -d "$ASSET_PAYLOAD" "$CONVISO_LOOKUP_ENDPOINT" \
+              | jq -r --arg exact_name "$ASSET_NAME_SEARCH" '[.data.assets.collection[]? | select(.name == $exact_name) | .id][0] // empty')
+            if [ -n "$CONVISO_ASSET_ID" ]; then break; fi
+            echo "##[debug] Asset ainda nao encontrado (tentativa $attempt/3). Aguardando o sync propagar..."
+            sleep 10
+          done
+
+          if [ -z "$CONVISO_ASSET_ID" ]; then
+            echo "##[warning] Asset '$ASSET_NAME_SEARCH' nao encontrado na Conviso. Pulando import."
+            echo "##[warning] O asset e criado pelo Conviso Sync; em projetos novos pode levar ate a proxima execucao."
+            exit 0
+          fi
+          echo "##[debug] Conviso Asset ID: $CONVISO_ASSET_ID"
+
+          # 2) Monta o multipart GraphQL e importa o SBOM
+          GQL_MUTATION='mutation ImportSbom($file: Upload!, $assetId: ID!, $companyId: ID!, $branchName: String) { importSbom(input: { file: $file, assetId: $assetId, companyId: $companyId, branchName: $branchName }) { success } }'
+          OPERATIONS=$(jq -n \
+            --arg q "$GQL_MUTATION" \
+            --arg assetId "$CONVISO_ASSET_ID" \
+            --arg companyId "$CONVISO_COMPANY_ID" \
+            --arg branchName "$BRANCH_NAME" \
+            '{query: $q, variables: {file: null, assetId: $assetId, companyId: $companyId, branchName: $branchName}}')
+
+          RESPONSE=$(curl -sS --max-time 60 \
+            -X POST "$CONVISO_IMPORT_ENDPOINT" \
+            -H "x-api-key: ${CONVISO_API_KEY}" \
+            -F operations="$OPERATIONS" \
+            -F map='{"0":["variables.file"]}' \
+            -F "0=@${SBOM_FILE};type=application/json")
+
+          echo "##[debug] Resposta da Conviso: $RESPONSE"
+          SUCCESS=$(echo "$RESPONSE" | jq -r '.data.importSbom.success // false')
+          if [ "$SUCCESS" == "true" ]; then
+            echo "##[section] SBOM (Syft 1.50) importado com sucesso para a Conviso."
+          else
+            echo "##[warning] Import do SBOM na Conviso nao retornou success. Verifique a resposta acima."
+          fi
+    ## -> Evaluate SCA Security Gate
+    - task: Bash@3
+      displayName: "Evaluate Security Gate"
+      condition: ne(variables.SKIP_SECURITY_GATE_SCA, 'true')
+      env:
+        CONVISO_COMPANY_ID: ${{ parameters.convisoCompany }}
+        APP_VERSION: ${{ parameters.appVersion }}
+      inputs:
+        targetType: 'inline'
+        script: |
+          isGateBranch=false
+          build_reason="$(Build.Reason)"
+
+          if [[ "$build_reason" == "PullRequest" ]]; then
+            eval_ref="$(System.PullRequest.TargetBranch)"
+            eval_name="${eval_ref#refs/heads/}"
+          else
+            eval_ref="$(Build.SourceBranch)"
+            eval_name="$(Build.SourceBranchName)"
+          fi
+
+          if [[ "$eval_name" == "master" || "$eval_name" == "main" || "$eval_ref" == refs/heads/release* || "$eval_ref" == refs/heads/stage* ]]; then
+            isGateBranch=true
+          fi
+
+          echo "##[debug] Dependency-Track Project ID: $(PROJECT_ID)"
+
+          set -e
+
+          # Gate 100% baseado em Audit Vulnerabilities (finding.analysis.state).
+          # Não depende mais do endpoint de Policy Violations — aprovação/rejeição
+          # de violation não é mais o critério. Bloqueia apenas findings nunca
+          # auditados (state NOT_SET ou null/"-"). Qualquer outro estado definido
+          # (IN_TRIAGE, EXPLOITABLE, FALSE_POSITIVE, NOT_AFFECTED, RESOLVED) libera o gate.
+          FINDINGS=$(curl -sf \
+                        -X GET "${DT_SCA_ENDPOINT}/v1/finding/project/$(PROJECT_ID)?suppressed=false" \
+                        -H "X-API-Key: $(DEPENDENCY-TRACK-TOKEN)" \
+                        -H 'Content-Type: application/json') || {
+                          echo "##vso[task.logissue type=error;] The Dependency-Track API is not responding due to a unexpected error. Please, try again by clicking on Rerun Failed Jobs or contact appsec_vivo.br@telefonica.com. Thanks"
+                          echo "##vso[task.complete result=Failed;]"
+                          exit 1
+                        }
+
+          BLOCKING=$(echo "$FINDINGS" | jq '[.[] | select(
+            (.vulnerability.severity == "CRITICAL" or .vulnerability.severity == "HIGH") and
+            (.analysis.isSuppressed != true) and
+            ((.analysis.state == "NOT_SET") or (.analysis == null) or (.analysis.state == null))
+          )]')
+
+          COUNT=$(echo "$BLOCKING" | jq 'length')
+
+          if [ "$COUNT" -gt 0 ]; then
+
+            # Para cada pacote vulnerável, procura no Dependency-Track a primeira versão
+            # em que a CVE já está corrigida e mostra ela junto das outras informações.
+
+            minusculo() {
+              tr '[:upper:]' '[:lower:]'
+            }
+
+            # Verdadeiro quando $1 vem antes de $2 (sort -V compara versão, não texto).
+            versao_menor() {
+              [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n 1)" = "$1" ]
+            }
+
+            purl_sem_versao() {
+              echo "$1" | sed 's/[?#].*//; s/@[^@]*$//' | minusculo
+            }
+
+            tipo_do_purl() {
+              echo "$1" | sed 's|^pkg:||; s|[/@?].*||' | minusculo
+            }
+
+            # O nome do pacote está no 5º campo do CPE (cpe:2.3:a:fornecedor:PACOTE:...)
+            # ou no último trecho do PURL (pkg:maven/grupo/PACOTE@versao).
+            nome_do_pacote() {
+              local nome="$2"
+
+              case "$1" in
+                PURL) nome=$(purl_sem_versao "$nome"); nome="${nome##*/}" ;;
+                *)    nome=$(echo "$nome" | cut -d: -f5) ;;
+              esac
+
+              echo "$nome" | minusculo
+            }
+
+            ecossistema() {
+              local valor
+              valor=$(echo "$1" | minusculo)
+
+              case "$valor" in
+                node.js|nodejs|node|npm)         echo npm ;;
+                python|pypi|pip)                 echo pypi ;;
+                java|maven)                      echo maven ;;
+                go|golang)                       echo golang ;;
+                .net|dotnet|nuget)               echo nuget ;;
+                php|composer)                    echo composer ;;
+                ruby|rubygems|gem)               echo gem ;;
+                rust|cargo)                      echo cargo ;;
+                wordpress|drupal|joomla|magento) echo "$valor" ;;
+                *)                               echo "" ;;
+              esac
+            }
+
+            plataforma_da_correcao() {
+              case "$1" in
+                PURL) ecossistema "$(tipo_do_purl "$2")" ;;
+                *)    ecossistema "$(echo "$2" | cut -d: -f11)" ;;
+              esac
+            }
+
+            plataforma_compativel() {
+              [ -z "$1" ] || [ -z "$2" ] || [ "$1" = "$2" ]
+            }
+
+            mesmo_pacote() {
+              if [ "$1" = "PURL" ] && [ -n "$4" ]; then
+                [ "$(purl_sem_versao "$2")" = "$(purl_sem_versao "$4")" ]
+                return
+              fi
+
+              [ "$(nome_do_pacote "$1" "$2")" = "$(echo "$3" | minusculo)" ]
+            }
+
+            dentro_da_faixa() {
+              if [ -n "$2" ] && versao_menor "$1" "$2"; then
+                return 1
+              fi
+
+              if [ -n "$3" ] && ! versao_menor "$3" "$1"; then
+                return 1
+              fi
+
+              return 0
+            }
+
+            detalhe_da_vulnerabilidade() {
+              curl -sf --max-time 10 \
+                -X GET "${DT_SCA_ENDPOINT}/v1/vulnerability/source/$1/vuln/$2" \
+                -H "X-API-Key: $(DEPENDENCY-TRACK-TOKEN)" \
+                -H 'Content-Type: application/json'
+            }
+
+            correcoes_publicadas() {
+              echo "$1" | jq -r '.affectedComponents[]?
+                | select((.versionEndExcluding // "") != "")
+                | [.identityType, .identity, .versionEndExcluding,
+                   (.versionStartIncluding // ""), (.versionStartExcluding // "")]
+                | @tsv'
+            }
+
+            faixas_da_cve() {
+              local detalhe="$1" nome="$2" versao="$3" purl="$4"
+              local correcoes tipo identidade fix inicio_incl inicio_excl plataforma
+              local meu_ecossistema por_nome="" por_plataforma="" produtos="" divergente=""
+
+              meu_ecossistema=$(ecossistema "$(tipo_do_purl "$purl")")
+              correcoes=$(correcoes_publicadas "$detalhe") || return 0
+
+              while IFS=$'\t' read -r tipo identidade fix inicio_incl inicio_excl; do
+                [ -n "$fix" ] || continue
+                versao_menor "$versao" "$fix" || continue
+                dentro_da_faixa "$versao" "$inicio_incl" "$inicio_excl" || continue
+
+                plataforma=$(plataforma_da_correcao "$tipo" "$identidade")
+                plataforma_compativel "$meu_ecossistema" "$plataforma" || {
+                  mesmo_pacote "$tipo" "$identidade" "$nome" "$purl" && divergente="sim"
+                  continue
+                }
+
+                if mesmo_pacote "$tipo" "$identidade" "$nome" "$purl"; then
+                  por_nome="${por_nome}${fix}|${inicio_incl}|${inicio_excl}"$'\n'
+                elif [ -n "$meu_ecossistema" ] && [ "$plataforma" = "$meu_ecossistema" ]; then
+                  produtos="${produtos}$(nome_do_pacote "$tipo" "$identidade")"$'\n'
+                  por_plataforma="${por_plataforma}${fix}|${inicio_incl}|${inicio_excl}"$'\n'
+                fi
+              done <<< "$correcoes"
+
+              if [ -n "$por_nome" ]; then
+                echo "$por_nome" | sort -u
+                return 0
+              fi
+
+              if [ "$(echo "$produtos" | grep -v '^$' | sort -u | wc -l)" -eq 1 ]; then
+                echo "$por_plataforma" | sort -u
+              elif [ -n "$divergente" ]; then
+                echo "DIVERGENTE"
+              fi
+            }
+
+            versao_limpa() {
+              local faixas="$1" candidata fix inicio_incl inicio_excl
+
+              while IFS= read -r candidata; do
+                [ -n "$candidata" ] || continue
+
+                while IFS='|' read -r fix inicio_incl inicio_excl; do
+                  versao_menor "$candidata" "$fix" || continue
+                  dentro_da_faixa "$candidata" "$inicio_incl" "$inicio_excl" || continue
+                  continue 2
+                done <<< "$faixas"
+
+                echo "$candidata"
+                return 0
+              done <<< "$(echo "$faixas" | cut -d'|' -f1 | sort -V -u)"
+            }
+
+            SAFE_VERSIONS=""
+            SAFE_PACKAGES=""
+            FAIXAS=""
+            VULN_LIST=$(echo "$BLOCKING" | jq -r '.[] | [(.vulnerability.source // "NVD"), (.vulnerability.vulnId // ""), (.component.name // ""), (.component.version // ""), (.component.purl // "")] | @tsv' | sort -u | head -n 50)
+
+            while IFS=$'\t' read -r VULN_SOURCE VULN_ID PKG_NAME PKG_VERSION PKG_PURL; do
+              [ -n "$VULN_ID" ] && [ -n "$PKG_VERSION" ] || continue
+
+              VULN_DETAIL=$(detalhe_da_vulnerabilidade "$VULN_SOURCE" "$VULN_ID") || {
+                echo "##[debug] Sem dados de correção no Dependency-Track para ${VULN_ID}"
+                continue
+              }
+
+              FAIXAS_DA_CVE=$(faixas_da_cve "$VULN_DETAIL" "$PKG_NAME" "$PKG_VERSION" "$PKG_PURL")
+              SAFE_VERSION=$(echo "$FAIXAS_DA_CVE" | cut -d'|' -f1 | grep -v '^$' | sort -V | head -n 1)
+              [ -n "$SAFE_VERSION" ] || continue
+
+              SAFE_VERSIONS="${SAFE_VERSIONS}${VULN_ID}|${PKG_NAME}|${PKG_VERSION}|${SAFE_VERSION}"$'\n'
+              [ "$SAFE_VERSION" != "DIVERGENTE" ] || continue
+
+              while IFS= read -r FAIXA; do
+                FAIXAS="${FAIXAS}${PKG_NAME}|${PKG_VERSION}|${FAIXA}"$'\n'
+              done <<< "$FAIXAS_DA_CVE"
+            done <<< "$VULN_LIST"
+
+            while IFS='|' read -r PACOTE INSTALADA; do
+              [ -n "$PACOTE" ] || continue
+
+              PKG_FAIXAS=""
+              while IFS='|' read -r NOME VERSAO FIX INI_INCL INI_EXCL; do
+                [ "$NOME" = "$PACOTE" ] && [ "$VERSAO" = "$INSTALADA" ] || continue
+                PKG_FAIXAS="${PKG_FAIXAS}${FIX}|${INI_INCL}|${INI_EXCL}"$'\n'
+              done <<< "$FAIXAS"
+
+              LIMPA=$(versao_limpa "$PKG_FAIXAS")
+              [ -n "$LIMPA" ] || continue
+
+              SAFE_PACKAGES="${SAFE_PACKAGES}${PACOTE}|${INSTALADA}|${LIMPA}"$'\n'
+            done <<< "$(echo "$FAIXAS" | cut -d'|' -f1,2 | sort -u)"
+
+            if ENRICHED=$(echo "$BLOCKING" | jq --arg safe "$SAFE_VERSIONS" --arg pacotes "$SAFE_PACKAGES" '
+              ($safe | split("\n") | map(select(. != "") | split("|"))) as $linhas
+              | ($linhas | map({ key: "\(.[0])|\(.[1])|\(.[2])", value: .[3] }) | from_entries) as $correcoes
+              | ($linhas | map(select(.[3] == "DIVERGENTE")) | map({ key: "\(.[1])|\(.[2])", value: true }) | from_entries) as $divergentes
+              | ($linhas | map(select(.[3] != "DIVERGENTE")) | group_by("\(.[1])|\(.[2])") | map(select(length > 1) | { key: "\(.[0][1])|\(.[0][2])", value: "│  CVEs cobertas: \([.[] | .[0]] | unique | join(", "))\n" }) | from_entries) as $cves
+              | ($pacotes | split("\n") | map(select(. != "") | split("|")) | map({ key: "\(.[0])|\(.[1])", value: .[2] }) | from_entries) as $limpas
+              | map(("\(.component.name // "")|\(.component.version // "")") as $chave
+                    | ($correcoes["\(.vulnerability.vulnId // "")|\($chave)"] // "") as $min
+                    | ($limpas[$chave] // "") as $limpa
+                    | (if $limpa != "" then $limpa elif $min != "" then $min elif $divergentes[$chave] then "DIVERGENTE" else "" end) as $seg
+                    | (if $limpa != "" then ($cves[$chave] // "") else "" end) as $lista
+                    | . + { safe_texto: (if $seg == "" then "não identificada automaticamente. Veja a Referência abaixo"
+                              elif $seg == "DIVERGENTE" then "ambiente do pacote divergente. Acione um Security Champion para avaliar a possibilidade de falso positivo"
+                              else "\u001b[1;32m\($seg)\u001b[0m (ou superior)\(if $lista == "" then ". Valide se essa versão não é afetada por outra CVE antes de atualizar" else "" end)" end),
+                            safe_extra: ((if $min != "" and $min != "DIVERGENTE" then "│  Minimum Fix  : \($min)\n" else "" end) + $lista) })
+            '); then
+              BLOCKING="$ENRICHED"
+            fi
+
+            CRITICAL_COUNT=$(echo "$BLOCKING" | jq '[.[] | select(.vulnerability.severity == "CRITICAL")] | length')
+            HIGH_COUNT=$(echo "$BLOCKING" | jq '[.[] | select(.vulnerability.severity == "HIGH")] | length')
+
+            if [[ "$isGateBranch" == "true" ]]; then
+              echo "##vso[task.logissue type=error;] Security Gate failed because critical and high potential vulnerabilities were found by our security tools in the source code for this project. For more information."
+              echo "##vso[task.logissue type=error;] Check Vivo Appsec team wiki in https://wikicorp.telefonica.com.br/pages/viewpage.action?pageId=524036659 for more details."
+            else
+              echo "##vso[task.logissue type=warning;] Vulnerabilidades críticas/altas encontradas em branch de desenvolvimento. Corrija antes do PR para não ser bloqueado nas branches principais."
+            fi
+
+            ASSET_NAME_SEARCH="${DT_APP_DEFAULT_NAME} ${APP_VERSION}"
+            ASSET_QUERY="{ assets(companyId: \"${CONVISO_COMPANY_ID}\", page: 1, limit: 10, search: {name: \"$ASSET_NAME_SEARCH\"}) { collection { id name } } }"
+            ASSET_PAYLOAD=$(jq -n --arg q "$ASSET_QUERY" '{query: $q}')
+            CONVISO_ASSET_ID=$(curl -sS --retry 3 --retry-delay 2 --max-time 15 -X POST -H "x-api-key: $(CONVISO-API-KEY)" -H "Content-Type: application/json" -d "$ASSET_PAYLOAD" "https://api.convisoappsec.com/graphql" | jq -r --arg exact_name "$ASSET_NAME_SEARCH" '[.data.assets.collection[]? | select(.name == $exact_name) | .id][0] // empty')
+
+            echo ""
+            echo "════════════════════════════════════════════════════════════════════════════════"
+            if [[ "$isGateBranch" == "true" ]]; then
+              echo "##[error]❌ SECURITY GATE FAILED — SCA"
+            else
+              echo "##[warning]⚠️  VULNERABILIDADES ENCONTRADAS — SCA — Gate não bloqueia em branch de desenvolvimento"
+            fi
+            echo "════════════════════════════════════════════════════════════════════════════════"
+            echo "📊 Resumo de Findings não auditados (Audit Vulnerabilities): $COUNT"
+            echo "📦 Resumo de Vulnerabilidades:"
+            echo "   🔴 Critical : $CRITICAL_COUNT"
+            echo "   🟠 High     : $HIGH_COUNT"
+            echo "════════════════════════════════════════════════════════════════════════════════"
+            echo "📖 PLAYBOOK DE CORREÇÃO (SCA) / REMEDIATION PLAYBOOK"
+            echo "════════════════════════════════════════════════════════════════════════════════"
+            echo "Preparamos um guia passo a passo para te ajudar a corrigir essas vulnerabilidades:"
+            echo "👉 https://wikicorp.telefonica.com.br/spaces/SEGDIG/pages/796298043/Playbook+para+Devs"
+            echo ""
+            echo "💡 DICA DE CORREÇÃO (DevEx):"
+            echo "• Se a Origem for 📦 Aplicação e o Tipo for Transitiva, NÃO edite arquivos em pastas internas."
+            echo "  Atualize a versão indiretamente pelo manifesto raiz (ex: package.json, pom.xml)."
+            echo "• Se a Origem for 🐳 Container, você NÃO conseguirá corrigir via código-fonte."
+            echo "  Você precisará atualizar a Imagem Base (ex: alterar a versão do FROM no Dockerfile)."
+            echo "════════════════════════════════════════════════════════════════════════════════"
+            echo ""
+
+            if [ -n "$CONVISO_ASSET_ID" ]; then
+              echo "🔗 Para detalhes completos das vulnerabilidades, acesse a listagem na Conviso Platform:"
+              echo "   https://app.convisoappsec.com/spa/company/${CONVISO_COMPANY_ID}/vulnerabilities?assetIds=$CONVISO_ASSET_ID&severities=HIGH&severities=CRITICAL&statuses=IDENTIFIED&statuses=CREATED&page=1&perPage=100"
+            else
+              echo "⚠️  Não foi possível obter o link das vulnerabilidades na Conviso Platform."
+            fi
+
+            echo ""
+            echo "##[section]## Detalhes das Vulnerabilidades ##"
+            echo ""
+
+            SBOM_FILE="$(Build.ArtifactStagingDirectory)/cyclonedx_report.json"
+
+            if [ -f "$SBOM_FILE" ]; then
+              echo "$BLOCKING" | jq -r --slurpfile bom "$SBOM_FILE" '
+                ($bom[0].metadata.component["bom-ref"]? // "") as $root_ref |
+                (($bom[0].dependencies // []) | map(select(.ref == $root_ref)) | (.[0] // {}).dependsOn // []) as $direct_refs |
+                (($bom[0].components // []) | map(select(.["bom-ref"] != null and .purl != null) | {(.["bom-ref"]): .purl}) | add // {}) as $refToPurl |
+                ($direct_refs | map($refToPurl[.]) | map(select(. != null)) | map({(.): true}) | add // {}) as $directPurls |
+                (($bom[0].components // []) | map(select(.purl != null) | {(.purl): .}) | add // {}) as $bomDict |
+              (($bom[0].components // []) | map(select(.purl == null) | {("\(.name)@\(.version)"): .type}) | add // {}) as $osDict |
+
+                .[] |
+
+                (if .component.purl != null then (((.component.purl | split(":")[1]) // "") | split("/")[0] // "Unknown") else "Unknown" end) as $pkg_type |
+
+                ($bomDict[.component.purl // "NO_PURL"] | .properties // null) as $full_props |
+                (if $full_props != null then
+                  ([$full_props[]? | select(.name | test("syft:location.*path")) | .value][0] // "N/A")
+                else "N/A" end) as $location |
+
+                (if $pkg_type == "apk" or $pkg_type == "deb" or $pkg_type == "rpm" or $pkg_type == "oci" or $pkg_type == "alpm"
+                  then "🐳 Container (Imagem Base \($pkg_type))"
+                elif ($pkg_type == "Unknown" and (($osDict["\(.component.name)@\(.component.version)"] == "operating-system") or ((.component.cpe // "") | test("^cpe:2\\.3:o:|^cpe:/o:"))))
+                  then "🐳 Container (OS/Sistema Operacional)"
+                elif ($location != "N/A" and ($location | test("^(/usr/local/lib/node_modules|/usr/lib/node_modules|/usr/local/lib/python|/usr/lib/python|/usr/share/java|/usr/local/tomcat|/opt|/usr/local/bin|/usr/bin|/bin|/sbin|/usr/sbin)")))
+                  then "🐳 Container (Global \($pkg_type))"
+                else "📦 Aplicação/SCA (\($pkg_type))" end) as $origin |
+
+                (if ($origin | test("Container"))
+                  then "N/A (Infra/OS)"
+                elif (.component.purl != null and $directPurls[.component.purl])
+                  then "🎯 Direta (Direct)"
+                else "🔀 Transitiva (Transitive)" end) as $dep_type |
+
+                "┌─ [\(.vulnerability.severity // "UNKNOWN")] \(.vulnerability.vulnId // "UNKNOWN")\n" +
+                "│  Componente   : \(.component.name // "Unknown") \(.component.version // "Unknown")\n" +
+                "│  Best Fix     : \(.safe_texto)\n\(.safe_extra)" +
+                "│  Origem       : \($origin)\n" +
+                "│  Tipo Dep     : \($dep_type)\n" +
+                "│  Caminho/Path : \($location)\n" +
+                "│  CWEs         : \(if (.vulnerability.cwes // []) | length > 0 then [.vulnerability.cwes[]? | "CWE-\(.cweId // "Unknown")"] | join(", ") else "N/A" end)\n" +
+                "│  Descrição    : \(.vulnerability.description // "Sem descrição" | gsub("[\r\n]+"; " ") | .[0:250])\(if (.vulnerability.description != null and (.vulnerability.description | length) > 100) then "..." else "" end)\n" +
+                "│  Referência   : \(if (.vulnerability.vulnId // "") | startswith("CVE") then "https://nvd.nist.gov/vuln/detail/\(.vulnerability.vulnId)" else "https://osv.dev/vulnerability/\(.vulnerability.vulnId // "Unknown")" end)\n" +
+                "└────────────────────────────────────────────────────────────────"'
+            else
+              echo "##[warning] Arquivo cyclonedx_report.json não encontrado. Exibindo log simplificado..."
+              echo "$BLOCKING" | jq -r '
+                .[] |
+                "┌─ [\(.vulnerability.severity)] \(.vulnerability.vulnId)\n" +
+                "│  Componente   : \(.component.name) \(.component.version)\n" +
+                "│  Best Fix     : \(.safe_texto)\n\(.safe_extra)" +
+                "│  CWEs         : \(if (.vulnerability.cwes // []) | length > 0 then [.vulnerability.cwes[] | "CWE-\(.cweId)"] | join(", ") else "N/A" end)\n" +
+                "│  Referência   : \(if .vulnerability.vulnId | startswith("CVE") then "https://nvd.nist.gov/vuln/detail/\(.vulnerability.vulnId)" else "https://osv.dev/vulnerability/\(.vulnerability.vulnId)" end)\n" +
+                "└────────────────────────────────────────────────────────────────"'
+            fi
+
+            echo "$FINDINGS" > "$(Build.ArtifactStagingDirectory)/sca-violations.json"
+
+            echo ""
+            echo "════════════════════════════════════════════════════════════════════════════════"
+            echo "📢 NOVO CANAL DE SUPORTE APPSEC / NEW APPSEC SUPPORT CHANNEL"
+            echo "════════════════════════════════════════════════════════════════════════════════"
+            echo "👉 Acesse nosso Centro de Excelência: https://telefonicacorp.sharepoint.com/sites/SuporteSecurityChampions.TMBNL/SitePages/Home.aspx"
+            echo "Dúvidas sobre como corrigir essas vulnerabilidades? Nosso suporte agora é centralizado no Teams para garantir um melhor atendimento!"
+            echo "(Questions on how to fix these vulnerabilities? Our support is now centralized on Teams to ensure a better support experience!)"
+            echo ""
+            echo "DICA!!! Preparamos um guia passo a passo para te ajudar a corrigir essas vulnerabilidades: https://wikicorp.telefonica.com.br/spaces/SEGDIG/pages/796298043/Playbook+para+Devs"
+            echo "1️⃣ Primeiro acesso? Cadastre-se rápido aqui:"
+            echo "   First access? Register quickly here:"
+            echo "   👉 https://protect.checkpoint.com/v2/r02/___https://forms.office.com/Pages/ResponsePage.aspx?id=DmBElwQ-Lkm6oSXsJFxvEIEUqkLE2nxJo9w5p_Ap3pBUQlUzV00zTTg5Rk1KSDVGSFUxTjMyR0g0UC4u___.YzJlOnRlbGVmb25pY2FicmF6aWw6YzpvOjE5ZDMxODQ5YTI2ODEyYzAzNzZhYjM4MTI0NmU3NTM2Ojc6YmY5MDplZDUwOWM3Y2IzOWY3MDU1YjlhZTE0NzI4NTI5OTEwNmNkZDE2MmFlNDJhOGQ5N2E0NDQyYmM3ZjkwYTk5ZGFiOmg6VDpG"
+            echo ""
+            echo "2️⃣ Acesse o Centro De Excelência AppSec Vivo (Teams):"
+            echo "   Access the AppSec Vivo Center of Excellence (Teams):"
+            echo "   👉 https://protect.checkpoint.com/v2/r02/___https://teams.microsoft.com/l/team/19%3A5umImaIp9MNp2h-NjxPlAXYxUdm5Y-ez-2jWOCyH-6A1*40thread.tacv2/conversations?groupId=f337901f-f683-4b96-bf88-71d273fbb61e&tenantId=9744600e-3e04-492e-baa1-25ec245c6f10___.YzJlOnRlbGVmb25pY2FicmF6aWw6YzpvOjE5ZDMxODQ5YTI2ODEyYzAzNzZhYjM4MTI0NmU3NTM2Ojc6NzBiMzo0YTgzNzQ1ZDU4ZTA5MDUwMDAzZWZkMzFhODEzMWE3Y2Q2ODM4NjZjYmU2ZWUwOGY1ZjU1NTBjMTVkMmFhYTZiOmg6VDpG"
+            echo "════════════════════════════════════════════════════════════════════════════════"
+            echo "📧 E-mail / Email: appsec_vivo.br@telefonica.com"
+            echo "🌙 Plantão / After-hours support (Evernow): +55 (11) 5028-1152"
+            echo ""
+
+            if [[ "$isGateBranch" == "true" ]]; then
+              echo "##vso[task.complete result=Failed;]Security Gate SCA falhou na branch principal."
+              exit 1
+            else
+              echo ""
+              echo "##vso[task.logissue type=warning;]⚠️ ATENÇÃO: O bloqueio do Security Gate está habilitado apenas para as branches principais (main, master, release* e stage*). Recomendamos fortemente a correção imediata destas vulnerabilidades. Caso não sejam corrigidas agora, sua pipeline será BLOQUEADA ao tentar realizar o merge/commit para as branches principais."
+              echo "##vso[task.complete result=SucceededWithIssues;]Vulnerabilidades encontradas em branch não principal."
+              exit 0
+            fi
+          fi
+          echo "##[debug] No critical and high vulnerabilities were found that violate AppSec policies."
+          echo "##[debug] For more information about the process, check Vivo Appsec team wiki in https://wikicorp.telefonica.com.br/pages/viewpage.action?pageId=524036659."
+
+    - task: PublishBuildArtifacts@1
+      displayName: "Publicar relatório de vulnerabilidades SCA"
+      condition: failed()
+      inputs:
+        pathToPublish: "$(Build.ArtifactStagingDirectory)/sca-violations.json"
+        artifactName: "sca-violations"
+
+    - bash: |
+        echo "##vso[task.setvariable variable=SCA_FAILED;isOutput=true]true"
+      name: sca_status
+      condition: failed()
+      displayName: "Set Variable SCA Failed"
+
+    - template: check_conviso_risks.yml
+      parameters:
+        convisoAssetName: "$(FORTIFY_APP_DEFAULT_NAME) $(FORTIFY_APP_VERSION)"
+        companyId: "${{ parameters.convisoCompany }}"
+
+  - ${{ else }}:
+
+    - task: Bash@3
+      displayName: 'Security Scan Skipped'
+      inputs:
+        targetType: inline
+        script: |
+          YELLOW='\033[1;33m'
+          BLUE='\033[0;34m'
+          NC='\033[0m' # No Color
+
+          if [[ "$(Build.Reason)" == "PullRequest" ]]; then
+            TARGET_BRANCH=$(echo "$(System.PullRequest.TargetBranch)" | sed 's/refs\/heads\///')
+            BRANCH_INFO="Target: $TARGET_BRANCH (via PR)"
+          else
+            BRANCH_INFO="$(Build.SourceBranchName)"
+          fi
+
+          echo -e "${YELLOW}==================================[ AÇÃO: SCAN IGNORADO (SKIPPED) ]==================================${NC}"
+          echo -e "Modo de Operação Ativo: ${YELLOW}VivoFlow${NC}"
+          echo -e "Branch Atual: ${YELLOW}$(Build.SourceBranchName)${NC}"
+          echo -e "Branch Avaliada: ${YELLOW}$BRANCH_INFO${NC}"
+          echo -e "Regras de Validação em Vigor: ${YELLOW}master, main, release/*, ${{ join(', ', parameters.vivoFlow) }}${NC}"
+          echo ""
+          echo -e "${YELLOW}MOTIVO: O scan de segurança foi intencionalmente ignorado pois o branch avaliado '$BRANCH_INFO' não corresponde a nenhuma das regras de validação ativas.${NC}"
+          echo ""
+          echo -e "${BLUE}Dica: Se este branch deveria ser validado, acione a Equipe de AppSec appsec_vivo.br@telefonica.com${NC}"
+          echo -e "${YELLOW}====================================================================================================${NC}"

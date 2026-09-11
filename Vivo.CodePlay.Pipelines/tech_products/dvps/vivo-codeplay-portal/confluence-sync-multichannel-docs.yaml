@@ -1,0 +1,248 @@
+# ==================================================================
+# Pipeline: Confluence Sync — CodePlay Portal
+# -----------------------------------------------------
+# Utiliza o smart sync do plugin vivo-multichannel-docs para determinar
+# o que precisa ser sincronizado desde o último sync por canal:
+#   - Arquivo adicionado/modificado → sync granular do arquivo
+#   - Arquivo deletado              → deleta página correspondente
+#   - Arquivo renomeado             → renomeia página no Confluence
+#   - Sem mudanças relevantes       → skip (sem custo de execução)
+#
+# A decisão é tomada pelo plugin (que lê .vivo-multichannel-sync-state.json).
+# O pipeline é responsável apenas por: instalar deps, acionar o plugin e
+# commitar o arquivo de estado atualizado com [skip ci].
+# ==================================================================
+
+parameters:
+  # ==================================================================
+  # Infraestrutura e Ambiente
+  # ==================================================================
+  - name: agentPool
+    displayName: 'Agent Pool para execução'
+    type: string
+    default: GeneralPurposeLinuxAgentsCI
+
+  # ==================================================================
+  # Controle de Execução
+  # ==================================================================
+  - name: dryRun
+    displayName: 'Dry-run (simula sem publicar)'
+    type: boolean
+    default: false
+
+  - name: forceFullSync
+    displayName: 'Forçar sync completo (ignora diff)'
+    type: boolean
+    default: false
+
+  # ==================================================================
+  # Configurações de Infraestrutura / Segredos
+  # ==================================================================
+  - name: serviceConnection
+    displayName: 'Service Connection ARM (acesso ao Key Vault)'
+    type: string
+    default: DevOpsSharedResources
+
+  - name: keyVaultName
+    displayName: 'Nome do Key Vault'
+    type: string
+    default: kv-azdevops-shared
+
+# ==================================================================
+# Variáveis Internas do Pipeline
+# ==================================================================
+variables:
+  - name: NODE_CACHE_FOLDER
+    value: $(Pipeline.Workspace)/.npm
+  - name: CONFLUENCE_CLOUD_ID
+    value: 486f6a68-f3f4-49ea-b153-776eff07af9c
+# ==================================================================
+# Estágios do Pipeline
+# ==================================================================
+stages:
+  # ================================================================
+  # Stage 1: Analyze — preview do que será sincronizado
+  # ================================================================
+  - stage: Analyze
+    displayName: '🔍 Analyze — Preview'
+    jobs:
+      - job: Preview
+        displayName: Preview do sync
+        pool: ${{ parameters.agentPool }}
+        steps:
+          - checkout: self
+            displayName: Checkout (full history)
+            fetchDepth: 0
+
+          - task: Cache@2
+            displayName: 'Cache Node dependencies'
+            inputs:
+              key: 'node | "$(Agent.OS)" | **/package-lock.json'
+              restoreKeys: |
+                node | "$(Agent.OS)" | **/package-lock.json
+              path: $(NODE_CACHE_FOLDER)
+
+          - script: |
+              echo "##[debug] Exporting B64_AZURE_DEVOPS_PAT var"
+              B64_AZURE_DEVOPS_PAT=$(echo -n $AZURE_DEVOPS_PAT | base64 -w0)
+              echo "##vso[task.setvariable variable=B64_AZURE_DEVOPS_PAT;isOutput=true;issecret=true]${B64_AZURE_DEVOPS_PAT}"
+            displayName: 'Exportando Token'
+            name: setupToken
+            env:
+              AZURE_DEVOPS_PAT: $(System.AccessToken)
+              SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+
+          - task: npm@1
+            displayName: 'npm install'
+            inputs:
+              command: 'install'
+              customRegistry: 'useNpmrc'
+              customRegistryFile: '.npmrc'
+            env:
+              NPM_CONFIG_CACHE: $(NODE_CACHE_FOLDER)
+              AZURE_DEVOPS_PAT: $(System.AccessToken)
+              B64_AZURE_DEVOPS_PAT: $(setupToken.B64_AZURE_DEVOPS_PAT)
+              SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+
+          - bash: |
+              set -euo pipefail
+              [[ "$SYSTEM_DEBUG" == "true" ]] && set -x
+
+              FORCE_FLAG=""
+              [[ "${{ parameters.forceFullSync }}" == "True" ]] && FORCE_FLAG="--force-full-sync"
+
+              echo "##[section]📋 Parâmetros"
+              echo "  forceFullSync: ${{ parameters.forceFullSync }}"
+              echo "  dryRun: ${{ parameters.dryRun }}"
+              echo ""
+              echo "##[section]🔍 Executando preview (dry-run)..."
+
+              # Captura saída do plugin para extrair a decisão de sync
+              OUTPUT=$(npx docusaurus publish-docs confluence --smart-sync --dry-run $FORCE_FLAG 2>&1 || true)
+              echo "$OUTPUT"
+
+              # Extrai a decisão do marcador impresso pelo plugin
+              DECISION=$(echo "$OUTPUT" | grep -oP 'SYNC_DECISION: \K\S+' | tail -1 || echo "FULL_SYNC")
+
+              echo ""
+              echo "##[section]Decisão final: $DECISION"
+              echo "##vso[task.setvariable variable=SYNC_DECISION;isOutput=true]${DECISION}"
+            displayName: 'Preview — Smart Sync'
+            name: preview
+            env:
+              CONFLUENCE_USERNAME: $(AZDO-CONFLUENCE-USERNAME)
+              CONFLUENCE_API_TOKEN: $(AZDO-CONFLUENCE-API-TOKEN)
+              CONFLUENCE_CLOUD_ID: $(CONFLUENCE_CLOUD_ID)
+              SYSTEM_DEBUG: $(System.Debug)
+
+  # ================================================================
+  # Stage 2: Publish — executa o sync
+  #   Skipado em modo dry-run ou quando decisão = SKIP.
+  # ================================================================
+  - stage: Publish
+    displayName: '🚀 Publish — Confluence Sync'
+    dependsOn: Analyze
+    condition: |
+      and(
+        succeeded(),
+        eq('${{ parameters.dryRun }}', false),
+        ne(stageDependencies.Analyze.Preview.outputs['preview.SYNC_DECISION'], 'SKIP'),
+        eq(variables['Build.SourceBranch'], 'refs/heads/master')
+      )
+    jobs:
+      - deployment: ConfluencePublish
+        displayName: Publicar no Confluence
+        pool: ${{ parameters.agentPool }}
+        environment: deploy-prod
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                  displayName: Checkout (full history)
+                  fetchDepth: 0
+                  persistCredentials: true
+
+                - task: Cache@2
+                  displayName: 'Cache Node dependencies'
+                  inputs:
+                    key: 'node | "$(Agent.OS)" | **/package-lock.json'
+                    restoreKeys: |
+                      node | "$(Agent.OS)" | **/package-lock.json
+                    path: $(NODE_CACHE_FOLDER)
+
+                - script: |
+                    echo "##[debug] Exporting B64_AZURE_DEVOPS_PAT var"
+                    B64_AZURE_DEVOPS_PAT=$(echo -n $AZURE_DEVOPS_PAT | base64 -w0)
+                    echo "##vso[task.setvariable variable=B64_AZURE_DEVOPS_PAT;isOutput=true;issecret=true]${B64_AZURE_DEVOPS_PAT}"
+                  displayName: 'Exportando Token'
+                  name: setupToken
+                  env:
+                    AZURE_DEVOPS_PAT: $(System.AccessToken)
+                    SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+
+                - task: npm@1
+                  displayName: 'npm install'
+                  inputs:
+                    command: 'install'
+                    customRegistry: 'useNpmrc'
+                    customRegistryFile: '.npmrc'
+                  env:
+                    NPM_CONFIG_CACHE: $(NODE_CACHE_FOLDER)
+                    AZURE_DEVOPS_PAT: $(System.AccessToken)
+                    B64_AZURE_DEVOPS_PAT: $(setupToken.B64_AZURE_DEVOPS_PAT)
+                    SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+
+                # ==============================================================
+                # Ler credenciais do Confluence via Key Vault
+                # ==============================================================
+                - task: AzureKeyVault@2
+                  displayName: Ler credenciais do Confluence (Key Vault)
+                  inputs:
+                    azureSubscription: ${{ parameters.serviceConnection }}
+                    KeyVaultName: ${{ parameters.keyVaultName }}
+                    SecretsFilter: AZDO-CONFLUENCE-USERNAME,AZDO-CONFLUENCE-API-TOKEN
+                    RunAsPreJob: false
+
+                # ==============================================================
+                # Executar sync via smart sync do plugin
+                # ==============================================================
+                - bash: |
+                    set -euo pipefail
+                    [[ "$SYSTEM_DEBUG" == "true" ]] && set -x
+
+                    FORCE_FLAG=""
+                    [[ "${{ parameters.forceFullSync }}" == "True" ]] && FORCE_FLAG="--force-full-sync"
+
+                    echo "##[section]🚀 Executando Confluence Sync"
+                    npx docusaurus publish-docs confluence --smart-sync $FORCE_FLAG
+                  displayName: Confluence Sync
+                  env:
+                    CONFLUENCE_USERNAME: $(AZDO-CONFLUENCE-USERNAME)
+                    CONFLUENCE_API_TOKEN: $(AZDO-CONFLUENCE-API-TOKEN)
+                    CONFLUENCE_CLOUD_ID: $(CONFLUENCE_CLOUD_ID)
+                    SYSTEM_DEBUG: $(System.Debug)
+
+                # ==============================================================
+                # Commitar arquivo de estado atualizado com [skip ci]
+                # ==============================================================
+                - bash: |
+                    set -euo pipefail
+                    [[ "$SYSTEM_DEBUG" == "true" ]] && set -x
+
+                    STATE_FILE=".vivo-multichannel-sync-state.json"
+
+                    git config user.email "azure-pipelines@telefonicati.onmicrosoft.com"
+                    git config user.name "Azure Pipelines"
+                    git add "$STATE_FILE"
+
+                    if git diff --cached --quiet; then
+                      echo "Estado não alterado. Nenhum commit necessário."
+                    else
+                      NEW_REF="$(git rev-parse HEAD)"
+                      git commit -m "chore(sync): atualizar estado multichannel $NEW_REF [skip ci]"
+                      git push origin HEAD:refs/heads/$(Build.SourceBranchName)
+                    fi
+                  displayName: Persistir estado de sync
+                  env:
+                    SYSTEM_DEBUG: $(System.Debug)

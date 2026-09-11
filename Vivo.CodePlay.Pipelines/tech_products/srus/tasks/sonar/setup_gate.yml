@@ -1,0 +1,59 @@
+parameters:
+- name: projectKey
+- name: qualityGate
+
+steps:
+# - template: /global/general/setup-sonarqube-qualitygate.yml
+#   parameters:
+#     projectKey: '${{ parameters.PROJECT_KEY }}'
+#     projectName: $(System.TeamProject)-$(Build.Repository.Name)
+#     qualityGate: '${{ parameters.QUALITY_GATE }}'
+
+- bash: |
+    url="$(SONARQUBE_URL)"
+    token="$(SONARQUBE_TOKEN)"
+    project_key="${{parameters.projectKey}}"
+    project_name="$(System.TeamProject)-$(Build.Repository.Name)"
+    app_quality_gate="${{parameters.qualityGate}}"
+    default_quality_gate="$(SONARQUBE_DEFAULT_QUALITYGATE)"
+
+    # If no custom quality gate was provided, use default.
+    if [[ -z $app_quality_gate ]]; then
+        app_quality_gate="$default_quality_gate"
+    fi
+
+    # Checks if the project exists. If not, creates it.
+    project_exists=$(curl -s -X POST -u $token: "$url/api/projects/search?projects=$project_key" | jq '.paging.total' | sed 's/null/0/g')
+
+    if [ "$project_exists" -ne 1 ]; then
+        project_status=$(curl -s -X POST -o ./.tmp.sonar.out -w "%{http_code}" -u $token: "$url/api/projects/create?name=$project_name&project=$project_key&visibility=public")
+
+        if [ "$project_status" -eq 200 ]; then
+            echo "SonarQube project created for $project_name"
+        else
+            echo "Error creating SonarQube project for $project_name...($(cat ./.tmp.sonar.out | jq '.errors[0].msg'))"
+        fi
+    fi
+
+    # Checks if the project's Quality Gate exists. If not, use default.
+    app_quality_gate_status=$(curl -s -o /dev/null -w "%{http_code}" -u $token: "$url/api/qualitygates/show?name=$app_quality_gate")
+
+    if [ "$app_quality_gate_status" -eq 200 ]; then
+        echo "Quality Gate found ($app_quality_gate)"
+    else
+        echo "Quality Gate not found ($app_quality_gate). Using default..."
+        
+        app_quality_gate="$default_quality_gate"
+    fi
+
+    # Links the project to its Quality Gate
+    echo "Ensuring project is linked to Quality Gate..."
+
+    status=$(curl -s -X POST -o /dev/null -w "%{http_code}" -u $token: "$url/api/qualitygates/select?gateName=$app_quality_gate&projectKey=$project_key")
+
+    if [ "$status" -ne 204 ]; then
+        echo "Error while linking application to Quality Gate!"
+    fi
+
+    rm -rf ./.tmp.sonar.out
+  displayName: 'Setup Project & Quality Gate'

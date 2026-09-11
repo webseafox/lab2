@@ -1,0 +1,142 @@
+parameters:
+  - name: BUNDLE_NAME
+    type: string
+  - name: MANUAL_BUNDLE_VERSION
+    type: string
+  - name: BUNDLE_NEXUS_REPOSITORY
+    type: string
+  - name: BUNDLE_NEXUS_COMPONENT_GROUP
+    type: string
+  - name: AZURE_STORAGE_CONTAINER_NAME
+    type: string
+  - name: AZURE_STORAGE_CONTAINER_PREFIX_PATH
+    type: string
+  - name: skipReleaseCreation
+    type: boolean
+  - name: AZURE_STORAGE_ACCOUNT_NAME
+    type: string
+  - name: AZURE_STORAGE_ACCOUNT_KEY
+    type: string
+
+stages:
+  - stage: PublishRelease
+    displayName: Publish Release
+    pool:
+      name: GeneralPurposeLinuxAgentsCI
+    dependsOn:
+      - environment_init
+      - ci_build
+      - ci_publish
+      - KeycloakAuth
+    condition: |
+      and(
+        in(dependencies.environment_init.result, 'Succeeded', 'SucceededWithIssues'),
+        in(dependencies.ci_build.result, 'Succeeded'),
+        not(in(dependencies.ci_publish.result, 'Failed', 'Canceled')),
+        in(dependencies.KeycloakAuth.result, 'Succeeded')
+      )
+
+    variables:
+      - name: BUNDLE_VERSION
+        ${{ if ne(parameters.MANUAL_BUNDLE_VERSION, '') }}:
+          value: ${{ parameters.MANUAL_BUNDLE_VERSION }}
+        ${{ else }}:
+          value: $[ stageDependencies.ci_build.build.outputs['new_version.NEW_VERSION'] ]
+
+      - name: NEXUS_DEPS_USR
+        value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEPS_USR'] ]
+      - name: NEXUS_DEPS_PSW
+        value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEPS_PSW'] ]
+
+    jobs:
+      - job: DownloadFromNexus
+        displayName: Download bundle from Nexus
+        condition: and( succeeded(), eq('${{ parameters.skipReleaseCreation }}', false ))
+        variables:
+          BUNDLE_NEXUS_URL: https://nexus.telefonica.com.br/repository/${{parameters.BUNDLE_NEXUS_REPOSITORY}}/@${{parameters.BUNDLE_NEXUS_COMPONENT_GROUP}}/${{parameters.BUNDLE_NAME}}/-/${{parameters.BUNDLE_NAME}}-$(BUNDLE_VERSION).tgz
+        steps:
+          - bash: |
+              echo "##[debug] Bundle Name: ${{parameters.BUNDLE_NAME}}"
+              echo "##[debug] Bundle Version: $(BUNDLE_VERSION)"
+              echo "##[debug] Bundle Repository: ${{parameters.BUNDLE_NEXUS_REPOSITORY}}"
+              echo "##[debug] Bundle Component Group: ${{parameters.BUNDLE_NEXUS_COMPONENT_GROUP}}"
+              echo "##[debug] Final URL: $(BUNDLE_NEXUS_URL)"
+
+              echo "##[debug] Testing URL connectivity..."
+              curl -I $(BUNDLE_NEXUS_URL) -u $(NEXUS_DEPS_USR):$(NEXUS_DEPS_PSW) || echo "##[warning] URL test failed"
+
+              echo "##[debug] Downloading bundle..."
+              curl --request GET --url $(BUNDLE_NEXUS_URL) -O -u $(NEXUS_DEPS_USR):$(NEXUS_DEPS_PSW)
+
+              echo "##[debug] Download completed. Files in directory:"
+              ls -la *.tgz 2>/dev/null || echo "No .tgz files found"
+              ls -la | head -10
+            displayName: "Download bundle from Nexus"
+          - bash: |
+              echo "##[debug] Bundle name: ${{parameters.BUNDLE_NAME}}"
+              echo "##[debug] Bundle version: $(BUNDLE_VERSION)"
+              echo "##[debug] Expected file: ${{parameters.BUNDLE_NAME}}-$(BUNDLE_VERSION).tgz"
+              echo "##[debug] Files in directory:"
+              ls -la *.tgz 2>/dev/null || echo "No .tgz files found"
+
+              # Check if the bundle file exists
+              if [ ! -f "${{parameters.BUNDLE_NAME}}-$(BUNDLE_VERSION).tgz" ]; then
+                echo "##[error] Bundle file not found: ${{parameters.BUNDLE_NAME}}-$(BUNDLE_VERSION).tgz"
+                echo "##[debug] Available files:"
+                ls -la
+                exit 1
+              fi
+
+              # Test if file is a valid gzip
+              if ! gzip -t "${{parameters.BUNDLE_NAME}}-$(BUNDLE_VERSION).tgz"; then
+                echo "##[error] File is not a valid gzip archive: ${{parameters.BUNDLE_NAME}}-$(BUNDLE_VERSION).tgz"
+                echo "##[debug] File type:"
+                file "${{parameters.BUNDLE_NAME}}-$(BUNDLE_VERSION).tgz"
+                echo "##[debug] First few lines of file:"
+                head -5 "${{parameters.BUNDLE_NAME}}-$(BUNDLE_VERSION).tgz"
+                exit 1
+              fi
+
+              # Extract the bundle
+              tar -zxvf ${{parameters.BUNDLE_NAME}}-$(BUNDLE_VERSION).tgz && \
+              mv package/dist/$(BUNDLE_VERSION) ${{parameters.BUNDLE_NAME}}-$(BUNDLE_VERSION)
+            displayName: "Extract bundle"
+
+          - task: Bash@3
+            condition: succeeded()
+            displayName: "Copiando para o blob storage"
+            #env:
+            #  HTTPS_PROXY: $(PROXY_AGENT_HTTPS)
+            #  HTTP_PROXY: $(PROXY_AGENT_HTTP)
+            #  NO_PROXY: $(PROXY_AGENT_NO_PROXY)
+            inputs:
+              targetType: inline
+              script: |
+                echo "##[debug] Target directory path: './${{parameters.AZURE_STORAGE_CONTAINER_NAME}}/${{parameters.AZURE_STORAGE_CONTAINER_PREFIX_PATH}}/${{parameters.BUNDLE_NAME}}'"
+                echo "##[debug] Source directory path: './${{parameters.BUNDLE_NAME}}-$(BUNDLE_VERSION)'"
+                # Instala o Azure CLI extension para o Azure DevOps
+                #az extension add --name storage-preview
+
+                # Copia a pasta e seu conteúdo para o Blob Storage
+
+                echo "Uploading *.$ext files..."
+                az storage blob upload-batch \
+                  --verbose \
+                  --account-name ${{parameters.AZURE_STORAGE_ACCOUNT_NAME}} \
+                  --account-key ${{parameters.AZURE_STORAGE_ACCOUNT_KEY}} \
+                  --overwrite \
+                  -d ${{parameters.AZURE_STORAGE_CONTAINER_NAME}}/${{parameters.AZURE_STORAGE_CONTAINER_PREFIX_PATH}}/${{parameters.BUNDLE_NAME}}/$(BUNDLE_VERSION) \
+                  -s ./${{parameters.BUNDLE_NAME}}-$(BUNDLE_VERSION) \
+
+          - task: CopyFiles@2
+            displayName: "Copy to Staging Directory"
+            inputs:
+              SourceFolder: ${{parameters.BUNDLE_NAME}}-$(BUNDLE_VERSION)
+              TargetFolder: $(Build.ArtifactStagingDirectory)/${{parameters.BUNDLE_NAME}}-$(BUNDLE_VERSION)
+              Contents: "**"
+              CleanTargetFolder: false
+          - task: PublishBuildArtifacts@1
+            displayName: "Publish Artifact"
+            inputs:
+              PathtoPublish: $(Build.ArtifactStagingDirectory)/${{parameters.BUNDLE_NAME}}-$(BUNDLE_VERSION)
+              ArtifactName: ${{parameters.BUNDLE_NAME}}-$(BUNDLE_VERSION)

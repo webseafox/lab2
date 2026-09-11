@@ -1,0 +1,459 @@
+## ========================================================================
+## Pipeline de Upload / Update de Arquivo em Repositórios (Modo Único ou Massivo)
+## ========================================================================
+## Objetivo:
+##   Criar (create) ou atualizar (update) um arquivo em:
+##     - Um único repositório (UNICO)
+##     - Conjunto de repositórios filtrados por prefixo (MASSIVO)
+##
+## Parâmetros:
+##   - executionMode: UNICO | MASSIVO
+##   - projectName: Nome do projeto (obrigatório em MASSIVO)
+##   - repoName: Nome do repositório (obrigatório em UNICO)
+##   - operationType: create | update
+##   - fileName: Nome do arquivo base localizado em sourceFolder (ex: README.md)
+##   - destinationPath: Caminho destino para create (ex: docs/README.md) | ignorado em update
+##   - sourceFolder: Pasta local onde buscar o arquivo (default: files/upload)
+##   - repoPrefix: Prefixo para filtrar repos em MASSIVO (default: src)
+##   - dryRun: Simular sem aplicar
+##   - overwrite: Em create, permitir sobrescrever existente
+##
+## Alterações recentes:
+##   - Removido parâmetro fileContent (sempre ler do arquivo físico)
+##   - Commit via git clone + add + commit + push (substitui REST push)
+##   - Mensagem de commit padronizada: build '<fileName>' for '<repoName>'
+##   - Branch padrão: master (fallback para main se não existir)
+##
+## Segurança:
+##   - PAT no grupo 'edit-library' com permissões Code (Read & Write)
+## ========================================================================
+
+parameters:
+  - name: executionMode
+    displayName: 'Modo de Execução'
+    type: string
+    default: 'UNICO'
+    values:
+      - UNICO
+      - MASSIVO
+  - name: projectName
+    displayName: 'Projeto (MASSIVO)'
+    type: string
+    default: ''
+    values:
+      - FRBR - FRAMEWORK BRASIL
+      - APPV - APP VIVO
+  - name: repoName
+    displayName: 'Repositório (UNICO)'
+    type: string
+    default: ''
+  - name: operationType
+    displayName: 'Operação (create/update)'
+    type: string
+    default: 'update'
+    values:
+      - update
+      - create
+  - name: fileName
+    displayName: 'Arquivo base (ex: README.md)'
+    type: string
+    default: ''
+  - name: destinationPath
+    displayName: 'Destino para create (ex: docs/README.md)'
+    type: string
+    default: ''
+  - name: sourceFolder
+    displayName: 'Pasta origem local'
+    type: string
+    default: 'files/upload'
+  - name: repoPrefix
+    displayName: 'Prefixo repos MASSIVO'
+    type: string
+    default: 'src'
+  - name: dryRun
+    displayName: 'Dry Run'
+    type: boolean
+    default: true
+  - name: overwrite
+    displayName: 'Sobrescrever (create)'
+    type: boolean
+    default: false
+
+trigger: none
+pr: none
+
+pool:
+  name: GeneralPurposeLinuxAgentsCD
+
+variables:
+  - name: AZURE_DEVOPS_ORG
+    value: 'https://dev.azure.com/telefonica-vivo-brasil/'
+  - group: 'edit-library'
+  - name: TARGET_BRANCH
+    value: 'master'
+
+jobs:
+- job: upload_update
+  displayName: 'Upload/Update de Arquivo em Repositório(s)'
+  steps:
+    - task: Bash@3
+      name: validar
+      displayName: 'Validar parâmetros'
+      inputs:
+        targetType: inline
+        script: |
+          set -e
+          EXEC_MODE='${{ parameters.executionMode }}'
+          PROJETO='${{ parameters.projectName }}'
+          REPO='${{ parameters.repoName }}'
+          OP='${{ parameters.operationType }}'
+          FILENAME='${{ parameters.fileName }}'
+          DEST_PATH='${{ parameters.destinationPath }}'
+          SOURCE_FOLDER='${{ parameters.sourceFolder }}'
+          PREFIX='${{ parameters.repoPrefix }}'
+          DRY_RUN='${{ parameters.dryRun }}'
+          OVERWRITE='${{ parameters.overwrite }}'
+
+          echo "Modo: $EXEC_MODE"
+          echo "Operação: $OP"
+          echo "FileName: $FILENAME"
+          echo "Destino: $DEST_PATH"
+          echo "Prefix: $PREFIX"
+          echo "Dry-run: $DRY_RUN"
+          echo "Overwrite: $OVERWRITE"
+          echo "Source folder: $SOURCE_FOLDER"
+
+          if [ -z "$FILENAME" ]; then echo "##[error] fileName obrigatório."; exit 1; fi
+          SOURCE_FILE="$SOURCE_FOLDER/$FILENAME"
+          if [ ! -f "$SOURCE_FILE" ]; then echo "##[error] Arquivo de origem não encontrado: $SOURCE_FILE"; exit 1; fi
+
+          if [ "$EXEC_MODE" = "UNICO" ]; then
+            if [ -z "$REPO" ]; then echo "##[error] repoName obrigatório em modo UNICO."; exit 1; fi
+            if [ "$OP" = "create" ] && [ -z "$DEST_PATH" ]; then echo "##[error] destinationPath obrigatório para create em modo UNICO."; exit 1; fi
+          else
+            if [ -z "$PROJETO" ]; then echo "##[error] projectName obrigatório em modo MASSIVO."; exit 1; fi
+            if [ "$OP" = "create" ] && [ -z "$DEST_PATH" ]; then echo "##[error] destinationPath obrigatório para create em modo MASSIVO."; exit 1; fi
+          fi
+
+          if [ "$OP" = "update" ]; then echo "destinationPath será ignorado em update."; fi
+
+          echo "##vso[task.setvariable variable=EXEC_MODE]$EXEC_MODE"
+          echo "##vso[task.setvariable variable=PROJETO]$PROJETO"
+          echo "##vso[task.setvariable variable=REPO]$REPO"
+          echo "##vso[task.setvariable variable=OP]$OP"
+          echo "##vso[task.setvariable variable=FILENAME]$FILENAME"
+          echo "##vso[task.setvariable variable=DEST_PATH]$DEST_PATH"
+          echo "##vso[task.setvariable variable=PREFIX]$PREFIX"
+          echo "##vso[task.setvariable variable=DRY_RUN]$DRY_RUN"
+          echo "##vso[task.setvariable variable=OVERWRITE]$OVERWRITE"
+          echo "##vso[task.setvariable variable=SOURCE_FILE]$SOURCE_FILE"
+
+    - task: Bash@3
+      name: auth_cli
+      displayName: 'Autenticar Azure DevOps CLI'
+      env:
+        AZURE_DEVOPS_PAT: $(AZURE_DEVOPS_PAT)
+      inputs:
+        targetType: inline
+        script: |
+          set -e
+          if ! command -v az >/dev/null 2>&1; then
+            echo "Instalando Azure CLI..."
+            curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+          fi
+          if ! az extension show --name azure-devops >/dev/null 2>&1; then
+            az extension add --name azure-devops
+          fi
+          if [ -z "$AZURE_DEVOPS_PAT" ]; then echo "##[error] PAT não encontrado no grupo 'edit-library'"; exit 1; fi
+          echo $AZURE_DEVOPS_PAT | az devops login --organization $(AZURE_DEVOPS_ORG) 2>&1 | grep -v WARNING || true
+          echo "Autenticado na organização: $(AZURE_DEVOPS_ORG)"
+
+    - task: Bash@3
+      name: listar_repos_alvo
+      displayName: 'Listar Repositórios Alvo'
+      inputs:
+        targetType: inline
+        script: |
+          set -e
+          EXEC_MODE="$(EXEC_MODE)"; PROJETO="$(PROJETO)"; REPO="$(REPO)"; PREFIX="$(PREFIX)"
+          if [ "$EXEC_MODE" = "UNICO" ]; then
+            echo "$REPO" > repos.txt
+            echo "Repositório único: $REPO"
+            echo "##vso[task.setvariable variable=REPO_COUNT]1"
+          else
+            echo "Listando repositórios do projeto: $PROJETO (prefixo: $PREFIX)"
+            REPOS_JSON=$(az repos list --org $(AZURE_DEVOPS_ORG) --project "$PROJETO" -o json)
+            FILTRADOS=$(echo "$REPOS_JSON" | jq -r ".[] | select(.name | startswith(\"$PREFIX\")) | .name")
+            if [ -z "$FILTRADOS" ]; then echo "##[error] Nenhum repositório com prefixo '$PREFIX' encontrado"; exit 1; fi
+            echo "$FILTRADOS" > repos.txt
+            COUNT=$(echo "$FILTRADOS" | wc -l | tr -d ' ')
+            echo "Total filtrados: $COUNT"
+            echo "$FILTRADOS"
+            echo "##vso[task.setvariable variable=REPO_COUNT]$COUNT"
+          fi
+          echo "##vso[task.setvariable variable=REPOS_PATH]$(System.DefaultWorkingDirectory)/repos.txt"
+
+    - task: Bash@3
+      name: processar_git
+      displayName: 'Processar Upload/Update'
+      env:
+        AZURE_DEVOPS_PAT: $(AZURE_DEVOPS_PAT)
+      inputs:
+        targetType: inline
+        script: |
+          set -e
+          EXEC_MODE="$(EXEC_MODE)"; OP="$(OP)"; FILENAME="$(FILENAME)"; DEST_PATH="$(DEST_PATH)"; DRY_RUN="$(DRY_RUN)"; OVERWRITE="$(OVERWRITE)"; PROJETO="$(PROJETO)";
+          BRANCH="$(TARGET_BRANCH)"; REPOS_FILE="$(REPOS_PATH)"; SOURCE_FILE="$(SOURCE_FILE)"; PREFIX="$(PREFIX)"
+          if [ ! -f "$REPOS_FILE" ]; then echo "##[error] Arquivo de repositórios não encontrado"; exit 1; fi
+          if [ ! -f "$SOURCE_FILE" ]; then echo "##[error] SOURCE_FILE não encontrado no agente: $SOURCE_FILE"; exit 1; fi
+          TOTAL_OK=0; TOTAL_FAIL=0; TOTAL_PROC=0
+          echo "Dry-run: $DRY_RUN"
+          PROJETO_ENC=$(echo "$PROJETO" | sed 's/ /%20/g')
+          while IFS= read -r REPO_NAME; do
+            [ -z "$REPO_NAME" ] && continue
+            TOTAL_PROC=$((TOTAL_PROC+1))
+            echo "--- Repositório: $REPO_NAME ---"
+            WORK_DIR="work_$REPO_NAME"
+            rm -rf "$WORK_DIR" 2>/dev/null || true
+            mkdir -p "$WORK_DIR"
+            cd "$WORK_DIR"
+            if [ -z "$AZURE_DEVOPS_PAT" ]; then echo "##[error] PAT ausente"; cd ..; TOTAL_FAIL=$((TOTAL_FAIL+1)); continue; fi
+            CLONE_URL="https://dev.azure.com/telefonica-vivo-brasil/$PROJETO_ENC/_git/$REPO_NAME"
+            GIT_ASKPASS_SCRIPT="$(pwd)/askpass.sh"
+            printf '#!/bin/sh\necho "$AZURE_DEVOPS_PAT"\n' > "$GIT_ASKPASS_SCRIPT"
+            chmod +x "$GIT_ASKPASS_SCRIPT"
+            export GIT_ASKPASS="$GIT_ASKPASS_SCRIPT"
+            export GIT_USERNAME="pat"
+            echo "Clonando branch '$BRANCH'..."
+            if ! git clone --depth=1 -b "$BRANCH" "$CLONE_URL" repo 2>/dev/null; then
+              echo "Branch '$BRANCH' não encontrada, tentando 'main' como fallback"
+              if git clone --depth=1 -b main "$CLONE_URL" repo 2>/dev/null; then
+                BRANCH="main"
+              else
+                echo "Falha ao clonar repositório $REPO_NAME"; cd ..; TOTAL_FAIL=$((TOTAL_FAIL+1)); continue
+              fi
+            fi
+            cd repo
+            git config user.name "pipeline-bot"
+            git config user.email "pipeline-bot@local"
+
+            if [ "$OP" = "create" ]; then TARGET_PATH="$DEST_PATH"; else TARGET_PATH="$FILENAME"; fi
+            if [ -z "$TARGET_PATH" ]; then echo "Destino vazio"; cd ../..; TOTAL_FAIL=$((TOTAL_FAIL+1)); continue; fi
+            mkdir -p "$(dirname "$TARGET_PATH")"
+            ACTION="$OP"
+            FILE_EXISTS_BEFORE="no"; [ -f "$TARGET_PATH" ] && FILE_EXISTS_BEFORE="yes"
+            if [ "$ACTION" = "create" ] && [ "$FILE_EXISTS_BEFORE" = "yes" ] && [ "$OVERWRITE" != "true" ]; then
+              echo "Arquivo já existe e overwrite=false: $TARGET_PATH"; cd ../..; TOTAL_FAIL=$((TOTAL_FAIL+1)); continue
+            fi
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "[DRY-RUN] $ACTION $TARGET_PATH em $REPO_NAME (existia? $FILE_EXISTS_BEFORE)"
+              cd ../..
+              TOTAL_OK=$((TOTAL_OK+1))
+              continue
+            fi
+            cp "$SOURCE_FILE" "$TARGET_PATH"
+            git add "$TARGET_PATH"
+            if git diff --cached --quiet; then
+              echo "Nenhuma mudança detectada para $TARGET_PATH (commit ignorado)"
+              cd ../..
+              TOTAL_OK=$((TOTAL_OK+1))
+              continue
+            fi
+            COMMIT_MSG="build '$FILENAME' for '$REPO_NAME'"
+            git commit -m "$COMMIT_MSG" || { echo "Falha no commit"; cd ../..; TOTAL_FAIL=$((TOTAL_FAIL+1)); continue; }
+            if ! git push origin "$BRANCH" 2>/dev/null; then
+              echo "Falha no push para $BRANCH"; cd ../..; TOTAL_FAIL=$((TOTAL_FAIL+1)); continue
+            fi
+            echo "OK: $ACTION $TARGET_PATH em $REPO_NAME (branch: $BRANCH)"
+            cd ../..
+            TOTAL_OK=$((TOTAL_OK+1))
+          done < "$REPOS_FILE"
+          echo "##vso[task.setvariable variable=TOTAL_PROC]$TOTAL_PROC"
+          echo "##vso[task.setvariable variable=TOTAL_OK]$TOTAL_OK"
+          echo "##vso[task.setvariable variable=TOTAL_FAIL]$TOTAL_FAIL"
+
+    - task: Bash@3
+      name: resumo_final
+      displayName: 'Resumo'
+      inputs:
+        targetType: inline
+        script: |
+          echo "============================================================"
+          echo "RESUMO UPLOAD/UPDATE"
+          echo "============================================================"
+          echo "Modo: $(EXEC_MODE)"
+          echo "Operação: $(OP)"
+          echo "Projeto: $(PROJETO)"
+          echo "Prefixo: $(PREFIX)"
+          echo "Repositório único: $(REPO)"
+          echo "FileName: $(FILENAME)"
+          echo "Destino(create): $(DEST_PATH)"
+          echo "Dry-run: $(DRY_RUN)"
+          echo "Overwrite: $(OVERWRITE)"
+          echo "Processados: $(TOTAL_PROC)"
+          echo "Sucesso: $(TOTAL_OK)"
+          echo "Falha: $(TOTAL_FAIL)"
+          echo "============================================================"
+
+    - task: Bash@3
+      name: auth
+      displayName: 'Autenticar Azure DevOps CLI'
+      env:
+        AZURE_DEVOPS_PAT: $(AZURE_DEVOPS_PAT)
+      inputs:
+        targetType: inline
+        script: |
+          set -e
+          if ! command -v az >/dev/null 2>&1; then
+            echo "Instalando Azure CLI..."
+            curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+          fi
+          if ! az extension show --name azure-devops >/dev/null 2>&1; then
+            az extension add --name azure-devops
+          fi
+          if [ -z "$AZURE_DEVOPS_PAT" ]; then echo "##[error] PAT não encontrado no grupo 'edit-library'"; exit 1; fi
+          echo $AZURE_DEVOPS_PAT | az devops login --organization $(AZURE_DEVOPS_ORG) 2>&1 | grep -v WARNING || true
+          echo "Autenticado na organização: $(AZURE_DEVOPS_ORG)"
+
+    - task: Bash@3
+      name: listar_repos
+      displayName: 'Listar Repositórios Alvo'
+      inputs:
+        targetType: inline
+        script: |
+          set -e
+          EXEC_MODE="$(EXEC_MODE)"
+          PROJETO="$(PROJETO)"
+          REPO="$(REPO)"
+          PREFIX="$(PREFIX)"
+          if [ "$EXEC_MODE" = "UNICO" ]; then
+            echo "$REPO" > repos.txt
+            echo "Repositório único: $REPO"
+            echo "##vso[task.setvariable variable=REPO_COUNT]1"
+          else
+            echo "Listando repositórios do projeto: $PROJETO (prefixo: $PREFIX)"
+            REPOS_JSON=$(az repos list --org $(AZURE_DEVOPS_ORG) --project "$PROJETO" -o json)
+            FILTRADOS=$(echo "$REPOS_JSON" | jq -r ".[] | select(.name | startswith(\"$PREFIX\")) | .name")
+            if [ -z "$FILTRADOS" ]; then echo "##[error] Nenhum repositório com prefixo '$PREFIX' encontrado"; exit 1; fi
+            echo "$FILTRADOS" > repos.txt
+            COUNT=$(echo "$FILTRADOS" | wc -l | tr -d ' ')
+            echo "Total filtrados: $COUNT"
+            echo "$FILTRADOS"
+            echo "##vso[task.setvariable variable=REPO_COUNT]$COUNT"
+          fi
+          echo "##vso[task.setvariable variable=REPOS_PATH]$(System.DefaultWorkingDirectory)/repos.txt"
+
+    - task: Bash@3
+      name: processar
+      displayName: 'Processar Upload/Update'
+      env:
+        AZURE_DEVOPS_PAT: $(AZURE_DEVOPS_PAT)
+      inputs:
+        targetType: inline
+        script: |
+          set -e
+          EXEC_MODE="$(EXEC_MODE)"; OP="$(OP)"; FILENAME="$(FILENAME)"; DEST_PATH="$(DEST_PATH)"; DRY_RUN="$(DRY_RUN)"; OVERWRITE="$(OVERWRITE)"; PROJETO="$(PROJETO)";
+          BRANCH="$(TARGET_BRANCH)"; REPOS_FILE="$(REPOS_PATH)"; ORG_URL="$(AZURE_DEVOPS_ORG)"; SOURCE_FILE="$(SOURCE_FILE)"; CONTENT_MODE="$(CONTENT_MODE)"
+          if [ ! -f "$REPOS_FILE" ]; then echo "##[error] Arquivo de repositórios não encontrado"; exit 1; fi
+          if [ ! -f "$SOURCE_FILE" ]; then echo "##[error] SOURCE_FILE não encontrado no agente: $SOURCE_FILE"; exit 1; fi
+          ORIG_CONTENT=$(cat "$SOURCE_FILE")
+          BASE64_CONTENT=$(printf "%s" "$ORIG_CONTENT" | base64 -w0 2>/dev/null || printf "%s" "$ORIG_CONTENT" | base64)
+          echo "Modo de obtenção de conteúdo: $CONTENT_MODE (arquivo: $SOURCE_FILE)"
+          TOTAL_OK=0; TOTAL_FAIL=0; TOTAL_PROC=0
+          echo "Dry-run: $DRY_RUN"
+          while IFS= read -r REPO_NAME; do
+            [ -z "$REPO_NAME" ] && continue
+            TOTAL_PROC=$((TOTAL_PROC+1))
+            echo "--- Repositório: $REPO_NAME ---"
+            # Obter repo id
+            REPO_ID=$(az repos show --repository "$REPO_NAME" --org $ORG_URL --project "$PROJETO" --query id -o tsv 2>/dev/null || true)
+            if [ -z "$REPO_ID" ]; then echo "Repo não encontrado: $REPO_NAME"; TOTAL_FAIL=$((TOTAL_FAIL+1)); continue; fi
+
+            # Obter última commit do branch
+            LAST_COMMIT=$(az repos ref list --org $ORG_URL --project "$PROJETO" --repository "$REPO_NAME" --filter heads/$BRANCH --query "[0].objectId" -o tsv 2>/dev/null || true)
+            if [ -z "$LAST_COMMIT" ]; then echo "Branch '$BRANCH' não encontrado em $REPO_NAME"; TOTAL_FAIL=$((TOTAL_FAIL+1)); continue; fi
+
+            TARGET_PATH="$FILENAME"
+            if [ "$OP" = "create" ]; then
+              TARGET_PATH="$DEST_PATH"
+            fi
+            if [ -z "$TARGET_PATH" ]; then echo "Destino vazio após lógica de operação"; TOTAL_FAIL=$((TOTAL_FAIL+1)); continue; fi
+
+            # Verificar existência do arquivo (scan simples via az repos pr create tentativa - CLI não possui get raw - usar az rest em tree)
+            # URL-encode nome do projeto (espaços) e caminho do arquivo
+            PROJETO_ENC=$(echo "$PROJETO" | sed 's/ /%20/g')
+            TARGET_PATH_ENC=$(echo "$TARGET_PATH" | sed 's/ /%20/g')
+            TREE_URL="$ORG_URL$PROJETO_ENC/_apis/git/repositories/$REPO_ID/items?path=$TARGET_PATH_ENC&includeContentMetadata=true&api-version=7.0"
+            # Autenticação via PAT para evitar warnings e garantir acesso
+            if [ -z "$AZURE_DEVOPS_PAT" ]; then echo "##[error] PAT não disponível no passo processar."; TOTAL_FAIL=$((TOTAL_FAIL+1)); continue; fi
+            BASIC_AUTH=$(printf ":%s" "$AZURE_DEVOPS_PAT" | base64)
+            EXISTE=$(az rest --method get --url "$TREE_URL" --headers "Authorization=Basic $BASIC_AUTH" --query 'contentMetadata.fileName' -o tsv 2>/dev/null || true)
+
+            if [ "$OP" = "create" ]; then
+              if [ -n "$EXISTE" ] && [ "$OVERWRITE" != "true" ]; then
+                echo "Arquivo já existe e overwrite=false: $TARGET_PATH"; TOTAL_FAIL=$((TOTAL_FAIL+1)); continue
+              fi
+            else
+              # update: se arquivo não existe, avisar e pular
+              if [ -z "$EXISTE" ]; then echo "Arquivo para update não encontrado: $FILENAME"; TOTAL_FAIL=$((TOTAL_FAIL+1)); continue; fi
+            fi
+
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "[DRY-RUN] Operação $OP em $REPO_NAME -> $TARGET_PATH"
+              TOTAL_OK=$((TOTAL_OK+1))
+              continue
+            fi
+
+            # Definir tipo de mudança (add vs edit) e mensagem padronizada de commit
+            if [ -n "$EXISTE" ]; then
+              CHANGE_TYPE="edit"
+            else
+              CHANGE_TYPE="add"
+            fi
+            COMMIT_MSG="build '$FILENAME' for '$REPO_NAME'"
+            # Construir objeto de create/update via push (Git push API) - contentType deve ser 'base64Encoded'
+            BODY=$(jq -n --arg ref "refs/heads/$BRANCH" --arg path "$TARGET_PATH" --arg content "$BASE64_CONTENT" --arg last "$LAST_COMMIT" --arg ct "$CHANGE_TYPE" --arg msg "$COMMIT_MSG" '{refUpdates:[{name:$ref,oldObjectId:$last}], commits:[{comment:$msg, changes:[{changeType:$ct, item:{path:$path}, newContent:{content:$content, contentType:"base64Encoded"}}]}] }')
+            PUSH_URL="$ORG_URL$PROJETO_ENC/_apis/git/repositories/$REPO_ID/pushes?api-version=7.0"
+            RESP=$(az rest --method post --url "$PUSH_URL" --body "$BODY" --headers "Content-Type=application/json" "Authorization=Basic $BASIC_AUTH" -o json 2>/dev/null || true)
+            if [ -z "$RESP" ]; then
+              echo "Falha: resposta vazia do endpoint de push."; TOTAL_FAIL=$((TOTAL_FAIL+1)); continue
+            fi
+            COMMIT_ID=$(echo "$RESP" | jq -r '.commits[0].commitId // empty' 2>/dev/null || true)
+
+            ERRO=$(echo "$RESP" | jq -r '.error.message // empty' 2>/dev/null || true)
+            if [ -n "$ERRO" ]; then
+              echo "Falha na operação: $ERRO"; TOTAL_FAIL=$((TOTAL_FAIL+1)); continue
+            fi
+            if [ -z "$COMMIT_ID" ]; then
+              echo "Falha: commitId não retornado. JSON bruto:"; echo "$RESP" | jq '.' 2>/dev/null || echo "$RESP"; TOTAL_FAIL=$((TOTAL_FAIL+1)); continue
+            fi
+            echo "OK: $OP $TARGET_PATH em $REPO_NAME (commit: $COMMIT_ID)"
+            TOTAL_OK=$((TOTAL_OK+1))
+          done < "$REPOS_FILE"
+
+          echo "##vso[task.setvariable variable=TOTAL_PROC]$TOTAL_PROC"
+          echo "##vso[task.setvariable variable=TOTAL_OK]$TOTAL_OK"
+          echo "##vso[task.setvariable variable=TOTAL_FAIL]$TOTAL_FAIL"
+
+    - task: Bash@3
+      name: resumo
+      displayName: 'Resumo'
+      inputs:
+        targetType: inline
+        script: |
+          echo "============================================================"
+          echo "RESUMO UPLOAD/UPDATE"
+          echo "============================================================"
+          echo "Modo: $(EXEC_MODE)"
+          echo "Operação: $(OP)"
+          echo "Projeto: $(PROJETO)"
+          echo "Prefixo: $(PREFIX)"
+          echo "Repositório único: $(REPO)"
+          echo "FileName: $(FILENAME)"
+          echo "Destino(create): $(DEST_PATH)"
+          echo "Dry-run: $(DRY_RUN)"
+          echo "Overwrite: $(OVERWRITE)"
+          echo "Processados: $(TOTAL_PROC)"
+          echo "Sucesso: $(TOTAL_OK)"
+          echo "Falha: $(TOTAL_FAIL)"
+          echo "============================================================"

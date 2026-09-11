@@ -1,0 +1,299 @@
+parameters:
+- name: environment
+  displayName: Escolha o ambiente para publicar
+  type: string
+  default: dev
+  values:
+  - dev
+  - preprod
+  - prod
+
+#Incluir Variaveis da Library
+variables:
+- name: ASDF_JDK_11
+  value: "openjdk-11.0.2"
+- name: System.debug
+  value: "true"
+- group: $(Build.Repository.Name)-${{ parameters.environment }}
+
+stages:
+
+- stage: deploy_kube
+  displayName: Deploy Kubernetes
+
+  # pool: VivoAzureCloudSharedAgents
+  pool: 
+    name: DefaultDevopsAgents
+    demands:
+    - Agent.Name -equals BRTAZLTS0085CO.azagent004
+
+  # variables:
+  # - name: HELM_REGISTRY_ACR_ENABLED
+  #   value: true
+  # - name: HELM_REGISTRY_ACR_NAME
+  #   value: "acrsharedservices01.azurecr.io"
+  # - name: HELM_REGISTRY_ACR_NAMESPACE
+  #   value: "helm"
+  # - name: HELM_REGISTRY_ACR_SUB_NAMESPACE
+  #   value: "devops"
+  # - name: HELM_REGISTRY_ACR_CHART_BASE_URL
+  #   value: "oci://acrsharedservices01.azurecr.io/helm/devops/"
+  # - name: HELM_REGISTRY_NEXUS_ENABLED
+  #   value: false
+  # - name: HELM_REGISTRY_NEXUS_REPO_NAME
+  #   value: "devops-helm"
+  # - name: HELM_REGISTRY_NEXUS_URL
+  #   value: "https://nexus.telefonica.com.br/repository"
+  # - name: HELM_UPGRADE_TIMEOUT
+  #   value: "300s"
+  # - name: ARGOROLLOUTS_UPGRADE_TIMEOUT
+  #   value: "300"
+  # - name: HELM_UPGRADE_HISTORY_MAX
+  #   value: "2"
+  # - name: HELM_IMAGE_PULL_SECRET
+  #   value: "vcr-docker"
+  # - name: DEFAULT_PREFIX_HELM_RELEASE_NAME_DEVELOPMENT
+  #   value: ""
+  # - name: DEFAULT_PREFIX_HELM_RELEASE_NAME_HOMOLOGATION
+  #   value: ""
+  # - name: DEFAULT_PREFIX_HELM_RELEASE_NAME_PRODUCTION
+  #   value: ""
+  # - name: DEFAULT_PREFIX_HELM_RELEASE_NAME_DEV
+  #   value: ""
+  # - name: DEFAULT_PREFIX_HELM_RELEASE_NAME_ESTEIRA1
+  #   value: ""
+  # - name: DEFAULT_PREFIX_HELM_RELEASE_NAME_ESTEIRA2
+  #   value: ""
+  # - name: DEFAULT_PREFIX_HELM_RELEASE_NAME_PREPROD
+  #   value: ""
+  # - name: DEFAULT_PREFIX_HELM_RELEASE_NAME_PRODLIKE
+  #   value: ""
+  # - name: DEFAULT_PREFIX_HELM_RELEASE_NAME_PRODUCAO
+  #   value: ""
+  # - name: DEFAULT_APPLICATION_HELM_CONFIG
+  #   value: ".azuredevops/config"
+  # - name: DEFAULT_APPLICATION_HELM_SECRET_FILENAME
+  #   value: "secrets.yaml"
+  # - name: HELM_REGISTRY_ACR_ENABLED
+  #   value: true
+  # - name: HELM_CHART_NAME
+  #   value: generic-java-microservice
+  # # - name: HELM_CHART_VERSION
+  # #   value: 1.0.15
+  # - name: HELM_RELEASE_NAME_PREFIX
+  #   value: 
+  # - name: HELM_RELEASE_NAME
+  #   value: ms-java-teste-v1
+  # - name: HELM_RELEASE_NAMESPACE
+  #   value: code-dev
+  # - name: HELM_TIMEOUT
+  #   value: 300s
+  # - name: HELM_IMAGE_REPOSITORY
+  #   value: ***.azurecr.io/code/ms-java-teste-v1
+  # - name: HELM_IMAGE_TAG
+  #   value: 1.0.0
+  # - name: HELM_IMAGE_PULL_SECRET
+  #   value: acr-code
+  # - name: HELM_HISTORY_MAX
+  #   value: 2
+  # - name: ENVIRONMENT_CONFIG
+  #   value: dev
+  # - name: K8S_KUBE_CONFIG
+  #   value: /devops/vsts-agent/standalone/azagent014/_work/_temp/kube-dev
+  # - name: HELM_OCI_CHART_BASE_URL
+  #   value: oci://acrsharedservices01.azurecr.io/helm/devops/
+  # - name: HELM_FULL_CHART_NAME
+  #   value: oci://acrsharedservices01.azurecr.io/helm/devops/generic-java-microservice
+
+  jobs:
+  - job: deploy_on_kube
+    continueOnError: False
+    condition: succeeded()
+    displayName: Deploy on Kubernetes (${{ parameters.environment }})
+    steps:
+
+    - task: DownloadBuildArtifacts@1
+      inputs:
+        project: '5dd6e0e3-0415-43c4-b730-17063944d467'
+        pipeline: '21575'
+        buildVersionToDownload: 'specific'
+        buildId: '290555'
+        buildType: 'specific'
+        itemPattern: |
+          bin/**/pom.xml
+          bin/.azuredevops/**/*
+          bin/catalog-info.y*ml
+          bin/pom.xml
+        downloadPath: '$(System.ArtifactsDirectory)'
+        cleanDestinationFolder: true
+
+    - checkout: none
+    # - task: DownloadBuildArtifacts@1
+    #   displayName: Download Artifact
+    #   inputs:
+    #     buildType: 'current'
+    #     downloadPath: '$(System.ArtifactsDirectory)'
+
+    - task: AzureKeyVault@2  
+      displayName: 'Getting AKV credentials'
+      timeoutInMinutes: 1
+      retryCountOnTaskFailure: 5  
+      inputs:    
+        azureSubscription: DevOpsSharedResources    
+        KeyVaultName: kv-azdevops-shared
+        SecretsFilter: >- 
+          DOCKER-REGISTRY-USERNAME, DOCKER-REGISTRY-PASSWORD,
+          HELM-REGISTRY-NEXUS-USERNAME, HELM-REGISTRY-NEXUS-PASSWORD,
+          HELM-REGISTRY-ACR-USERNAME, HELM-REGISTRY-ACR-PASSWORD,
+          NEXUS-DEPS-USR, NEXUS-DEPS-PSW
+
+    - task: DownloadSecureFile@1
+      name: kubeconfig
+      displayName: 'Download kube-${{parameters.environment}}'
+      inputs:
+        secureFile: 'kube-${{parameters.environment}}'
+
+    - task: XmlParseFromVivo@4
+      displayName: Get Main Info
+      name: pom_info
+      inputs:
+        type: 'file'
+        origin: $(System.ArtifactsDirectory)/bin/pom.xml
+        jpaths: |-
+          var POM_XML_VERSION = .project.version._text
+          var POM_XML_ARTIFACT_ID = .project.artifactId._text
+          var POM_XML_GROUP_ID = .project.groupId._text
+    
+    # - task: Bash@3
+    #   displayName: "[ACR] Helm registry login"
+    #   inputs:
+    #     script: |-
+    #       # source ~/.bashrc
+
+    #       helm registry login acrsharedservices01.azurecr.io
+    #         --username $(HELM-REGISTRY-ACR-USERNAME)
+    #         --password "$(HELM-REGISTRY-ACR-PASSWORD)
+
+    - task: YamlParseFromVivo@4
+      displayName: Get Metadata Info
+      name: catalog_info
+      inputs:
+        type: 'file'
+        origin: $(System.ArtifactsDirectory)/bin/catalog-info.yaml
+        jpaths: |-
+          var CATALOG_YAML_NAME = .metadata.name
+          var CATALOG_YAML_ACRONYM = .metadata.annotations['techarch.governance-app.acronym']
+          var CATALOG_YAML_SIGLA_BU = .metadata.annotations['techarch.governance-app.sigla_bu']
+          var CATALOG_YAML_RG = .metadata.annotations['techarch.governance-app.resource_group']
+          var CATALOG_YAML_MODULE = .metadata.annotations['techarch.governance-app.module']
+          var CATALOG_YAML_SONAR_PROJECT_KEY = .metadata.annotations['sonarqube.org/project-key']
+          var CATALOG_YAML_JAVA_LANGUAGE_VERSION = .metadata.annotations['arqtech.telefonica.com.br/language-version']
+          var CATALOG_YAML_K8S_NS = .metadata.annotations['vivo.io/kubernetes-k8s-namespace-${{ parameters.environment }}']
+          var CATALOG_YAML_K8S_NS_DEV = .metadata.annotations['vivo.io/kubernetes-k8s-namespace-dev']
+          var CATALOG_YAML_K8S_NS_HML = .metadata.annotations['vivo.io/kubernetes-k8s-namespace-hml']
+          var CATALOG_YAML_K8S_NS_PRD = .metadata.annotations['vivo.io/kubernetes-k8s-namespace-prd']
+          var CATALOG_YAML_K8S_NS_ESTEIRA1 = .metadata.annotations['vivo.io/kubernetes-k8s-namespace-esteira1']
+          var CATALOG_YAML_K8S_NS_ESTEIRA2 = .metadata.annotations['vivo.io/kubernetes-k8s-namespace-esteira2']
+          var CATALOG_YAML_K8S_NS_PREPROD = .metadata.annotations['vivo.io/kubernetes-k8s-namespace-preprod']
+          var CATALOG_YAML_K8S_NS_PRODLIKE = .metadata.annotations['vivo.io/kubernetes-k8s-namespace-prodlike']
+          var CATALOG_YAML_K8S_NS_PRODUCAO = .metadata.annotations['vivo.io/kubernetes-k8s-namespace-producao']
+
+          var CATALOG_YAML_HELM_REPO_NAME = .metadata.annotations['vivo.io/helm-repo-name']
+    # - template: /tech_products/code/template_tasks_javabasecloud_cd_v5-helm.yaml
+    #   parameters:
+    #     azureSubscription: aks-${{variables.CATALOG_YAML_SIGLA_BU}}-brsouth-${{ parameters.environment }}
+    #     azureResourceGroup: >-
+    #       $(
+    #         coalece(
+    #           variables.CATALOG_YAML_RG, 
+    #           'rg-aks-$(CATALOG_YAML_SIGLA_BU)-brsouth'
+    #         )
+    #       )
+    #     kubernetesCluster: aks-$(CATALOG_YAML_SIGLA_BU)-brsouth-${{ parameters.environment }}
+
+    - script: echo "##vso[task.setvariable variable=CATALOG_YAML_HELM_REPO_NAME]devops-helm"
+      condition: not(variables['CATALOG_YAML_HELM_REPO_NAME'])
+      displayName: Using default 'devops-helm'
+
+
+    - task: HelmDeploy@1
+      displayName: '[Nexus] Helm repo add'
+      condition: succeeded()
+      inputs:
+        # connectionType: 'Azure Resource Manager'
+        # azureResourceGroup: $(CATALOG_YAML_RG)
+        # kubernetesCluster: aks-$(CATALOG_YAML_SIGLA_BU)-brsouth-${{ parameters.environment }}
+        # azureResourceGroup: $(coalece(variables.CATALOG_YAML_RG, 'rg-aks-$(CATALOG_YAML_SIGLA_BU)-brsouth'))
+
+        connectionType: 'Azure Resource Manager'
+        azureResourceGroup: 'rg-devops-sharedservices'
+        azureSubscription: Development
+        # azureSubscription: DevOpsSharedResources
+        # azureSubscription: 'Development(76461b8e-edbd-464c-ad30-b13ba994709c)'
+        kubernetesCluster: 'aks-devops-shared'
+
+        command: 'repo'
+        arguments: >-
+          add $(CATALOG_YAML_HELM_REPO_NAME) 
+          "https://nexus.telefonica.com.br/repository/$(CATALOG_YAML_HELM_REPO_NAME)" 
+          --force-update 
+          --insecure-skip-tls-verify 
+          --username $(HELM-REGISTRY-NEXUS-USERNAME) 
+          --password $(HELM-REGISTRY-NEXUS-PASSWORD)
+      # env: 
+      #   azureServiceConnectionPrefix: aks-$(CATALOG_YAML_SIGLA_BU)-brsouth
+      #   azureResourceGroupPrefix: $(CATALOG_YAML_RG) # rg-aks-$(CATALOG_YAML_SIGLA_BU)-brsouth
+      #   azureKubernetesClusterPrefix: aks-$(CATALOG_YAML_SIGLA_BU)-brsouth
+      #   serviceConnectionDeploySuffix: ${{ parameters.environment }}
+
+    # - task: HelmDeploy@0
+    #   displayName: 'Helm Upgrade (Service Connection)'
+    #   inputs:
+    #     namespace: ${{ parameters.helmReleaseNamespace }}
+    #     command: upgrade
+    #     chartName: $(HELM_FULL_CHART_NAME)
+    #     chartVersion: ${{ parameters.helmChartVersion }}
+    #     releaseName: ${{ parameters.helmReleaseNamePrefix }}${{ parameters.helmReleaseName }}
+    #     overrideValues: |
+    #       nameOverride=${{ parameters.helmReleaseNamePrefix }}${{ parameters.helmReleaseName }}
+    #       fullnameOverride=${{ parameters.helmReleaseNamePrefix }}${{ parameters.helmReleaseName }}
+    #       containerName=${{ parameters.helmReleaseNamePrefix }}${{ parameters.helmReleaseName }}
+    #       image.repository=${{ parameters.helmImageRepository }}
+    #       image.tag=${{ parameters.helmImageTag }}
+    #       imagePullSecrets[0].name=${{ parameters.helmImagePullSecret }}
+    #     valueFile: .azuredevops/config/${{ parameters.environment }}/values.yml
+    #     arguments: '--install --wait --atomic --insecure-skip-tls-verify --timeout ${{ parameters.helmTimeout }} -f "$(Build.SourcesDirectory)/.azuredevops/config/${{ parameters.environment }}/environments_variables.yml" -f "$(Build.SourcesDirectory)/.azuredevops/config/${{ parameters.environment }}/secrets.yaml" --history-max ${{ parameters.helmHistoryMax }} --debug --output table'
+    #     azureSubscription: "$(azureServiceConnectionPrefix)-$(serviceConnectionDeploySuffix)"
+    #     azureResourceGroup: "$(azureResourceGroupPrefix)-$(serviceConnectionDeploySuffix)"
+    #     kubernetesCluster: "$(azureKubernetesClusterPrefix)-$(serviceConnectionDeploySuffix)"
+    #   condition: succeeded()
+      
+    # - task: Bash@3
+    #   displayName: 'Helm Upgrade'
+    #   condition: succeeded()
+    #   inputs:
+    #     workingDirectory: $(System.ArtifactsDirectory)/bin
+    #     targetType: inline
+    #     script: >-
+    #       helm upgrade "$(CATALOG_YAML_NAME)"
+    #       "oci://acrsharedservices01.azurecr.io/helm/devops/generic-java-microservice"
+    #       --version "1.0.15"
+    #       -f "./.azuredevops/config/${{ parameters.environment }}/values.yml"
+    #       -f "./.azuredevops/config/${{ parameters.environment }}/environments_variables.yml"
+    #       -f "./.azuredevops/config/${{ parameters.environment }}/secrets.yaml"
+    #       --kubeconfig "$(kubeconfig.secureFilePath)"
+    #       --namespace "$(CATALOG_YAML_K8S_NS)"
+    #       --install
+    #       --insecure-skip-tls-verify
+    #       --wait
+    #       --timeout 300s
+    #       --set "nameOverride=$(CATALOG_YAML_NAME)"
+    #       --set "fullnameOverride=$(CATALOG_YAML_NAME)"
+    #       --set "containerName=$(CATALOG_YAML_NAME)"
+    #       --set "image.repository=https://acrsharedservices01.azurecr.io/$(CATALOG_YAML_K8S_NS)/$(CATALOG_YAML_NAME)"
+    #       --set "image.tag=$(POM_XML_VERSION)"
+    #       --set "imagePullSecrets[0].name=${HELM_IMAGE_PULL_SECRET}"
+    #       --output table
+    #       --history-max 2
+    #       --atomic
+    #       --debug

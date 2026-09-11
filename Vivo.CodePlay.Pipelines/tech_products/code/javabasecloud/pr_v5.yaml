@@ -1,0 +1,88 @@
+# trigger: none
+
+# pr:
+#   branches:
+#     include:
+#     - "master"
+#     - "main"
+#     - "codeplay"
+
+variables:
+- name: System.debug
+  value: "true"
+
+- name: ASDF_JDK_8
+  value: "adoptopenjdk-8.0.352+8"
+- name: ASDF_JDK_11
+  value: "openjdk-11.0.2"
+- name: ASDF_JDK_17
+  value: "openjdk-17.0.2"
+- name: ASDF_JDK_SAP17
+  value: "sapmachine-17.0.10"
+
+
+stages:
+- stage: stage_build
+  displayName: Build
+  # pool: VivoAzureCloudSharedAgents
+  pool: 
+    name: DefaultDevopsAgents
+    demands:
+    - Agent.Name -equals BRTAZLTS0085CO.azagent004
+  jobs:
+  - job: job_build
+    displayName: Build, Unit Test and Pack
+    steps:
+    - checkout: self
+      fetchDepth: 1
+
+    - task: YamlParseFromVivo@4
+      displayName: Get Metadata Info
+      name: catalog_info
+      inputs:
+        type: 'file'
+        origin: $(Build.SourcesDirectory)/catalog-info.yaml
+        jpaths: |
+          var CATALOG_YAML_JAVA_LANGUAGE_VERSION = .metadata.annotations['arqtech.telefonica.com.br/language-version']
+
+    - task: NunjucksInline@4
+      displayName: Bind 'ASDF_JAVA_VERSION'
+      inputs:
+        sourceType: 'text'
+        source: |
+          var ASDF_JAVA_VERSION = {{ ASDF_JDK_$(CATALOG_YAML_JAVA_LANGUAGE_VERSION) }}
+
+    - task: AzureKeyVault@2
+      displayName: Secrets from AKV
+      inputs:
+        azureSubscription: 'DevOpsSharedResources'
+        KeyVaultName: 'kv-azdevops-shared'
+        SecretsFilter: >-
+          NEXUS-DEPS-USR, NEXUS-DEPS-PSW,
+          SONARQUBE-TOKEN
+
+    - task: Maven@3
+      displayName: Maven Build, Test & Package
+      continueOnError: False
+      env:
+        ASDF_JAVA_VERSION: $(ASDF_JAVA_VERSION)
+        NEXUS_DEPS_USR: $(NEXUS-DEPS-USR)
+        NEXUS_DEPS_PSW: $(NEXUS-DEPS-PSW)
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+      inputs:
+          options: >-
+            -s /home/svc_devopscorp/.m2/settings.xml
+            -U
+          mavenPomFile: $(Build.SourcesDirectory)/pom.xml
+          mavenOptions: '-Xmx3072m'
+          javaHomeOption: 'JDKVersion'
+          publishJUnitResults: false
+          testResultsFiles: $(Build.SourcesDirectory)/**/surefire-reports/TEST-*.xml
+          goals: 'clean install test'
+
+    - task: PublishTestResults@2
+      inputs:
+        testResultsFormat: 'JUnit'
+        testResultsFiles: '**/surefire-reports/TEST-*.xml'
+        mergeTestResults: true
+

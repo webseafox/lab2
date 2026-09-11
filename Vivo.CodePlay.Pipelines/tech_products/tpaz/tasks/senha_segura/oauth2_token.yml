@@ -1,0 +1,83 @@
+parameters:
+- name: module
+  default: PAM
+  values:
+  - PAM
+  - DSM
+  - CERTIFICATE
+- name: accessTokenEnabled
+  default: true
+- name: resourceType
+  default: ''
+  type: string
+
+
+steps:
+
+# =========================
+# 🔐 OCI (Calisto) - Buscar credenciais
+# =========================
+- task: AzureKeyVault@2
+  displayName: '[AKV][Senha Segura OCI Calisto][${{ parameters.module }}] Get API credentials'
+  condition: contains('${{ parameters.resourceType }}', 'oci')
+  inputs:
+    azureSubscription: DevOpsSharedResources
+    KeyVaultName: $(AKV_DEVOPS_NAME)
+    SecretsFilter: 'SENHA-SEGURA-OCI-CALISTO-CLIENT-ID, SENHA-SEGURA-OCI-CALISTO-CLIENT-SECRET'
+
+# =========================
+# 🔐 Azure (Venus) - Buscar credenciais
+# =========================
+- task: AzureKeyVault@2
+  displayName: '[AKV][Senha Segura Azure Venus][${{ parameters.module }}] Get API credentials'
+  condition: not(contains('${{ parameters.resourceType }}', 'oci'))
+  inputs:
+    azureSubscription: DevOpsSharedResources
+    KeyVaultName: $(AKV_DEVOPS_NAME)
+    SecretsFilter: 'SENHA-SEGURA-${{ parameters.module }}-CLIENT-ID, SENHA-SEGURA-${{ parameters.module }}-CLIENT-SECRET'
+
+# =========================
+# 🔓 Obter Token OAuth2
+# =========================
+- task: PythonScript@0
+  displayName: '[${{ parameters.module }}] Get access_token'
+  enabled: ${{ parameters.accessTokenEnabled }}
+  inputs:
+    scriptSource: inline
+    script: |
+      import requests
+      import os
+            
+      base_url = os.getenv('SENHA_SEGURA_BASE_URL')
+      client_id = os.getenv('SENHA_SEGURA_CLIENT_ID')
+      client_secret = os.getenv('SENHA_SEGURA_CLIENT_SECRET')
+
+      def oauth2_token():
+        url = base_url + '/iso/oauth2/token'
+        print('##[command] POST {} - Gerar access_token'.format(url))
+        response = requests.post(
+          url,
+          data = {
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "grant_type": "client_credentials",
+            "ttl": "60",
+          },
+          verify=False
+        )
+        response_json = response.json()
+        return response_json['access_token']
+
+      token = oauth2_token()
+      print('##vso[task.setvariable variable=SENHA_SEGURA_ACCESS_TOKEN;isSecret=true]{}'.format(token))
+  env:
+    SENHA_SEGURA_BASE_URL: $(SENHA_SEGURA_BASE_URL)
+    # Seleciona credenciais baseado em resourceType
+    # OCI (Calisto): vm-oci-linux, vm-oci-windows
+    # Azure (Venus): vm-linux, vm-windows
+    ${{ if contains(parameters.resourceType, 'oci') }}:
+      SENHA_SEGURA_CLIENT_ID: $(SENHA-SEGURA-OCI-CALISTO-CLIENT-ID)
+      SENHA_SEGURA_CLIENT_SECRET: $(SENHA-SEGURA-OCI-CALISTO-CLIENT-SECRET)
+    ${{ else }}:
+      SENHA_SEGURA_CLIENT_ID: $(SENHA-SEGURA-${{ parameters.module }}-CLIENT-ID)
+      SENHA_SEGURA_CLIENT_SECRET: $(SENHA-SEGURA-${{ parameters.module }}-CLIENT-SECRET)

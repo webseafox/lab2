@@ -1,0 +1,176 @@
+# This YAML file defines the stages and jobs for the "Bundle" stage in the pipeline.
+parameters:
+  - name: config
+    type: object
+  - name: flow
+    type: object
+
+stages:
+  - stage: stage_bundle
+    displayName: "Package & Publish"
+    pool: $(POOL)
+    dependsOn:
+      - stage_prep
+      - stage_build_test
+    condition: |
+      or(
+        and(
+          eq(variables['STAGE_SECURITY_ONLY'], True),
+          in(variables['TECHNOLOGY'], 'java', 'script'),
+          eq(variables['DISABLE_STAGE_CODE_SECURITY_ANALYSIS'], false),
+          in(dependencies.stage_prep.result, 'Succeeded', 'SucceededWithIssues'),
+          in(dependencies.stage_build_test.result, 'Succeeded', 'SucceededWithIssues', 'Skipped'),
+          ne(variables['APPLICATION_NAME'], 'bi-publisher-reports')
+        ),
+        and(
+          eq(variables['STAGE_SECURITY_ONLY'], True),
+          eq(variables['DISABLE_STAGE_CODE_SECURITY_ANALYSIS'], false),
+          in(dependencies.stage_prep.result, 'Succeeded', 'SucceededWithIssues'),
+          ne(variables['APPLICATION_NAME'], 'bi-publisher-reports')
+        ),
+        and(
+          ne(variables['TECHNOLOGY'], 'onlyHelmUpdate'),
+          ne(variables['APPLICATION_NAME'], 'bi-publisher-reports'),
+          in(dependencies.stage_prep.result, 'Succeeded', 'SucceededWithIssues'),
+          in(dependencies.stage_build_test.result, 'Succeeded', 'SucceededWithIssues', 'Skipped')
+        )
+      )
+    variables:
+      - name: VERSION
+        ${{ if eq(parameters.config.stageSecurityOnly, 'True') }}:
+          value: 99.99.99-sca
+        ${{ if eq(parameters.config.stageSecurityOnly, 'False') }}:
+          value: $[ stageDependencies.stage_prep.version.outputs['version.VERSION'] ]
+      - name: USE_FORTIFY
+        value: $[ stageDependencies.stage_prep.app_config_keys.outputs['evaluate_flags.USE_FORTIFY'] ]
+      - name: USE_CONVISO
+        value: $[ stageDependencies.stage_prep.app_config_keys.outputs['evaluate_flags.USE_CONVISO'] ]
+      - name: SKIP_SECURITY_GATE
+        value: $[ stageDependencies.stage_prep.app_config_keys.outputs['evaluate_flags.SKIP_SECURITY_GATE'] ]
+      - name: USE_CHECKMARX
+        value: $[ stageDependencies.stage_prep.app_config_keys.outputs['evaluate_flags.USE_CHECKMARX'] ]
+      - name: USE_DEPENDENCY_TRACK
+        value: $[ stageDependencies.stage_prep.app_config_keys.outputs['evaluate_flags.USE_DEPENDENCY_TRACK'] ]
+      - name: USE_DT_DOCKER
+        value: $[ stageDependencies.stage_prep.app_config_keys.outputs['evaluate_flags.USE_DT_DOCKER'] ]
+      - name: SKIP_SECURITY_GATE_SCA
+        value: $[ stageDependencies.stage_prep.app_config_keys.outputs['evaluate_flags.SKIP_SECURITY_GATE_SCA'] ]
+      - name: DOCKER_REGISTRY_CUSTOM_IMAGE
+        value: $[ stageDependencies.stage_prep.image_tag_definition.outputs['define_image_tag.DOCKER_REGISTRY_CUSTOM_IMAGE'] ]
+      - name: DOCKER_IMAGE_TAG
+        value: $[ stageDependencies.stage_prep.image_tag_definition.outputs['define_image_tag.DOCKER_IMAGE_TAG'] ]
+
+    jobs:
+      - job: build_image
+        displayName: "Build Image"
+        steps:
+          - script: |
+              echo "##[debug] VERSION .....................................................: $(VERSION)"
+              if [ "${{ parameters.flow.flow }}" == "CI" ]; then
+                echo "##[debug] USE FORTIFY .................................................: $(USE_FORTIFY)"
+                echo "##[debug] USE CONVISO .................................................: $(USE_CONVISO)"
+                echo "##[debug] SKIP SECURITY GATE ..........................................: $(SKIP_SECURITY_GATE)"
+                echo "##[debug] USE CHECKMARX ...............................................: $(USE_CHECKMARX)"
+                echo "##[debug] SKIP SECURITY GATE ..........................................: $(SKIP_SECURITY_GATE)"
+                echo "##[debug] USE DEPENDENCY TRACK ........................................: $(USE_DEPENDENCY_TRACK)"
+                echo "##[debug] USE DT DOCKER ...............................................: $(USE_DT_DOCKER)"
+                echo "##[debug] USE CONVISO .................................................: $(USE_CONVISO)"
+                echo "##[debug] SKIP SECURITY GATE SCA ......................................: $(SKIP_SECURITY_GATE_SCA)"
+              fi
+            displayName: "Build Show Variables"
+
+          - ${{ if eq(parameters.config.stageSecurityOnly, 'True') }}:
+              - template: ../../../../task_groups/checkout/checkout.yml
+                parameters:
+                  repository: self
+                  path: source_code
+          - ${{ else }}:
+              - checkout: none
+              - template: ../../../../task_groups/artifact/download.yml
+                parameters:
+                  displayName: Download Pipeline Artifact [source_with_shared_files]
+                  artifactName: source_with_shared_files
+                  targetPath: $(Agent.BuildDirectory)/source_code
+
+          - template: ../../../../task_groups/docker/build.yml
+            parameters:
+              containerRegistry: $(DOCKER_ACR_REGISTRY_SERVICE_CONNECTION_NAME)
+              dockerRegistry: $(DOCKER_REGISTRY_CUSTOM_IMAGE)
+              dockerImageTag: $(DOCKER_IMAGE_TAG)
+              applicationVersion: $(VERSION)
+              dockerfile: $(Agent.BuildDirectory)/source_code/Dockerfile
+              buildContext: $(Agent.BuildDirectory)/source_code
+              buildArgs: $(BUILD_ARGS)
+              outputFile: $(Agent.BuildDirectory)/build_log.txt
+
+      - job: sca_scan
+        displayName: "Security Analysis [SCA Scan]"
+        dependsOn: build_image
+        condition: |
+          and(
+            succeeded(),
+            eq(variables['DISABLE_SCA_SCAN'], false),
+            eq(variables.USE_DEPENDENCY_TRACK, true),
+            eq(variables.USE_DT_DOCKER, true)
+          )
+        variables:
+          - name: IMAGE_NAME
+            value: $[ dependencies.build_image.outputs['build_image.IMAGE_NAME'] ]
+        steps:
+          - checkout: none
+          - template: ../../../../task_groups/artifact/download.yml
+            parameters:
+              displayName: Download Custom Image [$(IMAGE_NAME)]
+              artifactName: custom_image
+              targetPath: $(Agent.BuildDirectory)/custom_image
+          - template: ../../../../task_groups/security/sca_scan_docker.yml
+            parameters:
+              tarFile: "$(Agent.BuildDirectory)/custom_image/$(IMAGE_NAME).tar"
+
+      - ${{ if eq(parameters.config.stageSecurityOnly, 'False') }}:
+          - job: publish_image
+            displayName: "Publish Image"
+            dependsOn:
+              - build_image
+              - sca_scan
+            condition: |
+              and(
+                in(dependencies.build_image.result, 'Succeeded', 'SucceededWithIssues'),
+                in(dependencies.sca_scan.result, 'Succeeded', 'SucceededWithIssues', 'Skipped')
+              )
+            variables:
+              - name: IMAGE_NAME
+                value: $[ dependencies.build_image.outputs['build_image.IMAGE_NAME'] ]
+            steps:
+              - checkout: none
+              - template: ../../../../task_groups/artifact/download.yml
+                parameters:
+                  displayName: Download Custom Image [$(IMAGE_NAME)]
+                  artifactName: custom_image
+                  targetPath: $(Agent.BuildDirectory)/custom_image
+              - script: |
+                  echo "##[debug] IMAGE NAME ........................................: $IMAGE_NAME"
+                  echo "##[command]docker load --input $(Agent.BuildDirectory)/custom_image/$(IMAGE_NAME).tar"
+                  LOAD=$(docker load --input $(Agent.BuildDirectory)/custom_image/$(IMAGE_NAME).tar)
+                  echo "$LOAD"
+
+                  LOADED_IMAGE=$(echo "$LOAD" | sed 's/^Loaded image: //')
+                  LATEST_VER="$(ENVIRONMENT)_${BRM_CORE_RELEASE_VERSION}_latest"
+                  LATEST_IMAGE=$(echo "$LOADED_IMAGE" | sed "s/:[^:]*$/:$LATEST_VER/")
+
+                  echo ""
+                  echo ">>>>> Creating Latest Tag for Environment [$(ENVIRONMENT)] <<<<<"
+                  echo "##[command]docker tag $LOADED_IMAGE $LATEST_IMAGE"
+                  docker tag $LOADED_IMAGE $LATEST_IMAGE
+
+                  IMAGE_NAME_FULL=$(echo "$LOAD" | awk -F': ' '{print $2}' | sed -E 's|^[^/]+/||; s|:[^:]*$||')
+                  echo "##vso[task.setvariable variable=IMAGE_NAME_FULL;isOutput=true]$IMAGE_NAME_FULL"
+                name: load_docker_image
+                displayName: "Load Docker Image"
+              - template: ../../../../task_groups/docker/publish.yml
+                parameters:
+                  imageName: "$(IMAGE_NAME)"
+                  containerRegistry: $(DOCKER_ACR_REGISTRY_SERVICE_CONNECTION_NAME)
+                  repositoryRegistry: $(load_docker_image.IMAGE_NAME_FULL)
+                  tags: $(VERSION)
+                  acrRegistryName: $(ACR_REGISTRY_NAME)

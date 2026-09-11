@@ -1,0 +1,143 @@
+parameters:
+- name: qa_environment
+  type: string
+
+stages:
+- stage: Preparation
+  displayName: "Preparation"
+  jobs:
+    - job: PreparationPipeline
+      displayName: "Preparing Pipeline"
+      steps:
+        - checkout: self  # self represents the repo where the initial Pipelines YAML file was found
+          submodules: true
+          persistCredentials: true
+          clean: false
+          fetchDepth: 0
+
+        - bash: |
+            echo "##[debug] PREPARING PIPELINE"
+
+- ${{ if eq(variables['Build.Reason'], 'PullRequest') }}:
+  - stage: BuildAndPublish
+    displayName: "Build and Publish"
+    pool: GeneralPurposeLinuxAgentsCI
+    jobs:
+    - job: Validate
+      displayName: 'Validating SOA'
+      steps:
+        - bash: |
+            echo "##vso[task.setvariable variable=AGENT_NAME;isoutput=true]$(Agent.Name)"
+          name: GetAgent
+        - template: /tech_products/orss/soatest/tasks/soa_validation.yml
+
+    - job: Build
+      displayName: 'Building SOA'
+      condition: and(succeeded(), eq(variables['EXECUTION_TYPE'], 'BUILD'))
+      dependsOn:
+      - Validate
+      variables:
+        AGENT_NAME: $[ dependencies.Validate.outputs['GetAgent.AGENT_NAME']]
+        EXECUTION_TYPE: $[ dependencies.Validate.outputs['IdentifyCommitsAndTypeOfExecution.EXECUTION_TYPE']]
+        PROJECT_TYPE: $[ dependencies.Validate.outputs['IdentifyTypeOfProject.PROJECT_TYPE']]
+        PARTITION: $[ dependencies.Validate.outputs['ValidatingChangedFilesAndProject.PARTITION']]
+        PROJECT: $[ dependencies.Validate.outputs['ValidatingChangedFilesAndProject.PROJECT']]
+        COMPOSITE_VERSION: $[ dependencies.Validate.outputs['GetCompositeVersion.COMPOSITE_VERSION']]
+        FILES: $[ dependencies.Validate.outputs['ValidatingChangedFilesAndProject.FILES']]
+      pool:
+        name: GeneralPurposeLinuxAgentsCI
+        demands: Agent.Name -equals $(AGENT_NAME)
+      steps:
+        - template: /tech_products/orss/soatest/tasks/soa_build.yml
+
+    - job: Publish
+      displayName: 'Publishing SOA'
+      condition: and(succeeded(), eq(variables['EXECUTION_TYPE'], 'BUILD'))
+      dependsOn:
+      - Validate
+      - Build
+      variables:
+        AGENT_NAME: $[ dependencies.Validate.outputs['GetAgent.AGENT_NAME']]
+        EXECUTION_TYPE: $[ dependencies.Validate.outputs['IdentifyCommitsAndTypeOfExecution.EXECUTION_TYPE']]
+        PROJECT_TYPE: $[ dependencies.Validate.outputs['IdentifyTypeOfProject.PROJECT_TYPE']]
+      pool:
+        name: GeneralPurposeLinuxAgentsCI
+        demands: Agent.Name -equals $(AGENT_NAME)
+      steps:
+        - template: /tech_products/orss/soatest/tasks/soa_publish.yml
+
+    - job: Tagging
+      displayName: 'Tagging SOA'
+      condition: and(succeeded(), eq(variables['EXECUTION_TYPE'], 'BUILD'))
+      dependsOn:
+      - Validate
+      - Build
+      - Publish
+      variables:
+        AGENT_NAME: $[ dependencies.Validate.outputs['GetAgent.AGENT_NAME']]
+        EXECUTION_TYPE: $[ dependencies.Validate.outputs['IdentifyCommitsAndTypeOfExecution.EXECUTION_TYPE']]
+        PROJECT_TYPE: $[ dependencies.Validate.outputs['IdentifyTypeOfProject.PROJECT_TYPE']]
+      pool:
+        name: GeneralPurposeLinuxAgentsCI
+        demands: Agent.Name -equals $(AGENT_NAME)
+      steps:
+        - template: /tech_products/orss/soatest/tasks/soa_tagging.yml
+        
+- ${{ elseif startsWith(variables['Build.SourceBranch'], 'refs/tags/') }}:
+  - stage: Deploy
+    displayName: "Deploy - ${{ upper(parameters.qa_environment) }}"
+    pool: GeneralPurposeLinuxAgentsCD
+    jobs:
+    - job: Validate
+      displayName: 'Validating SOA'
+      steps:
+        - bash: |
+            echo "##vso[task.setvariable variable=AGENT_NAME;isoutput=true]$(Agent.Name)"
+          name: GetAgent
+        - template: /tech_products/orss/soatest/tasks/soa_validation.yml
+
+    - job: DownloadPackage
+      displayName: 'Downloading SOA Package'
+      dependsOn:
+      - Validate
+      variables:
+        AGENT_NAME: $[ dependencies.Validate.outputs['GetAgent.AGENT_NAME']]
+      pool:
+        name: GeneralPurposeLinuxAgentsCD
+        demands: Agent.Name -equals $(AGENT_NAME)
+      steps:
+        - template: /tech_products/orss/soatest/tasks/soa_download_package.yml
+
+    - job: DeployPackage
+      displayName: 'Deploying SOA Package'
+      dependsOn:
+      - Validate
+      - DownloadPackage
+      variables:
+        AGENT_NAME: $[ dependencies.Validate.outputs['GetAgent.AGENT_NAME']]
+        EXECUTION_TYPE: $[ dependencies.Validate.outputs['IdentifyCommitsAndTypeOfExecution.EXECUTION_TYPE']]
+        PROJECT_TYPE: $[ dependencies.Validate.outputs['IdentifyTypeOfProject.PROJECT_TYPE']]
+        PARTITION: $[ dependencies.Validate.outputs['ValidatingChangedFilesAndProject.PARTITION']]
+        PROJECT: $[ dependencies.Validate.outputs['ValidatingChangedFilesAndProject.PROJECT']]
+        COMPOSITE_VERSION: $[ dependencies.Validate.outputs['GetCompositeVersion.COMPOSITE_VERSION']]
+        PACKAGE_NUMBER: $[ dependencies.DownloadPackage.outputs['IdentifyPackageNumber.PACKAGE_NUMBER']]
+      pool:
+        name: GeneralPurposeLinuxAgentsCD
+        demands: Agent.Name -equals $(AGENT_NAME)
+      steps:
+        - template: /tech_products/orss/soatest/tasks/soa_deploy.yml
+          parameters:
+            qa_environment: ${{ parameters.qa_environment }}      
+
+- ${{ else }}:
+  - stage: Error
+    jobs:
+    - job: Error
+      steps:  
+      - task: Bash@3
+        inputs:
+          targetType: 'inline'
+          script: |
+            script: |
+              print("##vso[task.logissue type=error;]Do Not Run Pipelines Without a Pull Request")
+              print("##vso[task.complete result=Failed;]Text")

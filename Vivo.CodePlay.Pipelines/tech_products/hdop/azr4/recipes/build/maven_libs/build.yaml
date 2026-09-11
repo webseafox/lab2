@@ -1,0 +1,97 @@
+parameters:
+  - name: mavenCommand
+    type: string
+    default: "mvn clean install -DskipTests"
+  - name: appDependenciesCachePathOutputVarName
+    type: string
+    default: "$(Pipeline.Workspace)/${FOLDER}"
+  - name: appDependenciesCacheFolderOutputVarName
+    type: string
+    default: ".cache/app_dependencies/repository"
+  - name: condition
+    type: object
+    default: "true"
+  - name: asdf_jdk
+    default: "17.0.2"
+  - name: branching_strategy
+    type: string
+    values:
+    - gitlabflow
+    - releaseflow
+    - stb
+    - gitlabflow-semantic
+    default: stb
+  - name: envs
+    type: object
+    default: {}
+
+jobs:
+- job: install
+  pool: GeneralPurposeLinuxAgentsCI
+  workspace:
+    clean: all
+  steps:
+
+  - script: |
+      asdf install java openjdk-${{ parameters.asdf_jdk }}
+      asdf local java openjdk-${{ parameters.asdf_jdk }}
+    displayName: Use Java ${{ parameters.asdf_jdk }}
+
+  - task: DownloadSecureFile@1
+    name: securitysettings
+    displayName: 'Download custom security.xml from secure file'
+    inputs:
+      secureFile: 'settings-security.xml'
+
+  - script: echo "##vso[task.setvariable variable=MAVEN_SETTINGS_SECURITY]$(securitysettings.secureFilePath)"
+    displayName: Set MAVEN_SETTINGS_SECURITY Var
+
+  - task: DownloadSecureFile@1
+    name: CustomSettings
+    displayName: 'Download custom settings.xml from secure file'
+    inputs:
+      secureFile: settings.xml
+  - script: echo "##vso[task.setvariable variable=MAVEN_SETTINGS]$(CustomSettings.secureFilePath)"
+    displayName: Set MAVEN_SETTINGS Var
+
+  - bash: |
+
+      APP_DEPENDENCIES_CACHE_PATH=""
+      FOLDER=""
+
+      echo "##[debug] CACHE_APP_DEPENDENCIES..................: ${CACHE_APP_DEPENDENCIES}"
+
+      if [ "${CACHE_APP_DEPENDENCIES}" == "true" ]; then
+        FOLDER=".cache/app_dependencies/repository"
+        APP_DEPENDENCIES_CACHE_PATH="$(Pipeline.Workspace)/${FOLDER}"
+
+        rm -R -f $APP_DEPENDENCIES_CACHE_PATH
+        mkdir -p $APP_DEPENDENCIES_CACHE_PATH
+      fi
+
+      echo "##vso[task.setvariable variable=$PATH_OUTPUT_VARIABLE_NAME;isreadonly=true]$APP_DEPENDENCIES_CACHE_PATH"
+      echo "##vso[task.setvariable variable=$FOLDER_OUTPUT_VARIABLE_NAME;isreadonly=true]$FOLDER"
+      mvn -version
+      sleep 10
+    displayName: Prepare App Dependencies Cache Repository
+    env:
+      PATH_OUTPUT_VARIABLE_NAME: ${{ parameters.appDependenciesCachePathOutputVarName }}
+      FOLDER_OUTPUT_VARIABLE_NAME: ${{ parameters.appDependenciesCacheFolderOutputVarName }}
+      CACHE_APP_DEPENDENCIES: ${{ parameters.condition }}
+
+  - task: Cache@2
+    inputs:
+      key: 'maven | "$(Agent.OS)" | **/pom.xml'
+      restoreKeys: |
+        maven | "$(Agent.OS)"
+        maven
+      path: "$(Pipeline.Workspace)/.cache/app_dependencies/repository"
+    displayName: Cache Maven Dependencies
+    condition: ${{ parameters.condition }}
+
+  - bash: |
+      mvn -version
+      echo '${MAVEN_SETTINGS}'
+      echo '${MAVEN_SETTINGS_SECURITY}'
+      ${{ parameters.mavenCommand }} -s ${MAVEN_SETTINGS} -Dsettings.security=$(MAVEN_SETTINGS_SECURITY) -Dmaven.wagon.http.ssl.insecure=true -Dmaven.wagon.http.ssl.allowall=true  
+    displayName: Maven Build

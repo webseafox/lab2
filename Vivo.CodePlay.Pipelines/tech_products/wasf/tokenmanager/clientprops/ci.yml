@@ -1,0 +1,103 @@
+stages:
+- stage: Validate
+  pool: GeneralPurposeLinuxAgentsCI
+  displayName: '✅ Validate'
+  jobs:
+
+
+  - job: ValidateJSON
+    displayName: '✅ ValidateJSON'
+    steps: 
+      - checkout: self
+        displayName: '🔄 Checkout code'
+      - task: UniversalPackages@0
+        displayName: '⬇️ Download json-validator'
+        inputs:
+          command: 'download'
+          downloadDirectory: '$(System.DefaultWorkingDirectory)/json-validator'
+          feedsToUse: 'internal'
+          vstsFeed: '3d53bc62-8749-4931-ae46-a443b73bc87a'
+          vstsFeedPackage: '64fe7c22-a864-4d4a-a20c-3695e3ba0114'
+          vstsPackageVersion: '0.0.*'
+      - task: UniversalPackages@0
+        displayName: '⬇️ Download python-token-tester'
+        inputs:
+          command: 'download'
+          downloadDirectory: '$(System.DefaultWorkingDirectory)/python-token-tester'
+          feedsToUse: 'internal'
+          vstsFeed: '3d53bc62-8749-4931-ae46-a443b73bc87a'
+          vstsFeedPackage: 'python-token-tester'
+          vstsPackageVersion: '0.0.*'
+
+      - task: CmdLine@2
+        displayName: '📋 Lista arquivos validadores'
+        inputs:
+          script: |
+            echo $(Build.SourcesDirectory)/json-validator
+            ls $(Build.SourcesDirectory)/json-validator
+            echo "====== TOKEN TESTER ======"
+            ls $(System.DefaultWorkingDirectory)/python-token-tester
+      
+      - task: DownloadSecureFile@1
+        name: schema
+        displayName: '🔐 Download secure file (JSON schema)'
+        inputs:
+          secureFile: 'clientPropsSCHEMA.json'
+      - task: DownloadSecureFile@1
+        name: keys
+        displayName: '🔐 Download secure file (keys)'
+      
+
+      - script: |
+            java -jar $(System.DefaultWorkingDirectory)/json-validator/JSON-validator.jar '$(Build.SourcesDirectory)/client-props.json' '$(schema.secureFilePath)'
+        displayName: '✅ Validacao JSON Schema'
+        name: "ValidaJSON"
+      - task: DownloadSecureFile@1
+        name: sshKey
+        displayName: '🔐 Download secure file (SSH key)'
+        inputs:
+          secureFile: '$(SSH_KEY_NAME)'
+      
+      - script: |
+          mkdir -p ~/.ssh
+          cp $(sshKey.secureFilePath) ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H $(IP) >> ~/.ssh/known_hosts
+          unzip $(keys.secureFilePath) -d $(System.DefaultWorkingDirectory)/keys
+          echo "==========CHAVES EXITENTES=========="
+          ls $(System.DefaultWorkingDirectory)/keys
+          pip install -r $(System.DefaultWorkingDirectory)/python-token-tester/requirements.txt
+          pip install requests[socks]
+          ssh -D 1080 ccenter@$(IP) -N &
+          python $(System.DefaultWorkingDirectory)/python-token-tester/oauth_tester_fixed.py $(Build.SourcesDirectory)/client-props.json $(System.DefaultWorkingDirectory)/keys/ $(ENVIRONMENT)
+        displayName: '✅ Execute OAuth Validation'
+        name: "ExecuteValidation"
+
+- stage: Publish
+  pool: GeneralPurposeLinuxAgentsCI
+  displayName: '📦 Publish'
+  condition: and(eq(variables['Build.Reason'], 'PullRequest'), eq(variables['System.PullRequest.TargetBranch'], 'refs/heads/master'))
+  dependsOn: [Validate]
+  jobs:
+    - job: Publish
+      displayName: '📦 Publish'
+      steps:
+        - checkout: self
+          displayName: '🔄 Checkout code'
+        # Adicione aqui os passos necessários para o publish
+        - script: |
+            # Apenas data
+            version=$(date +'%Y.%-m.%-d.%H%M')
+            echo $version  # Exemplo: 2025.6.23
+            echo "##vso[task.setvariable variable=timestamp]$version"
+          displayName: '🏷️ Gerar timestamp ddMMyyyy'
+        - task: UniversalPackages@0
+          displayName: '📦 Publish to Azure Artifacts'
+          inputs:
+            command: 'publish'
+            publishDirectory: '$(Build.SourcesDirectory)/client-props.json'
+            feedsToUsePublish: 'internal'
+            vstsFeedPublish: '3d53bc62-8749-4931-ae46-a443b73bc87a'
+            vstsFeedPackagePublish: 'token-manager-client-props'
+            versionOption: 'custom'
+            versionPublish: '$(timestamp)'

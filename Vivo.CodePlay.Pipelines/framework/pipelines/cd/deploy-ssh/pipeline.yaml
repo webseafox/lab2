@@ -1,0 +1,1307 @@
+# ==================================================================
+# Pipeline: Deploy via SSH - Deployment Remoto Automatizado
+# -----------------------------------------------------
+# Pipeline de deployment para aplicações em servidores remotos via SSH.
+# Suporta múltiplos ambientes, backup automático, validação pós-deploy
+# e rollback em caso de falha, utilizando conexões SSH seguras.
+# ==================================================================
+
+# Dependências:
+# - Service Connections SSH configuradas por ambiente
+# - Servidor remoto acessível via SSH com usuário configurado
+# - Scripts de deploy e validação no repositório
+# - SSH client instalado nos agentes do Azure DevOps
+
+parameters:
+  # ==================================================================
+  # Configurações de Infraestrutura e Ambiente
+  # ==================================================================
+  - name: agentPool
+    type: string
+    default: GeneralPurposeLinuxAgentsCD
+    displayName: 'Agent Pool para execução'
+
+  - name: environment
+    type: string
+    default: dev
+    displayName: 'Ambiente de destino para deployment'
+    values:
+      - dev
+      - preprod
+      - prod
+
+  - name: environmentPrefix
+    type: string
+    default: 'deploy-'
+    displayName: 'Prefixo do environment resource no Azure DevOps'
+
+  - name: rollbackEnvironmentSuffix
+    type: string
+    default: '-rollback'
+    displayName: 'Sufixo do environment resource para rollback'
+
+  # ==================================================================
+  # Configurações de Conexão SSH
+  # ==================================================================
+  - name: sshServiceConnection
+    displayName: 'Service Connection SSH por ambiente'
+    type: object
+    default:
+      dev: 'ssh-$(SIGLA)-dev'
+      preprod: 'ssh-$(SIGLA)-preprod'
+      prod: 'ssh-$(SIGLA)-prod'
+
+  # ==================================================================
+  # Configurações de Deployment
+  # ==================================================================
+  - name: version
+    type: string
+    displayName: 'Versão para deployment'
+    default: getLatestVersion() # Padrão para obter a última versão gerada para o repositório
+
+  - name: deploymentPath
+    displayName: 'Caminho de destino no servidor remoto por ambiente'
+    type: object
+    default:
+      dev: '/opt/app'
+      preprod: '/opt/app'
+      prod: '/opt/app'
+
+  # ==================================================================
+  # Configurações de Observabilidade (Opcional)
+  # ==================================================================
+  - name: applicationUrl
+    displayName: 'URL de acesso à aplicação por ambiente (opcional - deixe vazio se não aplicável)'
+    type: object
+    default:
+      dev: ''
+      preprod: ''
+      prod: ''
+
+  # ==================================================================
+  # Configurações de Azure Artifacts
+  # ==================================================================
+  - name: packageType
+    type: string
+    displayName: 'Tipo de package do Azure Artifacts'
+    default: upack
+    values:
+      - upack
+      - maven
+      - npm
+      - nuget
+      - pypi
+      - cargo
+
+  - name: feedName
+    type: string
+    displayName: 'Nome do feed do Azure Artifacts'
+    default: 'DevOps'
+
+  - name: packageDefinition
+    type: string
+    displayName: 'Identificação do package (ex: package-name, @scope/package, groupId:artifactId)'
+    default: '$(Build.Repository.Name)'
+
+  - name: filesPattern
+    type: string
+    displayName: 'Padrão de arquivos para transferir (ex: **/*.jar, **/*.war, **)'
+    default: '**'
+
+  # ==================================================================
+  # Scripts de Deployment (Obrigatório)
+  # ==================================================================
+  # Scripts DEVEM estar no repositório para versionamento e rastreabilidade
+  # Estrutura recomendada: .azuredevops/scripts/deploy.sh
+  - name: deployScript
+    type: string
+    default: '.azuredevops/scripts/deploy.sh'
+    displayName: 'Script de deployment (caminho no repositório)'
+
+  - name: preDeployScript
+    type: string
+    default: ''
+    displayName: 'Script pré-deploy (opcional)'
+
+  - name: postDeployScript
+    type: string
+    default: ''
+    displayName: 'Script pós-deploy (opcional)'
+
+  - name: rollbackScript
+    type: string
+    default: ''
+    displayName: 'Script de rollback customizado (opcional - para reverter DB, cache, etc)'
+
+  # ==================================================================
+  # Configurações de Estrutura de Diretórios
+  # ==================================================================
+  - name: workingDirectory
+    type: string
+    default: '$(Build.SourcesDirectory)'
+    displayName: 'Diretório base de trabalho'
+
+  - name: scriptsDirectory
+    type: string
+    default: '.azuredevops/scripts'
+    displayName: 'Diretório dos scripts no repositório'
+
+  # ==================================================================
+  # Configurações de Controle e Validação
+  # ==================================================================
+  - name: enableBackup
+    type: boolean
+    default: true
+    displayName: 'Habilitar backup antes do deploy'
+
+  - name: enableRollback
+    type: boolean
+    default: true
+    displayName: 'Habilitar rollback automático em falha'
+
+  - name: enableValidation
+    type: boolean
+    default: true
+    displayName: 'Habilitar validação pós-deploy'
+
+  - name: validationScript
+    type: string
+    default: '.azuredevops/scripts/validate.sh'
+    displayName: 'Script de validação pós-deploy (caminho no repositório)'
+
+  - name: backupRetentionDays
+    type: number
+    default: 7
+    displayName: 'Dias de retenção de backups'
+
+  - name: cleanupPattern
+    type: string
+    displayName: 'Padrão de arquivos para limpar antes do deploy (ex: *.jar,*.war)'
+    default: '*.jar,*.war,*.ear'
+
+  - name: deploymentTimeout
+    type: number
+    default: 30
+    displayName: 'Timeout em minutos para deployment'
+
+  - name: useLegacySSH
+    type: boolean
+    default: false
+    displayName: 'Usar tasks Legacy SSH (servidores antigos com algoritmos SHA1/DSS)'
+
+# ==================================================================
+# Variáveis Internas do Pipeline
+# ==================================================================
+variables:
+  - name: SIGLA
+    value: $[ lower(split(variables['System.TeamProject'],' ')[0]) ]
+  - name: ENVIRONMENT_RESOURCE
+    value: ${{ parameters.environmentPrefix }}${{ parameters.environment }}
+  - name: ROLLBACK_ENVIRONMENT_RESOURCE
+    value: ${{ parameters.environmentPrefix }}${{ parameters.environment }}${{ parameters.rollbackEnvironmentSuffix }}
+  - name: DEPLOYMENT_TAG
+    value: $(Build.BuildNumber)
+  - name: BACKUP_FILENAME
+    value: backup-before-$(Build.BuildNumber).tar.gz
+  - name: DEPLOYMENT_PATH
+    value: ${{ parameters.deploymentPath[parameters.environment] }}
+  - name: SSH_SERVICE_CONNECTION
+    value: ${{ parameters.sshServiceConnection[parameters.environment] }}
+  - name: SCRIPTS_SOURCE_PATH
+    value: ${{ parameters.workingDirectory }}/${{ parameters.scriptsDirectory }}
+  - name: APPLICATION_URL
+    value: ${{ parameters.applicationUrl[parameters.environment] }}
+
+# ==================================================================
+# Estágios do Pipeline
+# ==================================================================
+stages:
+  # Stage 1: Preparation - Validação e preparação de artifacts
+  - stage: Preparation
+    displayName: 'Preparation & Validation'
+    pool: ${{ parameters.agentPool }}
+    jobs:
+    - job: ValidateAndPrepare
+      displayName: 'Validate SSH Connection and Prepare Artifacts'
+      steps:
+      # ==================================================================
+      # Observabilidade e validação
+      # ==================================================================
+      - task: VivoUtilsFromVivo@1
+        displayName: 'Show Pipeline Parameters'
+        condition: eq(variables['System.Debug'], 'true')
+        inputs:
+          command: 'show-pipeline-parameters'
+          parameters: '${{ convertToJson(parameters) }}'
+      # Previne que utilize valores de prod em ambientes de non-prod
+      - task: VivoUtilsFromVivo@1
+        displayName: 'Validar Parâmetros de Ambiente'
+        inputs:
+          command: 'validate-environment-parameters'
+          parameters: '${{ convertToJson(parameters) }}'
+          environment: '${{ parameters.environment }}'
+
+      # Previne que utilize valores de prod em ambientes de non-prod
+      - task: VivoUtilsFromVivo@1
+        displayName: 'Validate Environment Parameters'
+        inputs:
+          command: 'validate-environment-parameters'
+          parameters: '${{ convertToJson(parameters) }}'
+          environment: '${{ parameters.environment }}'
+
+      # ==================================================================
+      # Configuração de tags do build
+      # ==================================================================
+      - script: |
+          echo "##vso[build.addbuildtag]ssh"
+          echo "##vso[build.addbuildtag]ssh-deployment"
+          echo "##vso[build.addbuildtag]deploy-ssh"
+          echo "##vso[build.addbuildtag]${{ parameters.environment }}"
+        displayName: 'Set Pipeline Execution Tags'
+
+      # Configuração inicial do ambiente
+      - checkout: self
+        fetchDepth: 1
+
+      # ==================================================================
+      # Determinação da versão para deploy
+      # ==================================================================
+      - task: VersionManagerVivo@8
+        inputs:
+          command: 'setDeployVersion'
+          version: ${{ parameters.version }}
+        displayName: 'Set Deployment Version'
+        name: VersionManagerVivo
+
+      - script: |         
+          echo "##vso[build.updatebuildnumber]deploy-ssh-${DEPLOY_VERSION}-${ENVIRONMENT}"
+          echo "##vso[build.addbuildtag]version-${DEPLOY_VERSION}"
+          echo "##vso[build.addbuildtag]environment-${ENVIRONMENT}"
+        displayName: 'Set Pipeline Execution Number and Tags'
+        env:
+          DEPLOY_VERSION: $(VersionManagerVivo.DEPLOY_VERSION)
+          ENVIRONMENT: ${{ parameters.environment }}
+
+      # ==================================================================
+      # Download de package do Azure Artifacts
+      # ==================================================================
+      - task: DownloadPackage@1
+        displayName: 'Download Package from Azure Artifacts (${{ parameters.packageType }})'
+        inputs:
+          packageType: ${{ parameters.packageType }}
+          feed: ${{ parameters.feedName }}
+          definition: ${{ parameters.packageDefinition }}
+          version: $(VersionManagerVivo.DEPLOY_VERSION)
+          downloadPath: '$(Pipeline.Workspace)/artifacts'
+
+      # Verificar conteúdo baixado
+      - bash: |
+          echo "=========================================="
+          echo "Downloaded Artifacts Verification"
+          echo "=========================================="
+          echo "Download Path: $(Pipeline.Workspace)/artifacts"
+          echo ""
+          echo "Contents:"
+          ls -lhR $(Pipeline.Workspace)/artifacts
+          echo ""
+          TOTAL_SIZE=$(du -sh $(Pipeline.Workspace)/artifacts | cut -f1)
+          echo "Total Size: ${TOTAL_SIZE}"
+          echo "=========================================="
+        displayName: 'Verify Downloaded Package'
+
+      # Validação de conectividade SSH
+      - ${{ if eq(parameters.useLegacySSH, false) }}:
+        - task: SSH@0
+          displayName: 'Validate SSH Connection'
+          inputs:
+            sshEndpoint: $(SSH_SERVICE_CONNECTION)
+            runOptions: 'inline'
+            inline: |
+              echo "=========================================="
+              echo "SSH Connection Validation"
+              echo "=========================================="
+              echo "Service Connection: $(SSH_SERVICE_CONNECTION)"
+              echo "Deployment Path: $(DEPLOYMENT_PATH)"
+              echo "=========================================="
+              echo "Connection successful!"
+            readyTimeout: '20000'
+
+      - ${{ if eq(parameters.useLegacySSH, true) }}:
+        - task: LegacySSH@0
+          displayName: 'Validate SSH Connection (Legacy)'
+          inputs:
+            sshEndpoint: $(SSH_SERVICE_CONNECTION)
+            runOptions: 'inline'
+            inline: |
+              echo "=========================================="
+              echo "SSH Connection Validation"
+              echo "=========================================="
+              echo "Service Connection: $(SSH_SERVICE_CONNECTION)"
+              echo "Deployment Path: $(DEPLOYMENT_PATH)"
+              echo "=========================================="
+              echo "Connection successful!"
+            readyTimeout: '20000'
+
+      # Verificação de permissões e paths
+      - ${{ if eq(parameters.useLegacySSH, false) }}:
+        - task: SSH@0
+          displayName: 'Verify Remote Path Permissions'
+          inputs:
+            sshEndpoint: $(SSH_SERVICE_CONNECTION)
+            runOptions: 'inline'
+            inline: |
+              echo "Verifying deployment path permissions..."
+              if [ ! -d "$(DEPLOYMENT_PATH)" ]; then
+                echo "Creating deployment path: $(DEPLOYMENT_PATH)"
+                mkdir -p $(DEPLOYMENT_PATH)
+              fi
+              if [ -w "$(DEPLOYMENT_PATH)" ]; then
+                echo "✓ Write permissions confirmed"
+              else
+                echo "✗ No write permissions on $(DEPLOYMENT_PATH)"
+                exit 1
+              fi
+
+      - ${{ if eq(parameters.useLegacySSH, true) }}:
+        - task: LegacySSH@0
+          displayName: 'Verify Remote Path Permissions (Legacy)'
+          inputs:
+            sshEndpoint: $(SSH_SERVICE_CONNECTION)
+            runOptions: 'inline'
+            inline: |
+              echo "Verifying deployment path permissions..."
+              if [ ! -d "$(DEPLOYMENT_PATH)" ]; then
+                echo "Creating deployment path: $(DEPLOYMENT_PATH)"
+                mkdir -p $(DEPLOYMENT_PATH)
+              fi
+              if [ -w "$(DEPLOYMENT_PATH)" ]; then
+                echo "✓ Write permissions confirmed"
+              else
+                echo "✗ No write permissions on $(DEPLOYMENT_PATH)"
+                exit 1
+              fi
+
+  # Stage 2: Deploy - Execução do deployment
+  - stage: Deploy
+    displayName: 'Deploy to ${{ parameters.environment }}'
+    dependsOn: Preparation
+    pool: ${{ parameters.agentPool }}
+    jobs:
+    - deployment: DeploySSH
+      displayName: 'SSH Deployment'
+      environment: $(ENVIRONMENT_RESOURCE)
+      variables:
+        DEPLOY_VERSION: $[ stageDependencies.Preparation.ValidateAndPrepare.outputs['VersionManagerVivo.DEPLOY_VERSION'] ]
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+            # Checkout do repositório para obter scripts de deploy
+            - checkout: self
+              fetchDepth: 1
+              displayName: 'Checkout Repository (Deploy Scripts)'
+
+            # Download de package do Azure Artifacts
+            - task: DownloadPackage@1
+              displayName: 'Download Package from Azure Artifacts (${{ parameters.packageType }})'
+              inputs:
+                packageType: ${{ parameters.packageType }}
+                feed: ${{ parameters.feedName }}
+                definition: ${{ parameters.packageDefinition }}
+                version: $(DEPLOY_VERSION)
+                downloadPath: '$(Pipeline.Workspace)/artifacts'
+
+            # Criação de backup da versão atual (se habilitado)
+            # Verificar estado atual do deployment path
+            - ${{ if eq(parameters.useLegacySSH, false) }}:
+              - task: SSH@0
+                displayName: 'Show Current Deployment State'
+                inputs:
+                  sshEndpoint: $(SSH_SERVICE_CONNECTION)
+                  runOptions: 'inline'
+                  inline: |
+                    echo "=========================================="
+                    echo "Current Deployment State (BEFORE Backup)"
+                    echo "=========================================="
+                    echo "Deployment Path: $(DEPLOYMENT_PATH)"
+                    echo ""
+                    if [ -d "$(DEPLOYMENT_PATH)" ] && [ "$(ls -A $(DEPLOYMENT_PATH) 2>/dev/null)" ]; then
+                      echo "📁 Directory exists with content:"
+                      ls -lh $(DEPLOYMENT_PATH)
+                      echo ""
+                      TOTAL_SIZE=$(du -sh $(DEPLOYMENT_PATH) 2>/dev/null | cut -f1 || echo "0")
+                      echo "Total Size: ${TOTAL_SIZE}"
+                    else
+                      echo "📁 Directory is empty or does not exist (first deployment)"
+                    fi
+                    echo "=========================================="
+
+            - ${{ if eq(parameters.useLegacySSH, true) }}:
+              - task: LegacySSH@0
+                displayName: 'Show Current Deployment State (Legacy)'
+                inputs:
+                  sshEndpoint: $(SSH_SERVICE_CONNECTION)
+                  runOptions: 'inline'
+                  inline: |
+                    echo "=========================================="
+                    echo "Current Deployment State (BEFORE Backup)"
+                    echo "=========================================="
+                    echo "Deployment Path: $(DEPLOYMENT_PATH)"
+                    echo ""
+                    if [ -d "$(DEPLOYMENT_PATH)" ] && [ "$(ls -A $(DEPLOYMENT_PATH) 2>/dev/null)" ]; then
+                      echo "📁 Directory exists with content:"
+                      ls -lh $(DEPLOYMENT_PATH)
+                      echo ""
+                      TOTAL_SIZE=$(du -sh $(DEPLOYMENT_PATH) 2>/dev/null | cut -f1 || echo "0")
+                      echo "Total Size: ${TOTAL_SIZE}"
+                    else
+                      echo "📁 Directory is empty or does not exist (first deployment)"
+                    fi
+                    echo "=========================================="
+
+            # Criação de backup da versão atual (se habilitado)
+            - ${{ if and(eq(parameters.enableBackup, true), eq(parameters.useLegacySSH, false)) }}:
+              - task: SSH@0
+                displayName: 'Backup Current Deployment'
+                inputs:
+                  sshEndpoint: $(SSH_SERVICE_CONNECTION)
+                  runOptions: 'inline'
+                  inline: |
+                    echo "=========================================="
+                    echo "Creating Backup of PREVIOUS Deployment"
+                    echo "=========================================="
+                    mkdir -p $(DEPLOYMENT_PATH)/backups
+                    
+                    if [ "$(ls -A $(DEPLOYMENT_PATH) 2>/dev/null | grep -v backups)" ]; then
+                      echo "📦 Previous deployment found - creating backup..."
+                      echo "Contents to backup:"
+                      ls -lh $(DEPLOYMENT_PATH) | grep -v backups | head -10
+                      
+                      echo ""
+                      echo "Creating backup: $(BACKUP_FILENAME)"
+                      cd $(DEPLOYMENT_PATH)
+                      tar --exclude='./backups' -czf backups/$(BACKUP_FILENAME) . 2>/dev/null
+                      
+                      BACKUP_SIZE=$(du -h backups/$(BACKUP_FILENAME) | cut -f1)
+                      echo "✓ Backup created successfully (${BACKUP_SIZE})"
+                    else
+                      echo "⚠ No previous deployment to backup (first deployment)"
+                    fi
+                    
+                    # Limpeza de backups antigos
+                    echo ""
+                    echo "Cleaning old backups (retention: ${{ parameters.backupRetentionDays }} days)..."
+                    find $(DEPLOYMENT_PATH)/backups -name "backup-*.tar.gz" -type f -mtime +${{ parameters.backupRetentionDays }} -delete 2>/dev/null
+                    
+                    echo "Available backups:"
+                    ls -lh $(DEPLOYMENT_PATH)/backups/ 2>/dev/null || echo "  (none)"
+                    echo "=========================================="
+
+            - ${{ if and(eq(parameters.enableBackup, true), eq(parameters.useLegacySSH, true)) }}:
+              - task: LegacySSH@0
+                displayName: 'Backup Current Deployment (Legacy)'
+                inputs:
+                  sshEndpoint: $(SSH_SERVICE_CONNECTION)
+                  runOptions: 'inline'
+                  inline: |
+                    echo "=========================================="
+                    echo "Creating Backup of PREVIOUS Deployment"
+                    echo "=========================================="
+                    mkdir -p $(DEPLOYMENT_PATH)/backups
+                    
+                    if [ "$(ls -A $(DEPLOYMENT_PATH) 2>/dev/null | grep -v backups)" ]; then
+                      echo "📦 Previous deployment found - creating backup..."
+                      echo "Contents to backup:"
+                      ls -lh $(DEPLOYMENT_PATH) | grep -v backups | head -10
+                      
+                      echo ""
+                      echo "Creating backup: $(BACKUP_FILENAME)"
+                      cd $(DEPLOYMENT_PATH)
+                      tar --exclude='./backups' -czf backups/$(BACKUP_FILENAME) . 2>/dev/null
+                      
+                      BACKUP_SIZE=$(du -h backups/$(BACKUP_FILENAME) | cut -f1)
+                      echo "✓ Backup created successfully (${BACKUP_SIZE})"
+                    else
+                      echo "⚠ No previous deployment to backup (first deployment)"
+                    fi
+                    
+                    # Limpeza de backups antigos
+                    echo ""
+                    echo "Cleaning old backups (retention: ${{ parameters.backupRetentionDays }} days)..."
+                    find $(DEPLOYMENT_PATH)/backups -name "backup-*.tar.gz" -type f -mtime +${{ parameters.backupRetentionDays }} -delete 2>/dev/null
+                    
+                    echo "Available backups:"
+                    ls -lh $(DEPLOYMENT_PATH)/backups/ 2>/dev/null || echo "  (none)"
+                    echo "=========================================="
+
+            # Limpeza de arquivos antigos (se padrão definido)
+            - ${{ if and(ne(parameters.cleanupPattern, ''), eq(parameters.useLegacySSH, false)) }}:
+              - task: SSH@0
+                displayName: 'Cleanup Old Package Files'
+                inputs:
+                  sshEndpoint: $(SSH_SERVICE_CONNECTION)
+                  runOptions: 'inline'
+                  inline: |
+                    echo "=========================================="
+                    echo "Cleaning Old Package Files"
+                    echo "=========================================="
+                    echo "Cleanup Pattern: ${{ parameters.cleanupPattern }}"
+                    echo ""
+                    
+                    if [ -n "${{ parameters.cleanupPattern }}" ]; then
+                      cd $(DEPLOYMENT_PATH)
+                      
+                      echo "Files before cleanup:"
+                      ls -lh . | grep -v backups | head -10
+                      echo ""
+                      
+                      # Converte "*.jar,*.war" em array
+                      IFS=',' read -ra PATTERNS <<< "${{ parameters.cleanupPattern }}"
+                      
+                      TOTAL_DELETED=0
+                      for pattern in "${PATTERNS[@]}"; do
+                        pattern=$(echo "$pattern" | xargs)  # Remove espaços
+                        echo "Removing files matching: $pattern"
+                        
+                        BEFORE=$(find . -maxdepth 1 -type f -name "$pattern" | wc -l)
+                        find . -maxdepth 1 -type f -name "$pattern" -delete 2>/dev/null
+                        AFTER=$(find . -maxdepth 1 -type f -name "$pattern" | wc -l)
+                        
+                        DELETED=$((BEFORE - AFTER))
+                        TOTAL_DELETED=$((TOTAL_DELETED + DELETED))
+                        
+                        if [ $DELETED -gt 0 ]; then
+                          echo "  ✓ Removed $DELETED file(s) matching $pattern"
+                        fi
+                      done
+                      
+                      echo ""
+                      echo "Total files removed: $TOTAL_DELETED"
+                      echo ""
+                      echo "Files after cleanup:"
+                      ls -lh . | grep -v backups | head -10
+                    else
+                      echo "⚠ Cleanup disabled (cleanupPattern is empty)"
+                    fi
+                    echo "=========================================="
+
+            - ${{ if and(ne(parameters.cleanupPattern, ''), eq(parameters.useLegacySSH, true)) }}:
+              - task: LegacySSH@0
+                displayName: 'Cleanup Old Package Files (Legacy)'
+                inputs:
+                  sshEndpoint: $(SSH_SERVICE_CONNECTION)
+                  runOptions: 'inline'
+                  inline: |
+                    echo "=========================================="
+                    echo "Cleaning Old Package Files"
+                    echo "=========================================="
+                    echo "Cleanup Pattern: ${{ parameters.cleanupPattern }}"
+                    echo ""
+                    
+                    if [ -n "${{ parameters.cleanupPattern }}" ]; then
+                      cd $(DEPLOYMENT_PATH)
+                      
+                      echo "Files before cleanup:"
+                      ls -lh . | grep -v backups | head -10
+                      echo ""
+                      
+                      # Converte "*.jar,*.war" em array
+                      IFS=',' read -ra PATTERNS <<< "${{ parameters.cleanupPattern }}"
+                      
+                      TOTAL_DELETED=0
+                      for pattern in "${PATTERNS[@]}"; do
+                        pattern=$(echo "$pattern" | xargs)  # Remove espaços
+                        echo "Removing files matching: $pattern"
+                        
+                        BEFORE=$(find . -maxdepth 1 -type f -name "$pattern" | wc -l)
+                        find . -maxdepth 1 -type f -name "$pattern" -delete 2>/dev/null
+                        AFTER=$(find . -maxdepth 1 -type f -name "$pattern" | wc -l)
+                        
+                        DELETED=$((BEFORE - AFTER))
+                        TOTAL_DELETED=$((TOTAL_DELETED + DELETED))
+                        
+                        if [ $DELETED -gt 0 ]; then
+                          echo "  ✓ Removed $DELETED file(s) matching $pattern"
+                        fi
+                      done
+                      
+                      echo ""
+                      echo "Total files removed: $TOTAL_DELETED"
+                      echo ""
+                      echo "Files after cleanup:"
+                      ls -lh . | grep -v backups | head -10
+                    else
+                      echo "⚠ Cleanup disabled (cleanupPattern is empty)"
+                    fi
+                    echo "=========================================="
+
+            # Transferência de scripts do repositório para servidor
+            - ${{ if eq(parameters.useLegacySSH, false) }}:
+              - task: CopyFilesOverSSH@0
+                displayName: 'Transfer Deploy Scripts via SCP'
+                inputs:
+                  sshEndpoint: $(SSH_SERVICE_CONNECTION)
+                  sourceFolder: $(SCRIPTS_SOURCE_PATH)
+                  contents: '**/*.sh'
+                  targetFolder: $(DEPLOYMENT_PATH)/scripts
+                  flattenFolders: false
+                  overwrite: true
+                  failOnEmptySource: true
+
+            - ${{ if eq(parameters.useLegacySSH, true) }}:
+              - task: LegacyCopyFilesOverSSH@0
+                displayName: 'Transfer Deploy Scripts via SCP (Legacy)'
+                inputs:
+                  sshEndpoint: $(SSH_SERVICE_CONNECTION)
+                  sourceFolder: $(SCRIPTS_SOURCE_PATH)
+                  contents: '**/*.sh'
+                  targetFolder: $(DEPLOYMENT_PATH)/scripts
+                  flattenFolders: false
+                  overwrite: true
+                  failOnEmptySource: true
+
+            # Transferência de arquivos do package via SCP
+            - ${{ if eq(parameters.useLegacySSH, false) }}:
+              - task: CopyFilesOverSSH@0
+                displayName: 'Transfer Package Files via SCP'
+                inputs:
+                  sshEndpoint: $(SSH_SERVICE_CONNECTION)
+                  sourceFolder: '$(Pipeline.Workspace)/artifacts'
+                  contents: ${{ parameters.filesPattern }}
+                  targetFolder: $(DEPLOYMENT_PATH)
+                  cleanTargetFolder: false
+                  overwrite: true
+                  failOnEmptySource: true
+
+            - ${{ if eq(parameters.useLegacySSH, true) }}:
+              - task: LegacyCopyFilesOverSSH@0
+                displayName: 'Transfer Package Files via SCP (Legacy)'
+                inputs:
+                  sshEndpoint: $(SSH_SERVICE_CONNECTION)
+                  sourceFolder: '$(Pipeline.Workspace)/artifacts'
+                  contents: ${{ parameters.filesPattern }}
+                  targetFolder: $(DEPLOYMENT_PATH)
+                  cleanTargetFolder: false
+                  overwrite: true
+                  failOnEmptySource: true
+
+            # Ajuste de permissões de execução
+            - ${{ if eq(parameters.useLegacySSH, false) }}:
+              - task: SSH@0
+                displayName: 'Set Execute Permissions'
+                inputs:
+                  sshEndpoint: $(SSH_SERVICE_CONNECTION)
+                  runOptions: 'inline'
+                  inline: |
+                    echo "Setting execute permissions recursively..."
+                    find $(DEPLOYMENT_PATH)/scripts -type f -name "*.sh" -exec chmod +x {} \;
+                    echo "✓ Execute permissions set for all scripts"
+
+            - ${{ if eq(parameters.useLegacySSH, true) }}:
+              - task: LegacySSH@0
+                displayName: 'Set Execute Permissions (Legacy)'
+                inputs:
+                  sshEndpoint: $(SSH_SERVICE_CONNECTION)
+                  runOptions: 'inline'
+                  inline: |
+                    echo "Setting execute permissions recursively..."
+                    find $(DEPLOYMENT_PATH)/scripts -type f -name "*.sh" -exec chmod +x {} \;
+                    echo "✓ Execute permissions set for all scripts"
+
+            # Execução de script pré-deploy (se fornecido)
+            - ${{ if and(ne(parameters.preDeployScript, ''), eq(parameters.useLegacySSH, false)) }}:
+              - task: SSH@0
+                displayName: 'Execute Pre-Deploy Script'
+                inputs:
+                  sshEndpoint: $(SSH_SERVICE_CONNECTION)
+                  runOptions: 'inline'
+                  inline: |
+                    echo "=========================================="
+                    echo "Pre-Deploy Script"
+                    echo "=========================================="
+                    cd $(DEPLOYMENT_PATH)/scripts
+                    
+                    SCRIPT_NAME=$(basename "${{ parameters.preDeployScript }}")
+                    echo "Executing: $SCRIPT_NAME"
+                    bash "$SCRIPT_NAME"
+                    
+                    echo "=========================================="
+
+            - ${{ if and(ne(parameters.preDeployScript, ''), eq(parameters.useLegacySSH, true)) }}:
+              - task: LegacySSH@0
+                displayName: 'Execute Pre-Deploy Script (Legacy)'
+                inputs:
+                  sshEndpoint: $(SSH_SERVICE_CONNECTION)
+                  runOptions: 'inline'
+                  inline: |
+                    echo "=========================================="
+                    echo "Pre-Deploy Script"
+                    echo "=========================================="
+                    cd $(DEPLOYMENT_PATH)/scripts
+                    
+                    SCRIPT_NAME=$(basename "${{ parameters.preDeployScript }}")
+                    echo "Executing: $SCRIPT_NAME"
+                    bash "$SCRIPT_NAME"
+                    
+                    echo "=========================================="
+
+            # Execução do script de deployment
+            - ${{ if eq(parameters.useLegacySSH, false) }}:
+              - task: SSH@0
+                displayName: 'Execute Deployment Script'
+                timeoutInMinutes: ${{ parameters.deploymentTimeout }}
+                inputs:
+                  sshEndpoint: $(SSH_SERVICE_CONNECTION)
+                  runOptions: 'inline'
+                  inline: |
+                    echo "=========================================="
+                    echo "Deployment Execution"
+                    echo "=========================================="
+                    echo "Version: $(DEPLOY_VERSION)"
+                    echo "Environment: ${{ parameters.environment }}"
+                    echo "Deployment Tag: $(DEPLOYMENT_TAG)"
+                    echo "=========================================="
+                    cd $(DEPLOYMENT_PATH)/scripts
+                    ./$(basename "${{ parameters.deployScript }}")
+                    echo "=========================================="
+                    echo "✓ Deployment completed successfully"
+                    echo "=========================================="
+
+            - ${{ if eq(parameters.useLegacySSH, true) }}:
+              - task: LegacySSH@0
+                displayName: 'Execute Deployment Script (Legacy)'
+                timeoutInMinutes: ${{ parameters.deploymentTimeout }}
+                inputs:
+                  sshEndpoint: $(SSH_SERVICE_CONNECTION)
+                  runOptions: 'inline'
+                  inline: |
+                    echo "=========================================="
+                    echo "Deployment Execution"
+                    echo "=========================================="
+                    echo "Version: $(DEPLOY_VERSION)"
+                    echo "Environment: ${{ parameters.environment }}"
+                    echo "Deployment Tag: $(DEPLOYMENT_TAG)"
+                    echo "=========================================="
+                    cd $(DEPLOYMENT_PATH)/scripts
+                    
+                    SCRIPT_NAME=$(basename "${{ parameters.deployScript }}")
+                    echo "Executing: $SCRIPT_NAME"
+                    bash "$SCRIPT_NAME"
+                    
+                    echo "=========================================="
+                    echo "✓ Deployment completed successfully"
+                    echo "=========================================="
+
+            # Validação pós-deploy (se habilitado)
+            - ${{ if and(eq(parameters.enableValidation, true), eq(parameters.useLegacySSH, false)) }}:
+              - task: SSH@0
+                displayName: 'Post-Deploy Validation'
+                inputs:
+                  sshEndpoint: $(SSH_SERVICE_CONNECTION)
+                  runOptions: 'inline'
+                  inline: |
+                    echo "=========================================="
+                    echo "Post-Deploy Validation"
+                    echo "=========================================="
+                    cd $(DEPLOYMENT_PATH)/scripts
+                    
+                    SCRIPT_NAME=$(basename "${{ parameters.validationScript }}")
+                    echo "Executing: $SCRIPT_NAME"
+                    bash "$SCRIPT_NAME"
+                    VALIDATION_RESULT=$?
+                    
+                    if [ $VALIDATION_RESULT -eq 0 ]; then
+                      echo "=========================================="
+                      echo "✓ Validation successful"
+                      echo "=========================================="
+                      exit 0
+                    else
+                      echo "=========================================="
+                      echo "✗ Validation failed"
+                      echo "=========================================="
+                      exit 1
+                    fi
+
+            - ${{ if and(eq(parameters.enableValidation, true), eq(parameters.useLegacySSH, true)) }}:
+              - task: LegacySSH@0
+                displayName: 'Post-Deploy Validation (Legacy)'
+                inputs:
+                  sshEndpoint: $(SSH_SERVICE_CONNECTION)
+                  runOptions: 'inline'
+                  inline: |
+                    echo "=========================================="
+                    echo "Post-Deploy Validation"
+                    echo "=========================================="
+                    cd $(DEPLOYMENT_PATH)/scripts
+                    
+                    SCRIPT_NAME=$(basename "${{ parameters.validationScript }}")
+                    echo "Executing: $SCRIPT_NAME"
+                    bash "$SCRIPT_NAME"
+                    VALIDATION_RESULT=$?
+                    
+                    if [ $VALIDATION_RESULT -eq 0 ]; then
+                      echo "=========================================="
+                      echo "✓ Validation successful"
+                      echo "=========================================="
+                      exit 0
+                    else
+                      echo "=========================================="
+                      echo "✗ Validation failed"
+                      echo "=========================================="
+                      exit 1
+                    fi
+
+            # Script pós-deploy (se fornecido)
+            - ${{ if and(ne(parameters.postDeployScript, ''), eq(parameters.useLegacySSH, false)) }}:
+              - task: SSH@0
+                displayName: 'Execute Post-Deploy Script'
+                inputs:
+                  sshEndpoint: $(SSH_SERVICE_CONNECTION)
+                  runOptions: 'inline'
+                  inline: |
+                    echo "=========================================="
+                    echo "Post-Deploy Script"
+                    echo "=========================================="
+                    cd $(DEPLOYMENT_PATH)/scripts
+                    
+                    SCRIPT_NAME=$(basename "${{ parameters.postDeployScript }}")
+                    echo "Executing: $SCRIPT_NAME"
+                    bash "$SCRIPT_NAME"
+                    
+                    echo "=========================================="
+
+            - ${{ if and(ne(parameters.postDeployScript, ''), eq(parameters.useLegacySSH, true)) }}:
+              - task: LegacySSH@0
+                displayName: 'Execute Post-Deploy Script (Legacy)'
+                inputs:
+                  sshEndpoint: $(SSH_SERVICE_CONNECTION)
+                  runOptions: 'inline'
+                  inline: |
+                    echo "=========================================="
+                    echo "Post-Deploy Script"
+                    echo "=========================================="
+                    cd $(DEPLOYMENT_PATH)/scripts
+                    
+                    SCRIPT_NAME=$(basename "${{ parameters.postDeployScript }}")
+                    echo "Executing: $SCRIPT_NAME"
+                    bash "$SCRIPT_NAME"
+                    
+                    echo "=========================================="
+
+            # Exibição de status final
+            - ${{ if eq(parameters.useLegacySSH, false) }}:
+              - task: SSH@0
+                displayName: 'Deployment Summary'
+                condition: succeeded()
+                inputs:
+                  sshEndpoint: $(SSH_SERVICE_CONNECTION)
+                  runOptions: 'inline'
+                  inline: |
+                    echo "=========================================="
+                    echo "Deployment Summary"
+                    echo "=========================================="
+                    echo "Environment: ${{ parameters.environment }}"
+                    echo "Version: $(DEPLOY_VERSION)"
+                    echo "Deployment Path: $(DEPLOYMENT_PATH)"
+                    echo "Deployment Tag: $(DEPLOYMENT_TAG)"
+                    echo "Status: SUCCESS"
+                    echo "=========================================="
+
+            - ${{ if eq(parameters.useLegacySSH, true) }}:
+              - task: LegacySSH@0
+                displayName: 'Deployment Summary (Legacy)'
+                condition: succeeded()
+                inputs:
+                  sshEndpoint: $(SSH_SERVICE_CONNECTION)
+                  runOptions: 'inline'
+                  inline: |
+                    echo "=========================================="
+                    echo "Deployment Summary"
+                    echo "=========================================="
+                    echo "Environment: ${{ parameters.environment }}"
+                    echo "Version: $(DEPLOY_VERSION)"
+                    echo "Deployment Path: $(DEPLOYMENT_PATH)"
+                    echo "Deployment Tag: $(DEPLOYMENT_TAG)"
+                    echo "Status: SUCCESS"
+                    echo "=========================================="
+
+            # Registro de deploy no Event Hub
+            - task: VivoEventHubTools@3
+              displayName: 'Registro de deploy no Event Hub'
+              condition: always() # A task passa o status do deploy
+              continueOnError: true
+              inputs:
+                command: 'deploy'
+                eventHubConnection: 'EVHCodeProd'
+                componentVersion: '$(DEPLOY_VERSION)'
+                deployArtifactName: '${{ parameters.packageDefinition }}'
+                deployArtifactType: '${{ parameters.packageType }}'
+                deployEnvironmentType: 'ssh'
+                deployEnvironmentName: '${{ parameters.environment }}'
+                deployEnvironmentAccessUrl: '$(APPLICATION_URL)'
+                annotations: 'deployment-path=$(DEPLOYMENT_PATH),package-type=${{ parameters.packageType }}'
+                pipelineType: 'framework/deploy-ssh'
+
+            # Limpeza de scripts do servidor
+            - ${{ if eq(parameters.useLegacySSH, false) }}:
+              - task: SSH@0
+                displayName: 'Cleanup Deploy Scripts'
+                condition: always()
+                inputs:
+                  sshEndpoint: $(SSH_SERVICE_CONNECTION)
+                  runOptions: 'inline'
+                  inline: |
+                    echo "Cleaning up deployment scripts..."
+                    rm -rf $(DEPLOYMENT_PATH)/scripts
+                    echo "✓ Deploy scripts removed from server"
+
+            - ${{ if eq(parameters.useLegacySSH, true) }}:
+              - task: LegacySSH@0
+                displayName: 'Cleanup Deploy Scripts (Legacy)'
+                condition: always()
+                inputs:
+                  sshEndpoint: $(SSH_SERVICE_CONNECTION)
+                  runOptions: 'inline'
+                  inline: |
+                    echo "Cleaning up deployment scripts..."
+                    rm -rf $(DEPLOYMENT_PATH)/scripts
+                    echo "✓ Deploy scripts removed from server"
+
+  # Stage 3: EmergencyRollback - Rollback automático em falha
+  - ${{ if and(eq(parameters.enableRollback, true), eq(parameters.enableBackup, true)) }}:
+    - stage: EmergencyRollback
+      displayName: 'Emergency Rollback'
+      dependsOn: Deploy
+      condition: succeededOrFailed()
+      pool: ${{ parameters.agentPool }}
+      jobs:
+      - deployment: RollbackDeployment
+        displayName: 'Rollback to Previous Version'
+        environment: $(ROLLBACK_ENVIRONMENT_RESOURCE)
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+              # Checkout do repositório para obter scripts de validação
+              - checkout: self
+                fetchDepth: 1
+                displayName: 'Checkout Repository (Validation Scripts)'
+
+              # Restauração do backup (ANTES de transferir scripts!)
+              - ${{ if eq(parameters.useLegacySSH, false) }}:
+                - task: SSH@0
+                  displayName: 'Restore from Backup'
+                  inputs:
+                    sshEndpoint: $(SSH_SERVICE_CONNECTION)
+                    runOptions: 'inline'
+                    inline: |
+                      echo "=========================================="
+                      echo "Emergency Rollback - Backup Restoration"
+                      echo "=========================================="
+                      echo "Target backup: $(BACKUP_FILENAME)"
+                      echo ""
+                      echo "Available backups:"
+                      ls -lh $(DEPLOYMENT_PATH)/backups/ 2>/dev/null || echo "  (none)"
+                      echo ""
+                      
+                      if [ -f "$(DEPLOYMENT_PATH)/backups/$(BACKUP_FILENAME)" ]; then
+                        BACKUP_SIZE=$(du -h $(DEPLOYMENT_PATH)/backups/$(BACKUP_FILENAME) | cut -f1)
+                        echo "✓ Backup found: $(BACKUP_FILENAME) (${BACKUP_SIZE})"
+                        echo ""
+                        echo "Current deployment state (before rollback):"
+                        ls -lh $(DEPLOYMENT_PATH) | grep -v backups | head -10
+                        echo ""
+                        
+                        cd $(DEPLOYMENT_PATH)
+                        
+                        # Remove arquivos atuais (exceto backups)
+                        echo "Removing current deployment files..."
+                        find . -mindepth 1 -maxdepth 1 ! -name 'backups' -exec rm -rf {} +
+                        
+                        # Restaura backup
+                        echo "Extracting backup..."
+                        tar -xzf backups/$(BACKUP_FILENAME) -C .
+                        
+                        echo ""
+                        echo "✓ Backup restored successfully"
+                        echo ""
+                        echo "Deployment state after rollback:"
+                        ls -lh $(DEPLOYMENT_PATH) | grep -v backups | head -10
+                      else
+                        echo "✗ Backup file not found: $(BACKUP_FILENAME)"
+                        echo ""
+                        echo "Available backups:"
+                        ls -lh $(DEPLOYMENT_PATH)/backups/ || echo "  No backups available"
+                        exit 1
+                      fi
+                      echo "=========================================="
+
+              - ${{ if eq(parameters.useLegacySSH, true) }}:
+                - task: LegacySSH@0
+                  displayName: 'Restore from Backup (Legacy)'
+                  inputs:
+                    sshEndpoint: $(SSH_SERVICE_CONNECTION)
+                    runOptions: 'inline'
+                    inline: |
+                      echo "=========================================="
+                      echo "Emergency Rollback - Backup Restoration"
+                      echo "=========================================="
+                      echo "Target backup: $(BACKUP_FILENAME)"
+                      echo ""
+                      echo "Available backups:"
+                      ls -lh $(DEPLOYMENT_PATH)/backups/ 2>/dev/null || echo "  (none)"
+                      echo ""
+                      
+                      if [ -f "$(DEPLOYMENT_PATH)/backups/$(BACKUP_FILENAME)" ]; then
+                        BACKUP_SIZE=$(du -h $(DEPLOYMENT_PATH)/backups/$(BACKUP_FILENAME) | cut -f1)
+                        echo "✓ Backup found: $(BACKUP_FILENAME) (${BACKUP_SIZE})"
+                        echo ""
+                        echo "Current deployment state (before rollback):"
+                        ls -lh $(DEPLOYMENT_PATH) | grep -v backups | head -10
+                        echo ""
+                        
+                        cd $(DEPLOYMENT_PATH)
+                        
+                        # Remove arquivos atuais (exceto backups)
+                        echo "Removing current deployment files..."
+                        find . -mindepth 1 -maxdepth 1 ! -name 'backups' -exec rm -rf {} +
+                        
+                        # Restaura backup
+                        echo "Extracting backup..."
+                        tar -xzf backups/$(BACKUP_FILENAME) -C .
+                        
+                        echo ""
+                        echo "✓ Backup restored successfully"
+                        echo ""
+                        echo "Deployment state after rollback:"
+                        ls -lh $(DEPLOYMENT_PATH) | grep -v backups | head -10
+                      else
+                        echo "✗ Backup file not found: $(BACKUP_FILENAME)"
+                        echo ""
+                        echo "Available backups:"
+                        ls -lh $(DEPLOYMENT_PATH)/backups/ || echo "  No backups available"
+                        exit 1
+                      fi
+                      echo "=========================================="
+
+              # Transferência de scripts para validação e rollback (DEPOIS do restore!)
+              - ${{ if eq(parameters.useLegacySSH, false) }}:
+                - task: CopyFilesOverSSH@0
+                  displayName: 'Transfer Validation Scripts via SCP'
+                  inputs:
+                    sshEndpoint: $(SSH_SERVICE_CONNECTION)
+                    sourceFolder: $(SCRIPTS_SOURCE_PATH)
+                    contents: '**/*.sh'
+                    targetFolder: $(DEPLOYMENT_PATH)/scripts
+                    flattenFolders: false
+                    overwrite: true
+                    failOnEmptySource: true
+
+              - ${{ if eq(parameters.useLegacySSH, true) }}:
+                - task: LegacyCopyFilesOverSSH@0
+                  displayName: 'Transfer Validation Scripts via SCP (Legacy)'
+                  inputs:
+                    sshEndpoint: $(SSH_SERVICE_CONNECTION)
+                    sourceFolder: $(SCRIPTS_SOURCE_PATH)
+                    contents: '**/*.sh'
+                    targetFolder: $(DEPLOYMENT_PATH)/scripts
+                    flattenFolders: false
+                    overwrite: true
+                    failOnEmptySource: true
+
+              # Ajuste de permissões para scripts de validação
+              - ${{ if eq(parameters.useLegacySSH, false) }}:
+                - task: SSH@0
+                  displayName: 'Set Execute Permissions for Validation Scripts'
+                  inputs:
+                    sshEndpoint: $(SSH_SERVICE_CONNECTION)
+                    runOptions: 'inline'
+                    inline: |
+                      echo "Setting execute permissions for validation scripts..."
+                      find $(DEPLOYMENT_PATH)/scripts -type f -name "*.sh" -exec chmod +x {} \;
+                      echo "✓ Execute permissions set"
+
+              - ${{ if eq(parameters.useLegacySSH, true) }}:
+                - task: LegacySSH@0
+                  displayName: 'Set Execute Permissions for Validation Scripts (Legacy)'
+                  inputs:
+                    sshEndpoint: $(SSH_SERVICE_CONNECTION)
+                    runOptions: 'inline'
+                    inline: |
+                      echo "Setting execute permissions for validation scripts..."
+                      find $(DEPLOYMENT_PATH)/scripts -type f -name "*.sh" -exec chmod +x {} \;
+                      echo "✓ Execute permissions set"
+
+              # Execução de script de rollback customizado (se fornecido)
+              - ${{ if and(ne(parameters.rollbackScript, ''), eq(parameters.useLegacySSH, false)) }}:
+                - task: SSH@0
+                  displayName: 'Execute Custom Rollback Script'
+                  inputs:
+                    sshEndpoint: $(SSH_SERVICE_CONNECTION)
+                    runOptions: 'inline'
+                    inline: |
+                      echo "=========================================="
+                      echo "Custom Rollback Script Execution"
+                      echo "=========================================="
+                      cd $(DEPLOYMENT_PATH)/scripts
+                      
+                      ROLLBACK_SCRIPT=$(basename "${{ parameters.rollbackScript }}")
+                      echo "Executing: $ROLLBACK_SCRIPT"
+                      bash "$ROLLBACK_SCRIPT"
+                      ROLLBACK_RESULT=$?
+                      
+                      if [ $ROLLBACK_RESULT -eq 0 ]; then
+                        echo "✓ Custom rollback logic completed successfully"
+                      else
+                        echo "✗ Custom rollback script failed"
+                        exit 1
+                      fi
+                      echo "========================================="
+
+              - ${{ if and(ne(parameters.rollbackScript, ''), eq(parameters.useLegacySSH, true)) }}:
+                - task: LegacySSH@0
+                  displayName: 'Execute Custom Rollback Script (Legacy)'
+                  inputs:
+                    sshEndpoint: $(SSH_SERVICE_CONNECTION)
+                    runOptions: 'inline'
+                    inline: |
+                      echo "=========================================="
+                      echo "Custom Rollback Script Execution"
+                      echo "=========================================="
+                      cd $(DEPLOYMENT_PATH)/scripts
+                      
+                      ROLLBACK_SCRIPT=$(basename "${{ parameters.rollbackScript }}")
+                      echo "Executing: $ROLLBACK_SCRIPT"
+                      bash "$ROLLBACK_SCRIPT"
+                      ROLLBACK_RESULT=$?
+                      
+                      if [ $ROLLBACK_RESULT -eq 0 ]; then
+                        echo "✓ Custom rollback logic completed successfully"
+                      else
+                        echo "✗ Custom rollback script failed"
+                        exit 1
+                      fi
+                      echo "========================================="
+
+              # Validação pós-rollback (se habilitado)
+              - ${{ if and(eq(parameters.enableValidation, true), eq(parameters.useLegacySSH, false)) }}:
+                - task: SSH@0
+                  displayName: 'Validate Rollback'
+                  inputs:
+                    sshEndpoint: $(SSH_SERVICE_CONNECTION)
+                    runOptions: 'inline'
+                    inline: |
+                      echo "=========================================="
+                      echo "Rollback Validation"
+                      echo "=========================================="
+                      cd $(DEPLOYMENT_PATH)/scripts
+                      
+                      VALIDATION_SCRIPT=$(basename "${{ parameters.validationScript }}")
+                      echo "Executing: $VALIDATION_SCRIPT"
+                      
+                      if [ -f "$VALIDATION_SCRIPT" ]; then
+                        chmod +x "$VALIDATION_SCRIPT"
+                        bash "$VALIDATION_SCRIPT"
+                        VALIDATION_RESULT=$?
+                        
+                        if [ $VALIDATION_RESULT -eq 0 ]; then
+                          echo "✓ Rollback validation successful"
+                        else
+                          echo "⚠ Rollback validation failed"
+                          exit 1
+                        fi
+                      else
+                        echo "⚠ Validation script not found in backup"
+                      fi
+                      echo "=========================================="
+
+              - ${{ if and(eq(parameters.enableValidation, true), eq(parameters.useLegacySSH, true)) }}:
+                - task: LegacySSH@0
+                  displayName: 'Validate Rollback (Legacy)'
+                  inputs:
+                    sshEndpoint: $(SSH_SERVICE_CONNECTION)
+                    runOptions: 'inline'
+                    inline: |
+                      echo "=========================================="
+                      echo "Rollback Validation"
+                      echo "=========================================="
+                      cd $(DEPLOYMENT_PATH)/scripts
+                      
+                      VALIDATION_SCRIPT=$(basename "${{ parameters.validationScript }}")
+                      echo "Executing: $VALIDATION_SCRIPT"
+                      
+                      if [ -f "$VALIDATION_SCRIPT" ]; then
+                        chmod +x "$VALIDATION_SCRIPT"
+                        bash "$VALIDATION_SCRIPT"
+                        VALIDATION_RESULT=$?
+                        
+                        if [ $VALIDATION_RESULT -eq 0 ]; then
+                          echo "✓ Rollback validation successful"
+                        else
+                          echo "⚠ Rollback validation failed"
+                          exit 1
+                        fi
+                      else
+                        echo "⚠ Validation script not found in backup"
+                      fi
+                      echo "=========================================="
+
+              # Exibição de status do rollback
+              - ${{ if eq(parameters.useLegacySSH, false) }}:
+                - task: SSH@0
+                  displayName: 'Rollback Summary'
+                  condition: succeeded()
+                  inputs:
+                    sshEndpoint: $(SSH_SERVICE_CONNECTION)
+                    runOptions: 'inline'
+                    inline: |
+                      echo "=========================================="
+                      echo "Rollback Summary"
+                      echo "=========================================="
+                      echo "Environment: ${{ parameters.environment }}"
+                      echo "Backup Restored: $(BACKUP_FILENAME)"
+                      echo "Deployment Path: $(DEPLOYMENT_PATH)"
+                      echo "Status: ROLLBACK COMPLETED"
+                      echo "=========================================="
+
+              - ${{ if eq(parameters.useLegacySSH, true) }}:
+                - task: LegacySSH@0
+                  displayName: 'Rollback Summary (Legacy)'
+                  condition: succeeded()
+                  inputs:
+                    sshEndpoint: $(SSH_SERVICE_CONNECTION)
+                    runOptions: 'inline'
+                    inline: |
+                      echo "=========================================="
+                      echo "Rollback Summary"
+                      echo "=========================================="
+                      echo "Environment: ${{ parameters.environment }}"
+                      echo "Backup Restored: $(BACKUP_FILENAME)"
+                      echo "Deployment Path: $(DEPLOYMENT_PATH)"
+                      echo "Status: ROLLBACK COMPLETED"
+                      echo "=========================================="
+
+              # Limpeza de scripts do servidor
+              - ${{ if eq(parameters.useLegacySSH, false) }}:
+                - task: SSH@0
+                  displayName: 'Cleanup Validation Scripts'
+                  condition: always()
+                  inputs:
+                    sshEndpoint: $(SSH_SERVICE_CONNECTION)
+                    runOptions: 'inline'
+                    inline: |
+                      echo "Cleaning up validation scripts..."
+                      rm -rf $(DEPLOYMENT_PATH)/scripts
+                      echo "✓ Validation scripts removed from server"
+
+              - ${{ if eq(parameters.useLegacySSH, true) }}:
+                - task: LegacySSH@0
+                  displayName: 'Cleanup Validation Scripts (Legacy)'
+                  condition: always()
+                  inputs:
+                    sshEndpoint: $(SSH_SERVICE_CONNECTION)
+                    runOptions: 'inline'
+                    inline: |
+                      echo "Cleaning up validation scripts..."
+                      rm -rf $(DEPLOYMENT_PATH)/scripts
+                      echo "✓ Validation scripts removed from server"

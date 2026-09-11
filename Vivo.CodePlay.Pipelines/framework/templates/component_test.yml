@@ -1,0 +1,202 @@
+parameters:
+  - name: componentTestsWorkingDirectory
+    type: string
+    default: $(Build.SourcesDirectory)
+
+  - name: componentTestsJarExtractPath
+    type: string
+    default: $(Build.SourcesDirectory)/target
+
+  - name: componentTestsComposeProjectName
+    type: string
+    default: $(Build.BuildId)
+
+  - name: componentTestsComposeMainService
+    type: string
+    default: ""
+
+  - name: componentTestsComposeFilePath
+    type: string
+    default: ""
+
+  - name: componentTestsResultDirectory
+    type: string
+    default: ""
+
+  - name: registryServiceConnection
+    type: string
+    default: "ACR-DEVOPS"
+
+  - name: akvDevopsName
+    type: string
+    default: "kv-azdevops-shared"
+
+steps:
+
+- task: AzureKeyVault@2  
+  displayName: 'Getting AKV credentials'
+  timeoutInMinutes: 1
+  retryCountOnTaskFailure: 5  
+  inputs:    
+    azureSubscription: DevOpsSharedResources    
+    KeyVaultName: ${{ parameters.akvDevopsName }}
+    SecretsFilter: 'NEXUS-DEPS-USR, NEXUS-DEPS-PSW'
+
+- task: Docker@2
+  displayName: "Docker login ACR"
+  inputs:
+    containerRegistry: "${{ parameters.registryServiceConnection }}"
+    command: login
+
+- bash: |
+    source ~/.bashrc
+    echo "componentTestsWorkingDirectory=${{ parameters.componentTestsWorkingDirectory }}"
+    echo "componentTestsJarExtractPath=${{ parameters.componentTestsJarExtractPath }}"
+    echo "componentTestsComposeProjectName=${{ parameters.componentTestsComposeProjectName }}"
+    echo "componentTestsComposeMainService=${{ parameters.componentTestsComposeMainService }}"
+    echo "componentTestsComposeFilePath=${{ parameters.componentTestsComposeFilePath }}"
+    echo "componentTestsResultDirectory=${{ parameters.componentTestsResultDirectory }}"
+  displayName: "Component tests Variables Info"
+
+- task: DownloadPipelineArtifact@2
+  displayName: 'Download Java Artifacts'
+  inputs:
+    artifactName: 'app'
+    downloadPath: '$(System.ArtifactsDirectory)/myArtifact'
+
+- task: ExtractFiles@1
+  displayName: 'Extract JARs to target folder'
+  inputs:
+    archiveFilePatterns: '$(System.ArtifactsDirectory)/myArtifact/app.tar'
+    destinationFolder: '${{ parameters.componentTestsJarExtractPath }}'
+
+- bash: |
+    echo "##[group]Debugging: Files and directories"
+    echo "componentTestsWorkingDirectory: ${{ parameters.componentTestsWorkingDirectory }}"
+    echo "componentTestsJarExtractPath: ${{ parameters.componentTestsJarExtractPath }}"
+    echo "componentTestsComposeFilePath: ${{ parameters.componentTestsComposeFilePath }}"
+    echo ""
+    echo "=== Contents of WORKING_DIRECTORY ==="
+    ls -la "${{ parameters.componentTestsWorkingDirectory }}" || echo "Directory not found"
+    echo ""
+    echo "=== Contents of JAR_EXTRACT_PATH ==="
+    ls -la "${{ parameters.componentTestsJarExtractPath }}" || echo "Directory not found"
+    echo ""
+    echo "=== Looking for docker-compose file ==="
+    FULL_COMPOSE_PATH="${{ parameters.componentTestsWorkingDirectory }}/${{ parameters.componentTestsComposeFilePath }}"
+    if [ -f "$FULL_COMPOSE_PATH" ]; then
+      echo "✅ Found: $FULL_COMPOSE_PATH"
+    else
+      echo "❌ NOT FOUND: $FULL_COMPOSE_PATH"
+      echo "Searching for docker-compose files..."
+      find "${{ parameters.componentTestsWorkingDirectory }}" -name "*docker-compose*.yml" -o -name "*docker-compose*.yaml" 2>/dev/null || echo "No docker-compose files found"
+    fi
+    echo "##[endgroup]"
+  displayName: "Debug: Verify file structure"
+
+- bash: |
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    NC='\033[0m'
+
+    if [ -d "$RESULT_DIRECTORY" ]; then
+      rm -rf $RESULT_DIRECTORY
+    fi
+    mkdir -p $RESULT_DIRECTORY
+    
+    docker compose -p $PROJECT_NAME -f $COMPOSE_FILE_PATH build && \
+    docker compose -p $PROJECT_NAME -f $COMPOSE_FILE_PATH up --attach $COMPOSE_MAIN_SERVICE --exit-code-from $COMPOSE_MAIN_SERVICE
+    TEST_EXIT_CODE=`echo $?`
+    
+    if [ $TEST_EXIT_CODE -eq 0 ] ; then
+      printf "${GREEN}Tests Passed${NC}\n"
+    else
+      printf "${RED}Tests Failed${NC} - Exit Code: $TEST_EXIT_CODE\n"
+    fi
+
+    exit $TEST_EXIT_CODE
+  displayName: Run component test
+  workingDirectory: "${{ parameters.componentTestsWorkingDirectory }}"
+  timeoutInMinutes: 120
+  env:
+    PROJECT_NAME: ${{ parameters.componentTestsComposeProjectName }}
+    COMPOSE_FILE_PATH: ${{ parameters.componentTestsComposeFilePath }}
+    COMPOSE_MAIN_SERVICE: ${{ parameters.componentTestsComposeMainService }}
+    RESULT_DIRECTORY: ${{ parameters.componentTestsResultDirectory }}
+    DEPS_CREDENTIAL_USR: $(NEXUS-DEPS-USR)
+    DEPS_CREDENTIAL_PSW: $(NEXUS-DEPS-PSW)
+    HTTPS_PROXY: $(PROXY_AGENT_HTTPS)
+    HTTP_PROXY: $(PROXY_AGENT_HTTP)
+    NO_PROXY: $(PROXY_AGENT_NO_PROXY)
+
+- bash: |
+    save_logs() {
+      mkdir -p $RESULT_DIRECTORY/logs
+      SERVICES=$(docker compose -p $PROJECT_NAME ps -a --services | awk '{if(NR>0) print $NF}')
+      for i in $SERVICES
+      do
+        docker compose -p $PROJECT_NAME logs ${i} > "$RESULT_DIRECTORY/logs/${i}.log"
+        echo "Log from service ${i} saved in $RESULT_DIRECTORY/logs/${i}.log"
+      done
+    }
+    
+    cleanup () {
+      docker compose -p $PROJECT_NAME kill
+      docker compose -p $PROJECT_NAME down
+    }
+    
+    save_logs
+    cleanup
+  displayName: Save logs and clean up containers
+  workingDirectory: "${{ parameters.componentTestsWorkingDirectory }}"
+  timeoutInMinutes: 30
+  condition: always()
+  env:
+    PROJECT_NAME: ${{ parameters.componentTestsComposeProjectName }}
+    COMPOSE_FILE_PATH: ${{ parameters.componentTestsComposeFilePath }}
+    COMPOSE_MAIN_SERVICE: ${{ parameters.componentTestsComposeMainService }}
+    RESULT_DIRECTORY: ${{ parameters.componentTestsResultDirectory }}
+    DEPS_CREDENTIAL_USR: $(NEXUS-DEPS-USR)
+    DEPS_CREDENTIAL_PSW: $((NEXUS-DEPS-PSW)
+
+- task: DeleteFiles@1
+  condition: always()
+  inputs:
+    SourceFolder: '$(Build.ArtifactStagingDirectory)'
+    Contents: |
+      **/*
+
+- task: CopyFiles@2
+  condition: always()
+  displayName: 'Copy log files'
+  inputs:
+    SourceFolder: '${{ parameters.componentTestsWorkingDirectory }}/${{ parameters.componentTestsResultDirectory }}'
+    TargetFolder: '$(Build.ArtifactStagingDirectory)'
+    OverWrite: true
+    Contents: |
+      **
+
+- task: PublishBuildArtifacts@1
+  condition: always()
+  displayName: 'Publish Test Artifact'
+  inputs:
+    ArtifactName: 'component-test-result'
+
+- script: |
+    files=$(find $(pwd) -type f -user root)
+    if [ -n "$files" ]; then
+      echo "##[debug]Arquivos com owner root encontrados:"
+      echo "$files"
+      echo "##vso[task.logissue type=warning; ]Arquivos com owner root encontrados. Consulte os logs para mais informações."
+      echo "##[debug]Ajustando permissões dos arquivos encontrados..."
+      sudo find $(pwd) -type f -user root -exec /usr/bin/chown svc_devopscorp:svc_devopscorp {} +
+      if [ $? -eq 0 ]; then
+        echo "##[debug]OK"
+      else
+        echo "##vso[task.logissue type=error]Erro ao ajustar ownership dos arquivos do Teste de Componentes."
+      fi
+    else
+      echo "##[debug]Não foram encontrados arquivos com owner root. Nada a ser ajustado."
+    fi
+  displayName: 'Verify and change root files ownership'
+  condition: always()

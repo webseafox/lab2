@@ -1,0 +1,126 @@
+parameters:
+  - name: qa_environment
+    type: string
+  - name: skip_deploy
+    type: boolean
+    default: false
+
+variables:
+  - template: /tech_products/ngin/initialize/variables_global.yml
+  - template: /tech_products/ngin/initialize/variables_weblogic_osgi.yml
+  - template: /.azuredevops/config/${{ parameters.qa_environment }}/environments_variables.yml@self
+  - group: "${{ variables['Build.DefinitionName'] }}"
+
+resources:
+  repositories:
+    - repository: FortifyExclusion
+      name: DevOps/Vivo.Fortify.Exclusions
+      type: git
+      ref: refs/heads/master
+      endpoint: CodePlay
+    - repository: CorePipelines
+      name: DevOps/Vivo.Core.Pipelines
+      type: git
+      ref: refs/tags/latest
+      endpoint: CorePipelines      
+
+stages:
+  - stage: build_test
+    jobs:
+      - job: build_test
+        displayName: 'Build Job'
+        pool:
+          vmImage: 'ubuntu-latest'
+        variables:
+          MAVEN_OPTS: '-Xmx3072m'
+          MAVEN_CACHE_FOLDER: $(Pipeline.Workspace)/.m2/repository
+
+        steps:
+          - task: JavaToolInstaller@0
+            displayName: 'Use Java 8'
+            inputs:
+              versionSpec: 8
+              jdkArchitectureOption: x64
+              jdkSourceOption: 'PreInstalled'
+
+          - task: DownloadPipelineArtifact@2
+            displayName: 'Download Artifacts from Previous Build'
+            inputs:
+              buildType: 'specific'
+              project: 'SMRH - Smart History'
+              pipeline: 'alarm-monitor-libs'
+              runVersion: 'latest'
+              artifact: 'eisa'
+              targetPath: '$(Pipeline.Workspace)/maven-repo'
+
+          - script: |
+              echo "Using downloaded artifacts..."
+              mkdir -p ~/.m2/repository/br/com/eisa
+              cp -r $(Pipeline.Workspace)/maven-repo/* ~/.m2/repository/br/com/eisa/
+              echo "Contents of ~/.m2/repository/br:"
+              ls -laR ~/.m2/repository/br
+            displayName: 'Copy Artifacts to Local Maven Repository'
+
+          - task: Maven@3
+            inputs:
+              mavenPomFile: 'pom.xml'
+              mavenOptions: '-Xmx3072m'
+              options: '-B -e -X -DskipTests'
+              goals: 'clean install'
+
+          - script: |
+              echo "Build directory: $(Build.SourcesDirectory)"
+              echo "Staging directory: $(Build.ArtifactStagingDirectory)"
+              echo "Copying JARs and POMs from Maven local repository to staging directory..."
+              mkdir -p $(Build.ArtifactStagingDirectory)
+              cp -r ~/.m2/repository/br/com/eisa/smarts/* $(Build.ArtifactStagingDirectory)/
+              ls -la $(Build.ArtifactStagingDirectory)
+            displayName: 'Copy Maven Local Repository to Staging Directory'
+
+          - task: PublishBuildArtifacts@1
+            inputs:
+              PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+              ArtifactName: 'jar'
+  
+  ## -> Gates for CI - Weblogic
+  - template: /tech_products/ngin/templates/ci/ci_gates_scgw.yml
+    parameters:
+      qa_environment: ${{ parameters.qa_environment }}
+
+  ## -> Security for CI - Weblogic
+  - template: /tech_products/ngin/templates/ci/ci_security_weblogic_osgi.yml
+    parameters:
+      fortifyExclusionRepository: FortifyExclusion
+
+  - stage: Deploy
+    jobs:
+      - job: PreDeploymentChecks
+        displayName: 'PreDeployment Checks'
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - script: echo "Running pre-deployment checks..."
+            displayName: 'Run PreDeployment Checks'
+
+      - job: Deploy
+        displayName: 'Deploy Job'
+        ##dependsOn: build_test
+        pool:
+          vmImage: 'ubuntu-latest'
+        condition: succeeded()
+        steps:
+          - task: DownloadPipelineArtifact@2
+            inputs:
+              buildType: 'current'
+              artifactName: 'maven-artifact'
+              targetPath: '$(Pipeline.Workspace)/maven-artifact'
+
+          - task: CopyFilesOverSSH@0
+            displayName: 'CopyFiles'
+            inputs:
+              sshEndpoint: vip
+              sourceFolder: '$(Pipeline.Workspace)/maven-artifact/urs/urs-package/24.2.0-SNAPSHOT/'
+              contents: urs-package-24.2.0-SNAPSHOT-package.tar.gz
+              targetFolder: '/tmp/oms'
+              cleanTargetFolder: false
+              overwrite: true    

@@ -1,0 +1,71 @@
+parameters:
+- name: run_component_test
+  type: boolean
+- name: archiveName
+  type: string
+  default: app
+
+stages:
+- stage: package
+  dependsOn:
+  - security
+  - build_test_bff_and_client
+  - gates
+  - ${{ if eq(parameters.run_component_test, True)}}:
+    - component_test
+  displayName: "Package & Publish"
+  pool: $(PRIVATE_AGENT_DEFAULT)
+  jobs:
+  - job: npm_check_publish
+    displayName: "Npm Check and Publish"
+    variables:
+      - name: APP_VERSION
+        value: $[ stageDependencies.build_test_bff_and_client.bump_version.outputs['component_bump_version.API_NEW_VERSION'] ]
+    steps:
+    - template: /tech_products/srus/tasks/catalog_info/extract_variables.yml
+      parameters:
+          workingDirectory: $(Build.SourcesDirectory)
+    - task: DownloadPipelineArtifact@2
+      inputs:
+        downloadPath: '$(System.ArtifactsDirectory)/myArtifact'
+    - task: ExtractFiles@1
+      displayName: Extract App Files
+      inputs:
+        archiveFilePatterns: '$(System.ArtifactsDirectory)/myArtifact/app/app.tar' ## obter nome via parametros
+        destinationFolder: '$(System.DefaultWorkingDirectory)/app'
+    - template: /tech_products/srus/tasks/nodejs/npm_package_version.yml
+      parameters:
+        currentVersion: "$(APP_VERSION)"
+        appName: "$(APP_NAME)"
+    - template: /tech_products/srus/tasks/nodejs/update_repo_version_bff_client.yml
+      parameters:
+        newVersion: "$(APP_VERSION)"
+        condition: and(succeeded(), eq(variables.BUMP_VERSION_ENABLED, true))
+
+  - job: "Package"
+    condition: and(always(), eq(variables.flowIsTagging, false), eq(variables.flowIsMain, true))
+    displayName: "Package"
+    dependsOn: npm_check_publish
+    variables:
+      - name: SONAR_TASK_ID_CLIENT
+        value: $[ stageDependencies.gates_client.sonarqube.outputs['sonar_task_id.SONAR_TASK_ID'] ]
+      - name: SONAR_TASK_ID_BFF
+        value: $[ stageDependencies.gates_bff.sonarqube.outputs['sonar_task_id.SONAR_TASK_ID'] ]
+      - name: APP_VERSION
+        value: $[ stageDependencies.build_test_bff_and_client.bump_version.outputs['component_bump_version.API_NEW_VERSION'] ]
+      - name: VERSION_EXISTS
+        value: $[ dependencies.npm_check.outputs['check_version_exists.VERSION_EXISTS'] ]
+      - name: USE_DT_DOCKER
+        value: $[ stageDependencies.security.app_config_keys.outputs['evaluate_flags.USE_DT_DOCKER'] ]
+      - name: USE_CONVISO
+        value: $[ stageDependencies.security.app_config_keys.outputs['evaluate_flags.USE_CONVISO'] ]
+      - name: SKIP_SECURITY_GATE_SCA
+        value: $[ stageDependencies.security.app_config_keys.outputs['evaluate_flags.SKIP_SECURITY_GATE_SCA'] ]
+    steps:
+    - template: /tech_products/srus/tasks/catalog_info/extract_variables.yml
+      parameters:
+        workingDirectory: $(Build.SourcesDirectory)
+    - template: /tech_products/srus/task_groups/package/docker_package.yml
+      parameters: 
+        artifactName: app
+

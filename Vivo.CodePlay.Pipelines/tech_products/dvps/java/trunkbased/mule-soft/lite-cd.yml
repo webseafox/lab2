@@ -1,0 +1,165 @@
+parameters:
+- name: ENV_CONFIG_NAME
+- name: packageVersion
+- name: ENV_MAP
+  type: object
+  default:
+    poc: 
+      propertiesFileName: "B2B-DEV-FENIX.yaml"
+      anypointEnv: "B2B-DEV-FENIX"
+      anypointEnvAppName: "dev"
+      envHealthEndpoint: "dev"
+    dev: 
+      propertiesFileName: "B2B-DEV-FENIX.yaml"
+      anypointEnv: "B2B-DEV-FENIX"
+      anypointEnvAppName: "dev"
+      envHealthEndpoint: "dev"
+
+    esteira01: 
+      propertiesFileName: "B2B-Esteira1.yaml"
+      anypointEnv: "B2B-Esteira1"
+      anypointEnvAppName: "qa1"
+      envHealthEndpoint: "esteira1"
+
+    esteira02: 
+      propertiesFileName: "B2B-Esteira2.yaml"
+      anypointEnv: "B2B-Esteira2"
+      anypointEnvAppName: "qa2"
+      envHealthEndpoint: "esteira2"
+
+    preprod: 
+      propertiesFileName: "B2B-PreProd.yaml"
+      anypointEnv: "B2B-PreProd"
+      anypointEnvAppName: "preprod"
+      envHealthEndpoint: "preprod"
+
+    prodlike: 
+      propertiesFileName: "B2B-Prodlike.yaml"
+      anypointEnv: "B2B-Prodlike"
+      anypointEnvAppName: "prodlike"
+      envHealthEndpoint: "prodlike"
+
+    master: 
+      propertiesFileName: "B2B-Producao.yaml"
+      anypointEnv: "B2B-Producao"
+      anypointEnvAppName: "prod"
+      envHealthEndpoint: "prod"  
+
+variables:
+
+# # PROPERTIES_FILE_NAME="$(yq -r .${ENV_CONFIG_NAME}.propertiesFileName tech_products/mule-fenix/provisioners/mule/api_default/env_config.yml)"
+- name: PROPERTIES_FILE_NAME
+  value: "${{ parameters.ENV_MAP[parameters.ENV_CONFIG_NAME].propertiesFileName }}"
+
+# # ANYPOINT_ENV="$(yq -r .${ENV_CONFIG_NAME}.anypointEnv tech_products/mule-fenix/provisioners/mule/api_default/env_config.yml)"
+- name: ANYPOINT_ENV
+  value: "${{ parameters.ENV_MAP[parameters.ENV_CONFIG_NAME].anypointEnv }}"
+
+# # ANYPOINT_ENV_APP_NAME="$(yq -r .${ENV_CONFIG_NAME}.anypointEnvAppName tech_products/mule-fenix/provisioners/mule/api_default/env_config.yml)"
+- name: ANYPOINT_ENV_APP_NAME
+  value: "${{ parameters.ENV_MAP[parameters.ENV_CONFIG_NAME].anypointEnvAppName }}"
+
+- group: "azdo-team-project-variables"
+- group: mule-tlf-resource-prc
+- ${{ if eq(variables['Build.SourceBranch'], 'refs/heads/master') }}:
+  - group: "mule-prod-variables"
+stages:
+- stage: deploy
+  displayName: "Deploy"
+  pool:
+    name: "GeneralPurposeLinuxAgentsCD"
+  jobs:
+  - job: run_deploy
+    displayName: "Running deploy on CloudHub"
+    steps:
+    
+    - task: AzureKeyVault@2
+      displayName: 'Getting AKV credentials'
+      timeoutInMinutes: 1
+      retryCountOnTaskFailure: 5
+      inputs:
+        azureSubscription: DevOpsSharedResources
+        KeyVaultName: kv-azdevops-shared
+        SecretsFilter: 'NEXUS-DEFAULT-USR, NEXUS-DEFAULT-PSW'
+    
+    - task: XmlParseFromVivo@4
+      displayName: 'Get groupId and artifactId from pom.xml'
+      inputs:
+        type: 'file'
+        origin: $(Build.SourcesDirectory)/pom.xml
+        jpaths: |
+          var POM_XML_GROUP_ID = .project.groupId._text
+          var POM_XML_ARTIFACT_ID = .project.artifactId._text
+
+    - task: UniversalPackages@0
+      displayName: Download a Universal Package
+      inputs:
+        command: download
+        vstsFeed: "3d53bc62-8749-4931-ae46-a443b73bc87a"
+        vstsFeedPackage: "$(POM_XML_GROUP_ID).$(Build.SourceBranchName).$(POM_XML_ARTIFACT_ID)"
+        vstsPackageVersion: "${{ parameters.packageVersion }}"
+        downloadDirectory: "$(Build.ArtifactStagingDirectory)"
+
+    - task: XmlParseFromVivo@4
+      displayName: 'Get New pom.xml info'
+      inputs:
+        type: 'file'
+        origin: $(Build.ArtifactStagingDirectory)/pom.xml
+        jpaths: |
+          var POM_XML_VERSION = .project.version._text
+          var POM_XML_GROUP_ID = .project.groupId._text
+          var POM_XML_ARTIFACT_ID = .project.artifactId._text
+
+    - task: DownloadSecureFile@1
+      displayName: 'Getting settings file'
+      name: muleSettings
+      inputs:
+        secureFile: "settings-mule.xml"
+    
+    - task: CmdLine@2
+      displayName: Extracting properties from config file
+      inputs:
+        script: >
+          echo "##vso[task.setvariable variable=CLOUD_HUB_PROPS]"
+
+          if [ ! -f "src/main/resources/properties/$(PROPERTIES_FILE_NAME)" ]; then
+              echo "The file 'src/main/resources/properties/$(PROPERTIES_FILE_NAME)' does not exist."
+              exit 0
+          fi
+
+          PROPS=$(yq '.cloudhub | select (.!=null)' src/main/resources/properties/$(PROPERTIES_FILE_NAME) | tr -d ':' | awk '{print $1}')
+
+          if [ -z "$PROPS" ]; then
+              echo "The field 'cloudhub' does not exist."
+              exit 0
+          fi
+
+          for PROP in $PROPS; do
+            PROPERTIES_ARGS_STRING="$PROPERTIES_ARGS_STRING -D$PROP=$(yq ".cloudhub.$PROP" src/main/resources/properties/$(PROPERTIES_FILE_NAME))"
+          done
+
+          echo "##vso[task.setvariable variable=CLOUD_HUB_PROPS]${PROPERTIES_ARGS_STRING}"
+        workingDirectory: $(Build.SourcesDirectory)
+
+    - task: Maven@4
+      displayName: 'Executing maven deploy on CloudHub'
+      inputs:
+        mavenPOMFile: '$(Build.ArtifactStagingDirectory)/pom.xml'
+        goals: 'mule:deploy'
+        options: >- 
+          -s $(muleSettings.secureFilePath) 
+          -DmuleDeploy 
+          -Dmule.artifact=$(Build.ArtifactStagingDirectory)/target/$(POM_XML_ARTIFACT_ID)-$(POM_XML_VERSION)-mule-application.jar 
+          -DskipTests 
+          -DconnectedAppClientId=$(MULE_APP_CLIENT_ID) 
+          -DconnectedAppClientSecret=$(MULE_APP_CLIENT_SECRET) 
+          -Denv.short=$(ANYPOINT_ENV_APP_NAME) 
+          -DbusinessGroupId=$(MULE_BUSINESS_GROUP_ID) 
+          -Denv=$(ANYPOINT_ENV) 
+          -Dsecurity.key=$(MULE_SECURITY_KEY) 
+          -Danypoint.platform.client_id=$(MULE_ANYPOINT_CLIENT_ID) 
+          -Danypoint.platform.client_secret=$(MULE_ANYPOINT_CLIENT_SECRET) $(CLOUD_HUB_PROPS)
+      env:
+        PUB_CREDENTIAL_USR: $(NEXUS-DEFAULT-USR)
+        PUB_CREDENTIAL_PSW: $(NEXUS-DEFAULT-PSW)
+        

@@ -1,0 +1,65 @@
+parameters:
+- name: serviceConnectionSuffix
+  type: string
+  default: "$(subscriptionEnv)"
+- name: subscriptionId
+  type: string
+- name: resourceGroup
+  type: string
+- name: apimName
+  type: string
+- name: environment
+  type: string
+- name: apiName
+  type: string
+- name: apiRevision
+  type: string
+- name: policyFile
+  type: string
+- name: condition
+  type: object
+  default: succeeded()
+
+steps:
+- task: AzureCLI@2
+  displayName: "Create / Update API Policy"
+  condition: ${{ parameters.condition }}
+  inputs:
+    azureSubscription: $(serviceConnectionPrefixName)-${{ parameters.serviceConnectionSuffix }}
+    scriptType: bash
+    scriptLocation: inlineScript
+    inlineScript: |
+      set -euo pipefail
+
+      az account set --subscription "${{ parameters.subscriptionId }}"
+
+      TOKEN=$(az account get-access-token --query accessToken -o tsv)
+      API_REV_ID="/subscriptions/${{ parameters.subscriptionId }}/resourceGroups/${{ parameters.resourceGroup }}/providers/Microsoft.ApiManagement/service/${{ parameters.apimName }}/apis/${{ parameters.apiName }}-${{ parameters.environment }};rev=${{ parameters.apiRevision }}"
+      BODY=$(jq -Rs --arg format "xml" '{properties: {format: $format, value: .}}' < "${{ parameters.policyFile }}")
+
+      API_URL="https://management.azure.com${API_REV_ID}/policies/policy?api-version=2024-05-01"
+
+      echo "=== Atualizando policy global da API ==="
+      if [[ "${PIPELINE_DEBUG_OUTPUT:-false}" == "true" ]]; then
+        echo "  → URL: $API_URL"
+        echo "  → Request body: $BODY"
+      fi
+
+      HTTP_RESPONSE=$(curl -sS -w "\n%{http_code}" -X PUT \
+        "$API_URL" \
+        -H "Authorization: Bearer $TOKEN" \
+        -H "Content-Type: application/json" \
+        --data "$BODY")
+
+      HTTP_BODY=$(echo "$HTTP_RESPONSE" | head -n -1)
+      HTTP_STATUS=$(echo "$HTTP_RESPONSE" | tail -n 1)
+
+      echo "  → HTTP Status: $HTTP_STATUS"
+
+      if [[ "$HTTP_STATUS" -lt 200 || "$HTTP_STATUS" -ge 300 ]]; then
+        echo "❌ Erro ao atualizar API Policy. HTTP Status: $HTTP_STATUS"
+        echo "  → Response: $HTTP_BODY"
+        exit 1
+      fi
+
+      echo "✅ API Policy criado ou atualizado com sucesso."

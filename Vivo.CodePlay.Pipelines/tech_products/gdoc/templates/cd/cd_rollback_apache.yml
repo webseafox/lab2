@@ -1,0 +1,130 @@
+parameters:
+  - name: packageName
+  - name: packageVersion
+  - name: environment
+  - name: rollbackDate
+
+stages:
+  - stage: cd_deploy
+    displayName: "CD - Deploy ${{ parameters.environment }}"
+    condition: succeeded()
+    pool:
+      $(PRIVATE_AGENT_IAC)
+
+    jobs:
+      - deployment: deploy
+        displayName: Deploy
+        condition: succeeded()
+        environment:
+          name: deploy-${{ parameters.environment }}
+        continueOnError: false
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+              ## -> Download Artifacts
+              - download: none
+
+              ## -> Realiza o stop do apache
+              - task: LegacySSH@0
+                displayName: Stopping Servers
+                condition: succeeded()
+                continueOnError: false 
+                inputs:
+                  sshEndpoint: gedoc_${{ parameters.environment }}
+                  runOptions: 'inline'
+                  inline: |
+                    /VIVOGED01/deploy/azure_deployment/stop.sh /VIVOGED01/deploy/azure_deployment/servers.lst
+                  readyTimeout: '20000'
+
+              ## -> Checa o status após o stop
+              - task: LegacySSH@0
+                displayName: Checking Status
+                condition: succeeded()
+                continueOnError: false
+                inputs:
+                  sshEndpoint: gedoc_${{ parameters.environment }}
+                  runOptions: 'inline'
+                  inline: |
+                    /VIVOGED01/deploy/azure_deployment/status.sh /VIVOGED01/deploy/azure_deployment/servers.lst
+                  readyTimeout: '20000'
+
+              ## -> Realiza o Backup da Aplicação
+              - task: LegacySSH@0
+                displayName: Running Backup
+                condition: succeeded()
+                continueOnError: false
+                inputs:
+                  sshEndpoint: gedoc_${{ parameters.environment }}
+                  runOptions: 'inline'
+                  inline: |
+                    nohup /VIVOGED01/deploy/azure_deployment/installer.sh /VIVOGED01/deploy/azure_deployment/servers.lst rollback ${{ parameters.rollbackDate }} &
+                  readyTimeout: '20000'
+
+              ## -> Inicia os servidores
+              - task: LegacySSH@0
+                displayName: Starting Servers
+                condition: succeeded()
+                continueOnError: false
+                inputs:
+                  sshEndpoint: gedoc_${{ parameters.environment }}
+                  runOptions: 'inline'
+                  inline: |
+                    /VIVOGED01/deploy/azure_deployment/start.sh /VIVOGED01/deploy/azure_deployment/servers.lst
+                  readyTimeout: '20000'
+
+              ## -> Checa o status após o start
+              - task: LegacySSH@0
+                displayName: Checking Status After Start
+                condition: succeeded()
+                continueOnError: false
+                inputs:
+                  sshEndpoint: gedoc_${{ parameters.environment }}
+                  runOptions: 'inline'
+                  inline: |
+                    /VIVOGED01/deploy/azure_deployment/status.sh /VIVOGED01/deploy/azure_deployment/servers.lst
+                  readyTimeout: '20000'
+            on:
+              success:
+                steps:
+                - task: Bash@3
+                  displayName: Deploy Success
+                  name: success_message
+                  inputs:
+                    targetType: inline
+                    script: |
+                      echo "##[section] ================================================================================================================================="
+                      echo "##[section]                                                      ROLLBACK WAS SUCCESSFUL! "
+                      echo "##[section] ================================================================================================================================="
+                      echo "##[section] Parabéns! Sua aplicação foi reimplantada com sucesso no ambiente."
+                      echo "##[section] Acesse a url da sua aplicação e valide se sua nova versão foi entregue com sucesso."
+                      echo "##[section] "
+                      echo "##[section] $(ALERT_MESSAGE_ARROW) Sua aplicação foi reimplantada com sucesso no ambiente."
+                      echo "##[section] $(ALERT_MESSAGE_ARROW) Verifique com o responsável técnico como acessar acessar a sua aplicação."
+                      echo "##[section] $(ALERT_MESSAGE_ARROW) Caso não esteja conseguindo acessar a sua aplicação entre em contato com o suporte."
+                      echo "##[section] "
+                      echo "##[section]================================================================================================================================="
+
+                      ## -> Set Pipeline Tag on success
+                      echo "##vso[build.addbuildtag]deploy-${{ parameters.environment }}=succeeded"
+              failure:
+                steps:
+                - task: Bash@3
+                  displayName: Deploy Failure
+                  name: failure_message
+                  inputs:
+                    targetType: inline
+                    script: |
+                      echo "##[error] ================================================================================================================================="
+                      echo "##[error]                                                    ROLLBACK WAS NOT SUCCESSFUL! "
+                      echo "##[error] ================================================================================================================================="
+                      echo "##[error] Se está vendo essa mensagem é porque aconteceu algo errado durante a reimplantação da sua aplicação."
+                      echo "##[error] "
+                      echo "##[error] Segue abaixo umas dicas para o Troubleshooting:"
+                      echo "##[error] $(ALERT_MESSAGE_ARROW) Consulte o log do estágio de deploy da aplicação."
+                      echo "##[error] $(ALERT_MESSAGE_ARROW) Verifique com o responsável técnico como proceder em caso de falha de ambiente."
+                      echo "##[error] "
+                      echo "##[error] ================================================================================================================================="
+
+                      ## -> Set Pipeline Tag on failure
+                      echo "##vso[build.addbuildtag]deploy-${{ parameters.environment }}=failed"

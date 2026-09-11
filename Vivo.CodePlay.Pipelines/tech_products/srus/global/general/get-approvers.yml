@@ -1,0 +1,92 @@
+steps:
+- script: | 
+    #!/bin/bash
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    BLUE='\033[0;34m'
+    RED='\033[1;33m'
+    BG_GREEN='\033[42;1;37m'
+
+    BUILD_ID="$(Build.BuildId)"
+    TIMELINE_ID="$(System.TimelineId)" 
+    STAGE_IDENTIFIER="deploy"
+    TOKEN="$(System.AccessToken)"
+    PROJECT="$(System.TeamProject)"
+    ORG="$(CMD-GET-ORGANIZATION-NAME)"
+    
+    BASE_URL="https://$ORG:$TOKEN@dev.azure.com"
+    URL_TIMELINE="$BASE_URL/$ORG/$PROJECT/_apis/build/builds/$BUILD_ID/timeline/$TIMELINE_ID?api-version=7.0"
+
+    curl -s -o $(Agent.TempDirectory)/timelines.json $URL_TIMELINE
+
+    TIMELINE=$(cat $(Agent.TempDirectory)/timelines.json | jq ".records[] | select(.type == \"Stage\") | select( .identifier == \"$STAGE_IDENTIFIER\")")
+    STAGE_ID=$(echo $TIMELINE | jq -r '.id')
+    URL_APPROVERS="$BASE_URL/$ORG/_apis/Contribution/HierarchyQuery/project/$PROJECT?api-version=6.1-preview.1"
+
+    BODY=$(cat <<EOF
+    {
+        "contributionIds": [
+            "ms.vss-build-web.checks-panel-data-provider"
+        ],
+        "dataProviderContext": {
+            "properties": {
+                "buildId": "$BUILD_ID",
+                "stageIds": "$STAGE_ID",
+                "checkListItemType": 1,
+                "sourcePage": {
+                    "url": "https://dev.azure.com/$ORG/$PROJECT/_build/results?buildId=$BUILD_ID&view=results",
+                    "routeId": "ms.vss-build-web.ci-results-hub-route",
+                    "routeValues": {
+                        "project": "$PROJECT",
+                        "viewname": "build-results",
+                        "controller": "ContributedPage",
+                        "action": "Execute"
+                    }
+                }
+            }
+        }
+    }
+    EOF
+    )
+
+    curl -s --location --request POST $URL_APPROVERS --header 'Content-Type: application/json' --data-raw "$BODY" -o  $(Agent.TempDirectory)/approvers.json
+    CHECKS=$(cat $(Agent.TempDirectory)/approvers.json | jq -r '.dataProviders."ms.vss-build-web.checks-panel-data-provider"')
+
+    if [[ "$CHECKS" == "null" ]]; then
+        printf "
+        ${RED}=================================================================================================================================
+        ${RED}                                                       VALIDATE APPROVERS
+        ${RED}=================================================================================================================================
+        Nesta etapa do pipenline é necessário algumas validações e aprovações para podermos entregarmos a sua aplicação no ambiente de destino.
+
+        Identificamos alguns problemas com seu pipeline nesta execução:
+        $(ALERT_MESSAGE_ARROW) Não foi configurado aprovadores para implantação do seu pipeline. É necessário incluir aprovadores e executar o
+        seu pipeline novamente. Caso não saiba como fazer isso entre em contato com sua liderança técnica.
+
+        Vamos guia-lo durante todas as fases do pipeline.
+        Caso tenha dúvidas sobre essa fase do pipeline acesse a nossa documentação: $(CORPORATE_WIKI_DOC_URL)
+        ${RED}=================================================================================================================================
+        "
+        exit 1
+    else
+        APPROVERS=$(cat $(Agent.TempDirectory)/approvers.json| jq '.dataProviders."ms.vss-build-web.checks-panel-data-provider"[].approvals[].steps[].assignedApprover.displayName')
+        printf "
+        ${GREEN}=================================================================================================================================
+        ${GREEN}                                                       VALIDATE APPROVERS
+        ${GREEN}=================================================================================================================================
+        Seu pipeline atende os critérios de implantação exigidos pelos Gates de Qualidade.
+
+        Para poder seguir com a sua implantação é necessário uma aprovação manual. Segue abaixo a lista de aprovadores configurados 
+        para o seu pipeline:
+
+        $APPROVERS
+
+        Vamos guia-lo durante todas as fases do pipeline.
+        Caso tenha dúvidas sobre essa fase do pipeline acesse a nossa documentação: $(CORPORATE_WIKI_DOC_URL)
+        ${GREEN}=================================================================================================================================
+        "
+        echo "##vso[task.setvariable variable=VAR_APPROVERS;]$APPROVERS";
+        exit 0;
+    fi    
+  displayName: Get Approvers
+  name: t_get_approvers

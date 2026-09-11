@@ -1,0 +1,102 @@
+parameters:
+- name: environment
+  displayName: Escolha o ambiente para publicar
+  type: string
+  default: dev
+  values:
+  - dev
+  - preprod
+  - prod
+
+- name: vivonow_chg
+  displayName: Numero CHG do VivoNow, somente para 'prod'
+  default: CHG0000001
+
+variables:
+- name: System.debug
+  value: "true"
+
+stages:
+- stage: stage_push_to_docker
+  displayName: Push to Docker (${{ parameters.environment }})
+  condition: eq('${{ parameters.environment }}', 'prod')
+  # pool: VivoAzureCloudSharedAgents
+  pool: 
+    name: DefaultDevopsAgents
+    demands:
+    - Agent.Name -equals BRTAZLTS0085CO.azagent004
+  jobs:
+  - job: job_retag_docker
+    continueOnError: False
+    displayName: Push to Docker (RELEASE)
+    steps:
+
+    - checkout: self
+      fetchDepth: 1
+
+    - task: XmlParseFromVivo@4
+      displayName: Get Main Info
+      name: pom_info
+      inputs:
+        type: 'file'
+        origin: pom.xml
+        jpaths: |
+          var POM_XML_VERSION = .project.version._text
+    
+    - task: YamlParseFromVivo@4
+      displayName: Get Metadata Info
+      name: catalog_info
+      inputs:
+        type: 'file'
+        origin: catalog-info.yaml
+        jpaths: |-
+          var CATALOG_YAML_NAME = .metadata.name
+          var CATALOG_YAML_ACRONYM = .metadata.annotations['techarch.governance-app.acronym']
+
+    - task: Docker@2
+      displayName: Docker Pull (SNAPSHOT)
+      name: docker_pull
+      inputs:
+        containerRegistry: ACR-DEVOPS
+        command: pull
+        arguments:
+          "\
+          acrsharedservices01.azurecr.io\
+          /$(CATALOG_YAML_ACRONYM)\
+          /$(CATALOG_YAML_NAME)\
+          :$(POM_XML_VERSION)-SNAPSHOT\
+          "
+
+    - task: Docker@2
+      displayName: Docker Tag to (RELEASE)
+      name: docker_tag
+      inputs:
+        containerRegistry: ACR-DEVOPS
+        command: tag
+        arguments: 
+          "\
+          acrsharedservices01.azurecr.io\
+          /$(CATALOG_YAML_ACRONYM)\
+          /$(CATALOG_YAML_NAME)\
+          :$(POM_XML_VERSION)-SNAPSHOT\
+          \ \
+          acrsharedservices01.azurecr.io\
+          /$(CATALOG_YAML_ACRONYM)\
+          /$(CATALOG_YAML_NAME)\
+          :$(POM_XML_VERSION)-RELEASE\
+          "
+
+    - task: Docker@2
+      displayName: Push to (Docker)
+      name: docker_push
+      condition: succeeded()
+      inputs:
+        containerRegistry: ACR-DEVOPS
+        command: push
+        arguments:
+          "\
+          acrsharedservices01.azurecr.io\
+          /$(CATALOG_YAML_ACRONYM)\
+          /$(CATALOG_YAML_NAME)\
+          :$(POM_XML_VERSION)-RELEASE\
+          "

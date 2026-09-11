@@ -1,0 +1,153 @@
+parameters:
+  - name: repositoryName
+    type: string
+    default: ""
+  - name: branchName
+    type: string
+    default: ""
+  - name: codeHealerPipelineName
+    type: string
+    default: ""
+  - name: codeHealerPipelineBranch
+    type: string
+    default: "master"
+  - name: codeHealerProject
+    type: string
+    default: ""
+  - name: scaFailedCondition
+    type: string
+    default: "failed()"
+  - name: dependsOn
+    type: string
+    default: ""
+  - name: minNodeVersion
+    type: string
+    default: "16"
+
+stages:
+  - stage: code_healer_sca
+    dependsOn: ${{ parameters.dependsOn }}
+    condition: ${{ parameters.scaFailedCondition }}
+    displayName: "Code-Healer SCA"
+    pool: $(PRIVATE_AGENT_DEFAULT)
+    jobs:
+      - job: validate_node_version
+        displayName: "Validate Node.js Minimum Version"
+        timeoutInMinutes: 5
+        steps:
+          - checkout: self
+            fetchDepth: 1
+
+          - task: CmdLine@2
+            displayName: "Check Node version"
+            name: check_version
+            inputs:
+              script: |
+                echo "##[section]#################### NODE VERSION CHECK (builder.Dockerfile) ####################"
+
+                DOCKERFILE="$(Build.SourcesDirectory)/.azuredevops/builder.Dockerfile"
+                MIN_VERSION="${MIN_NODE_VERSION}"
+
+                echo "##[debug] Min Node version required: ${MIN_VERSION}"
+                echo "##[debug] Dockerfile path: ${DOCKERFILE}"
+
+                if [ ! -f "$DOCKERFILE" ]; then
+                  echo "##vso[task.logissue type=warning]builder.Dockerfile not found at ${DOCKERFILE}. Skipping Code-Healer SCA."
+                  echo "##vso[task.setvariable variable=VERSION_OK;isOutput=true]false"
+                  exit 0
+                fi
+
+                FROM_LINE=$(grep -i "^FROM" "$DOCKERFILE" | head -1)
+                echo "##[debug] FROM line: ${FROM_LINE}"
+
+                NODE_VERSION_FULL=$(echo "$FROM_LINE" | grep -oP 'node[:/]\K[0-9]+(\.[0-9]+)*' | head -1)
+
+                if [ -z "$NODE_VERSION_FULL" ]; then
+                  echo "##vso[task.logissue type=warning]Could not extract Node.js version from builder.Dockerfile. Skipping Code-Healer SCA."
+                  echo "##[debug] FROM line was: ${FROM_LINE}"
+                  echo "##vso[task.setvariable variable=VERSION_OK;isOutput=true]false"
+                  exit 0
+                fi
+
+                PROJECT_MAJOR=$(echo "$NODE_VERSION_FULL" | cut -d'.' -f1)
+                MIN_MAJOR=$(echo "$MIN_VERSION" | sed 's/^v//' | cut -d'.' -f1)
+
+                echo "##[section]Detected Node.js version: ${NODE_VERSION_FULL} (major: ${PROJECT_MAJOR})"
+                echo "##[section]Minimum required major version: ${MIN_MAJOR}"
+
+                if [ "$PROJECT_MAJOR" -ge "$MIN_MAJOR" ] 2>/dev/null; then
+                  echo "##[section]Node.js version check PASSED (${PROJECT_MAJOR} >= ${MIN_MAJOR})"
+                  echo "##vso[task.setvariable variable=VERSION_OK;isOutput=true]true"
+                else
+                  echo "##vso[task.logissue type=warning]Service Node.js version (${NODE_VERSION_FULL}, major: ${PROJECT_MAJOR}) is below minimum required (${MIN_MAJOR}). Skipping Code-Healer SCA."
+                  echo "##vso[task.setvariable variable=VERSION_OK;isOutput=true]false"
+                fi
+            env:
+              MIN_NODE_VERSION: ${{ parameters.minNodeVersion }}
+
+      - job: trigger_code_healer
+        displayName: "Trigger Code-Healer SCA Pipeline"
+        dependsOn: validate_node_version
+        condition: and(succeeded(), eq(dependencies.validate_node_version.outputs['check_version.VERSION_OK'], 'true'))
+        timeoutInMinutes: 30
+        steps:
+          - task: CmdLine@2
+            displayName: "Install azure-devops CLI extension"
+            retryCountOnTaskFailure: 3
+            inputs:
+              script: |
+                echo "##[group]Install azure-devops extension"
+                az extension add --name azure-devops
+                echo "##[endgroup]"
+            env:
+              HTTP_PROXY: $(PROXY_AGENT_HTTP)
+              HTTPS_PROXY: $(PROXY_AGENT_HTTPS)
+              NO_PROXY: $(PROXY_AGENT_NO_PROXY)
+
+          - task: CmdLine@2
+            displayName: "Trigger Code-Healer SCA"
+            inputs:
+              script: |
+                echo "##[section]#################### CODE-HEALER SCA ####################"
+
+                PIPELINE_NAME="${CODE_HEALER_PIPELINE_NAME}"
+                PROJECT="${CODE_HEALER_PROJECT}"
+                ORG="https://dev.azure.com/telefonica-vivo-brasil"
+                BRANCH_NAME=$(echo "${SOURCE_BRANCH}" | sed 's/refs\/heads\///g')
+
+                echo "##[debug] Repository: ${REPOSITORY_NAME}"
+                echo "##[debug] Branch: ${BRANCH_NAME}"
+                echo "##[debug] Pipeline: ${PIPELINE_NAME}"
+                echo "##[debug] Project: ${PROJECT}"
+
+                if [ -z "$PIPELINE_NAME" ] || [ -z "$PROJECT" ]; then
+                  echo "##vso[task.logissue type=error]Pipeline name or project not configured for Code-Healer SCA."
+                  echo "##vso[task.complete result=Failed;]"
+                  exit 1
+                fi
+
+                RUN_ID=$(az pipelines run \
+                  --name "$PIPELINE_NAME" \
+                  --branch "$CODE_HEALER_PIPELINE_BRANCH" \
+                  --project "$PROJECT" \
+                  --org "$ORG" \
+                  --parameters repository="${REPOSITORY_NAME}" branch="${BRANCH_NAME}" \
+                  --query "id" -o tsv)
+
+                if [ -z "$RUN_ID" ]; then
+                  echo "##vso[task.logissue type=error]Failed to trigger Code-Healer SCA pipeline."
+                  echo "##vso[task.complete result=Failed;]"
+                  exit 1
+                fi
+
+                echo "##[section]Code-Healer SCA pipeline triggered successfully. RUN_ID: $RUN_ID"
+            env:
+              AZURE_DEVOPS_EXT_PAT: $(System.AccessToken)
+              CODE_HEALER_PIPELINE_NAME: ${{ parameters.codeHealerPipelineName }}
+              CODE_HEALER_PIPELINE_BRANCH: ${{ parameters.codeHealerPipelineBranch }}
+              CODE_HEALER_PROJECT: ${{ parameters.codeHealerProject }}
+              REPOSITORY_NAME: ${{ parameters.repositoryName }}
+              SOURCE_BRANCH: ${{ parameters.branchName }}
+              HTTP_PROXY: $(PROXY_AGENT_HTTP)
+              HTTPS_PROXY: $(PROXY_AGENT_HTTPS)
+              NO_PROXY: $(PROXY_AGENT_NO_PROXY)

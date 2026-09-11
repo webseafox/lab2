@@ -1,0 +1,79 @@
+parameters:
+  - name: webhookUrl
+  - name: environment
+  - name: podsStatus
+  - name: nodesStatus
+
+steps:
+  - task: CmdLine@2
+    displayName: "Send Message"
+    retryCountOnTaskFailure: "3"
+    continueOnError: true
+    inputs:
+      script: |
+        echo "##[debug] WEB_HOOK_URL................: ${{ parameters.webhookUrl }}"
+        echo "##[debug] ENVIRONMENT.................: ${{ parameters.environment }}"
+        echo "##[debug] PODS_STATUS.................: ${{ parameters.podsStatus }}"
+        echo "##[debug] NODES_STATUS................: ${{ parameters.nodesStatus }}"
+
+        NODES_STATS="##### **Node\'s Status:**\n"
+        IFS=';' read -ra ADDR <<< "${{ parameters.nodesStatus }}"
+        for log_line in "${ADDR[@]}"; do
+          IFS=',' read -ra ADDR <<< "${log_line}"
+          case "${ADDR[1]}" in
+            "Ready") NODES_STATS+="[✅] *${ADDR[0]}*     **Status:** *${ADDR[1]}*     **Age:** *${ADDR[2]}*     **Version:** *${ADDR[3]}*\n\n" ;;
+            *) NODES_STATS+="[🔴] *${ADDR[0]}*     **Status:** *${ADDR[1]}*     **Age:** *${ADDR[2]}*     **Version:** *${ADDR[3]}*\n\n" ;;
+          esac
+        done
+
+        PODS_STATS="##### **Pod\'s Status:**\n"
+        IFS=';' read -ra ADDR <<< "${{ parameters.podsStatus }}"
+        for log_line in "${ADDR[@]}"; do
+          IFS=',' read -ra ADDR <<< "${log_line}"
+          case "${ADDR[1]}" in
+            "Running") PODS_STATS+="[🔝] *${ADDR[0]}* **Status:** *${ADDR[1]}* **Age:** *${ADDR[2]}*\n\n" ;;
+            "Completed") PODS_STATS+="[✅] *${ADDR[0]}* **Status:** *${ADDR[1]}* **Age:** *${ADDR[2]}*\n\n" ;;
+            *) PODS_STATS+="[🔴] *${ADDR[0]}* **Status:** *${ADDR[1]}* **Age:** *${ADDR[2]}*\n\n" ;;
+          esac
+        done
+
+        # Start the "Send Message" group
+        echo "##[group]Send Message"
+        shopt -s nocasematch
+
+        # Define the JSON message to be sent
+        JSON_MESSAGE='{
+            "@type": "MessageCard",
+            "@context": "http://schema.org/extensions",
+            "themeColor": "0076D7",
+            "summary": "-",
+            "sections": [{
+                "activityTitle": "**Monitoring Environment [${{ parameters.environment }}]**",
+                "activitySubtitle": "Build $(Build.BuildNumber)",
+                "activityImage": "https://cdn-icons-png.flaticon.com/512/11331/11331268.png",
+                "markdown": true
+            },            
+            {
+                "startGroup": true,
+                "markdown": true,
+                "text": "'$NODES_STATS'"
+            },
+            {
+                "startGroup": true,
+                "markdown": true,
+                "text": "'$PODS_STATS'"
+            },
+            {
+                "markdown": true,
+                "text": "##### ***🔝 Running*** | ***✅ Completed*** | ***🔴 Error***"
+            },
+            ]
+        }'
+
+        # Send the message via curl
+        curl -v -X POST ${{ parameters.webhookUrl }} \
+          -H 'Content-Type: application/json; charset=utf-8' \
+          --data-binary @- << EOF
+          $JSON_MESSAGE
+        EOF
+        echo "##[endgroup]"

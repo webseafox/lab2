@@ -1,0 +1,59 @@
+parameters:
+  - name: KEYCLOAK_URL
+    type: string
+  - name: CLIENT_ID
+    type: string
+  - name: CLIENT_SECRET
+    type: string
+
+stages:
+  - stage: KeycloakAuth
+    displayName: "Keycloak Auth"
+    pool:
+      name: GeneralPurposeLinuxAgentsCI
+    dependsOn:
+      - PublishRelease
+    condition: succeeded()
+    jobs:
+      - job: GetKeycloakToken
+        displayName: "Get Keycloak Token"
+        steps:
+          - bash: |
+              if [ -z "$CLIENT_SECRET" ] || [ -z "$CLIENT_ID" ]; then
+                echo "##vso[task.logissue type=error;]Missing parameter \"CLIENT_SECRET\" or \"CLIENT_ID\""
+                echo "##vso[task.complete result=Failed;]"
+              fi
+            env:
+              CLIENT_SECRET: ${{ parameters.CLIENT_SECRET }}
+              CLIENT_ID: ${{ parameters.CLIENT_ID }}
+            displayName: Check for required parameters
+
+          - bash: |
+              response=$(curl --request POST \
+                    --url "${{parameters.KEYCLOAK_URL}}/protocol/openid-connect/token" \
+                    --header 'Content-Type: application/x-www-form-urlencoded' \
+                    --data grant_type=client_credentials \
+                    --data client_id=${{parameters.CLIENT_ID}} \
+                    --data client_secret=${{parameters.CLIENT_SECRET}} \
+                    -m 10 \
+                    -w "%{http_code}" \
+                    --silent --show-error)
+
+              http_code=${response: -3}
+              response_body=${response::-3}
+              token=$response_body
+
+              if [[ "$http_code" -ne 200 ]]; then
+                echo "Call to Keycloak API failed with status code $http_code"
+                echo "$token"
+                exit 1
+              fi
+
+              echo "##vso[task.setvariable variable=KEYCLOAK_TOKEN;isOutput=true]$token"
+            name: CallKeycloakApi
+            displayName: "Call Keycloak API"
+
+          - bash: |
+              echo $(CallKeycloakApi.KEYCLOAK_TOKEN)
+            name: PrintKeycloakToken
+            displayName: "debug - Print Keycloak Token"

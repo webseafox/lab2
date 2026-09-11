@@ -1,0 +1,79 @@
+parameters:
+  - name: config
+    type: object
+  - name: iacParameters
+    type: object
+
+variables:
+  - template: ../../global/variables/load.yml
+    parameters:
+      iacParameters: ${{ parameters.iacParameters }}
+  - template: variables/load.yml
+    parameters:
+      config: ${{ parameters.config }}
+      iacParameters: ${{ parameters.iacParameters }}
+
+resources:
+  repositories:
+    - repository: CorePipelines
+      name: DevOps/Vivo.Core.Pipelines
+      type: git
+      ref: refs/heads/master
+      endpoint: CorePipelines
+
+stages:  
+  - ${{ if eq(variables['Build.Reason'], 'Schedule') }}:
+    - stage: orchestrator
+      displayName: "Orchestrator"
+      condition: eq(variables['SCHEDULE_ENABLED'], 'true')
+      pool: $(POOL)
+      jobs:
+        - job: analyzeSchedule
+          displayName: "Analyze Schedule"
+          steps:
+            - checkout: none
+            - script: echo "##vso[build.addbuildtag]Scheduled"
+              displayName: 'Adding the Scheduled TAG to the build'
+            - template: /tech_products/brm-fenix/tasks/iac/schedule_analyze.yml
+              parameters:
+                envSchedule: $(SCHEDULE_ENVIRONMENT)
+
+        - job: triggerPipeline
+          displayName: "Trigger - "
+          dependsOn: analyzeSchedule
+          condition: eq(dependencies.analyzeSchedule.outputs['schedule_analyze.SCHEDULE_MATCHED'], 'true')
+          strategy:
+            matrix: $[ dependencies.analyzeSchedule.outputs['schedule_analyze.SCHEDULE_MATRIX_JSON'] ]
+          steps:
+            - checkout: none
+            - template: /tech_products/brm-fenix/task_groups/cd/trigger.yml
+              parameters:
+                pipelineName: "[[DEVELOPMENT]] IaC - Environment [Schedule]"
+                branch: $(Build.SourceBranchName)
+                params: >
+                  {
+                    "action": "$(ACTION)",
+                    "environment": "$(ENV)",
+                    "numberAffectedNodes": "${{ parameters.iacParameters.numberAffectedNodes }}",
+                    "isTriggered": "true",
+                  }
+
+  - ${{ if eq(variables['Build.Reason'], 'Manual') }}:
+    - template: stages/pipeline_initialization.yml
+      parameters:
+        iacParameters: ${{ parameters.iacParameters }}
+    
+    - template: stages/run.yml
+      parameters:
+        iacParameters: ${{ parameters.iacParameters }}
+
+    - template: stages/finish.yml
+      parameters:
+        iacParameters: ${{ parameters.iacParameters }}
+            
+    # - ${{ if and(eq(parameters.iacParameters.action, 'START'), eq(parameters.iacParameters.target, 'environment')) }}:
+    #   - template: stages/trigger_qa.yml
+    #     parameters:
+    #       iacParameters: ${{ parameters.iacParameters }}
+    
+

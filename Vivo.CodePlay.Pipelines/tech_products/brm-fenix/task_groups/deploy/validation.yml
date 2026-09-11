@@ -1,0 +1,130 @@
+# This YAML file contains the deployment validation steps for a specific application.
+# It includes tasks such as downloading pipeline artifacts, checking for errors, executing SSH commands, validating Helm releases, and checking job status.
+
+parameters:
+- name: deployLogFile # The name of the deployment log file.
+- name: applicationName # The name of the application being deployed.
+- name: continueOnError # Whether to continue on error during the deployment process.
+- name: enableHelmReleaseValidate
+  default: true
+
+steps:
+- script: |
+    echo "##[debug] deployLogFile..............................................: ${{ parameters.deployLogFile }}"
+    echo "##[debug] applicationName............................................: ${{ parameters.applicationName }}"
+    echo "##[debug] enableHelmReleaseValidate..................................: ${{ parameters.enableHelmReleaseValidate }}"
+    echo "##[debug] continueOnError............................................: ${{ parameters.continueOnError }}"
+  displayName: 'Show Parameters'
+
+- template: ../../task_groups/artifact/download.yml
+  parameters:
+    displayName: Download Pipeline Artifact [${{ parameters.deployLogFile }}]
+    artifactName: ${{ parameters.deployLogFile }}
+    targetPath: $(Agent.BuildDirectory)/${{ parameters.deployLogFile }}
+
+# This step checks for errors during the deployment process.
+- template: ../../tasks/bash/check_errors_v2.yml
+  parameters:
+    step: 'Deploy'
+    outputFile: $(Agent.BuildDirectory)/${{ parameters.deployLogFile }}/${{ parameters.deployLogFile }}.txt
+    continueOnError: ${{ parameters.continueOnError }}
+
+- ${{ if in(parameters.applicationName, 'db-upgrade', 'pricing-design-center') }}:
+  - template: ../../tasks/ssh/get_job_logs.yml
+    parameters:
+      sshEndpoint: BRM_BASTION_$(ENVIRONMENT)
+      ${{ if eq(parameters.applicationName, 'db-upgrade') }}:
+        jobPodName: config-jobs
+        imageName: config_jobs_tlf
+      ${{ if eq(parameters.applicationName, 'pricing-design-center') }}:
+        jobPodName: pdc-import-export-job
+  # This template creates a log file containing the 'config-jobs' logs.
+  - template: ../../tasks/bash/create_logs_file.yml
+    parameters:
+      inputVariableLogs: "$(JOB_LOGS) $(JOB_LOGS_2) $(JOB_LOGS_3) $(JOB_LOGS_4) $(JOB_LOGS_5) $(JOB_LOGS_6) $(JOB_LOGS_7) $(JOB_LOGS_8) $(JOB_LOGS_9) $(JOB_LOGS_10)"
+      logsFileOutput: $(Agent.BuildDirectory)/logs.txt
+  # This template checks for errors in the 'config-jobs' logs.
+  - template: ../../tasks/bash/check_errors_v2.yml
+    parameters:
+      ${{ if eq(parameters.applicationName, 'db-upgrade') }}:
+        step: config-jobs
+      ${{ if eq(parameters.applicationName, 'pricing-design-center') }}:
+        step: pdc-import-export-job
+      outputFile: $(Agent.BuildDirectory)/logs.txt
+      continueOnError: ${{ parameters.continueOnError }}
+
+- ${{ if and(eq(parameters.enableHelmReleaseValidate, 'true'), ne(parameters.applicationName, 'bi-publisher-reports')) }}:
+  # This task executes SSH commands to get the status of Helm releases.
+  - task: SSH@0
+    name: helm_status
+    displayName: "Helm Releases Get Status"
+    inputs:
+      sshEndpoint: BRM_BASTION_$(ENVIRONMENT)
+      runOptions: 'inline'
+      inline: |
+        RELEASE_VERSION="$(BRM_CORE_RELEASE_VERSION)"
+        REL_NAMESPACE="brm${RELEASE_VERSION}-apps"
+
+        # Run the 'helm ls' command to get the status of Helm releases and save the output to 'helm_status.txt'.
+        echo "##[debug] BRM_CORE_RELEASE_VERSION....................................: ${RELEASE_VERSION}"
+        echo "##[debug] HELM_RELEASE_NAMESPACE......................................: ${REL_NAMESPACE}"
+        echo "##[command]helm ls -n ${REL_NAMESPACE} | grep -E '$(HELM_RELEASE_TO_VALIDATION)' |& tee helm_status.txt"
+        helm ls -n ${REL_NAMESPACE} | grep -E '$(HELM_RELEASE_TO_VALIDATION)' |& tee helm_status.txt
+
+        # Read the 'helm_status.txt' file line by line and store the status in the 'HELM_RELEASES_STATUS' variable.
+        HELM_RELEASES_STATUS=""
+        while IFS= read -r line || [[ -n "$line" ]]; do
+          if [ "${#HELM_RELEASES_STATUS}" -gt 0 ]; then
+            HELM_RELEASES_STATUS+=";$line"
+          else
+            HELM_RELEASES_STATUS+="$line"
+          fi
+        done < helm_status.txt
+
+        # Set the 'HELM_RELEASES_STATUS' variable as a pipeline variable.
+        echo "##vso[task.setvariable variable=HELM_RELEASES_STATUS;]$HELM_RELEASES_STATUS"
+      readyTimeout: '20000'
+      failOnStdErr: false
+
+  # This template creates a log file containing the Helm releases status.
+  - template: ../../tasks/bash/create_logs_file.yml
+    parameters:
+      inputVariableLogs: $(HELM_RELEASES_STATUS)
+      logsFileOutput: $(Agent.BuildDirectory)/helm_list.txt
+
+  - task: CmdLine@2
+    name: helm_releases_validate
+    displayName: "Helm Releases Validate"
+    continueOnError: ${{ parameters.continueOnError }}
+    inputs:
+      script: |
+        RELEASE_VERSION="$(BRM_CORE_RELEASE_VERSION)"
+        REL_NAME="brm${RELEASE_VERSION}-apps"
+        printf "##[debug] BRM CORE RELEASE VERSION...............................................: ${RELEASE_VERSION}\n"
+        printf "##[debug] HELM RELEASE NAMESPACE.................................................: ${REL_NAME}\n"
+        printf "##[debug] HELM RELEASE VALIDATED.................................................: $(HELM_RELEASE_TO_VALIDATION)\n"
+
+        FAILED_RELEASE=""
+
+        # Read the 'helm_list.txt' file line by line and check if any Helm release has failed.
+        while IFS= read -r linha || [[ -n "$linha" ]]; do
+          if [[ $linha == *"$REL_NAME"* ]]; then
+            aux=$( echo "$linha" | awk '{print $1, $8}' )
+            if [[ $aux != *"deployed"* ]]; then
+              FAILED_RELEASE=$( echo "$aux" | awk '{print $1}' )
+              echo "!!!!! Helm release $FAILED_RELEASE FAILED !!!!!"
+
+              release_failed=true
+            fi
+          fi
+        done < $(Agent.BuildDirectory)/helm_list.txt
+
+        # If any Helm release has failed, log an error and mark the deployment as failed. Otherwise, mark it as successful.
+        if [[ $release_failed == "true" ]]; then
+          echo "##vso[task.logissue type=error;]Release Deployment FAILED for $FAILED_RELEASE !!"
+          echo "##vso[task.complete result=Failed;]"
+
+          exit 1 
+        else
+          echo ">>>>> Release $(HELM_RELEASE_TO_VALIDATION) deployed SUCCESSFULLY !! <<<<<"
+        fi

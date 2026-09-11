@@ -1,0 +1,159 @@
+parameters:
+  environment: ''
+
+jobs:
+- deployment: deployment
+  pool: GeneralPurposeLinuxAgentsCD
+  continueOnError: false
+  environment: 
+    name: deploy-${{ parameters.environment }}
+  strategy:
+    runOnce:   
+      deploy:
+        steps:
+        - checkout: self
+          persistCredentials: true
+        - template: /tech_products/azr4/templates/steps/get_latest_version.yaml
+        - task: Bash@3
+          name: deploy
+          displayName: 'Deploy'
+          continueOnError: false
+          env:
+            NEW_VERSION: $(get_version.VERSION)
+            CLIENT_ID: $(AZURE_CLIENT_ID)
+            CLIENT_SECRET: $(AZURE_CLIENT_SECRET)
+            TENANT_ID: $(AZURE_TENANT_ID)
+            MULTI_CONTAINERAPP: $(MULTI_CONTAINERAPP)
+            SUBSCRIPTION: $(AZURE_SUBSCRIPTION)
+            BRANCH_NAME: $(Build.SourceBranchName)
+            CONTAINER_APP_NAME: $(CONTAINER_APP_NAME)
+            ENVIRONMENT: ${{ parameters.environment }}
+          inputs:
+            targetType: inline
+            script: |
+              #!/bin/bash
+              set -e
+
+              update_image() {
+                local manifest
+                local type
+                local image
+                local image_name
+                local last_version
+                local new_image
+                local manifest_path="$1"
+                # Ler o arquivo YAML
+                echo "##[debug] Reading manifest file: $manifest_path"
+                manifest=$(yq e '.' "$manifest_path")
+          
+                # Extrair a info do containerAPP
+                type=$(echo "$manifest" | yq e '.type' -)
+                if [ "$type" == "Microsoft.App/jobs" ]; then
+                  export CONTAINER_APP_TYPE="job"
+                fi
+          
+                image=$(echo "$manifest" | yq e '.properties.template.containers[0].image' -)
+                image_name=$(echo "$image" | cut -d':' -f1)
+                last_version=$(echo "$image" | cut -d':' -f2)
+          
+                # Definir a última versão como variável de ambiente
+                export LAST_VERSION="$last_version"
+                echo "##[debug] Old version: $LAST_VERSION, New Version: $NEW_VERSION"
+          
+                # Atualizar a imagem do contêiner com a nova versão
+                new_image="${image_name}:${NEW_VERSION}"
+                manifest=$(echo "$manifest" | yq e ".properties.template.containers[0].image = \"$new_image\"" -)
+          
+                # Escrever o arquivo YAML atualizado
+                echo "$manifest" | yq e -P - > "$manifest_path"
+                cat "$manifest_path"
+              }
+
+              echo "##[debug] Starting deployment environment ${ENVIRONMENT}, version ${NEW_VERSION}, multi-containerapp $MULTI_CONTAINERAPP"
+              AZURE_FOLDER="azure/${ENVIRONMENT}"
+              CONTAINER_APP_TYPE=""
+
+              echo "##[debug] Starting deploy - ${ENVIRONMENT} ${CONTAINER_APP_TYPE}"
+              echo "##[debug] Logging in to Azure CLIENT_ID: ${CLIENT_ID}, TENANT_ID: ${TENANT_ID}, SUBSCRIPTION: ${SUBSCRIPTION}"
+              az login --service-principal --username ${CLIENT_ID} \
+                --password ${CLIENT_SECRET} --tenant ${TENANT_ID}
+              az account set --subscription "${SUBSCRIPTION}" 
+              echo "##[debug] Logging succeeded"
+              if [ "$MULTI_CONTAINERAPP" == "true" ]; then
+                  CONTAINERAPP_LIST=($(ls "$AZURE_FOLDER" | sed -e 's/\.[^.]*$//'))
+              else
+                CONTAINERAPP_LIST="${CONTAINER_APP_NAME}"
+              fi
+              echo "##[debug] ContainerApp list resolved: ${CONTAINERAPP_LIST[@]}"
+              for CONTAINERAPP in "${CONTAINERAPP_LIST[@]}"; do
+                echo "##[debug] Processing unit '$CONTAINERAPP' (multi=$MULTI_CONTAINERAPP)"
+                if [ "$MULTI_CONTAINERAPP" == "true" ]; then
+                  CONTAINERAPP_PATH="${AZURE_FOLDER}/${CONTAINERAPP}.yaml"
+                  update_image "${CONTAINERAPP_PATH}"
+                else
+                  CONTAINERAPP_PATH="${AZURE_FOLDER}.yaml"
+                  update_image "${CONTAINERAPP_PATH}"
+                fi
+                echo "##[debug] Updated manifest image version in ${CONTAINERAPP_PATH}"
+                CONAPP_ID=$(yq e '.id' ${CONTAINERAPP_PATH})
+                echo "##[debug] Using yaml manifest - ${CONTAINERAPP_PATH}"
+                # Verifica se o recurso (Container App ou Job) existe; se não existir, cria.
+                if az resource show --ids "${CONAPP_ID}" &> /dev/null; then
+                  echo "##[debug] Resource exists. Updating ${CONAPP_ID}"
+                  echo "##[command] az containerapp ${CONTAINER_APP_TYPE} update --ids ${CONAPP_ID} --yaml ${CONTAINERAPP_PATH}"
+                  az containerapp ${CONTAINER_APP_TYPE} update --ids ${CONAPP_ID} --yaml ${CONTAINERAPP_PATH}
+                  if [ $? -ne 0 ]; then
+                    echo "##vso[task.logissue type=error;] Failed to update resource from ${CONTAINERAPP_PATH}"
+                    echo "##vso[task.complete result=Failed;]"
+                    exit 1
+                  fi
+                else
+                  echo "##[debug] Resource NOT found. Creating from manifest ${CONTAINERAPP_PATH}"
+                  # Extrair resource group e nome do ID
+                  RESOURCE_GROUP=$(echo "$CONAPP_ID" | awk -F'/' '{for(i=1;i<=NF;i++){if($i=="resourceGroups"){print $(i+1); exit}}}')
+                  APP_NAME=$(echo "$CONAPP_ID" | awk -F'/' '{print $NF}')
+                  if [ -z "$RESOURCE_GROUP" ] || [ -z "$APP_NAME" ]; then
+                    echo "##vso[task.logissue type=error;] Unable to parse resource group or app name from ID: $CONAPP_ID"
+                    echo "##vso[task.complete result=Failed;]"
+                    exit 1
+                  fi
+                  echo "##[debug] Parsed RESOURCE_GROUP=$RESOURCE_GROUP APP_NAME=$APP_NAME"
+                  # create não aceita --ids; passamos nome e resource group explicitamente
+                  if [ "$CONTAINER_APP_TYPE" == "job" ]; then
+                    echo "##[command] az containerapp job create --name $APP_NAME --resource-group $RESOURCE_GROUP --yaml ${CONTAINERAPP_PATH}"
+                    az containerapp job create --name "$APP_NAME" --resource-group "$RESOURCE_GROUP" --yaml ${CONTAINERAPP_PATH}
+                  else
+                    echo "##[command] az containerapp create --name $APP_NAME --resource-group $RESOURCE_GROUP --yaml ${CONTAINERAPP_PATH}"
+                    az containerapp create --name "$APP_NAME" --resource-group "$RESOURCE_GROUP" --yaml ${CONTAINERAPP_PATH}
+                  fi
+                  if [ $? -ne 0 ]; then
+                    echo "##vso[task.logissue type=error;] Failed to create resource from ${CONTAINERAPP_PATH}"
+                    echo "##vso[task.complete result=Failed;]"
+                    exit 1
+                  fi
+                  echo "##[debug] Create command finished for $APP_NAME (rg=$RESOURCE_GROUP)"
+                fi
+                echo "##[debug] Finished processing '$CONTAINERAPP'"
+              done
+
+              ## Atualizar o arquivo de versão
+              git config user.email "azuredevops@telefonica.com"
+              git config user.name "Azure DevOps"
+              git branch -a
+              git fetch --all
+              git checkout ${BRANCH_NAME}
+              git pull
+              git add azure/
+              if [ -z "$(git status --porcelain)" ]; then
+              echo "##[debug] No changes to commit, project is up to date"
+              exit 0
+              fi
+              git commit -m "[CI SKIP] Update Version '${LAST_VERSION} -> ${NEW_VERSION}'" --author="$BUILD_REQUESTEDFOR <$BUILD_REQUESTEDFOREMAIL>"      
+              git status
+              echo "##[command] git push origin ${BRANCH_NAME}"
+              git push origin ${BRANCH_NAME}
+              if [ $? -ne 0 ]; then 
+                echo "##vso[task.logissue type=error;] Git push failed. Permission denied"
+                echo "##vso[task.complete result=Failed;]"
+                exit 1
+              fi  

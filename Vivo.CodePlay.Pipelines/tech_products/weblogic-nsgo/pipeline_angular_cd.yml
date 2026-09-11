@@ -1,0 +1,185 @@
+parameters:
+- name: qa_environment
+  type: string
+  default: 'hml'
+- name: DEFAULT_WORKDIR_ARTIFACTS
+  default: "$(System.ArtifactsDirectory)/extracted_tars/app"
+- name: JAVA_DIRECTORY
+- name: JAVA_PACKAGE_DEFINITION
+- name: JAVA_PACKAGE_FILE
+- name: JAVA_PACKAGE_VERSION
+- name: PACKAGE_FEED
+- name: PACKAGE_VIEW
+- name: WEBLOGIC_MIDDLEWARE_HOME
+- name: WEBLOGIC_PACKAGE_DEFINITION
+- name: WEBLOGIC_PACKAGE_FILE
+- name: WEBLOGIC_PACKAGE_VERSION
+- name: WEBLOGIC_VERSION
+- name: WEBLOGIC_CLUSTER_NAME
+- name: WEBLOGIC_CLUSTER_SERVERS
+- name: WEBLOGIC_PASSWORD
+- name: WEBLOGIC_URL
+- name: WEBLOGIC_USER
+- name: VERSION
+
+resources:
+  repositories:
+  - repository: FortifyExclusion
+    name: DevOps/Vivo.Fortify.Exclusions
+    type: git
+    ref: refs/heads/master
+    endpoint: CorePipelines
+  - repository: CorePipelines
+    name: DevOps/Vivo.Core.Pipelines
+    type: git
+    ref: refs/tags/latest
+    endpoint: CorePipelines
+
+stages:
+- stage: download_${{ parameters.qa_environment }}
+  displayName:  "Deploy on ${{ parameters.qa_environment }}"
+  pool: $(PRIVATE_AGENT_SHARED)
+  jobs:
+  - job: DeployJob_${{ parameters.qa_environment }}
+    workspace:
+      clean: all
+    displayName: "Deploy on ${{ parameters.qa_environment }}"
+    steps:
+    - download: none 
+    - checkout: self 
+
+    - task: DownloadPackage@1
+      displayName: 'Download Oracle JDK-8'
+      inputs:
+        packageType: 'upack'
+        feed: ${{ parameters.PACKAGE_FEED }}
+        view: ${{ parameters.PACKAGE_VIEW }}
+        definition: ${{ parameters.JAVA_PACKAGE_DEFINITION }}
+        version: ${{ parameters.JAVA_PACKAGE_VERSION }}
+        downloadPath: '$(System.ArtifactsDirectory)'
+
+    - task: JavaToolInstaller@0
+      displayName: 'Use Java 8'
+      inputs:
+        versionSpec: 8
+        jdkArchitectureOption: x64
+        jdkSourceOption: LocalDirectory
+        jdkFile: '$(System.ArtifactsDirectory)/${{ parameters.JAVA_PACKAGE_FILE }}'
+        jdkDestinationDirectory: '$(System.ArtifactsDirectory)/java'
+        createExtractDirectory: false
+
+    - task: DownloadPackage@1
+      displayName: 'Download Oracle Weblogic 12.2.1-3-0'
+      inputs:
+        packageType: 'upack'
+        feed: ${{ parameters.PACKAGE_FEED }}
+        view: ${{ parameters.PACKAGE_VIEW }}
+        definition: ${{ parameters.WEBLOGIC_PACKAGE_DEFINITION }}
+        version: ${{ parameters.WEBLOGIC_PACKAGE_VERSION }}
+        downloadPath: '$(System.ArtifactsDirectory)'
+
+    - task: ExtractFiles@1        
+      displayName: 'Extract Oracle Weblogic'
+      inputs:
+        archiveFilePatterns: '$(System.ArtifactsDirectory)/${{ parameters.WEBLOGIC_PACKAGE_FILE }}'
+        destinationFolder: '$(System.ArtifactsDirectory)/oracle'
+        cleanDestinationFolder: false
+        overwriteExistingFiles: true
+
+    - task: AzureKeyVault@2
+      displayName: 'Getting AKV Credentials'
+      timeoutInMinutes: 1
+      retryCountOnTaskFailure: 5
+      inputs:
+        azureSubscription: 'DevOpsSharedResources'
+        KeyVaultName: 'kv-azdevops-shared'
+        SecretsFilter: 'NEXUS-DEPS-USR, NEXUS-DEPS-PSW, NEXUS-DEFAULT-USR, NEXUS-DEFAULT-PSW'
+
+    - task: Bash@3
+      name: list_artifacts_in_nexus
+      inputs:
+        targetType: 'inline'
+        script: |
+            echo "Fetching all available versions of 'novo-sgoe-portal' from Nexus..."  
+            # Fazer o request para buscar todos os artefatos
+            ALL_ARTIFACTS=$(curl -s -u $(NEXUS-DEFAULT-USR):$(NEXUS-DEFAULT-PSW) \
+            'https://nexus.telefonica.com.br/service/rest/v1/search?repository=sgoe-frontend-npm' | \
+            jq -r '.items | map({version: .version, downloadUrl: .assets[].downloadUrl})')
+            # Exibir todos os artefatos encontrados
+            echo "Available artifacts: "
+            echo "$ALL_ARTIFACTS"
+      
+            if [ -z "$ALL_ARTIFACTS" ]; then
+              echo "No artifacts found in the repository."
+            fi
+      displayName: List all artifacts in Nexus
+
+    - task: Bash@3
+      name: get_latest_version_and_download
+      inputs:
+        targetType: 'inline'
+        script: |
+          if [ -z "${{ parameters.VERSION }}" ]; then
+            echo "Fetching latest version..."
+            SELECTED_VERSION=$(curl -s -u $(NEXUS-DEFAULT-USR):$(NEXUS-DEFAULT-PSW) \
+            'https://nexus.telefonica.com.br/service/rest/v1/search?repository=sgoe-frontend-npm&name=novo-sgoe-portal' | \
+            jq -r '.items | map(.version) | sort_by(split(".") | map(tonumber)) | last')
+            echo "Version: $SELECTED_VERSION"
+          else
+            SELECTED_VERSION=${{ parameters.VERSION }}
+            echo "Specific version provided: $SELECTED_VERSION"
+          fi
+          ARTIFACT_URL="https://nexus.telefonica.com.br/repository/sgoe-frontend-npm/novo-sgoe-portal/-/novo-sgoe-portal-$SELECTED_VERSION.tgz"
+          echo "Downloading artifact from: $ARTIFACT_URL"
+          curl -L -u $(NEXUS-DEFAULT-USR):$(NEXUS-DEFAULT-PSW) "$ARTIFACT_URL" -o $(System.ArtifactsDirectory)/novo-sgoe-portal-$SELECTED_VERSION.tgz
+          echo "Download of artifact sgoe-$SELECTED_VERSION.tgz completed."
+          cd $(System.ArtifactsDirectory)
+          ARTIFACT_PATH=$(ls -t $(System.ArtifactsDirectory)/*.tgz | head -n 1)
+          ARTIFACT_NAME=$(basename $ARTIFACT_PATH)
+          echo "##vso[task.setvariable variable=ARTIFACT_NAME]$ARTIFACT_NAME"
+          echo "##vso[task.setvariable variable=ARTIFACT_PATH]$ARTIFACT_PATH"
+          echo "Artifact name: $ARTIFACT_NAME"
+          echo "Directory: $ARTIFACT_PATH"
+          ls -lah
+      displayName: Get latest version and download from Nexus
+
+    - task: Bash@3
+      displayName: Undeploy Application
+      continueOnError: true
+      inputs:
+        targetType: inline
+        script: | 
+          echo "##[debug]Undeploying..."
+          ls -alh .azuredevops/scripts/undeployApp.py
+          $(System.ArtifactsDirectory)/${{ parameters.WEBLOGIC_MIDDLEWARE_HOME }}/oracle_common/common/bin/wlst.sh .azuredevops/scripts/undeployApp.py ${{ parameters.WEBLOGIC_USER }} ${{ parameters.WEBLOGIC_PASSWORD }} ${{ parameters.WEBLOGIC_URL }} "novo-sgoe-portal" ${{ parameters.WEBLOGIC_CLUSTER_NAME }}
+      env:
+        HTTPS_PROXY: "http://10.240.58.39:3128"
+
+    - task: ExtractFiles@1
+      displayName: 'Extract .tgz'
+      inputs:
+        archiveFilePatterns: '$(System.ArtifactsDirectory)/$(ARTIFACT_NAME)'
+        destinationFolder: '$(System.ArtifactsDirectory)/bin'
+        cleanDestinationFolder: false
+
+    - task: Bash@3
+      displayName: Convert File to .war
+      inputs:
+        targetType: 'inline'
+        script: |
+          echo "test .tgz file..."
+          cd $(System.ArtifactsDirectory)
+          ls -lah;pwd
+          ls -lah bin/package/novo-sgoe-portal
+          jar -cvf novo-sgoe-portal.war -C bin/package/novo-sgoe-portal .
+          ls -lah;pwd
+
+    - task: Bash@3
+      displayName: Deploy Application
+      inputs:
+        targetType: inline
+        script: | 
+          echo "##[debug]Deploying..."
+          $(System.ArtifactsDirectory)/${{ parameters.WEBLOGIC_MIDDLEWARE_HOME }}/oracle_common/common/bin/wlst.sh .azuredevops/scripts/deployApp.py ${{ parameters.WEBLOGIC_USER }} ${{ parameters.WEBLOGIC_PASSWORD }} ${{ parameters.WEBLOGIC_URL }} novo-sgoe-portal" (v_${{ parameters.VERSION }})" $(System.ArtifactsDirectory)/novo-sgoe-portal.war ${{ parameters.WEBLOGIC_CLUSTER_NAME }}
+      env:
+        HTTPS_PROXY: "http://10.240.58.39:3128"

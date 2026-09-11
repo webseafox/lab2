@@ -1,0 +1,68 @@
+parameters:
+- name: environment
+  type: string
+- name: gitTag
+- name: incrementLevel
+  default: patch    
+
+stages:
+- stage: Publish
+  displayName: Check & Publish
+  variables:
+  - name: LIB_CURRENT_VERSION
+    value: $[ stageDependencies.version.bump_version.outputs['export_current_version.LIB_VERSION'] ]
+  - name: LIB_NEW_VERSION
+    value: $[ stageDependencies.version.bump_version.outputs['component_bump_version.LIB_NEW_VERSION'] ]
+  dependsOn:
+    - version
+    - security
+    - gate
+  pool: $(PRIVATE_AGENT_DEFAULT)
+  jobs:
+    - job: npm_check_publish
+      displayName: "Check"
+      steps:
+      - template: /tasks/catalog_info/extract_variables.yml
+        parameters:
+            workingDirectory: $(Build.SourcesDirectory)
+      - task: DownloadPipelineArtifact@2
+        inputs:
+          downloadPath: '$(System.ArtifactsDirectory)/myArtifact'
+      - task: ExtractFiles@1
+        displayName: Extract App Files
+        inputs:
+          archiveFilePatterns: '$(System.ArtifactsDirectory)/myArtifact/app/app.tar' ## obter nome via parametros
+          destinationFolder: '$(System.DefaultWorkingDirectory)/app'
+      - template: /tasks/nodejs/update_repo_version.yml
+        parameters:
+          newVersion: "$(LIB_NEW_VERSION)"
+          condition: eq(variables.BUMP_VERSION_ENABLED, true)
+
+    - deployment: publish
+      condition: succeeded()
+      dependsOn:
+        - npm_check_publish
+      workspace:
+        clean: all     
+      environment: ${{ parameters.environment }}
+      displayName: Publish Library
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+              - download: none
+              - template: /task_groups/publish/npm_lib_publish.yml
+          on:
+            success:
+              steps:
+                - template: /provisioners/app/trunkbased/nodejs/lib_custom/steps/publish/success.yml
+                  parameters:
+                    gitTag: ${{parameters.gitTag}}                    
+                    currentVersion: $(LIB_CURRENT_VERSION)
+                    newVersion: $(LIB_NEW_VERSION)
+                    incrementLevel: ${{ parameters.incrementLevel }}
+                - template: /tasks/telemetry/telemetry.yml                
+            failure:
+              steps:
+                - template: /provisioners/app/trunkbased/nodejs/lib_custom/steps/publish/failure.yml
+                - template: /tasks/telemetry/telemetry.yml

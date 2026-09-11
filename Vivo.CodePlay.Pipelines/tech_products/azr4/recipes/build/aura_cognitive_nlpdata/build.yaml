@@ -1,0 +1,452 @@
+jobs:
+  - job: NlpDataPipeline
+    displayName: 'Cognitive NLP Data Pipeline'
+    pool: 'GeneralPurposeLinuxAgentsCI'
+    timeoutInMinutes: 480
+    container:
+      image: auraregistrybr.azurecr.io/aura-cognitive/base:1.0.11
+      endpoint: auraregistrybr
+    steps:
+      # Ensure repository is checked out with credentials for git push
+      - checkout: self
+        persistCredentials: true
+        fetchDepth: 2
+        displayName: 'Checkout repository (with credentials)'
+
+      # Download secure files first
+      - task: DownloadSecureFile@1
+        name: pipconf
+        inputs:
+          secureFile: 'aura-pip-conf'
+
+      - task: DownloadSecureFile@1
+        name: pypirc
+        inputs:
+          secureFile: 'aura-pypi-conf'
+
+      # Copy secure files to proper locations
+      - script: |
+          mkdir -p ~/.config/pip
+          cp "$(pipconf.secureFilePath)" ~/.config/pip/pip.conf
+          cp "$(pypirc.secureFilePath)" ~/.pypirc
+          echo "Installed pip.conf and .pypirc"
+        displayName: 'Configure pip and twine authentication'
+
+      - task: DownloadSecureFile@1
+        name: envFile
+        inputs:
+          secureFile: 'nlpdata-pre-env'
+
+      - bash: |
+          while IFS='=' read -r key value; do
+            if [[ "$key" == "CLU_SUBSCRIPTION_KEYS" || "$key" == "CLU_STORAGE_SUBSCRIPTION_KEYS" ]]; then
+              echo "Skipping $key (using value from variable group)"
+              continue
+            fi
+            echo "##vso[task.setvariable variable=$key]$value"
+          done < "$(envFile.secureFilePath)"
+        displayName: "Load variables"
+
+      # 1. Env Variables
+      - bash: |
+          echo "##[group]Compute derived variables"
+          echo "BUILD_REASON=$BUILD_REASON"
+          echo "IS_PR=FALSE" >> $(Build.Repository.LocalPath)/.env.sh
+          echo "MERGED_BRANCH=${BUILD_SOURCEBRANCHNAME}" >> $(Build.Repository.LocalPath)/.env.sh
+          echo "##[endgroup]"
+          cat $(Build.Repository.LocalPath)/.env.sh
+        displayName: 'Set environment variables'
+      
+      - script: git --version
+
+      # 2. Send URL to PR (non-PR only)
+      - ${{ if ne(variables['Build.Reason'], 'PullRequest') }}:
+        - template: /tech_products/azr4/templates/nlp/sendPRComment.yml
+          parameters:
+            organization: 'Telefonica'
+            title: 'Generating package for $(REPO_NAME)'
+            body: 'Pipeline generating package NLP url: $(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)'
+
+      # 3. Check Version
+      - template: /tech_products/azr4/templates/nlp/checkVersion.yml
+        parameters:
+          branchType: '$(Build.SourceBranchName)'
+
+      # 4. Create Virtualenv
+      - template: /tech_products/azr4/templates/nlp/createVirtualenv.yml
+        parameters:
+          pipConfFilePath: '$(pipConfFile.secureFilePath)'
+          pypiConfFilePath: '$(pypircFile.secureFilePath)'
+          auraCogLibVersion: '2.0.1'
+          auraCogCiRepo: 'https://dev.azure.com/telefonica-vivo-brasil/QPRK%20-%204P%20AURA%20WHATSAPP%20FACEBOOK/_git/aura-cognitive-ci'
+
+      # 5. Configure Nlpdata Tools (non-PR only)
+      - ${{ if ne(variables['Build.Reason'], 'PullRequest') }}:
+        - template: /tech_products/azr4/templates/nlp/configureNlpdataTools.yml
+          parameters:
+            repository: '$(Build.Repository.Name)'
+            branch: '$(Build.SourceBranchName)'
+
+      # 6. Import nlpdata-tools
+      - template: /tech_products/azr4/templates/nlp/importNlpdataTools.yml
+
+      # 7. Provisioning tmp folders
+      - bash: |
+          set -e
+          set -x
+
+          source "${AURA_VENVBASE}/bin/activate"
+
+          PROJECT_ROOT_FOLDER="$(Build.Repository.LocalPath)"
+          VALIDATION_TMP_FOLDER="${PROJECT_ROOT_FOLDER}/validation_tmp"
+          REPO_NAME="$(Build.Repository.Name)"
+
+          TMP_FOLDER="$(Build.Repository.LocalPath)/tmp"
+          echo "##vso[task.setvariable variable=TMP_FOLDER]$TMP_FOLDER"
+
+          PLATFORM="BR"
+          echo "##vso[task.setvariable variable=PLATFORM]$PLATFORM"
+
+          CLU_RESOURCE_NAME=clu-br-pro-new
+          CLU_STORAGE_RESOURCE_NAME=clushared-br-pro-a05c61ecab
+
+          echo "##vso[task.setvariable variable=CLU_RESOURCE_NAME]$CLU_RESOURCE_NAME"
+          echo "##vso[task.setvariable variable=CLU_STORAGE_RESOURCE_NAME]$CLU_STORAGE_RESOURCE_NAME"
+          echo "##vso[task.setvariable variable=CLU_SUBSCRIPTION_KEYS]$CLU_SUBSCRIPTION_KEYS"
+          echo "##vso[task.setvariable variable=CLU_STORAGE_SUBSCRIPTION_KEYS]$CLU_STORAGE_SUBSCRIPTION_KEYS"
+
+          MODELS_FOLDER="${TMP_FOLDER}/models"
+          TMP_TRAINED_MODELS_FOLDER="${TMP_FOLDER}/trained_models"
+          PIPELINE_EVAL_FOLDER="${TMP_FOLDER}/pipeline_eval"
+          VALIDATION_FOLDER="${PROJECT_ROOT_FOLDER}/validation"
+          RESULTS_FOLDER="${TMP_FOLDER}/results"
+          RESULT_FOLDER="${TMP_FOLDER}/results"
+          export RESULT_FOLDER="${TMP_FOLDER}/results"
+          RESULTS_JSON="${RESULTS_FOLDER}/pipeline_eval/BR/results.json"
+          RESULTS_REGRESSION_JSON="${RESULTS_FOLDER}/pipeline_eval/BR/regression/results.json"
+
+          TMP_MERGED_CONFIG="${TMP_FOLDER}/merged_config"
+          COMMON_FOLDER="${PROJECT_ROOT_FOLDER}/.tmp/aura-nlpdata-tools/common"
+
+          mkdir -p "${TMP_FOLDER}"
+          mkdir -p "${MODELS_FOLDER}"
+          mkdir -p "${TMP_TRAINED_MODELS_FOLDER}"
+          mkdir -p "${TMP_MERGED_CONFIG}"
+          cp -r "${PROJECT_ROOT_FOLDER}/config" "${TMP_FOLDER}"
+          mkdir -p "${PIPELINE_EVAL_FOLDER}/ob/BR/resources"
+          mkdir -p "${PIPELINE_EVAL_FOLDER}/ob/BR/resources/regression"
+          cp -r "${PROJECT_ROOT_FOLDER}/pipeline_eval/ob/BR/resources"/* "${PIPELINE_EVAL_FOLDER}/ob/BR/resources"
+
+          python3 -m auracog_lib.config.config_merger \
+              --outputPath "${TMP_MERGED_CONFIG}/bootstrap.cfg.tpl" \
+              --inputPaths "${COMMON_FOLDER}/config/bootstrap.cfg.tpl" \
+                          "${COMMON_FOLDER}/config/BR/bootstrap.cfg.tpl" \
+                          "${COMMON_FOLDER}/config/BR/${REPO_NAME}/bootstrap.cfg.tpl" \
+                          "${PROJECT_ROOT_FOLDER}/config/etc/bootstrap.cfg"
+          envsubst < ${TMP_MERGED_CONFIG}/bootstrap.cfg.tpl > ${TMP_FOLDER}/config/etc/bootstrap.cfg
+
+          python3 -m auracog_lib.config.config_merger \
+              --outputPath "${TMP_MERGED_CONFIG}/validation_bootstrap.cfg.tpl" \
+              --inputPaths "${COMMON_FOLDER}/validation/config/bootstrap.cfg.tpl" \
+                          "${COMMON_FOLDER}/validation/BR/config/bootstrap.cfg.tpl" \
+                          "${COMMON_FOLDER}/validation/BR/${REPO_NAME}/config/bootstrap.cfg.tpl" \
+                          "${PROJECT_ROOT_FOLDER}/config/etc/bootstrap.cfg"
+
+          mkdir -p "${VALIDATION_TMP_FOLDER}/config/etc/validation_config"
+          envsubst < ${TMP_MERGED_CONFIG}/validation_bootstrap.cfg.tpl > ${VALIDATION_TMP_FOLDER}/config/etc/bootstrap.cfg
+          cp ${COMMON_FOLDER}/validation/*.json.tpl ${VALIDATION_TMP_FOLDER} || :
+          cp ${COMMON_FOLDER}/validation/BR/*.json.tpl ${VALIDATION_TMP_FOLDER} || :
+          cp ${COMMON_FOLDER}/validation/BR/${REPO_NAME}/*.json.tpl ${VALIDATION_TMP_FOLDER} || :
+
+          # Copy original validators (from nlpdata-ob) to maintain compatibility in all repos
+          cp ${VALIDATION_FOLDER}/*.json.tpl ${VALIDATION_TMP_FOLDER} || :
+          cp ${VALIDATION_FOLDER}/config/etc/validation_config/*.json ${VALIDATION_TMP_FOLDER}/config/etc/validation_config || :
+
+          echo "Provisioned tmp folders"
+        displayName: 'Provisioning tmp folders'
+        env:
+          CLU_SUBSCRIPTION_KEYS: $(CLU_SUBSCRIPTION_KEYS)
+          CLU_STORAGE_SUBSCRIPTION_KEYS: $(CLU_STORAGE_SUBSCRIPTION_KEYS)
+
+      # 8. Validate nlp data tool config (PR only)
+      - ${{ if eq(variables['Build.Reason'], 'PullRequest') }}:
+        - template: /tech_products/azr4/templates/nlp/installPipelinesAndLibs.yml
+          parameters:
+            pipelinesVersion: '2.0.1'
+            libVersion: '2.0.1'
+            pipConfFilePath: '$(pipConfFile.secureFilePath)'
+            pypiConfFilePath: '$(pypircFile.secureFilePath)'
+        - bash: |
+            source "$(AURA_VENVBASE)/bin/activate"
+            echo "Validate nlp data tool config (placeholder)"
+          displayName: 'Run nlp data tool config validation'
+
+      # 9. Install libraries
+      - template: /tech_products/azr4/templates/nlp/installLibraries.yml
+        parameters:
+          requirementsPath: '$(Build.Repository.LocalPath)/requirements.txt'
+          nexusHost: 'nexus.tid.es'
+          nexusUrl: 'https://$(NEXUS_USERNAME):$(NEXUS_PASSWORD)@nexus.tid.es/repository/pypi-nlpau-aura-cognitive-buffer/simple'
+
+      # 12. Train
+      - template: /tech_products/azr4/templates/nlp/train.yml
+        parameters:
+          projectName: 'br-wa'
+          packageName: 'resources_br-wa'
+
+      # 13. Test
+      - template: /tech_products/azr4/templates/nlp/test.yml
+
+      # 14. Copy results
+      - bash: |
+          set -e
+          set -x
+
+          PIPELINE_EVAL_FOLDER="tmp/pipeline_eval"
+          RESULTS_FOLDER="tmp/results"
+          EXTENSION_FILES_LIST="csv json txt"
+
+          EVAL_SRC_FOLDER="${PIPELINE_EVAL_FOLDER}/ob/BR/resources"
+          EVAL_RESULTS_FOLDER="${RESULTS_FOLDER}/pipeline_eval/BR"
+          mkdir -p "${EVAL_RESULTS_FOLDER}"
+          for extension in ${EXTENSION_FILES_LIST}; do
+              cp "${EVAL_SRC_FOLDER}"/*.${extension} "${EVAL_RESULTS_FOLDER}" || true
+          done
+
+          EVAL_SRC_REGRESSION_FOLDER="${EVAL_SRC_FOLDER}/regression"
+          EVAL_RESULTS_REGRESSION_FOLDER="${EVAL_RESULTS_FOLDER}/regression"
+          mkdir -p "${EVAL_RESULTS_REGRESSION_FOLDER}"
+          for extension in ${EXTENSION_FILES_LIST}; do
+              cp "${EVAL_SRC_REGRESSION_FOLDER}"/*.${extension} "${EVAL_RESULTS_REGRESSION_FOLDER}" || true
+          done
+        displayName: 'Copy results'
+
+      # 16. Validate grammar (PR only)
+      - template: /tech_products/azr4/templates/nlp/validateGrammar.yml
+
+      # 17. Validate accuracy (PR only)
+      - template: /tech_products/azr4/templates/nlp/validateAccuracy.yml
+
+      - bash: |
+          set -euo pipefail
+
+          if [[ "$(Build.Reason)" != "PullRequest" ]]; then
+            echo "Not a PR build. Skipping comment."
+            exit 0
+          fi
+
+          LOG_FILE=".logs/accuracy.log"
+          if [[ ! -f "$LOG_FILE" ]]; then
+            echo "Log file not found. Skipping comment."
+            exit 0
+          fi
+
+          if ! grep -E -i -q "(error|exception|traceback|fatal|assert)" "$LOG_FILE"; then
+            echo "No error markers found in log. Skipping comment."
+            exit 0
+          fi
+
+          source "$(AURA_VENVBASE)/bin/activate"
+
+          ORG_URL="$(System.CollectionUri)"
+          PROJECT="$(System.TeamProject)"
+          REPO_ID="$(Build.Repository.ID)"
+          PR_ID="$(System.PullRequest.PullRequestId)"
+          TOKEN="$(System.AccessToken)"
+          
+          if [[ -z "$ORG_URL" || -z "$PROJECT" || -z "$REPO_ID" || -z "$PR_ID" ]]; then
+            echo "Missing PR context variables. Skipping."
+            exit 0
+          fi
+          
+          if [[ -z "$TOKEN" ]]; then
+            echo "System.AccessToken is empty. Enable 'Allow scripts to access OAuth token'."
+            exit 1
+          fi
+          
+          mkdir -p .logs
+          PROJECT_ENCODED=$(python3 -c "import urllib.parse; print(urllib.parse.quote('''$PROJECT'''))")
+          
+          python3 - << 'PY' > .logs/pr_comment.json
+          import json, pathlib
+          p = pathlib.Path(".logs/accuracy.log")
+          txt = p.read_text(errors="replace")
+          tail = txt[-65000:]
+          md = (
+              "### Pipeline failure: accuracy validation\n\n"
+              "Last log lines:\n\n"
+              "```text\n" + tail + "\n```"
+          )
+          payload = {
+              "comments": [
+                  {
+                      "parentCommentId": 0,
+                      "content": md,
+                      "commentType": 1
+                  }
+              ],
+              "status": 1
+          }
+          print(json.dumps(payload))
+          PY
+          
+          ORG_URL="${ORG_URL%/}"
+          API="${ORG_URL}/${PROJECT_ENCODED}/_apis/git/repositories/${REPO_ID}/pullRequests/${PR_ID}/threads?api-version=7.1"
+          
+          RESPONSE=$(curl -w "\n%{http_code}" -X POST \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $TOKEN" \
+            --data-binary @.logs/pr_comment.json \
+            "$API")
+          
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+          
+          if [[ "$HTTP_CODE" -ge 200 && "$HTTP_CODE" -lt 300 ]]; then
+            echo "Comment posted successfully"
+          else
+            echo "Failed to post comment. HTTP $HTTP_CODE"
+            exit 1
+          fi
+        displayName: "Comment failure log on PR"
+        condition: and(failed(), eq(variables['Build.Reason'], 'PullRequest'))
+        env:
+          SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+
+      - script: |
+          export PIP_INDEX_URL="https://aura-core-br:$(EXTERNAL_ARTIFACTS_PAT_2)@pkgs.dev.azure.com/div-aura/c833fd5d-6da1-4867-a4a1-1e518d009c19/_packaging/aura-core-br/pypi/simple/"
+          export PIP_EXTRA_INDEX_URL="https://pypi.org/simple"
+          pip install azure-cli
+          export PATH="$HOME/.local/bin:$PATH"
+          az --version
+        displayName: 'Install Azure CLI'
+
+      # Step 1: Handle version.txt and set PRODUCT_VERSION
+      - bash: |
+          set -e
+          set -x
+          VERSION_FILE="$(Build.Repository.LocalPath)/version.txt"
+          if [ ! -f "$VERSION_FILE" ]; then
+              echo "0.0.1" > "$VERSION_FILE"
+          else
+              VERSION=$(cat "$VERSION_FILE" | tr -d "'" | tr -d "\"" | xargs)
+              IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION"
+              PATCH=$((PATCH + 1))
+              NEW_VERSION="$MAJOR.$MINOR.$PATCH"
+              echo "$NEW_VERSION" > "$VERSION_FILE"
+          fi
+          PRODUCT_VERSION=$(cat "$VERSION_FILE" | tr -d "'" | tr -d "\"" | xargs)
+          echo "##vso[task.setvariable variable=PRODUCT_VERSION]$PRODUCT_VERSION"
+        displayName: 'Handle version.txt and set PRODUCT_VERSION'
+
+      # Step 2: Package training
+      - bash: |
+            set -e
+            set -x
+            PROJECT_ROOT_FOLDER="$(Build.Repository.LocalPath)"
+            PACKAGE_NAME="resources_br-wa"
+            PLATFORM="BR"
+            NLP_CONFIG=tmp/config/etc/nlp_config/nlp.json
+            BASE_DIR="${PROJECT_ROOT_FOLDER}/${PACKAGE_NAME}"
+            DIR_RESOURCES="${BASE_DIR}/opt/aura/nlp/resources/"
+            DIR_PIPELINE_EVAL="${BASE_DIR}/opt/aura/nlp/pipeline_eval/"
+            DIR_METADATA="${BASE_DIR}/opt/aura/nlp/metadata/${PACKAGE_NAME}"
+            PLATFORM_LOWERCASE="br"
+            MODELS_FOLDER="${TMP_FOLDER}/models"
+            DIR_CONFIG="${BASE_DIR}/opt/aura/nlp/config/"
+            DIR_PACKAGE_CONFIG="${BASE_DIR}/DEBIAN"
+            RESULTS_FOLDER="${TMP_FOLDER}/results"
+            PIPELINE_EVAL_FOLDER="${TMP_FOLDER}/pipeline_eval"
+
+            if [[ -d "${BASE_DIR}" ]]; then rm -Rf "${BASE_DIR}"; fi
+            mkdir -p  "${DIR_PACKAGE_CONFIG}"
+
+            echo "Package: resources-nlp-data-br-wa" > "${DIR_PACKAGE_CONFIG}/control"
+            echo "Architecture: all" >> "${DIR_PACKAGE_CONFIG}/control"
+            echo "Maintainer: NLP team" >> "${DIR_PACKAGE_CONFIG}/control"
+            echo "Version: $PRODUCT_VERSION" >> "${DIR_PACKAGE_CONFIG}/control"
+            echo "Description: Resources for NLP data br-wa." >> "${DIR_PACKAGE_CONFIG}/control"
+            echo "X-Results-Json: $(base64 -w 0 "${PIPELINE_EVAL_FOLDER}/ob/${PLATFORM}/resources/results.json")" >> "${DIR_PACKAGE_CONFIG}/control"
+            echo -n > "${DIR_PACKAGE_CONFIG}/conffiles"
+
+            mkdir -p "${DIR_RESOURCES}"
+            cp -R "${MODELS_FOLDER}"/* "${DIR_RESOURCES}" || true
+            mkdir -p "${DIR_CONFIG}"
+            cp "${NLP_CONFIG}" "${DIR_CONFIG}/${PACKAGE_NAME}.json"
+
+            mkdir -p "${DIR_METADATA}/${PRODUCT_VERSION}"
+            cp -R "${RESULTS_FOLDER}" "${DIR_METADATA}/${PRODUCT_VERSION}"
+            cp "${PIPELINE_EVAL_FOLDER}/ob/${PLATFORM}/resources/results.json" "${DIR_METADATA}/${PRODUCT_VERSION}/results.json"
+            
+            mkdir -p "$(Build.ArtifactStagingDirectory)/pipeline-eval"
+            cp -R "${PIPELINE_EVAL_FOLDER}/ob/${PLATFORM}/"* "$(Build.ArtifactStagingDirectory)/pipeline-eval/"
+
+            mkdir -p "${DIR_PIPELINE_EVAL}"
+            cp -R "${PROJECT_ROOT_FOLDER}"/pipeline_eval/* "${DIR_PIPELINE_EVAL}"
+
+            dpkg-deb -Zgzip --build "${BASE_DIR}"
+
+            AZURE_STORAGE_ACCOUNT='stgfunctionsenvbrpro'
+            AZURE_CONTAINER='cognitive-nlpdata'
+            AZURE_CONTAINER_URL="https://${AZURE_STORAGE_ACCOUNT}.blob.core.windows.net/${AZURE_CONTAINER}/${PLATFORM_LOWERCASE}/${PACKAGE_NAME}/${PRODUCT_VERSION}/"
+            DEBIAN_PACKAGE="${PACKAGE_NAME}.deb"
+
+            EXISTS=$(azcopy list "${AZURE_CONTAINER_URL}${PACKAGE_NAME}.deb?${NLP_STORAGE_SAS}" | grep -c "${PACKAGE_NAME}.deb" || true)
+            if [[ "$EXISTS" -eq 0 ]]; then
+                azcopy copy "${DEBIAN_PACKAGE}" "${AZURE_CONTAINER_URL}${PACKAGE_NAME}.deb?${NLP_STORAGE_SAS}"
+            else
+                echo "CRITICAL ERROR: DEBIAN FILE ALREADY EXIST"
+                exit 1
+            fi
+        displayName: 'Package training'
+        env:
+          NLP_STORAGE_SAS: $(NLP_STORAGE_SAS)
+
+      - task: PublishPipelineArtifact@1
+        displayName: "Publicar artifact"
+        inputs:
+          targetPath: '$(Build.ArtifactStagingDirectory)/pipeline-eval'
+          artifact: 'pipeline-eval'
+          publishLocation: 'pipeline'
+
+      # Step 3: Commit version.txt changes
+      - bash: |
+          set -e
+          set -x
+          VERSION_FILE="$(Build.Repository.LocalPath)/version.txt"
+          git config user.email "azuredevops@telefonica.com"
+          git config user.name "Azure DevOps"
+          git add "$VERSION_FILE"
+          git commit -m "Update version.txt to $PRODUCT_VERSION [skip ci]"
+        condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+        displayName: 'Commit version.txt changes'
+
+      - bash: |
+          set -euo pipefail
+          set -x
+          TARGET_REF="$(Build.SourceBranch)"
+          if [[ "$TARGET_REF" != refs/heads/* ]]; then
+            echo "Not a branch build ($TARGET_REF). Skipping push."
+            exit 0
+          fi
+          git push origin "HEAD:${TARGET_REF}"
+        condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+        displayName: "Push version.txt changes"
+
+      - bash: |
+          set -euo pipefail
+          set -x
+          TAG_NAME="v$PRODUCT_VERSION"
+          git fetch --tags origin
+          if git rev-parse "${TAG_NAME}" >/dev/null 2>&1; then
+            echo "Tag ${TAG_NAME} already exists locally."
+          else
+            git tag -a "${TAG_NAME}" -m "Release ${TAG_NAME}"
+          fi
+          if git ls-remote --tags origin | grep -q "refs/tags/${TAG_NAME}$"; then
+            echo "Tag ${TAG_NAME} already exists on remote. Skipping push."
+            exit 0
+          fi
+          git push origin "${TAG_NAME}"
+        condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+        displayName: "Create and push release tag"

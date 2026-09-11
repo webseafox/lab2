@@ -1,0 +1,93 @@
+parameters:
+
+- name: configFile
+  default: $(SONARQUBE_CONFIG_FILE)
+
+- name: workdirArtifacts
+  default: $(DEFAULT_WORKDIR_ARTIFACTS)
+
+- name: workingDirectory
+  type: string
+  default: $(Build.SourcesDirectory)
+
+- name: artifactName
+  default: 'app'
+
+- name: artifactType
+  default: 'build'
+  type: string
+  values:
+  - build
+  - pipeline
+
+stages:
+- stage: gate
+  displayName: "Quality Gates"
+  dependsOn: 
+  - build_test
+  variables:
+    APP_VERSION: $[ stageDependencies.build_test.bump_version.outputs['component_bump_version.LIB_NEW_VERSION'] ]
+  pool: $(PRIVATE_AGENT_DEFAULT)
+  jobs:
+  - job: sonarqube
+    condition: and(succeeded(), eq(variables.flowIsTagging, false), ne(variables.skip_sonarqube, true), eq(variables.flowIsMain, true))
+    displayName: Code Analysis
+    steps:
+    - template: /tech_products/srus/tasks/catalog_info/extract_variables.yml
+      parameters:
+        skipDownload: true
+        workingDirectory: $(Build.SourcesDirectory)
+
+    - ${{ if eq(parameters['artifactType'], 'build') }}:
+      - task: DownloadBuildArtifacts@1
+        displayName: 'Download Build Artifacts'
+        inputs:
+          artifactName: ${{ parameters.artifactName }}
+          parallelizationLimit: 20
+          extractTars: true
+
+    - ${{ if eq(parameters['artifactType'], 'pipeline') }}:
+      - task: DownloadPipelineArtifact@2
+        displayName: 'Download Pipeline Artifacts'
+        inputs:
+          artifactName: ${{ parameters.artifactName }}
+          targetPath: ${{ parameters.workdirArtifacts }}
+
+    - task: SonarAnalysisFromVivo@4
+      displayName: 'SonarQube Full Analysis'
+      inputs:
+        command: 'analysis'
+        SonarQubeVip: 'VIVO_SONARQUBE_VIP'
+        SonarQube: 'VIVO_SONARQUBE'
+        scannerMode: 'cli'
+        configFile: '${{ parameters.configFile }}'
+        cliProjectKey: '$(SONAR_PROJECT_KEY)'
+        cliProjectName: '$(System.TeamProject)-$(Build.Repository.Name)'
+        cliProjectVersion: '$(APP_VERSION)'
+        qualityGate: $(SONARQUBE_DEFAULT_QUALITYGATE)
+        acronym: $(SIGLA)
+        reportPath: '$(Agent.TempDirectory)/sonar/$(Build.BuildId)/report-task.txt'
+        pollingTimeoutSec: $(SONARQUBE_QUALITYGATE_TIMEOUT)
+        useOpaRepository: 'true'
+        codePlayServiceConnection: 'CodePlay'
+        opaProject: 'DVPS - DEVOPS'
+        opaRepository: 'Vivo.OpenPolicy.SonarQube'
+        opaBranch: 'master'
+        useAppConfig: true
+        appConfigurationEndpoint: 'https://appcs-azdevops-shared.azconfig.io'
+        azureSubscription: DevOpsSharedResources
+        sonarUrlPemCertificate: $(Agent.HomeDirectory)/../../certs/CACORP.pem
+        extraProperties: |
+          sonar.projectBaseDir=${{ parameters.workdirArtifacts }}
+          sonar.javascript.lcov.reportPaths=${{ parameters.workingDirectory }}/test-results/coverage/lcov.info
+          sonar.typescript.lcov.reportPaths=${{ parameters.workingDirectory }}/test-results/coverage/lcov.info
+          sonar.scanner.metadataFilePath=$(Agent.TempDirectory)/sonar/$(Build.BuildId)/report-task.txt
+          sonar.qualitygate.wait=false
+          sonar.qualitygate.timeout=$(SONARQUBE_QUALITYGATE_TIMEOUT)
+          sonar.exclusions=**/node_modules/**,**/dist/**,**/build/**,**/*.spec.ts,**/*.test.ts,**/*.d.ts
+          sonar.sources=${{ parameters.workingDirectory }}
+          sonar.test.inclusions=**/*.spec.ts,**/*.test.ts,**/*.spec.js,**/*.test.js
+          sonar.test.exclusions=**/*.spec.ts,**/*.test.ts
+          sonar.verbose=${SYSTEM_DEBUG,,}
+      env:
+        ASDF_JAVA_VERSION: "openjdk-11.0.2"

@@ -1,0 +1,195 @@
+parameters:
+  - name: deploy_scgw_option
+    type: string
+  - name: skip_deploy
+    type: boolean
+    default: true
+  - name: environment
+    type: string
+  - name: project_version
+    type: string
+  - name: redis_cluster
+    type: string
+
+stages:
+  - stage: Deploy
+    condition: and(ne('${{ parameters.project_version }}', 'none'), eq('${{ parameters.skip_deploy }}', 'false')) 
+
+    ${{ if or(contains(parameters.environment, 'producao'), contains(parameters.environment, 'prod')) }}:
+      pool: "VivoOnPremPrdAgents"
+    ${{ else }}:
+      pool: "vivoOnPremHmlAgents"
+
+    jobs:
+      - job: ExtractBuildId
+        displayName: 'Extract Build ID'
+        steps:
+
+          - ${{ if startsWith(variables['Build.SourceBranch'], 'refs/tags') }}:
+              - script: |
+                  build_id=$(grep 'buildId' $(Build.SourcesDirectory)/.azuredevops/build.yaml | awk '{print $2}')
+                  echo "##vso[task.setvariable variable=BUILD_ID;isOutput=true]$build_id"
+                  echo "##[debug] Exporting variable 'BUILD_ID': $build_id"
+                displayName: 'Extract Build ID'
+                name: exportBuildId
+      - deployment: DeployJob
+        dependsOn:
+          - ExtractBuildId
+        displayName: "Deploy SCGW"
+        condition: and(
+          succeeded(),
+          eq('${{ parameters.skip_deploy }}', false),
+          ne('${{ parameters.project_version }}', 'none')
+          )
+        variables:
+          buildId: $[ dependencies.ExtractBuildId.outputs['exportBuildId.build_id'] ]
+
+        ${{ if or(contains(parameters.environment, 'lab'), contains(parameters.environment, 'teste')) }}:
+          environment: 
+            name: "deploy-lab_scgw"
+            resourceType: VirtualMachine
+        ${{ else }}:
+          environment: "deploy-${{ parameters.environment }}"
+          
+        workspace:
+          clean: all
+        strategy:
+          runOnce:
+            preDeploy:
+              steps:
+                - script: echo "Running pre-deployment checks..."
+                  displayName: 'Run PreDeployment Checks'
+                ## ARTIFACTS ANOTHER BUILD ID
+                - ${{ if startsWith(variables['Build.SourceBranch'], 'refs/tags') }}:
+                    - task: DownloadBuildArtifacts@1
+                      displayName: 'Download Specific Build Artifact'
+                      inputs:
+                        buildType: specific
+                        project: 'SMRC - SMART CGW'
+                        pipeline: 'SMRC - SMART CGW'
+                        buildVersionToDownload: specific
+                        buildId: '$(buildId)'
+                        artifactName: 'jar'
+                        downloadPath: '$(Pipeline.Workspace)/'
+
+                    - task: DownloadPipelineArtifact@2
+                      displayName: 'Download Specific script Artifact'
+                      inputs:
+                        buildType: specific
+                        project: 'SMRC - SMART CGW'
+                        pipeline: 'SMRC - SMART CGW'
+                        buildVersionToDownload: specific
+                        buildId: '$(buildId)'
+                        artifactName: 'scripts'
+                        targetPath: '$(Pipeline.Workspace)/scripts'
+
+                ## ARTIFACTS CURRENT BUILD ID
+                - ${{ else }}:
+                    - task: DownloadPipelineArtifact@2
+                      inputs:
+                        buildType: 'current'
+                        artifactName: 'jar'
+                        targetPath: '$(Pipeline.Workspace)/'
+
+                    - task: DownloadPipelineArtifact@2
+                      inputs:
+                        buildType: 'current'
+                        artifactName: 'scripts'
+                        targetPath: '$(Pipeline.Workspace)/scripts'
+
+                - task: SSH@0
+                  displayName: 'Create target directory if it does not exist'
+                  inputs:
+                    sshEndpoint: ${{ parameters.environment }}
+                    runOptions: inline
+                    inline: |
+                      sudo su - svc_scgwadm <<EOF
+                      mkdir -p /home/svc_scgwadm/scripts
+                      EOF
+
+                - task: SSH@0
+                  displayName: 'Create target directory if it does not exist'
+                  inputs:
+                    sshEndpoint: ${{ parameters.environment }}
+                    runOptions: inline
+                    inline: |
+                      sudo su - svc_scgwadm <<EOF
+                      mkdir -p /home/svc_scgwadm/deploy_version 
+                      EOF
+                - task: CopyFilesOverSSH@0
+                  displayName: 'Copy deploy script'
+                  inputs:
+                    sshEndpoint: ${{ parameters.environment }}
+                    sourceFolder: '$(Pipeline.Workspace)/scripts/'
+                    contents: '**'
+                    targetFolder: '/home/svc_scgwadm/scripts'
+                    cleanTargetFolder: true
+                    overwrite: true
+
+                - task: CopyFilesOverSSH@0
+                  displayName: 'Copy artifact to environment'
+                  inputs:
+                    sshEndpoint: ${{ parameters.environment }}
+                    sourceFolder: '$(Pipeline.Workspace)/jar/'
+                    contents: '${{ parameters.deploy_scgw_option }}-${{ parameters.project_version }}.rpm'
+                    targetFolder: '/home/svc_scgwadm/deploy_version'
+                    cleanTargetFolder: false
+                    overwrite: true
+
+                - task: SSH@0
+                  displayName: 'Check if artifact exists'
+                  continueOnError: false
+                  inputs:
+                    sshEndpoint: ${{ parameters.environment }}
+                    runOptions: 'commands'
+                    commands: |
+                      sudo su - svc_scgwadm <<EOF
+                      sed -i 's/\r$//' /home/svc_scgwadm/scripts/check_artifact_existence.sh && sed -i 's/\r$//' /home/svc_scgwadm/scripts/deploy_utils.sh
+                      chmod -R +x /home/svc_scgwadm/scripts/check_artifact_existence.sh && chmod -R +x /home/svc_scgwadm/scripts/deploy_utils.sh
+                      sh /home/svc_scgwadm/scripts/check_artifact_existence.sh /home/svc_scgwadm/deploy_version/ ${{ parameters.deploy_scgw_option }}-${{ parameters.project_version }}.rpm
+                      EOF
+                - task: SSH@0
+                  name: exportOldVersion
+                  displayName: 'Extract Old Version for Rollback'
+                  continueOnError: false
+                  inputs:
+                    sshEndpoint: ${{ parameters.environment }}
+                    runOptions: 'commands'
+                    commands: |
+                      sudo su - svc_scgwadm <<EOF
+                      sed -i 's/\r$//' /home/svc_scgwadm/scripts/get_current_version.sh && sed -i 's/\r$//' /home/svc_scgwadm/scripts/deploy_utils.sh
+                      chmod -R +x /home/svc_scgwadm/scripts/get_current_version.sh && chmod -R +x /home/svc_scgwadm/scripts/deploy_utils.sh
+                      sh /home/svc_scgwadm/scripts/get_current_version.sh ${{ parameters.deploy_scgw_option }}
+                      EOF
+            deploy:
+              steps:
+
+                - task: SSH@0
+                  continueOnError: false
+                  displayName: 'Execute deploy script'
+                  condition: succeeded()
+                  inputs:
+                    sshEndpoint: ${{ parameters.environment }}
+                    runOptions: commands
+                    commands: |
+                      sudo su - svc_scgwadm <<EOF
+                      sed -i 's/\r$//' /home/svc_scgwadm/scripts/deploy_scgw.sh && sed -i 's/\r$//' /home/svc_scgwadm/scripts/deploy_utils.sh
+                      chmod -R +x /home/svc_scgwadm/scripts/deploy_scgw.sh && chmod -R +x /home/svc_scgwadm/scripts/deploy_utils.sh
+                      sh /home/svc_scgwadm/scripts/deploy_scgw.sh /home/svc_scgwadm/deploy_version/ ${{ parameters.deploy_scgw_option }}-${{ parameters.project_version }}.rpm ${{ parameters.deploy_scgw_option }} ${{ parameters.redis_cluster }} ${{ parameters.environment }}
+                      EOF
+            on:
+              failure:
+                steps:
+
+                  - task: SSH@0
+                    condition: succeeded()
+                    displayName: 'Execute Rollback'
+                    inputs:
+                      sshEndpoint: ${{ parameters.environment }}
+                      runOptions: commands
+                      commands: |
+                        sudo su - svc_scgwadm <<EOF
+                        sed -i 's/\r$//' /home/svc_scgwadm/scripts/rollback_scgw.sh && sed -i 's/\r$//' /home/svc_scgwadm/scripts/deploy_utils.sh
+                        chmod -R +x /home/svc_scgwadm/scripts/rollback_scgw.sh && chmod -R +x /home/svc_scgwadm/scripts/deploy_utils.sh
+                        sh /home/svc_scgwadm/scripts/rollback_scgw.sh ${{ parameters.deploy_scgw_option }} ${{ parameters.redis_cluster }}
+                        EOF

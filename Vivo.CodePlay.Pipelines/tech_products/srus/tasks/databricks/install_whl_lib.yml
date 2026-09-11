@@ -1,0 +1,401 @@
+parameters:
+- name: pythonVersion
+  type: string
+- name: databricksHost
+  type: string
+- name: databricksToken
+  type: string
+
+steps:
+
+- bash: |
+    REPO_NAME=$(Build.Repository.Name)
+    if [[ "$REPO_NAME" == nt-telecom-* ]]; then
+        echo "##vso[task.setvariable variable=projectType]databricks"
+        echo "Projeto telecom, pulando passos referentes à lib-telecom-negocio..."
+    elif [[ "$REPO_NAME" == *"nt-mercadoria-orquestrador"* || "$REPO_NAME" == *"lib-telecom-negocio"* || "$REPO_NAME" == *"nt-exemplo-databricks"* || "$REPO_NAME" == *"lib-servico-negocio"* || "$REPO_NAME" == *"nt-james-webb"* ]]; then
+        echo "##vso[task.setvariable variable=projectType]mercadoria"
+        echo "Projeto mercadoria, pulando passos referentes à lib-telecom-negocio..."
+    elif [[ "$REPO_NAME" == *"nt-lakehouse"* ]]; then
+        echo "##vso[task.setvariable variable=projectType]lakehouse"
+        echo "Projeto lakehouse, pulando passos referentes à lib-telecom-negocio..."
+    elif [[ "$REPO_NAME" == nt-servico-* ]]; then
+        echo "##vso[task.setvariable variable=projectType]databricks"
+        echo "Projeto nota de serviço, pulando passos referentes à lib-telecom-negocio..."
+    else
+        echo "Unknown project type"
+        exit 1
+    fi
+  displayName: 'Set project type based on repository name'
+
+- bash: |
+    echo "Current projectType: $(projectType)"
+  displayName: 'Debug projectType variable'
+
+- bash: |
+    echo "##[debug]Creating installWhlLibrary.py script..."
+    cat << EOF > installWhlLibrary.py
+    # installWhlLibrary.py
+    import getopt
+    import io
+    import json
+    import sys
+    import requests
+    import os
+    import base64
+
+    print("Current working directory:", os.getcwd())
+    print("Contents of current directory:", os.listdir())  
+
+
+    def main():
+        reqParams = [
+            "shard", "token", "libsPath", "dbfsPath", "reqFile", "initScript"]
+        helpMessage = """Usage: installWhlLibrary.py
+            -s <shard>
+            -t <token>
+            -l <libsPath>
+            -d <dbfsPath>
+            -r <reqFile>
+            -i <initScript>"""
+
+        databricksHost = ""
+        token = ""
+        libsPath = ""
+        dbfsPath = ""
+        reqFile = ""
+        initScript = ""
+
+        try:
+            opts, _ = getopt.getopt(
+                sys.argv[1:],
+                "hstcld",
+                [
+                    "shard=",
+                    "token=",
+                    "libsPath=",
+                    "dbfsPath=",
+                    "reqFile=",
+                    "initScript="
+                ],
+            )
+        except getopt.GetoptError:
+            print(helpMessage)
+            sys.exit(2)
+
+        if not opts:
+            print(helpMessage)
+            sys.exit(2)
+        elif not ['-h'] == [opt[0] for opt in opts]:
+            paramsCheck = [
+                p for p in reqParams if "--" + p not in [opt[0] for opt in opts]
+            ]
+            if paramsCheck:
+                print("The following parameters are required: " + str(paramsCheck))
+                exit(2)
+
+        for opt, arg in opts:
+            if opt == "-h":
+                print(helpMessage)
+                sys.exit()
+            elif opt in ("-s", "--shard"):
+                databricksHost = arg
+            elif opt in ("-t", "--token"):
+                token = arg
+            elif opt in ("-l", "--libsPath"):
+                libsPath = arg
+            elif opt in ("-d", "--dbfsPath"):
+                dbfsPath = arg
+            elif opt in ("-r", "--reqFile"):
+                reqFile = arg
+            elif opt in ("-i", "--initScript"):
+                initScript = arg
+
+        print("-s is " + databricksHost)
+        print("-t is " + token)
+        print("-l is " + libsPath)
+        print("-d is " + dbfsPath)
+        print("-r is " + reqFile)
+        print("-i is " + initScript)
+
+        print("Getting list of .WHL libraries from this pipeline")
+        pipelineLibs = getPipelineLibs(libsPath)
+
+        print("Getting list of .WHL libraries from the databricks host")
+        currentLibs = getCurrentLibs(databricksHost, token, dbfsPath)
+
+        libsToRemove = []
+        libsToAdd = []
+        libsToKeep = []
+
+        print("Checking pipeline and databricks libraries...")
+        for depLib in getDependencyLibs(reqFile):
+            libName, _ = depLib.split("==")
+            pipeLib = [
+                plib for plib in pipelineLibs if plib.startswith(libName + "-")
+            ]
+            currLib = [
+                clib for clib in currentLibs if clib.startswith(libName + "-")
+            ]
+
+            if currLib:
+                currentLibs.remove(currLib[0])
+
+            if pipeLib and currLib and pipeLib[0] == currLib[0]:
+                print("Including " + currLib[0] + " to keep in databricks")
+                libsToKeep.append(currLib[0])
+            elif pipeLib and currLib and pipeLib[0] != currLib[0]:
+                print("Including " + currLib[0] + " to be removed from databricks")
+                libsToRemove.append(currLib[0])
+                print("Including " + pipeLib[0] + " to be added to databricks")
+                libsToAdd.append(pipeLib[0])
+            elif pipeLib and not currLib:
+                print("Including " + pipeLib[0] + " to be added to databricks")
+                libsToAdd.append(pipeLib[0])
+            elif currLib and not pipeLib:
+                print("Including " + currLib[0] + " to be removed from databricks")
+                libsToRemove.append(currLib[0])
+
+        if currentLibs:
+            print(
+                "Including all remaing libs from databricks to be removed: "
+                + str(currentLibs)
+            )
+            libsToRemove.extend(currentLibs)
+
+        if not libsToRemove and not libsToAdd:
+            print("There're no libraries to change")
+            sys.exit()
+
+        removeCurrentLibs(databricksHost, token, dbfsPath, libsToRemove)
+        addPipelineLibs(databricksHost, token, dbfsPath, libsPath, libsToAdd)
+
+        if libsToAdd or libsToRemove:
+            updateInitScript(
+                databricksHost, token, initScript, dbfsPath, libsToAdd + libsToKeep
+            )
+
+
+    def updateInitScript(shard, token, scriptName, dbfsPath, libList):
+        print("Getting the script Id for '" + scriptName + "'...")
+        scriptId = getInitScriptId(shard, token, scriptName)
+        if scriptId:
+            print("The script Id '" + scriptId + "' was found")
+        else:
+            print("The script Id wasn't found for '" + scriptName + "'")
+
+        with io.BytesIO() as tempScript:
+            tempScript.write(b"#!/bin/bash\n")
+            for lib in libList:
+                libPath = os.path.join("/dbfs", dbfsPath, lib)
+                tempScript.write(
+                    b"\n/databricks/python/bin/pip install " + libPath.encode()
+                )
+
+            postData = {
+                "name": scriptName,
+                "script": base64.b64encode(tempScript.getvalue()).decode(),
+            }
+            tempScript.close()
+            if scriptId is not None:
+                print("Updating current script for the .WHL libraries...")
+                resp = requests.patch(
+                    shard + "/api/2.0/global-init-scripts/" + scriptId,
+                    data=json.dumps(postData),
+                    auth=("token", token),
+                )
+                if resp.status_code == 200:
+                    print("Script '" + scriptName + "' was updated")
+                else:
+                    print(
+                        "An error occurred while updating current script."
+                        + getApiErrorMessage(resp)
+                    )
+            else:
+                print("Creating a new script with the .WHL libraries...")
+                resp = requests.post(
+                    shard + "/api/2.0/global-init-scripts/",
+                    data=json.dumps(postData),
+                    auth=("token", token),
+                )
+                if resp.status_code == 200:
+                    print("Script '" + scriptName + "' was created")
+                else:
+                    print(
+                        "An error occurred while creating new script"
+                        + getApiErrorMessage(resp)
+                    )
+
+
+    def getInitScriptId(shard, token, scriptName):
+        resp = requests.get(
+            shard + "/api/2.0/global-init-scripts", auth=("token", token))
+        scriptsObj = json.loads(resp.text)
+        if scriptsObj.get("scripts"):
+            scriptsId = [
+                script["script_id"]
+                for script in scriptsObj["scripts"]
+                if script["name"] == scriptName
+            ]
+            if scriptsId:
+                return scriptsId[0]
+
+
+    def addPipelineLibs(shard, token, dbfsPath, pipeLibPath, libList):
+        for lib in libList:
+            rollback = False
+            libPath = os.path.join("/", dbfsPath, lib)
+            print("Adding '" + libPath + "' to databricks...")
+            resp = requests.post(
+                shard + "/api/2.0/dbfs/create",
+                data=json.dumps({"path": libPath}),
+                auth=("token", token),
+            )
+            handleObj = json.loads(resp.text)
+            if handleObj.get("handle"):
+                handleId = handleObj["handle"]
+                with open(os.path.join(pipeLibPath, lib), "rb") as libFile:
+                    contents = libFile.read(1024 * 512)
+                    while contents != b"":
+                        postData = {
+                            "handle": handleId,
+                            "data": base64.b64encode(contents).decode(),
+                        }
+                        respAdd = requests.post(
+                            shard + "/api/2.0/dbfs/add-block",
+                            data=json.dumps(postData),
+                            auth=("token", token),
+                        )
+                        if respAdd.status_code != 200:
+                            print(
+                                "An error occurred while adding library '"
+                                + libPath
+                                + "' to databricks. "
+                                + getApiErrorMessage(respAdd)
+                            )
+                            rollback = True
+                            break
+                        contents = libFile.read(1024 * 512)
+                if not rollback:
+                    respClose = requests.post(
+                        shard + "/api/2.0/dbfs/close",
+                        data=json.dumps({"handle": handleId}),
+                        auth=("token", token),
+                    )
+                    if respClose.status_code == 200:
+                        print("Library '" + libPath + "' was added")
+                    else:
+                        print(
+                            "An error occurred while adding library '"
+                            + libPath
+                            + "' to databricks. "
+                            + getApiErrorMessage(respClose)
+                        )
+                else:
+                    removeCurrentLibs(shard, token, dbfsPath, [lib])
+
+
+    def removeCurrentLibs(shard, token, dbfsPath, libList):
+        for lib in libList:
+            libPath = os.path.join("/", dbfsPath, lib)
+            print("Removing '" + libPath + "' from databricks...")
+            resp = requests.post(
+                shard + "/api/2.0/dbfs/delete?path=" + libPath,
+                auth=("token", token)
+            )
+            if resp.status_code == 200:
+                print("Library '" + libPath + "' was removed")
+            else:
+                print(
+                    "An error occurred while removing library '"
+                    + libPath
+                    + "'. from databricks"
+                    + getApiErrorMessage(resp)
+                )
+
+
+    def getDependencyLibs(reqFile):
+        return [
+            line.strip()
+            for line in open(reqFile).read().split("\n")
+            if line.strip() and not line
+                .strip()
+                .startswith(('"', "#", "-", "git+"))
+        ]
+
+
+    def getPipelineLibs(libsPath):
+        return [
+            libName
+            for libName in [libs for _, _, libs in os.walk(libsPath)][0]
+            if os.path.splitext(libName)[1] in [".whl"]
+        ]
+
+
+    def getCurrentLibs(shard, token, dbfsPath):
+        resp = requests.get(
+            shard + "/api/2.0/dbfs/list?path=/" + dbfsPath, auth=("token", token)
+        )
+
+        if resp.status_code == 404:
+            return []
+
+        if resp.status_code != 200:
+            print(
+                "An error occurred while retrieving libraries from databricks. "
+                + getApiErrorMessage(resp)
+            )
+            exit(1)
+
+        d = json.loads(resp.text)
+        if d.get("files"):
+            libList = d["files"]
+
+            return [
+                lib["path"].split("/")[-1] for lib in libList if (lib.get("path"))
+            ]
+        else:
+            return []
+
+
+    def getApiErrorMessage(resp: requests.Response):
+        message = "An error occurred while requesting REST API. "
+        message += "Requested URL: '" + resp.url + "'. "
+        message += "Http error code: '" + str(resp.status_code) + "'. "
+        respObj = json.loads(resp.text)
+        if respObj.get("error_code"):
+            message += "API Error code: '" + str(respObj["error_code"]) + "'. "
+        if respObj.get("message"):
+            message += " - Message: '" + respObj["message"] + "'."
+        return message
+
+
+    if __name__ == "__main__":
+        main()
+
+    EOF
+  displayName: Creating InstallWhlLibrary script
+  condition: eq(variables['projectType'], 'telecom')
+
+- template: /tech_products/srus/tasks/python/run_bash_on_docker_databricks.yml
+  parameters:
+    pythonVersion: "${{ parameters.pythonVersion }}"
+    scriptNameOrCmd: |
+        echo "##[debug]Criando ambiente virtual python..."
+        python -m venv .venv
+
+        echo "##[debug]Ativando ambiente virtual python..."
+        source .venv/bin/activate
+
+        echo "##[debug]Instalando biblioteca requests..."
+        pip install requests
+        
+        echo "##[debug]Instalando bibliotecas WHL no databricks..."
+        python installWhlLibrary.py \
+            --shard=${{ parameters.databricksHost }} \
+            --token=${{ parameters.databricksToken }} \
+            --libsPath=libraries \
+            --dbfsPath=libraries/python/libs/ \
+            --reqFile=requirements.artifacts \
+            --initScript=lib_classe_negocio_sirius
+    displayName: Installing WHL libraries

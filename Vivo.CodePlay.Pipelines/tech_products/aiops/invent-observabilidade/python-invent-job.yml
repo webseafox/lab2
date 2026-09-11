@@ -1,0 +1,163 @@
+parameters:
+- name: agentPool
+  type: string
+  default: SREConfiabilidadeAgents
+  displayName: Agent Pool
+
+- name: demands
+  type: object
+  default: {}
+  displayName: Agent Demands
+
+- name: variableGroup
+  type: string
+  default: ''
+  displayName: Variable Group
+
+- name: pythonCommand
+  type: string
+  default: python
+  displayName: Python Command
+
+- name: venvDir
+  type: string
+  default: .venv
+  displayName: Virtual Environment Directory
+
+- name: jobDisplayName
+  type: string
+  default: Executar script Python (Invent)
+  displayName: Job Display Name
+
+- name: scriptPath
+  type: string
+  displayName: Script Path
+
+- name: scriptArgs
+  type: object
+  default: {}
+  displayName: Script Arguments
+
+- name: pipPackages
+  type: object
+  default:
+    items:
+      - sqlalchemy
+      - psycopg2-binary
+      - pandas
+      - requests
+  displayName: Pip Packages
+
+- name: proxyVarName
+  type: string
+  default: ''
+  displayName: Proxy Environment Variable Name
+
+- name: envVars
+  type: object
+  default: {}
+  displayName: Environment Variables
+
+- name: enableDebugListing
+  type: boolean
+  default: false
+  displayName: Enable Debug Workspace Listing
+
+stages:
+- stage: RunPythonInventJob
+  displayName: Run Python Invent Job
+  jobs:
+  - job: ExecuteScript
+    displayName: ${{ parameters.jobDisplayName }}
+    pool:
+      name: ${{ parameters.agentPool }}
+      ${{ if ne(convertToJson(parameters.demands), '{}') }}:
+        demands: ${{ parameters.demands }}
+
+    variables:
+      - ${{ if ne(parameters.variableGroup, '') }}:
+        - group: ${{ parameters.variableGroup }}
+      - name: PIP_CACHE_DIR
+        value: $(Pipeline.Workspace)/.pip-cache
+
+    steps:
+    - checkout: self
+      clean: true
+
+    - ${{ if eq(parameters.enableDebugListing, true) }}:
+      - script: |
+          pwd
+          ls -la
+        displayName: Listar workspace (debug)
+
+    - task: Cache@2
+      displayName: Cache pip
+      inputs:
+        key: 'pip | "$(Agent.OS)" | ${{ parameters.pythonCommand }} | v1'
+        restoreKeys: |
+          pip | "$(Agent.OS)" | ${{ parameters.pythonCommand }}
+          pip | "$(Agent.OS)"
+        path: $(PIP_CACHE_DIR)
+
+    - bash: |
+        set -eo pipefail
+
+        ${{ parameters.pythonCommand }} --version
+        ${{ parameters.pythonCommand }} -m pip --version
+
+        VENV_DIR="${{ parameters.venvDir }}"
+        VENV_PY="$VENV_DIR/bin/python"
+
+        ${{ parameters.pythonCommand }} -m venv "$VENV_DIR"
+
+        PIP_ARGS=(--timeout 120)
+
+        TRUSTED_HOSTS="${TRUSTED_PIP_HOSTS:-pypi.org files.pythonhosted.org}"
+        for host in $TRUSTED_HOSTS; do
+          PIP_ARGS+=(--trusted-host "$host")
+        done
+
+        retry() {
+          local max_attempts=3
+          local attempt=1
+          local sleep_time
+
+          until "$@"; do
+            if [ "$attempt" -ge "$max_attempts" ]; then
+              return 1
+            fi
+
+            sleep_time=$((attempt * 5))
+            echo "Attempt ${attempt} failed, retrying in ${sleep_time}s..." >&2
+            sleep "$sleep_time"
+            attempt=$((attempt + 1))
+          done
+        }
+
+        proxy_name="${{ parameters.proxyVarName }}"
+        if [ -n "$proxy_name" ]; then
+          proxy_val="${!proxy_name:-}"
+          if [ -n "$proxy_val" ]; then
+            PIP_ARGS+=(--proxy "$proxy_val")
+          fi
+        fi
+
+        "$VENV_PY" -m pip install --upgrade pip setuptools wheel "${PIP_ARGS[@]}"
+
+        PIP_PACKAGES_JSON='${{ convertToJson(parameters.pipPackages) }}'
+        PIP_PACKAGES="$($VENV_PY -c "import json,sys; v=json.loads(sys.argv[1]); print(' '.join(v) if isinstance(v,list) else (' '.join(v.get('items',[])) if isinstance(v,dict) else str(v)))" "$PIP_PACKAGES_JSON")"
+        if [ -n "$PIP_PACKAGES" ]; then
+          retry "$VENV_PY" -m pip install "${PIP_ARGS[@]}" $PIP_PACKAGES || { echo "pip install failed for: $PIP_PACKAGES" >&2; exit 1; }
+        fi
+
+        SCRIPT_ARGS_JSON='${{ convertToJson(parameters.scriptArgs) }}'
+        SCRIPT_ARGS=()
+        if [ "$SCRIPT_ARGS_JSON" != "null" ] && [ "$SCRIPT_ARGS_JSON" != "[]" ] && [ "$SCRIPT_ARGS_JSON" != "{}" ]; then
+          while IFS= read -r -d '' arg; do
+            SCRIPT_ARGS+=("$arg")
+          done < <("$VENV_PY" -c "import json,sys; v=json.loads(sys.argv[1]); v=[v] if isinstance(v,str) else (v.get('items',[]) if isinstance(v,dict) else v); [sys.stdout.buffer.write(str(s).encode()+b'\\0') for s in (v or [])]" "$SCRIPT_ARGS_JSON")
+        fi
+
+        "$VENV_PY" "${{ parameters.scriptPath }}" "${SCRIPT_ARGS[@]}"
+      displayName: Executar script Python
+      env: ${{ parameters.envVars }}

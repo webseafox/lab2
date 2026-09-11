@@ -1,0 +1,82 @@
+parameters:
+  - name: EXTENSION_NAME
+  - name: EXTENSION_ID
+  - name: SKIP_TESTS
+  - name: TAG
+  - name: environment
+
+stages:  
+
+  - stage: npmPackage
+    displayName: Package
+    jobs:
+      - job: package
+        displayName: Package
+        steps:
+          
+          - task: Npm@1
+            continueOnError: true
+            displayName: Npm Run clean
+            inputs:
+              command: "custom"
+              customCommand: "run clean"
+
+          - task: TfxInstaller@5
+            displayName: 'Use Node CLI for Azure DevOps'
+            inputs:
+              version: 'v0.21.1'
+              checkLatest: true
+
+          - task: Npm@1
+            displayName: Packing all
+            inputs:
+              command: "custom"
+              customCommand: "run package"
+
+          - bash: |
+              if [ -z "$TAG" ]; then
+                  if [ -f "package/vss-extension.json" ]; then
+                      VERSION=$(cat package/vss-extension.json | grep "\"version\":" | cut -d '"' -f4)
+                  elif [ -f "vss-extension.json" ]; then
+                      VERSION=$(cat vss-extension.json | grep "\"version\":" | cut -d '"' -f4)
+                  else
+                      echo "Arquivo vss-extension.json não foi encontrado. Não foi possível determinar a versão."
+                      exit 1
+                  fi
+              else
+                  VERSION='${{ parameters.TAG }}'
+              fi    
+              
+              echo "Versão detectada: $VERSION"
+              
+              echo "##vso[task.setvariable variable=VERSION;isOutput=true]$VERSION"
+            name: packageInfo
+
+  
+  - stage: tagVersion
+    displayName: 'Tag Version'
+    dependsOn: npmPackage
+    jobs:
+      - job: tagVersion
+        displayName: 'Tag Version'
+        variables:
+          VERSION: $[ stageDependencies.npmPackage.package.outputs['packageInfo.VERSION'] ]
+        steps:
+          - checkout: self
+            clean: true
+            fetchTags: true
+            persistCredentials: true
+
+          - task: Bash@3
+            displayName: "Criar Tag no Azure Repos"
+            inputs:
+              targetType: inline
+              script: |
+                # Define a variável de versão
+
+                TAG_VERSION=$VERSION
+                echo "Criando tag: $TAG_VERSION"
+
+                # Cria a tag e faz push para o repositório remoto
+                git tag "$TAG_VERSION"
+                git push origin "$TAG_VERSION"

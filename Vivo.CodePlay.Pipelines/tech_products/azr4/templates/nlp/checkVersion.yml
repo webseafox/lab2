@@ -1,0 +1,102 @@
+# Template: Check Version and Compute Versioning Tags
+# This template extracts the last git tag for the current branch,
+# and computes the commit versioning tag (BREAKING, FEATURE, PATCH, etc.)
+# based on commit messages between the last tag and HEAD.
+#
+# Usage in pipeline:
+#   - template: /tech_products/azr4/templates/checkVersion.yml
+#     parameters:
+#       branchType: 'release'  # Can be: 'release', 'main', 'hotfix', 'fasttrack', etc.
+
+parameters:
+  - name: branchType
+    type: string
+    default: 'release'
+
+steps:
+  - bash: |
+      #!/bin/bash
+      set -e
+      
+      BRANCH_TYPE="${{ parameters.branchType }}"
+      CURRENT_BRANCH="$(Build.SourceBranchName)"
+      
+      echo "##[group]Detecting branch type and computing last git tag"
+      echo "Current branch: $CURRENT_BRANCH"
+      echo "Branch type parameter: $BRANCH_TYPE"
+      
+      # Fetch tags to ensure we have the latest
+      git fetch --tags origin || git fetch --tags
+      
+      # Compute LAST_GIT_TAG based on branch type
+      # This mirrors the logic from different BranchVersioning subclasses
+      
+      case "$BRANCH_TYPE" in
+        release)
+          # ReleaseBranchVersioning: match tags like v1.0.0 (excluding fasttrack)
+          LAST_GIT_TAG=$(git tag --sort=version:refname --merged="origin/$CURRENT_BRANCH" 2>/dev/null | grep -iE '^v([0-9]+\.[0-9]+\.[0-9]+)(-.*)?$' | grep -viE '^v([0-9]+\.[0-9]+\.[0-9]+)(-fasttrack-.*)$' | tail -n 1 || echo "")
+          ;;
+        main)
+          # MainBranchVersioning: match tags like v1.0.0-main
+          LAST_GIT_TAG=$(git tag --sort=version:refname --merged="origin/$CURRENT_BRANCH" 2>/dev/null | grep -iE '^v([0-9]+\.[0-9]+\.[0-9]+)(-main)?$' | tail -n 1 || echo "")
+          ;;
+        hotfix)
+          # HotfixBranchVersioning: match tags like v1.0.0-hotfix
+          LAST_GIT_TAG=$(git tag --sort=version:refname --merged="origin/$CURRENT_BRANCH" 2>/dev/null | grep -iE '^v([0-9]+\.[0-9]+\.[0-9]+)(-hotfix)?$' | tail -n 1 || echo "")
+          ;;
+        fasttrack)
+          # FasttrackBranchVersioning: match tags like v1.0.0-fasttrack
+          LAST_GIT_TAG=$(git tag --sort=version:refname --merged="origin/$CURRENT_BRANCH" 2>/dev/null | grep -iE '^v([0-9]+\.[0-9]+\.[0-9]+)(-fasttrack)?$' | tail -n 1 || echo "")
+          ;;
+        *)
+          # Default: match any semantic version tag
+          LAST_GIT_TAG=$(git tag --sort=version:refname --merged="origin/$CURRENT_BRANCH" 2>/dev/null | grep -iE '^v[0-9]+\.[0-9]+\.[0-9]+' | tail -n 1 || echo "")
+          ;;
+      esac
+      
+      echo "Last Git Tag: $LAST_GIT_TAG"
+      echo "##vso[task.setvariable variable=LAST_GIT_TAG]$LAST_GIT_TAG"
+      echo "##[endgroup]"
+    displayName: 'Get last git tag'
+
+  - bash: |
+      #!/bin/bash
+      set -e
+      
+      LAST_GIT_TAG="$(LAST_GIT_TAG)"
+      
+      if [ -z "$LAST_GIT_TAG" ]; then
+        echo "##[group]No previous tag found, skipping commit versioning tag detection"
+        echo "COMMIT_VERSIONING_TAG will be empty"
+        echo "##vso[task.setvariable variable=COMMIT_VERSIONING_TAG]"
+        echo "##[endgroup]"
+        exit 0
+      fi
+      
+      echo "##[group]Computing commit versioning tag"
+      echo "Last tag: $LAST_GIT_TAG"
+      
+      # Define commit versioning tags (in priority order)
+      # These should match the CommitVersioningTag enum values
+      declare -a COMMIT_VERSIONING_TAGS=("BREAKING" "FEATURE" "PATCH" "HOTFIX")
+      
+      COMMIT_VERSIONING_TAG=""
+      
+      for tag in "${COMMIT_VERSIONING_TAGS[@]}"; do
+        # Check if any commit between LAST_GIT_TAG and HEAD contains [[TAG_NAME]]
+        if git log "${LAST_GIT_TAG}..HEAD" --oneline 2>/dev/null | grep -iE "\[\[$tag\]\]" &>/dev/null; then
+          COMMIT_VERSIONING_TAG="$tag"
+          echo "Found commit versioning tag: $COMMIT_VERSIONING_TAG"
+          break
+        fi
+      done
+      
+      if [ -z "$COMMIT_VERSIONING_TAG" ]; then
+        echo "##[warning]No commit versioning tag found in commits. Defaulting to PATCH"
+        COMMIT_VERSIONING_TAG="PATCH"
+      fi
+      
+      echo "Commit Versioning Tag: $COMMIT_VERSIONING_TAG"
+      echo "##vso[task.setvariable variable=COMMIT_VERSIONING_TAG]$COMMIT_VERSIONING_TAG"
+      echo "##[endgroup]"
+    displayName: 'Compute commit versioning tag'

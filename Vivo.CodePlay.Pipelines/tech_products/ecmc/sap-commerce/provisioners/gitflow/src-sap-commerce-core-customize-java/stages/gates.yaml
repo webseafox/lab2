@@ -1,0 +1,97 @@
+stages:
+- stage: code_analysis
+  displayName: "Code quality analysis"
+  pool:
+    name: $(PRIVATE_AGENT_DEFAULT)
+    # demands: Agent.Version -gtVersion 2.210.1
+  dependsOn:
+    - build_test_for_gates
+  jobs:
+    - job: "information_analysis"
+      displayName: "Information Analysis Sonar Report"
+      steps:
+        - checkout: none
+        - bash: |
+            echo "##[section]Executar análise do scan realizado durante o Build"
+          displayName: "Job information"
+
+
+    - job: "analysis_sonar_report"
+      displayName: "Analysis Report"
+      workspace:
+        clean: all
+      variables:
+        JACOCO_EXEC: $[ stageDependencies.build_test_for_gates.start_build.outputs['run_jacoco.JACOCO_EXEC'] ]
+        PITEST_EXEC: $[ stageDependencies.build_test_for_gates.start_build.outputs['run_pitest.PITEST_EXEC'] ]
+      steps:
+      - task: AzureKeyVault@2
+        displayName: "Getting AKV credentials"
+        timeoutInMinutes: 1
+        retryCountOnTaskFailure: 5
+        inputs:
+          azureSubscription: DevOpsSharedResources
+          KeyVaultName: $(AKV_DEVOPS_NAME)
+          SecretsFilter: 'SONARQUBE-TOKEN'
+        condition: and(eq(variables.SONAR_IS_ENABLED, True), ne(variables.SONAR_SELF_HOSTED, 'true'))
+
+      - template: /tech_products/ecmc/sap-commerce/task_groups/gates/sonarqube_validation_or_break.yaml
+
+      - template: /tech_products/ecmc/sap-commerce/task_groups/gates/pitest_validation_or_break.yaml
+
+      - template: /tech_products/ecmc/sap-commerce/task_groups/gates/junit_validation_or_break.yaml
+
+      - bash: |
+          echo "##[debug]Parâmetro JACOCO_EXEC: $(JACOCO_EXEC)"
+          if [[ "$(JACOCO_EXEC)" != "True" ]]; then
+            echo "⚠️  ATENÇÃO: A execução dos testes foi pulada, portanto a validação de testes não será aplicada."
+            exit 0
+          fi
+
+          if [[ "$(SONAR_SELF_HOSTED)" == "true" ]]; then
+            SONARQUBE_TOKEN="${SONARQUBE_TOKEN_SELF_HOSTED}"
+          fi
+
+          BRANCH=""
+
+          if [[ $(Build.Reason) == "PullRequest" ]]; then
+            SONAR_PROJECT_STATUS_URL="${SONARQUBE_URL}/api/issues/search?componentKeys=${SONAR_PROJECT_KEY}&pullRequest=$(System.PullRequest.PullRequestId)"
+          else
+            BRANCH=$(echo "$(Build.SourceBranch)" | sed 's/refs\/heads\///g')
+            SONAR_PROJECT_STATUS_URL="${SONARQUBE_URL}/api/issues/search?componentKeys==${SONAR_PROJECT_KEY}&branch=$BRANCH"
+          fi
+
+          echo "##[debug]URL do Relatório do Sonar: ${SONAR_PROJECT_STATUS_URL}"
+
+          ANALYSIS_STATUS=$(curl -k --max-time 3000 -s -u "${SONARQUBE_TOKEN}:" "$SONAR_PROJECT_STATUS_URL")
+          ISSUES_JSON=$(jq '.issues[]' <<< $ANALYSIS_STATUS)
+
+          while read data; do
+            # METRIC KEY
+            STATUS_ISS=$(jq '.status' <<< $data)
+            TYPE_ISS=$(jq '.type' <<< $data)
+            SEVERITY_ISS=$(jq '.severity' <<< $data)
+            COMPONENT_ISS=$(jq '.component' <<< $data)
+            MESSAGE_ISS=$(jq '.message' <<< $data)
+            ASSIGNEE_ISS=$(jq '.assignee' <<< $data)
+            AUTHOR_ISS=$(jq '.author' <<< $data)
+            if [[ $STATUS_ISS == "\"OPEN\"" ]]; then
+              echo "##[warning]................................... ISSUE ..................................."
+              echo "##[warning]Type.......: $STATUS_ISS"
+              echo "##[warning]Severity...: $SEVERITY_ISS"
+              echo "##[warning]Component..: $COMPONENT_ISS"
+              echo "##[warning]Message....: $MESSAGE_ISS"
+              echo "##[warning]Assignee...: $ASSIGNEE_ISS"
+              echo "##[warning]Author.....: $AUTHOR_ISS"
+              echo "##[warning].............................................................................."
+              echo ""
+            fi
+            echo ""
+          done < <(echo "$ISSUES_JSON" | jq -c '.')
+        displayName: 'Sonar Issues Report'
+        condition: and(eq(variables.SONAR_IS_ENABLED, True), eq(variables['Build.Reason'], 'PullRequest'))
+        continueOnError: true
+        env:
+          SONARQUBE_TOKEN: $(SONARQUBE-TOKEN)
+          SONARQUBE_TOKEN_SELF_HOSTED: $(SONARQUBE_TOKEN_SELF_HOSTED)
+          SONARQUBE_TOKEN_TAG_SELF_HOSTED: $(SONARQUBE_TOKEN_TAG_SELF_HOSTED)
+          BREAK_IF_COVERAGE_ERROR: $(BREAK_IF_COVERAGE_ERROR)

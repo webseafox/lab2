@@ -1,0 +1,68 @@
+parameters:
+- name: version
+  type: string
+
+stages:
+- stage: deploy
+  displayName: "Deploy"
+  dependsOn: [ init ]
+  variables:
+    PROPERTIES_FILE_NAME: $[ stageDependencies.init.get_env_config.outputs['env_configuration.PROPERTIES_FILE_NAME'] ]
+    ANYPOINT_ENVIRONMENT: $[ stageDependencies.init.get_env_config.outputs['env_configuration.ANYPOINT_ENVIRONMENT'] ]
+    ANYPOINT_ENVIRONMENT_IN_APPLICATION_NAME: $[ stageDependencies.init.get_env_config.outputs['env_configuration.ANYPOINT_ENVIRONMENT_IN_APPLICATION_NAME'] ]
+    ARTIFACT_ID: $[ stageDependencies.init.find_artifact_id.outputs['pom_reference.ARTIFACT_ID'] ]
+    PACKAGE_VERSION: $[ lower('${{ parameters.version }}') ]
+  pool:
+    name: $(PRIVATE_AGENT_DEFAULT_DEPLOY)
+  jobs:
+  - job: run_deploy
+    displayName: "Running Deploy on CloudHub"
+    steps:
+    - task: DownloadPackage@1
+      inputs:
+        packageType: 'maven'
+        feed: '$(AZURE_ARTIFACTS_FEED)'
+        definition: 'com.telefonica:release-$(ARTIFACT_ID)' 
+        version: $(PACKAGE_VERSION)
+        downloadPath: '$(System.ArtifactsDirectory)/mule_jar'
+        files: '*.jar'
+
+    - script: |
+        ARTIFACT_PATH="${PWD}/$(ls *.jar)"
+        echo "##vso[task.setvariable variable=ARTIFACT_PATH]${ARTIFACT_PATH}"
+      workingDirectory: '$(System.ArtifactsDirectory)/mule_jar'
+      displayName: 'Getting artifact path'
+
+    - task: DownloadSecureFile@1
+      displayName: 'Getting settings file'
+      name: muleSettings
+      inputs:
+        secureFile: $(MULE_SETTINGS_FILE)
+
+    - template: /tech_products/mule-fenix/steps/properties/extract_properties.yml
+      parameters:
+        file: src/main/resources/properties/$(PROPERTIES_FILE_NAME)
+        propertiesField: cloudhub
+        outputVariable: CLOUD_HUB_PROPS
+
+    - task: Maven@4
+      displayName: 'Executing maven deploy on CloudHub'
+      inputs:
+        mavenPOMFile: 'pom.xml'
+        goals: 'mule:deploy'
+        options: '-s $(muleSettings.secureFilePath)
+          -DmuleDeploy
+          -Dmule.artifact=$(ARTIFACT_PATH)
+          -DskipTests
+          -DconnectedAppClientId=$(MULE_APP_CLIENT_ID)
+          -DconnectedAppClientSecret=$(MULE_APP_CLIENT_SECRET)
+          -Denv.short=$(ANYPOINT_ENVIRONMENT_IN_APPLICATION_NAME)
+          -DbusinessGroupId=$(MULE_BUSINESS_GROUP_ID)
+          -Denv=$(ANYPOINT_ENVIRONMENT)
+          -Dsecurity.key=$(MULE_SECURITY_KEY)
+          -Danypoint.platform.client_id=$(MULE_ANYPOINT_CLIENT_ID)
+          -Danypoint.platform.client_secret=$(MULE_ANYPOINT_CLIENT_SECRET)
+          $(CLOUD_HUB_PROPS)'
+      env:
+        PUB_CREDENTIAL_USR: $(NEXUS-DEFAULT-USR)
+        PUB_CREDENTIAL_PSW: $(NEXUS-DEFAULT-PSW)

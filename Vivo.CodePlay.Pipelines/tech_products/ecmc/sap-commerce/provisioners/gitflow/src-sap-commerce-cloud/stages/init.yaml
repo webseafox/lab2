@@ -1,0 +1,239 @@
+parameters:
+- name: copy_publish_to_artifacts
+  type: boolean
+  default: False
+- name: branch_frontend
+  type: string
+  default: ''
+- name: branch_backend
+  type: string
+  default: ''
+- name: environment_code
+  type: string
+
+stages:
+- stage: pipeline_init
+  displayName: "Start pipeline"
+  pool:
+    name: $(PRIVATE_AGENT_DEFAULT)
+  jobs:
+    - ${{ if in(variables['Build.Reason'], 'Schedule') }}:
+      - job: validate_run_scheduled
+        workspace:
+          clean: all
+        displayName: "Pre validate run"
+        steps:
+          - checkout: self
+            fetchDepth: 2
+            persistCredentials: true
+
+          - bash: |
+              echo "##vso[task.setvariable variable=NO_CHANGES]FALSE"
+
+              LAST_HASH=$(git log -n 1  --pretty=format:"%H")
+              FILES_CHANGED=$(git log -n 1 --name-only --pretty=format: )
+              TOTAL_FILES=$(echo $FILES_CHANGED | wc -l)
+
+              if [ $TOTAL_FILES -eq 1 ] && [ "$FILES_CHANGED" == "VERSION" ]; then
+                echo "##[error]Total de arquivos modificados: $TOTAL_FILES"
+                echo "##[error]Encerrando pipeline"
+                echo "##[error]O único arquivo modificado foi $FILES_CHANGED"
+                echo "##vso[task.setvariable variable=NO_CHANGES]TRUE"
+                echo "##[error]Não existem arquivos relevantes para o build da aplicação."
+                echo "##[error]A pipeline será encerrada sem criação de build na plataforma da SAP"
+              fi
+
+              echo "##[section]Arquivos alterados"
+              for FILE_CHANGED in $FILES_CHANGED; do
+                echo "##[section]$FILE_CHANGED"
+              done
+            displayName: "Validate run"
+            condition: eq(variables['Build.Reason'], 'Schedule')
+
+          - bash: |
+              if [ $NO_CHANGES_ENV == "TRUE" ]; then
+                echo "NO_CHANGES $(NO_CHANGES)"
+                echo "NO_CHANGES_ENV $NO_CHANGES_ENV"
+                az pipelines build cancel --build-id $(Build.BuildId)
+              fi
+            displayName: "Cancel if empty changes"
+            env:
+              AZURE_DEVOPS_EXT_PAT: $(SYSTEM_ACCESS_TOKEN_JOBS)
+              NO_CHANGES_ENV: $(NO_CHANGES)
+
+    - ${{ if and(in(variables['Build.Reason'], 'IndividualCI', 'BatchedCI', 'Manual', 'Schedule'), and(eq(parameters.branch_backend, ''), eq(parameters.branch_frontend, '')))  }}:
+      - job: get_hash_commit
+        workspace:
+          clean: all
+        displayName: "Get hash commit"
+        steps:
+          - checkout: self
+            fetchDepth: 2
+            persistCredentials: true
+
+          - bash: |
+              echo "##[debug]<<<RETORNANDO HASH DO BACKEND>>>"
+              HASH_BACKEND=$(git submodule status core-customize | awk '{print substr($1, 2)}')
+              echo "##[debug]<<HASH DO BACKEND - $HASH_BACKEND>>>"
+              echo "##vso[task.setvariable variable=HASH_BACKEND;isOutput=true]$HASH_BACKEND"
+
+              echo "##[debug]<<<RETORNANDO HASH DO FRONTEND>>>"
+              HASH_FRONTEND=$(git submodule status js-storefront | awk '{print substr($1, 2)}')
+              echo "##[debug]<<HASH DO FRONTEND - $HASH_FRONTEND>>>"
+              echo "##vso[task.setvariable variable=HASH_FRONTEND;isOutput=true]$HASH_FRONTEND"
+            displayName: "Get hash commit"
+            name: "task_get_hash_commit"
+
+    - job: first_steps
+      workspace:
+        clean: all
+      dependsOn:
+      - ${{ if and(in(variables['Build.Reason'], 'IndividualCI', 'BatchedCI', 'Manual', 'Schedule'), and(eq(parameters.branch_backend, ''), eq(parameters.branch_frontend, '')))  }}:
+        - get_hash_commit
+      - ${{ if in(variables['Build.Reason'], 'Schedule') }}:
+        - validate_run_scheduled
+      displayName: "Running init"
+      steps:
+        - checkout: self
+          fetchDepth: 1
+          persistCredentials: true
+
+        - ${{ if and(or(startsWith(variables['Build.SourceBranch'], 'refs/heads/stage/'), in(variables['Build.SourceBranch'], 'refs/heads/main', 'refs/heads/master')), in(variables['Build.Reason'], 'IndividualCI', 'BatchedCI', 'Manual', 'Schedule')) }}:
+
+          # UPDATE VERSION WITH TEMPLATE SEMANTIC VERSIONING
+          - template: /tech_products/ecmc/shared/tasks/upgrade_semantic_version_with_python.yaml
+            parameters:
+              taskName: determine_new_version
+              extraEnvironmentVars:
+                FILE_VERSION_PATH: "VERSION"
+
+          - bash: |
+              ENVIRONMENT_CODE="${{ parameters.environment_code }}"
+              echo "ENVIRONMENT_CODE is \"$ENVIRONMENT_CODE\""
+              ENVIRONMENT_VERIFY=$(echo "$ENVIRONMENT_CODE" | grep "Escolha")
+              if [[ "$ENVIRONMENT_VERIFY" != "" ]]; then
+                echo "##[error]O ambiente escolhido \"$ENVIRONMENT_CODE\" não é válido"
+                exit 1
+              fi
+
+              ORIGINAL_IFS="${IFS}"
+
+              BUILD_ID=$(Build.BuildId)
+
+              cd $(Build.SourcesDirectory)
+
+              set -e
+
+              echo "##[section]BUILD.SOURCEBRANCH: ................. $(PROJECT_SOURCE_BRANCH)"
+
+              if [ "$USE_SEMANTIC_VERSION" == "true" ]; then
+                echo "##vso[task.setvariable variable=SAP_COMMERCE_OPTIONS_VERSION;isOutput=true]${SAP_COMMERCE_OPTIONS_VERSION}"
+                echo "##[debug]Verificando se ACTUAL_BRANCH ${ACTUAL_BRANCH} é igual ao conteúdo da variável BRANCH_NAME_TO_USE_SEMANTIC ${BRANCH_NAME_TO_USE_SEMANTIC}"
+
+                if [[ "${ACTUAL_BRANCH}" == "refs/heads/${BRANCH_NAME_TO_USE_SEMANTIC}" ]]; then
+
+                  # Construir nova versão semântica
+                  echo "##[section]New semantic version: $NEW_VERSION"
+
+                  # Atualizar versao semantica file VERSION com nova versão
+                  echo -n $NEW_VERSION > VERSION
+                  echo "##[section]VERSION updated successfully"
+
+                  # Atualizar variáveis do pipeline
+                  echo "##vso[task.setvariable variable=NEW_VERSION;]$NEW_VERSION"
+                  echo "##vso[task.setvariable variable=COMPONENT_VERSION;]$NEW_VERSION"
+
+                  git add -f VERSION
+                else
+                  # Construir nova versão não semântica
+                  echo "##[section]New not semantic version: $NEW_VERSION"
+
+                  # Atualizar versao não semantica no file .azuredevops/VERSION
+                  echo -n $NEW_VERSION > .azuredevops/VERSION
+                  echo "##[section].azuredevops/VERSION updated successfully"
+                  git add -f .azuredevops/VERSION
+                fi
+
+                  NEW_VERSION_FILE=$NEW_VERSION
+                  NEW_VERSION_CLEAN="$NEW_VERSION.${BUILD_ID}"
+
+                  GIT_CURRENT_SHA_AGGREGATOR=$(git rev-parse HEAD)
+                  echo "##vso[task.setvariable variable=GIT_CURRENT_SHA_AGGREGATOR]${GIT_CURRENT_SHA_AGGREGATOR}"
+              else
+                echo "UPDATE_VERSION_CUSTOM $UPDATE_VERSION_CUSTOM"
+                if [[ "$UPDATE_VERSION_CUSTOM" == "True" ]]; then
+                  echo "##[section]Gitflow - branch sN (Ex: s1)"
+                  CURRENT_VERSION=$(date '+%Y%m%d.%H%M%S')
+                  NEW_VERSION="v${CURRENT_VERSION}.${BUILD_ID}"
+                else
+                  if [[ "$IS_DEV_BRANCH" == "True" ]]; then
+                    echo "##[section]DEV TESTS | DEV BRANCH"
+                    CURRENT_VERSION=$(date '+%Y%m%d.%H%M%S')
+                    NEW_VERSION="${CURRENT_VERSION}.${BUILD_ID}-DEV"
+                    echo "##[command]TEMP BRANCH NAME: ................... $NEW_VERSION"
+                  else
+                    CURRENT_VERSION=$(GET_VERSION_FILE)
+                    if [[ "$UPDATE_VERSION" == "True" ]]; then
+                      IFS='.' read -ra VERSION_PARTS <<< "$CURRENT_VERSION"
+                      PATCH_VERSION=$((${VERSION_PARTS[2]} + 1))
+                      CURRENT_VERSION="${VERSION_PARTS[0]}.${VERSION_PARTS[1]}.${PATCH_VERSION}"
+                      NEW_VERSION="v${CURRENT_VERSION}.${BUILD_ID}"
+                    else
+                      NEW_VERSION="v$CURRENT_VERSION.${BUILD_ID}"
+                    fi
+                  fi
+                fi
+
+                NEW_VERSION_FILE=$CURRENT_VERSION
+                NEW_VERSION_CLEAN="$CURRENT_VERSION.${BUILD_ID}"
+              fi
+
+              IFS="${ORIGINAL_IFS}"
+
+              echo "##[section]NEW VERSION: ........................ $NEW_VERSION"
+              echo "##[section]CHANGE SEMANTIC VERSION: ............ $UPDATE_VERSION"
+              echo "##[section]CURRENT VERSION: .................... $CURRENT_VERSION"
+              echo "##[section]BUILD_ID: ........................... $BUILD_ID"
+
+              echo "##vso[task.setvariable variable=NEW_VERSION_FILE]$NEW_VERSION_FILE"
+              echo "##vso[task.setvariable variable=IS_DEV_BRANCH;isOutput=true]$IS_DEV_BRANCH"
+              echo "##vso[task.setvariable variable=NEW_VERSION;isOutput=true]$NEW_VERSION"
+              echo "##vso[task.setvariable variable=NEW_VERSION_CLEAN;isOutput=true]$NEW_VERSION_CLEAN"
+            name: set_build_version
+            displayName: 'Set new Version'
+            env:
+              ACTUAL_BRANCH: $(Build.SourceBranch)
+              UPDATE_VERSION: ${{ and(in(variables['Build.SourceBranch'], 'refs/heads/master'), in(variables['Build.Reason'], 'IndividualCI', 'BatchedCI', 'Manual', 'Schedule'))  }}
+              IS_DEV_BRANCH: ${{ and(eq(variables['Build.Reason'], 'Manual'), ne(parameters.branch_frontend, ''), ne(parameters.branch_backend, '')) }}
+              UPDATE_VERSION_CUSTOM: ${{ and(startsWith(variables['Build.SourceBranch'], 'refs/heads/stage/'), in(variables['Build.Reason'], 'IndividualCI', 'BatchedCI', 'Manual', 'Schedule')) }}
+            ${{ if in(variables['Build.Reason'], 'Schedule') }}:
+              condition: succeeded()
+
+          - template: /tech_products/ecmc/sap-commerce/tasks/versioning/send_commit_with_new_version.yaml
+            parameters:
+              isCore: true
+              workingDirectory: $(Build.SourcesDirectory)/$(Build.Repository.Name)
+
+          - ${{ if eq(parameters.copy_publish_to_artifacts, True) }}:
+            - bash: |
+                FILE=$(Build.SourcesDirectory)/$(Build.Repository.Name)/catalog-info.yaml
+                if [ ! -f "$FILE" ]; then
+                  echo "##[error] Unable to find catalog-info.yaml file $FILE"
+                  exit 1
+                fi
+              displayName: "Check for catalog-info.yml"
+
+            - task: CopyFiles@2
+              displayName: "Copy catalog-info.yaml to Staging Directory"
+              inputs:
+                TargetFolder: "$(Build.ArtifactStagingDirectory)"
+                OverWrite: true
+                CleanTargetFolder: true
+                Contents: |
+                  $(Build.SourcesDirectory)/catalog-info.yaml
+
+          - task: PublishPipelineArtifact@1
+            displayName: "Publish catalog-info.yaml"
+            inputs:
+              artifactName: "catalog-info"
+              targetPath: "$(Build.ArtifactStagingDirectory)"

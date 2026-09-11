@@ -1,0 +1,128 @@
+parameters:
+- name: imageName
+  type: string
+- name: imageTag
+  type: string
+  default: $(Build.BuildId)
+- name: dockerfilePath
+  type: string
+  default: '**/Dockerfile'
+- name: buildContext
+  type: string
+  default: '.'
+- name: registryServiceConnection
+  type: string
+- name: loginRegistryServiceConnections
+  type: object
+  default: []
+- name: runSecuritySCA
+  type: boolean
+  default: false
+- name: pushImage
+  type: boolean
+  default: true
+- name: buildArgs
+  type: object
+  default: []
+
+steps:
+# Login nos Container Registries
+- ${{ each registry in parameters.loginRegistryServiceConnections }}:
+  - task: Docker@2
+    displayName: 'Login to Registry - ${{ registry }}'
+    inputs:
+      command: 'login'
+      containerRegistry: '${{ registry }}'
+
+- task: CmdLine@2
+  displayName: "Print das variáveis2"
+  inputs:
+    script: |
+      source ~/.bashrc
+      echo "--build-arg ${{ join(' --build-arg ', parameters.buildArgs) }}"
+
+
+# Build da imagem Docker com boas práticas de segurança
+- task: Docker@2
+  displayName: 'Build Docker Image'
+  inputs:
+    command: 'build'
+    dockerfile: '${{ parameters.dockerfilePath }}'
+    buildContext: '${{ parameters.buildContext }}'
+    repository: '${{ parameters.imageName }}'
+    containerRegistry: '${{ parameters.registryServiceConnection }}'
+    tags: ${{ parameters.imageTag }}
+    arguments: --build-arg ${{ join(' --build-arg ', parameters.buildArgs) }}
+    #${{ if gt(length(parameters.buildArgs), 0) }}:
+    #  arguments: --build-arg ${{ join(' --build-arg ', parameters.buildArgs) }}
+
+- task: CmdLine@2
+  displayName: 'Inspect Docker Image'
+  name: inspect
+  inputs:
+    script: |-
+      docker image ls
+      FULL_IMAGE_NAME=$(docker images --format '{{.Repository}}:{{.Tag}}' | grep '${{ parameters.imageName }}:${{ parameters.imageTag }}')
+      echo "##[debug] FULL_IMAGE_NAME: $FULL_IMAGE_NAME"
+      echo "##vso[task.setvariable variable=FULL_IMAGE_NAME]${FULL_IMAGE_NAME}"
+      echo "##[debug] Inspect Image"
+      docker inspect $FULL_IMAGE_NAME
+
+# Escaneamento de segurança da imagem (opcional)
+- ${{ if eq(parameters.runSecuritySCA, true) }}:
+  #- script: |
+  #    echo "Running security scan on Docker image..."
+  #    # Implementar scan de segurança aqui (Trivy, Clair, etc.)
+  #  displayName: 'Security Scan'
+
+  ## -> Download Security Tokens
+  - task: AzureKeyVault@2
+    displayName: 'Getting AKV Security Credentials'
+    name: get_security_credentials
+    timeoutInMinutes: 1
+    retryCountOnTaskFailure: 5
+    inputs:
+      azureSubscription: DevOpsSharedResources
+      KeyVaultName: 'kv-azdevops-shared'
+      SecretsFilter: 'CONVISO-API-KEY, DEPENDENCY-TRACK-TOKEN'
+    condition: and(eq(variables['DEPENDENCY-TRACK-TOKEN'], ''), eq(variables['CONVISO-API-KEY'], ''))
+
+#  - task: Bash@3
+#    displayName: 'Set Security Credentials Variables'
+#    name: security_credentials
+#    condition: succeeded()
+#    continueOnError: false
+#    inputs:
+#      targetType: inline
+#      script: |
+#        echo "##[group] Secrets for Security"
+#        
+#        echo "##vso[task.setvariable variable=DT_SCA_TOKEN;isSecret=true]$(DEPENDENCY-TRACK-TOKEN)"
+#        echo "##vso[task.setvariable variable=CONVISO_API_KEY;isSecret=true]$(CONVISO-API-KEY)"
+#
+#        echo "##[endgroup]"
+#        echo "##[debug] To open and check the information above, click the arrows on the left."
+
+#  - task: VivoAppSecTools@1
+#    displayName: 'Vivo AppSec Tools Run SCA'
+#    name: run_sca
+#    inputs:
+#      command: 'runScaOnly'
+#      azdoProjectName: '$(System.TeamProject)-$(Build.Repository.Name)'
+#      azdoProjectVersion: 'DevSecOps'
+#      scaUseDockerImage: true
+#      scaFullDockerImageName: '$(FULL_IMAGE_NAME)'
+#      dependencyTrackToken: '$(DT_SCA_TOKEN)'
+#      debugLogging: true    
+
+# Push da imagem para o registry
+- ${{ if eq(parameters.pushImage, true) }}:
+  - task: Docker@2
+    displayName: 'Push Docker Image'
+    inputs:
+      command: 'push'
+      repository: '${{ parameters.imageName }}'
+      containerRegistry: '${{ parameters.registryServiceConnection }}'
+      tags: ${{ parameters.imageTag }}
+
+

@@ -1,0 +1,120 @@
+parameters:
+  - name: runSync
+    type: boolean
+
+steps:
+  - task: Bash@3
+    displayName: "Uploading SBOM to DT & Wait for Sync"
+    condition: and(succeeded(), eq(variables['VERSION_OK'], 'true'), eq('${{ parameters.runSync }}', 'true'))
+    env:
+      DT_SCA_ENDPOINT: $(DT_SCA_ENDPOINT)
+      DT_TOKEN: $(DEPENDENCY-TRACK-TOKEN)
+      APP_NAME: $(DT_APP_DEFAULT_NAME)
+      APP_VERSION: $(DT_APP_DEFAULT_VERSION)
+      CACORP_LOCATION: $(CACORP_LOCATION)
+    inputs:
+      workingDirectory: $(REPO_NAME)
+      targetType: inline
+      script: |
+        echo "##[section]#################### UPLOADING SBOM TO DT & SYNC ####################"
+        echo "##[debug] Project Name: ${APP_NAME}"
+        echo "##[debug] Project Version: ${APP_VERSION}"
+
+        if [ ! -f "cyclonedx_report.json" ]; then
+          echo "##vso[task.logissue type=error]cyclonedx_report.json not found."
+          echo "##vso[task.complete result=Failed;]"
+          exit 1
+        fi
+
+        BOMCONTENT=$(cat cyclonedx_report.json | base64 -w 0)
+        ODTFILE="bom_payload.json"
+        RESPONSE_FILE="dt_response.json"
+
+        PAYLOAD='{ "projectName": "'${APP_NAME}'", "projectVersion": "'${APP_VERSION}'", "autoCreate": true, "bom": "'${BOMCONTENT}'" }'
+        echo -n $PAYLOAD > $ODTFILE
+        echo "##[debug] SBOM Payload generated successfully."
+
+        echo "##[group]Uploading to Dependency-Track"
+
+        HTTP_CODE=$(curl -s --cacert "${CACORP_LOCATION}" \
+                    -w "%{http_code}" \
+                    -o "${RESPONSE_FILE}" \
+                    -X PUT "${DT_SCA_ENDPOINT}/v1/bom" \
+                    -H "X-API-Key: ${DT_TOKEN}" \
+                    -H 'Content-Type: application/json' \
+                    -d "@${ODTFILE}")
+
+        RESPONSE=$(cat "${RESPONSE_FILE}")
+
+        echo "##[debug] HTTP Code: ${HTTP_CODE}"
+        echo "##[debug] Upload Response: ${RESPONSE}"
+        echo "##[endgroup]"
+
+
+        if [[ "$HTTP_STATUS" =~ ^(200|201)$ ]]; then
+           echo "##vso[task.logissue type=error]Falha ao enviar SBOM para o Dependency-Track. HTTP Code: ${HTTP_CODE}"
+           echo "##vso[task.complete result=Failed;]"
+           exit 1
+        fi
+
+        sbomToken=$(jq -r '.token' <<< "$RESPONSE")
+
+        if [ -z "$sbomToken" ] || [ "$sbomToken" == "null" ]; then
+           echo "##vso[task.logissue type=error]Falha ao recuperar o token do Dependency-Track no JSON."
+           echo "##vso[task.complete result=Failed;]"
+           exit 1
+        fi
+
+        echo "##[debug] SBOM Token: $sbomToken"
+        echo "##vso[task.setvariable variable=SBOM_TOKEN]$sbomToken"
+
+        i="0"
+        retries="25"
+        echo "##[group]Aguardando Sincronização finalizar no Dependency-Track..."
+
+        while [[ $i -lt $retries ]]
+        do
+          RESPONSE=$(curl -s --cacert "${CACORP_LOCATION}" \
+                      -X GET "${DT_SCA_ENDPOINT}/v1/event/token/${sbomToken}" \
+                      -H "X-API-Key: ${DT_TOKEN}" \
+                      -H 'Content-Type: application/json')
+
+          echo "##[debug] Status de processamento: ${RESPONSE}"
+
+          if [[ "$(jq -r '.processing' <<< "$RESPONSE")" == "false" ]]; then
+              echo "##[endgroup]"
+              echo "##[section]Sincronização finalizada com sucesso!"
+
+              APP_NAME_ENCODED=$(echo -n "$APP_NAME" | jq -sRr @uri)
+
+              RESPONSE_LOOKUP=$(curl -s --cacert "${CACORP_LOCATION}" \
+                          -X GET "${DT_SCA_ENDPOINT}/v1/project/lookup?name=${APP_NAME_ENCODED}&version=${APP_VERSION}" \
+                          -H "X-API-Key: ${DT_TOKEN}" \
+                          -H 'Content-Type: application/json')
+
+              echo "##[debug] Valor do Lookup: ${RESPONSE_LOOKUP}"
+              DT_PROJECT_ID=$(jq -r '.uuid' <<< "$RESPONSE_LOOKUP")
+
+              echo "##[debug] Project ID: $DT_PROJECT_ID"
+              echo "##vso[task.setvariable variable=PROJECT_ID]$DT_PROJECT_ID"
+              exit 0
+          fi
+
+          i=$[$i+1]
+          sleep 15s
+        done
+
+        echo "##[endgroup]"
+        echo "##vso[task.logissue type=error]Tempo esgotado - A Sincronização não foi finalizada, tente rodar novamente."
+        echo "##vso[task.complete result=Failed;]"
+        exit 1
+
+  - task: convisoAzureSyncTask@1
+    displayName: "Conviso Sync"
+    condition: and(succeeded(), eq(variables['VERSION_OK'], 'true'), eq('${{ parameters.runSync }}', 'true'))
+    continueOnError: true
+    inputs:
+      API_KEY: "$(CONVISO-API-KEY)"
+      PROJECT_ID: "$(PROJECT_ID)"
+      INTEGRATION: "DEPENDENCY_TRACK"
+      COMPANY_ID: "$(CONVISO_COMPANY_ID)"

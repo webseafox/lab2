@@ -1,0 +1,136 @@
+﻿parameters:
+  - name: enable_devflow_validations
+    type: boolean
+    default: False
+  - name: qa_branch
+    type: boolean
+    default: False
+  - name: s1_branch
+    type: boolean
+    default: False
+
+stages:
+- stage: bump_version
+  displayName: "Bump Version"
+  pool:
+    name: $(PRIVATE_AGENT_DEFAULT)
+    # demands: Agent.Version -gtVersion 2.210.1
+  dependsOn:
+    - pipeline_init
+  jobs:
+    - job: "bump_version"
+      displayName: "Bump Version"
+      steps:
+      - checkout: self
+        fetchDepth: 1
+        persistCredentials: true
+
+      # UPDATE VERSION WITH TEMPLATE SEMANTIC VERSIONING
+      - template: /tech_products/ecmc/shared/tasks/upgrade_semantic_version_with_python.yaml
+        parameters:
+          taskName: determine_new_version
+          extraEnvironmentVars:
+            FILE_VERSION_PATH: "VERSION"
+
+      - bash: |
+          cd $(Build.SourcesDirectory)
+          CURRENT_VERSION=$(GET_VERSION_FILE)
+          # CURRENT_VERSION=$(cat VERSION)
+          echo "Versão atual: $CURRENT_VERSION"
+
+          SET_VERSION=""
+
+          ORIGINAL_IFS="${IFS}"
+
+          echo "##[command]QA BRANCH: ${{ parameters.qa_branch }}"
+          echo "##[command]S1 BRANCH: ${{ parameters.s1_branch }}"
+
+          if [[ ${{ parameters.qa_branch }} == "True" || ${{ parameters.s1_branch }} == "True" ]]; then
+            echo "##[command]Montando versão de $(PROJECT_SOURCE_BRANCH) com base na data"
+            SET_VERSION=$(date +"%Y%m%d.%H%M%S")
+            echo "##[command]Nova versão: $SET_VERSION"
+          else
+            echo "##[command]Montando versão semântica em $(PROJECT_SOURCE_BRANCH)"
+            IFS='.' read -ra VERSION_PARTS <<< "$CURRENT_VERSION"
+            PATCH_VERSION=$((${VERSION_PARTS[2]} + 1))
+            SET_VERSION="${VERSION_PARTS[0]}.${VERSION_PARTS[1]}.${PATCH_VERSION}"
+
+            echo "Nova versão: $SET_VERSION"
+          fi
+
+          echo -n $SET_VERSION > VERSION
+
+          if [ "$USE_SEMANTIC_VERSION" == "true" ]; then
+            echo "##vso[task.setvariable variable=SAP_COMMERCE_OPTIONS_VERSION;isOutput=true]${SAP_COMMERCE_OPTIONS_VERSION}"
+
+            echo "##[debug]Verificando se ACTUAL_BRANCH ${ACTUAL_BRANCH} é igual ao conteúdo da variável BRANCH_NAME_TO_USE_SEMANTIC ${BRANCH_NAME_TO_USE_SEMANTIC}"
+
+            if [[ "${ACTUAL_BRANCH}" == "refs/heads/${BRANCH_NAME_TO_USE_SEMANTIC}" ]]; then
+
+              # Construir nova versão semântica
+              echo "##[section]New semantic version: $NEW_VERSION"
+
+              # Atualizar versao semantica file VERSION com nova versão
+              echo -n $NEW_VERSION > VERSION
+              echo "##[section]VERSION updated successfully"
+
+              # Atualizar variáveis do pipeline
+              echo "##vso[task.setvariable variable=NEW_VERSION;]$NEW_VERSION"
+              echo "##vso[task.setvariable variable=COMPONENT_VERSION;]$NEW_VERSION"
+
+              git add -f VERSION
+              if [ $? -ne 0 ]; then
+                echo "[error]No changes to commit."
+                exit 1
+              fi
+            else
+              # Construir nova versão não semântica
+              echo "##[section]New not semantic version: $NEW_VERSION"
+
+              # Atualizar versao não semantica no file .azuredevops/VERSION
+              echo -n $NEW_VERSION > .azuredevops/VERSION
+              echo "##[section].azuredevops/VERSION updated successfully"
+
+              git add -f .azuredevops/VERSION
+              if [ $? -ne 0 ]; then
+                echo "[error]No changes to commit."
+                exit 1
+              fi
+            fi
+            SET_VERSION=$NEW_VERSION
+          fi
+
+          IFS="${ORIGINAL_IFS}"
+
+          git config user.email "azure-pipelines@telefonicati.onmicrosoft.com"
+          git config user.name "Azure Pipelines"
+
+          git commit -m "[CI SKIP] Change [${SAP_COMMERCE_OPTIONS_VERSION}] VERSION file: ${NEW_VERSION}"
+          if [ $? -ne 0 ]; then
+            echo "[error]No changes to commit."
+            exit 1
+          fi
+
+          echo "[debug]Pushing changes to branch $(PROJECT_SOURCE_BRANCH) (command git push origin HEAD:)"
+
+          git push origin HEAD:$(PROJECT_SOURCE_BRANCH)
+
+          if [ $? -ne 0 ]; then
+            echo "[error]No changes to commit."
+            exit 1
+          fi
+
+          GIT_CURRENT_SHA_OLD=$(git rev-parse HEAD)
+
+          echo "[debug]GIT_CURRENT_SHA_OLD ........... : $GIT_CURRENT_SHA_OLD"
+          GIT_CURRENT_SHA=$(git log -n 1 --pretty='%H')
+          echo "[debug]GIT_CURRENT_SHA ............... : $GIT_CURRENT_SHA"
+          echo "Meu novo SHA: $GIT_CURRENT_SHA"
+
+          #TODO: NAO ESQUECER QUE TEM QUE TROCAR SET_VERSION PARA NEW_VERSION
+          echo "##vso[task.setvariable variable=NEW_VERSION;isoutput=true]$SET_VERSION"
+          echo "##vso[task.setvariable variable=NEW_GIT_SHA;isoutput=true]$GIT_CURRENT_SHA"
+        name: BumpVersion
+        displayName: 'Bump Version'
+        env:
+          ACTUAL_BRANCH: $(Build.SourceBranch)

@@ -1,0 +1,65 @@
+parameters:
+- name: fortifyExclusionRepository
+
+stages:
+- stage: security
+  displayName: "Security"
+  dependsOn: pipeline_init
+  pool:
+    name: $(PRIVATE_AGENT_DEFAULT)
+  jobs:
+  - job: app_config_keys
+    displayName: "Get AppSec Config Keys"
+    steps:
+    - template: /task_groups/security/get_appconfig_keys.yml@CorePipelines
+
+  - job: fortify_scan
+    dependsOn: app_config_keys
+    variables:
+      USE_FORTIFY: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_FORTIFY'] ]
+      USE_CONVISO: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_CONVISO'] ]
+      SKIP_SECURITY_GATE: $[ dependencies.app_config_keys.outputs['evaluate_flags.SKIP_SECURITY_GATE'] ]
+    condition: and(
+                    succeeded(),
+                    and(
+                      eq(variables.USE_FORTIFY, 'true'),
+                      eq(variables.flowIsToReview, true),
+                      not(startsWith(variables['Build.SourceBranch'], 'refs/tags/'))
+                    )
+                  )
+    displayName: "Fortify Scan"
+    steps:
+    - template: /task_groups/security/run_fortify_scan.yml@CorePipelines
+      parameters:
+        isGitFlow: true
+        gateCondition: and(
+                        succeeded(),
+                        ne(variables.skip_fortify_gate, true),
+                        ne(variables.USE_CONVISO, 'true')
+                      )
+        fortifyExclusionRepository: ${{ parameters.fortifyExclusionRepository }}
+        skipSecurityGate: $(SKIP_SECURITY_GATE)
+    - template: /tasks/telemetry/telemetry.yml@CorePipelines
+
+  - job: conviso_sync
+    dependsOn:
+    - fortify_scan
+    - app_config_keys
+    variables:
+      USE_CONVISO: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_CONVISO'] ]
+      SKIP_SECURITY_GATE: $[ dependencies.app_config_keys.outputs['evaluate_flags.SKIP_SECURITY_GATE'] ]
+    condition: and(
+                    succeeded(),
+                    eq(variables.USE_CONVISO, 'true'),
+                    or (
+                      eq(variables['Build.SourceBranch'], 'refs/heads/master'),
+                      eq(variables['Build.SourceBranch'], 'refs/heads/main'),
+                      eq(variables['System.PullRequest.TargetBranch'], 'refs/heads/master'),
+                      eq(variables['System.PullRequest.TargetBranch'], 'refs/heads/main')
+                    )
+                  )
+    displayName: "Conviso Sync"
+    steps:
+    - template: /task_groups/security/run_conviso_integration.yml@CorePipelines
+      parameters:
+        skipSecurityGate: $(SKIP_SECURITY_GATE)

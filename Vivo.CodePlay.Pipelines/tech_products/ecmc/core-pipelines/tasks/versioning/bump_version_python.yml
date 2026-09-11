@@ -1,0 +1,69 @@
+parameters:
+- name: currentVersion
+  type: string
+- name: newVersionVariableOut
+  type: string
+- name: bumpVersionOnManual
+  type: boolean
+  default: true
+
+steps:
+- task: VersionManagerVivo@8
+  inputs:
+    branchStrategy: trunkbased
+    command: 'nextVersion'
+    versionFile: pyproject.toml
+    bumpMethod: patch
+  name: bump_version_uv
+  displayName: "Bump version from pyproject.toml file"
+  condition: and(
+              succeeded(),
+              eq(variables['VERSION_MANAGER_TYPE'], 'uv'),
+              in(variables['Build.SourceBranch'], 'refs/heads/main', 'refs/heads/master')
+            )
+
+- bash: |
+    echo "[command]Bumping version from version file ........: Running cat VERSION"
+    CURRENT_VERSION=$(cat VERSION)
+    IFS='.' read -ra VERSION_PARTS <<< "$CURRENT_VERSION"
+    PATCH_VERSION=$((${VERSION_PARTS[2]} + 1))
+    NEW_VERSION="${VERSION_PARTS[0]}.${VERSION_PARTS[1]}.${PATCH_VERSION}"
+    echo $NEW_VERSION > VERSION
+    echo "[section]Setting variable VERSION: ${NEW_VERSION}"
+    echo "##vso[task.setvariable variable=VERSION;isOutput=true]${NEW_VERSION}"
+
+    #echo "##vso[task.setvariable variable=NEW_COMPONENT_VERSION]${NEW_VERSION}"
+
+  name: bump_version_default
+  displayName: "Bump version from version file"
+  workingDirectory: "$(Build.SourcesDirectory)"
+  condition: and(
+              succeeded(),
+              eq(variables['VERSION_MANAGER_TYPE'], 'version_file'),
+              in(variables['Build.SourceBranch'], 'refs/heads/main', 'refs/heads/master')
+            )
+- bash: |
+    set -euo pipefail
+    if [ "${VERSION_MANAGER_TYPE}" == "uv" ]; then
+      NEW_COMPONENT_VERSION=$(bump_version_uv.VERSION)
+    else
+      NEW_COMPONENT_VERSION=$(bump_version_default.VERSION)
+    fi
+    if [ -z "${NEW_COMPONENT_VERSION}" ]; then
+      echo "[error]A variável NEW_COMPONENT_VERSION não está definida. Falha ao atualizar a versão."
+      echo "[error]Verifique na task Bump version acima se a variável NEW_COMPONENT_VERSION foi definida corretamente."
+      exit 1
+    fi
+    echo "##vso[task.setvariable variable=${NEW_VERSION_OUT};isOutput=true]${NEW_COMPONENT_VERSION}"
+    echo "[command]Exporting variable ${NEW_VERSION_OUT}: ${NEW_COMPONENT_VERSION}"
+  displayName: 'Defining New Component Version'
+  name: component_bump_version
+  condition: and(
+              succeeded(),
+              in(variables['VERSION_MANAGER_TYPE'], 'uv', 'version_file'),
+              in(variables['Build.SourceBranch'], 'refs/heads/main', 'refs/heads/master')
+            )
+  env:
+    NEW_COMPONENT_VERSION: $(NEW_COMPONENT_VERSION)
+    NEW_VERSION_OUT: "${{ parameters.newVersionVariableOut }}"
+

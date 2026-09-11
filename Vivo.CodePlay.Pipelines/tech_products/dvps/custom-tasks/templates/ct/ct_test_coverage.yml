@@ -1,0 +1,137 @@
+parameters:
+  - name: EXTENSION_NAME
+  - name: EXTENSION_ID
+  - name: SKIP_TESTS
+  - name: TAG
+  - name: environment
+
+stages:
+  - stage: test
+    displayName: Test and Coverage
+    jobs:
+      - job: test
+        displayName: 'Execução dos testes'
+        steps:
+          - checkout: self
+            clean: true
+            fetchTags: true
+            persistCredentials: true
+
+          - task: Npm@1
+            continueOnError: true
+            displayName: Npm Install root
+            inputs:
+              command: "custom"
+              customCommand: "install"
+
+          - task: Npm@1
+            displayName: Test & Coverage
+            inputs:
+              command: "custom"
+              customCommand: "run coverage"
+
+          - task: PublishTestResults@2
+            displayName: Tests Results
+            continueOnError: true
+            inputs:
+              testResultsFormat: "JUnit"
+              testResultsFiles: "**/test-results.xml"
+              mergeResults: true
+              testRunTitle: "${{ parameters.EXTENSION_ID }}"
+
+          - script: |
+              npx eslint@8.57.0 "$(Build.SourcesDirectory)" --ignore-pattern "node_modules/*" -f json -o eslint-report.json || true
+            displayName: 'Run ESLint'
+
+          - task: PublishPipelineArtifact@1
+            displayName: 'Publicar artifact meuarquivo'
+            inputs:
+              targetPath: '$(Build.SourcesDirectory)/eslint-report.json' 
+              artifact: 'eslint-report.json'
+              publishLocation: 'pipeline'
+
+      - job: sonar
+        displayName: 'Download e Execução do Sonar'
+        dependsOn: test
+        steps:
+          - checkout: self
+            clean: true
+            fetchTags: true
+            persistCredentials: true
+
+          - task: Bash@3
+            displayName: 'Download SonarScanner CLI'
+            name: sonarScannerDownload
+            inputs:
+              workingDirectory: $(System.ArtifactsDirectory)
+              targetType: inline
+              script: |
+                echo "Verificando se o SonarScanner já está presente"
+                echo "System.ArtifactsDirectory: $(System.ArtifactsDirectory)"
+                #ls -la $(System.ArtifactsDirectory)/extracted_tars/
+
+                SONAR_SCANNER_DIR=sonar-scanner-5.0.1.3006-linux
+                SONAR_SCANNER_ZIP=sonar-scanner-cli-5.0.1.3006-linux.zip
+                SONAR_SCANNER_URL=https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/$SONAR_SCANNER_ZIP
+
+                if [ -d "$SONAR_SCANNER_DIR" ]; then
+                  echo "SonarScanner já está instalado em $SONAR_SCANNER_DIR"
+                  echo "Interrompendo a pipeline."
+                  ls -la $(Agent.TempDirectory)
+                  exit 1
+                else
+                  echo "Baixando SonarScanner CLI"
+                  wget $SONAR_SCANNER_URL
+                  unzip $SONAR_SCANNER_ZIP -d $(Build.SourcesDirectory)/
+                  $(Build.SourcesDirectory)/sonar-scanner --version 
+                  chmod +x $(Build.SourcesDirectory)/$SONAR_SCANNER_DIR/bin/sonar-scanner
+                fi
+
+          - task: AzureKeyVault@2
+            displayName: Secrets from AKV
+            inputs:
+              RunAsPreJob: true
+              azureSubscription: "DevOpsSharedResources"
+              KeyVaultName: "kv-azdevops-shared"
+              SecretsFilter: >-
+                SONARQUBE-TOKEN
+
+          - task: DownloadPipelineArtifact@2
+            displayName: 'Baixar artifact do Eslint'
+            inputs:
+              artifact: 'eslint-report.json'
+              path: '$(Build.SourcesDirectory)'
+          
+          - bash: |
+              if [ -z "$TAG" ]; then
+                  if [ -f "package/vss-extension.json" ]; then
+                      VERSION=$(cat package/vss-extension.json | grep "\"version\":" | cut -d '"' -f4)
+                  elif [ -f "vss-extension.json" ]; then
+                      VERSION=$(cat vss-extension.json | grep "\"version\":" | cut -d '"' -f4)
+                  else
+                      echo "Arquivo vss-extension.json não foi encontrado. Não foi possível determinar a versão."
+                      exit 1
+                  fi
+              else
+                  VERSION='${{ parameters.TAG }}'
+              fi    
+              
+              echo "Versão detectada: $VERSION"
+              
+              echo "##vso[task.setvariable variable=VERSION;isOutput=true]$VERSION"
+            name: packageInfo
+         
+          - task: SonarqubeScan@0
+            inputs:
+              sonarlogin: $(SONARQUBE-TOKEN)
+              sonarQubeEndpoint: 'http://sonar.devops.redecorp.br'
+              projectDirectory: '$(Build.SourcesDirectory)'
+              projectKey: "${{ parameters.EXTENSION_ID }}"
+              projectName: '"${{ parameters.EXTENSION_NAME }}"'
+              projectVersion: '$(packageInfo.VERSION)'
+              sources: 'Tasks,.scripts'
+              eslintReportPath: eslint-report.json
+              sonarConfigFile: '$(Build.SourcesDirectory)/.azuredevops/'
+              projectBaseDir: '$(Build.SourcesDirectory)'
+            env:
+              PATH: $(Build.SourcesDirectory)/sonar-scanner-5.0.1.3006-linux/bin:$(PATH)

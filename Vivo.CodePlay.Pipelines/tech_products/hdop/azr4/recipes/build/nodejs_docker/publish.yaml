@@ -1,0 +1,104 @@
+parameters:
+- name: envs
+  type: object
+  default: {}
+- name: branching_strategy
+  type: string
+  default: 'stb'
+
+jobs:
+- job: package
+  pool: GeneralPurposeLinuxAgentsCI
+  workspace:
+    clean: all
+  variables:
+    # Precisa importar de novo, do contrário não funciona
+    - template: ./variables.yaml
+      parameters:
+          envs: ${{ parameters.envs }}
+    - ${{ if and(or(eq(parameters.branching_strategy, 'gitlabflow'), eq(parameters.branching_strategy, 'gitlabflow-semantic')), ne(variables['Build.SourceBranchName'], '')) }}:
+      - template: ./variables/${{ variables['Build.SourceBranchName'] }}.yaml
+        parameters:
+            envs: ${{ parameters.envs }}
+  steps:
+  - template: /tech_products/hdop/templates/steps/version_update.yaml
+  - task: Docker@2
+    name: login_devops
+    displayName: 'Login to Docker Registry'
+    continueOnError: true
+    inputs:
+      containerRegistry: ACR-DEVOPS
+      displayName: 'Login to Docker Registry'
+      command: 'login'
+  - task: Docker@2
+    name: login
+    displayName: 'Login to Docker Registry'
+    inputs:
+      containerRegistry: ${{ variables.IMAGE_REGISTRY_CONNECTION }}
+      displayName: 'Login to Docker Registry'
+      command: 'login'
+  - task: Cache@2
+    continueOnError: true
+    condition: eq(variables['CACHE_APP_DEPENDENCIES'], 'true')
+    inputs:
+      key: "node | $(Agent.OS) | **/package-lock.json, **/npm-shrinkwrap.json, **/package.json"
+      path: "$(Build.SourcesDirectory)/node_modules"
+      restoreKeys: |
+        node | $(Agent.OS)
+        node
+  - template: /tech_products/hdop/templates/steps/set_nodejs_version.yaml
+    parameters:
+      NODE_VERSION: $(NODE_VERSION)
+  - script: |
+      npm install ${NPM_INSTALL_ARGS}
+    displayName: 'Install Dependencies'
+    condition: eq(variables['CACHE_APP_DEPENDENCIES'], 'true')
+    env:
+      NPM_INSTALL_ARGS: $(NPM_INSTALL_ARGS)
+  # ==================================================================
+  # [Compliance] Verifica se o repositório está em conformidade com as políticas de configuração
+  # ==================================================================
+  - task: VivoDevOpsConfigCompliance@1
+    displayName: 'Check DevOps Config Compliance'
+    inputs:
+      workDir: ${{ variables.DOCKER_BUILD_CONTEXT }}
+      policySets: |
+        image-definition-files
+  - task: Docker@2
+    name: build
+    displayName: 'Build Docker Image'
+    inputs:
+      containerRegistry: ${{ variables.IMAGE_REGISTRY_CONNECTION }}
+      repository: ${{ variables.IMAGE_NAME }}
+      displayName: 'Docker Build'
+      command: 'build'
+      Dockerfile: ${{ variables.DOCKERFILE_PATH }}
+      tags: $(set_version.version)
+      arguments: ${{ variables.DOCKER_BUILD_ARGS }}
+      buildContext: ${{ variables.DOCKER_BUILD_CONTEXT }}
+  - script: |
+      FULL_IMAGE_NAME=$(docker images --format '{{.Repository}}:{{.Tag}}' | grep "${IMAGE_NAME}:${IMAGE_TAG}")
+      echo "##[debug] FULL_IMAGE_NAME: $FULL_IMAGE_NAME"
+      echo "##vso[task.setvariable variable=FULL_IMAGE_NAME;isOutput=true]${FULL_IMAGE_NAME}"
+    displayName: 'Extract Docker Image Name to SCA'
+    name: get_image
+    env:
+      IMAGE_NAME: ${{ variables.IMAGE_NAME }}
+      IMAGE_TAG: $(set_version.version)
+  - template: /tech_products/hdop/templates/steps/execute_sca.yaml
+    parameters:
+      scaAnalysisType: 'image'
+      fullImageName: $(get_image.FULL_IMAGE_NAME)
+  - task: Docker@2
+    name: publish
+    displayName: 'Publish Docker Image'
+    condition: succeeded()
+    inputs:
+      containerRegistry: ${{ variables.IMAGE_REGISTRY_CONNECTION }}
+      repository: ${{ variables.IMAGE_NAME }}
+      displayName: 'Docker Publish'
+      command: 'push'
+      addPipelineData: true
+      addBaseImageData: true
+      Dockerfile: ${{ variables.DOCKERFILE_PATH }}
+      tags: $(set_version.version)

@@ -1,0 +1,68 @@
+steps:
+  - task: Bash@3
+    displayName: "Static Analysis: run_analysis (gera .json)"
+    continueOnError: true
+    inputs:
+      targetType: inline
+      script: |
+        set -euo pipefail
+        mkdir -p "$(Build.ArtifactStagingDirectory)/static-analysis"
+
+        echo "==> Executando: dart run lib_static_analysis:run_analysis ."
+        dart run lib_static_analysis:run_analysis .
+
+        echo "==> Coletando apenas os arquivos relevantes"
+        if [ -f "analysis_output.json" ]; then
+          cp analysis_output.json "$(Build.ArtifactStagingDirectory)/static-analysis/"
+        fi
+
+        if ls static_analysis_report-*.json >/dev/null 2>&1; then
+          cp static_analysis_report-*.json "$(Build.ArtifactStagingDirectory)/static-analysis/"
+        fi
+
+  - task: PublishBuildArtifacts@1
+    displayName: "Publicar artifacts da Static Analysis"
+    condition: succeededOrFailed()
+    inputs:
+      PathtoPublish: "$(Build.ArtifactStagingDirectory)/static-analysis"
+      ArtifactName: "static-analysis"
+      publishLocation: "Container"
+
+  - task: Bash@3
+    displayName: "Static Analysis: fill_service_map + commit"
+    continueOnError: true
+    env:
+      SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+    inputs:
+      targetType: inline
+      script: |
+        set -euo pipefail
+        export GIT_CONFIG_PARAMETERS="'safe.directory=$(Build.SourcesDirectory)'"
+        git config user.email "${BUILD_REQUESTEDFOREMAIL:-azuredevops@telefonica.com}"
+        git config user.name  "${BUILD_REQUESTEDFOR:-Azure DevOps}"
+
+        RAW_REF="$(Build.SourceBranch)"
+        if [[ "$RAW_REF" =~ ^refs/heads/ ]]; then
+          CURRENT_BRANCH="${RAW_REF#refs/heads/}"
+        else
+          CURRENT_BRANCH="$(Build.SourceBranchName)"
+        fi
+        echo "Branch atual: ${CURRENT_BRANCH}"
+
+        dart run lib_static_analysis:fill_service_map || { echo "fill_service_map falhou"; exit 0; }
+
+        git fetch --prune origin "${CURRENT_BRANCH}" || true
+        if git show-ref --verify --quiet "refs/remotes/origin/${CURRENT_BRANCH}"; then
+          git checkout "${CURRENT_BRANCH}" || git checkout -b "${CURRENT_BRANCH}"
+          git pull --rebase origin "${CURRENT_BRANCH}" || true
+        else
+          git checkout "${CURRENT_BRANCH}" || git checkout -b "${CURRENT_BRANCH}"
+        fi
+
+        if git status --porcelain | awk '{print $2}' | grep -q '^catalog-info.yaml$'; then
+          git add catalog-info.yaml
+          git commit -m "chore(static-analysis): atualiza catalog-info.yaml (fill_service_map) [skip ci]" || true
+          git push origin "HEAD:${CURRENT_BRANCH}" || echo "Push falhou (branch protegida ou sem permissão)"
+        else
+          echo "Nenhuma alteração em catalog-info.yaml."
+        fi

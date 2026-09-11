@@ -1,0 +1,136 @@
+steps:
+  - task: AzureCLI@2
+    displayName: "Preparar imagem corrigida para o ACR"
+    condition: and(succeeded(), eq(variables['FIX_STATUS'], 'success'))
+    inputs:
+      azureSubscription: DevOpsSharedResources
+      scriptType: bash
+      scriptLocation: inlineScript
+      workingDirectory: "$(CONTAINER_AGENT_PATH)"
+      inlineScript: |
+        echo "##[section]#################### PREPARAR IMAGEM PARA O ACR ####################"
+        set -e
+
+        IMAGE_NAME=$(jq -r '.image_name' fix.json)
+        LOCAL_IMAGE_TAG=$(jq -r '.local_image_tag' fix.json)
+        IMAGE_WITHOUT_REGISTRY="${IMAGE_NAME#*/}"
+        SIGLA=$(printf '%s' "$SYSTEM_TEAMPROJECT" | awk '{print tolower($1)}')
+        BASE_REPO="${IMAGE_WITHOUT_REGISTRY%:*}"
+        case "$BASE_REPO" in
+          "$SIGLA"/*) REPO_PATH="$BASE_REPO" ;;
+          *) REPO_PATH="${SIGLA}/${BASE_REPO}" ;;
+        esac
+        LAST_SEGMENT="${IMAGE_NAME##*/}"
+        if [[ "$LAST_SEGMENT" == *:* ]]; then
+          HAS_EXPLICIT_TAG=true
+          TAG_ORIGINAL="${IMAGE_NAME##*:}"
+        else
+          HAS_EXPLICIT_TAG=false
+          TAG_ORIGINAL=""
+        fi
+        ACR_REGISTRY="$ACR_REGISTRY_NAME"
+        ACR_NAME="${ACR_REGISTRY%%.*}"
+
+        echo "##[debug] Repositório ACR: $REPO_PATH"
+        echo "##[debug] Tag original: ${TAG_ORIGINAL:-<sem-tag>}"
+        EXISTING_TAGS=$(az acr repository show-tags --name "$ACR_NAME" --repository "$REPO_PATH" --username "$ACR_USERNAME" --password "$ACR_PASSWORD" --output tsv) || EXISTING_TAGS=""
+
+        MAX_VERSION=0
+        MAX_SEMVER=""
+
+        while IFS= read -r CURRENT_TAG; do
+          if [ "$HAS_EXPLICIT_TAG" = true ]; then
+            case "$CURRENT_TAG" in
+              "${TAG_ORIGINAL}"-[0-9]*.[0-9]*.[0-9]*)
+                SUFFIX="${CURRENT_TAG#${TAG_ORIGINAL}-}"
+                if [[ "$SUFFIX" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+                  MAJ="${BASH_REMATCH[1]}"
+                  MIN="${BASH_REMATCH[2]}"
+                  PAT="${BASH_REMATCH[3]}"
+                  VAL=$(( MAJ * 1000000 + MIN * 1000 + PAT ))
+                  if [ "$VAL" -gt "$MAX_VERSION" ]; then
+                    MAX_VERSION="$VAL"
+                    MAX_SEMVER="${MAJ}.${MIN}.${PAT}"
+                  fi
+                fi
+                ;;
+            esac
+          else
+            case "$CURRENT_TAG" in
+              [0-9]*.[0-9]*.[0-9]*)
+                if [[ "$CURRENT_TAG" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+                  MAJ="${BASH_REMATCH[1]}"
+                  MIN="${BASH_REMATCH[2]}"
+                  PAT="${BASH_REMATCH[3]}"
+                  VAL=$(( MAJ * 1000000 + MIN * 1000 + PAT ))
+                  if [ "$VAL" -gt "$MAX_VERSION" ]; then
+                    MAX_VERSION="$VAL"
+                    MAX_SEMVER="${MAJ}.${MIN}.${PAT}"
+                  fi
+                fi
+                ;;
+            esac
+          fi
+        done <<< "$EXISTING_TAGS"
+
+        if [ -z "$MAX_SEMVER" ]; then
+          if [ "$HAS_EXPLICIT_TAG" = true ]; then
+            DEST_TAG="${TAG_ORIGINAL}-1.0.0"
+          else
+            DEST_TAG="1.0.0"
+          fi
+        else
+          IFS='.' read -r MAJ MIN PAT <<< "$MAX_SEMVER"
+          NEW_PATCH=$(( PAT + 1 ))
+          if [ "$HAS_EXPLICIT_TAG" = true ]; then
+            DEST_TAG="${TAG_ORIGINAL}-${MAJ}.${MIN}.${NEW_PATCH}"
+          else
+            DEST_TAG="${MAJ}.${MIN}.${NEW_PATCH}"
+          fi
+        fi
+
+        NEW_ACR_IMAGE="${ACR_REGISTRY}/${REPO_PATH}:${DEST_TAG}"
+        echo "##[debug] Nova referência ACR: $NEW_ACR_IMAGE"
+        echo "##[command] docker tag $LOCAL_IMAGE_TAG $NEW_ACR_IMAGE"
+        docker tag "$LOCAL_IMAGE_TAG" "$NEW_ACR_IMAGE"
+
+        echo "##vso[task.setvariable variable=DEST_REPO]$REPO_PATH"
+        echo "##vso[task.setvariable variable=DEST_TAG]$DEST_TAG"
+        echo "##vso[task.setvariable variable=NEW_ACR_IMAGE]$NEW_ACR_IMAGE"
+    env:
+      ACR_REGISTRY_NAME: $(DOCKER_ACR_REGISTRY)
+      SYSTEM_TEAMPROJECT: $(System.TeamProject)
+      ACR_USERNAME: $(DOCKER-REGISTRY-ACR-USERNAME)
+      ACR_PASSWORD: $(DOCKER-REGISTRY-ACR-PASSWORD)
+
+  - task: Docker@2
+    displayName: "Publicar imagem corrigida no ACR"
+    condition: and(succeeded(), eq(variables['FIX_STATUS'], 'success'), ne(variables['NEW_ACR_IMAGE'], ''))
+    inputs:
+      containerRegistry: $(DOCKER_ACR_REGISTRY_SERVICE_CONNECTION_NAME)
+      command: push
+      repository: $(DEST_REPO)
+      tags: $(DEST_TAG)
+
+  - bash: |
+      echo "##[section]#################### CRIAR PULL REQUESTs ####################"
+      echo "##[command] uv run python -m src.main create-pr --data fix.json --new-image $NEW_ACR_IMAGE"
+      uv run python -m src.main create-pr --data fix.json --new-image "$NEW_ACR_IMAGE"
+    displayName: "Criar pull request da correção"
+    workingDirectory: "$(CONTAINER_AGENT_PATH)"
+    condition: and(succeeded(), eq(variables['FIX_STATUS'], 'success'), ne(variables['NEW_ACR_IMAGE'], ''))
+    env:
+      COPILOT_API_KEY: $(COPILOT_API_KEY)
+      ARCANE_TEAMS_URL: $(ARCANE_TEAMS_URL)
+      CHAT_ID_TEAMS: $(TEAMS_CHAT_CONTAINER_ID)
+      AZURE_PAT: $(AZDO_PAT)
+      AZURE_PROJECT: $(System.TeamProject)
+      AZURE_DOCKERFILE_NAMES: $(AZURE_DOCKERFILE_NAMES)
+      COMMIT_MESSAGE_PATTERN: $(COMMIT_MESSAGE_PATTERN)
+      PR_TITLE_PATTERN: $(PR_TITLE_PATTERN)
+      MODEL_NAME: $(MODEL_NAME)
+      ENVIRONMENT: production
+      HTTP_PROXY: $(PROXY_AGENT_HTTP)
+      HTTPS_PROXY: $(PROXY_AGENT_HTTPS)
+      NO_PROXY: $(PROXY_AGENT_NO_PROXY)
+      PIPELINE_URL: "$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)&view=results"

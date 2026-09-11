@@ -1,0 +1,84 @@
+parameters:
+- name: description
+  default: ""
+  type: string
+
+- name: maven_command
+  default: ""
+  type: string
+
+- name: docker_image
+  default: ""
+  type: string
+
+- name: scenariosType
+  default: ""
+  type: string
+
+stages:
+- stage: scenarios_exec
+  displayName: "${{ parameters.description }} ${{ parameters.scenariosType }}"
+  pool:
+    name: GeneralPurposeLinuxAgentsCI
+  jobs:
+  - job: scenarios_exec
+    displayName: "Execução do Cenário"
+    timeoutInMinutes: 180
+    cancelTimeoutInMinutes: 3 
+    steps:
+      - task: AzureKeyVault@2
+        displayName: 'Recuperando credenciais'
+        inputs:
+          azureSubscription: DevOpsSharedResources
+          KeyVaultName: kv-azdevops-shared
+          secretsFilter: 'NEXUS-DEPS-USR, NEXUS-DEPS-PSW'
+
+      - task: Docker@2
+        displayName: 'Fazendo autenticação'
+        inputs:
+          command: 'login'
+          containerRegistry: ACR-DEVOPS
+          timeoutInMinutes: 90
+
+      - bash: | 
+          echo "##[debug] comando maven ${{ parameters.maven_command }}"
+        displayName: "Maven command"
+
+      - bash: |
+          # Runs builder image
+          docker run --rm \
+            --user="$(id -u):$(id -g)" \
+            --log-driver none \
+            -e HTTPS_PROXY="$HTTPS_PROXY" \
+            -e HTTP_PROXY="$HTTP_PROXY" \
+            -e NO_PROXY="$NO_PROXY" \
+            -e JAVA_OPTS_MEMORY_MAX="$DEFAULT_MAX_MEMORY_BUILD" \
+            -e TZ="America/Sao_Paulo" \
+            -e SYSTEM_ACCESSTOKEN="$SYSTEM_ACCESSTOKEN" \
+            -e NEXUS_DEPS_USR="$NEXUS_DEPS_USR" \
+            -e NEXUS_DEPS_PSW="$NEXUS_DEPS_PSW" \
+            -v $(pwd):/app \
+            -v $HOME/.m2:/.m2 \
+            -w /app \
+          acrsharedservices01.azurecr.io/base/qa/selenium-junit/oraclient/runtime:1.0.1 \
+          /bin/bash -c "mvn ${{ parameters.maven_command }}"
+        displayName: 'Fazendo o build'
+        env:
+          SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+          NEXUS_DEPS_USR: $(NEXUS-DEPS-USR)
+          NEXUS_DEPS_PSW: $(NEXUS-DEPS-PSW)
+          DEFAULT_MAX_MEMORY_BUILD: "$DEFAULT_MAX_MEMORY_BUILD"
+          DOCKER_WORKDIR: $(DOCKER_WORKDIR)/app/
+
+      - task: PublishPipelineArtifact@1
+        displayName: 'Upload relatório'
+        inputs:
+          targetPath: '$(System.DefaultWorkingDirectory)/RunResults/'
+          publishLocation: 'pipeline'
+        condition: always() 
+      - task: DeleteFiles@1
+        displayName: 'Limpar diretório'
+        inputs:
+          SourceFolder: '$(System.DefaultWorkingDirectory)/s'
+          Contents: 'RunResults/**'     
+        condition: always()     

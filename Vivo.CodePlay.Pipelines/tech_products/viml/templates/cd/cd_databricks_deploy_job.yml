@@ -1,0 +1,146 @@
+# templates/cd/cd_databricks_deploy_job.yml
+parameters:
+  - name: jobType
+    type: string
+  - name: displayName
+    type: string
+  - name: enabled
+    type: boolean
+  - name: repoName
+    type: string
+  - name: repoPathDatabricks
+    type: string
+
+steps:
+- ${{ if eq(parameters.enabled, true) }}:
+  - bash: |
+      set -e
+
+      echo "🚀 Iniciando deploy do job no Databricks..."
+
+      # === Configurações ===
+      JOB_TYPE="${JOB_TYPE}"
+      CONFIG_FILE="$SYSTEM_DEFAULTWORKINGDIRECTORY/config/jobs-config.json"
+
+      WORKSPACE_URL_DATABRICKS="${WORKSPACE_URL_DATABRICKS}"
+      DATABRICKS_TOKEN="${DATABRICKS_TOKEN}"
+
+      echo "🔎 Job solicitado: $JOB_TYPE"
+
+      # Validações básicas
+      if [[ -z "$JOB_TYPE" ]]; then
+        echo "❌ Parâmetro JOB_TYPE não fornecido. Uso: $0 [train|predict|evaluate]"
+        exit 1
+      fi
+
+      if [[ ! -f "$CONFIG_FILE" ]]; then
+        echo "❌ Arquivo de configuração '$CONFIG_FILE' não encontrado."
+        exit 1
+      fi
+
+      if [[ -z "$WORKSPACE_URL_DATABRICKS" || -z "$DATABRICKS_TOKEN" ]]; then
+        echo "❌ Variáveis WORKSPACE_URL_DATABRICKS e/ou DATABRICKS_TOKEN não definidas."
+        exit 1
+      fi
+
+      if [[ -z "$REPO_NAME" || -z "$REPO_PATH_DATABRICKS" ]]; then
+        echo "❌ Variáveis REPO_NAME e/ou REPO_PATH_DATABRICKS não definidas."
+        exit 1
+      fi
+
+      # Extrai o payload do job do JSON
+      JOB_TEMPLATE=$(jq -c --arg job "$JOB_TYPE" '.[$job]' "$CONFIG_FILE") || {
+        echo "❌ Falha ao ler configuração do job '$JOB_TYPE'."
+        exit 1
+      }
+
+      if [[ "$JOB_TEMPLATE" == "null" ]]; then
+        echo "❌ Job '$JOB_TYPE' não encontrado no arquivo JSON."
+        exit 1
+      fi
+
+      # Substitui os placeholders ${REPO_NAME} e ${REPO_PATH_DATABRICKS} no payload
+      JOB_PAYLOAD=$(echo "$JOB_TEMPLATE" | envsubst '$REPO_NAME $REPO_PATH_DATABRICKS')
+
+      # Extrai o nome do job já substituído
+      JOB_NAME=$(echo "$JOB_PAYLOAD" | jq -r '.name')
+      echo "⚙️  Configurando job: $JOB_NAME"
+
+      # Função para validar resposta HTTP
+      check_response() {
+        local status=$1
+        local response_body=$2
+
+        if [[ "$status" -ge 200 && "$status" -lt 300 ]]; then
+          echo "✅ Operação realizada com sucesso."
+        else
+          echo "❌ Erro na requisição. Código HTTP: $status"
+          echo "Resposta do servidor:"
+          echo "$response_body" | jq .
+          exit 1
+        fi
+      }
+
+      # Busca job existente pelo nome
+      response=$(mktemp)
+      http_status=$(curl -s -w "%{http_code}" -o "$response" -X GET "$WORKSPACE_URL_DATABRICKS/api/2.1/jobs/list" \
+        -H "Authorization: Bearer $DATABRICKS_TOKEN")
+
+      check_response "$http_status" "$(cat $response)"
+
+      # Debug (opcional): exibe resposta da API
+      # echo "Resposta da API jobs/list:"
+      # cat "$response"
+
+      # Verifica se o campo "jobs" existe e não é null
+      JOBS_EXISTS=$(jq 'has("jobs") and (.jobs != null)' "$response")
+
+      if [[ "$JOBS_EXISTS" == "true" ]]; then
+        EXISTING_JOB_ID=$(jq -r --arg name "$JOB_NAME" '.jobs[]? | select(.settings.name == $name) | .job_id' "$response")
+      else
+        EXISTING_JOB_ID=""
+      fi
+
+      rm -f "$response"
+
+      if [[ -n "$EXISTING_JOB_ID" ]]; then
+        echo "♻️  Job já existe (ID: $EXISTING_JOB_ID). Atualizando..."
+
+        UPDATE_PAYLOAD=$(jq -n --argjson new_settings "$JOB_PAYLOAD" --arg job_id "$EXISTING_JOB_ID" \
+          '{job_id: ($job_id | tonumber), new_settings: $new_settings}')
+
+        response=$(mktemp)
+        http_status=$(curl -s -w "%{http_code}" -o "$response" -X POST "$WORKSPACE_URL_DATABRICKS/api/2.1/jobs/reset" \
+          -H "Authorization: Bearer $DATABRICKS_TOKEN" \
+          -H "Content-Type: application/json" \
+          -d "$UPDATE_PAYLOAD")
+
+        check_response "$http_status" "$(cat $response)"
+        echo "✅ Resposta da atualização:"
+        cat "$response" | jq
+        rm -f "$response"
+
+      else
+        echo "✨ Criando novo job..."
+
+        response=$(mktemp)
+        http_status=$(curl -s -w "%{http_code}" -o "$response" -X POST "$WORKSPACE_URL_DATABRICKS/api/2.1/jobs/create" \
+          -H "Authorization: Bearer $DATABRICKS_TOKEN" \
+          -H "Content-Type: application/json" \
+          -d "$JOB_PAYLOAD")
+
+        check_response "$http_status" "$(cat $response)"
+        echo "✅ Resposta da criação:"
+        cat "$response" | jq
+        rm -f "$response"
+      fi
+
+      echo "🚀 Deploy do job '$JOB_TYPE' finalizado com sucesso."
+
+    displayName: ${{ parameters.displayName }}
+    env:
+      JOB_TYPE: ${{ parameters.jobType }}
+      REPO_NAME: ${{ parameters.repoName }}
+      REPO_PATH_DATABRICKS: ${{ parameters.repoPathDatabricks }}
+      DATABRICKS_TOKEN: $(DATABRICKS_TOKEN)
+      WORKSPACE_URL_DATABRICKS: $(WORKSPACE_URL_DATABRICKS)

@@ -1,0 +1,82 @@
+parameters:
+  environment: ''
+
+jobs:
+- deployment: deployment
+  pool: GeneralPurposeLinuxAgentsCD
+  environment: 
+    name: deploy-${{ parameters.environment }}
+  strategy:
+    runOnce:   
+      deploy:
+        steps:
+        - checkout: self
+          persistCredentials: true
+        - template: /tech_products/hdop/templates/steps/get_latest_version.yaml
+        # Não funciona pegar da variavel https://github.com/microsoft/azure-pipelines-tasks/issues/6885
+        # - task: DownloadSecureFile@1
+        #   name: securitysettings
+        #   displayName: 'Download custom ssh key from secure file'
+        #   inputs:
+        #     secureFile: ${{ variables.SSH_CRED_SECURE_FILE_NAME }}
+      ##   - task: SSH@0 e CopyFilesOverSSH@0 nao funcionam por que nao le variáveis -_-'
+        - task: Bash@3
+          name: deploy
+          displayName: 'Deploy'
+          continueOnError: false
+          env:
+            NEW_VERSION: $(get_version.VERSION)
+            SSH_KEY: $(Agent.TempDirectory)/id_rsa
+            NEXUS_USERNAME: $(NEXUS_USERNAME)
+            NEXUS_PASSWORD: $(NEXUS_PASSWORD)
+            SSH_CRED_FILE_B64_CONTENT: $(SSH_CRED_FILE_B64_CONTENT)
+            SSH_SERVER: $(SSH_SERVER)
+            SSH_USER: $(SSH_USER)
+            SSH_PATH: $(SSH_PATH)
+            PROJECT_NAME: $(PROJECT_NAME)
+          inputs:
+            targetType: inline
+            script: |
+              export FILE_PATH="${PROJECT_NAME}-${NEW_VERSION}.tar.gz"
+              echo ${SSH_CRED_FILE_B64_CONTENT} | base64 -d > "${SSH_KEY}"
+              chmod 600 "${SSH_KEY}"
+              url="${NEXUS_PROTOCOL}://${NEXUS_URL}/repository/${NEXUS_GROUP_NAME}/${NEXUS_GROUP_ID}/${PROJECT_NAME}/${NEW_VERSION}/${FILE_PATH}"
+              echo "##[debug] Downloading ${url}"
+              token=$(echo -n "${NEXUS_USERNAME}:${NEXUS_PASSWORD}" | base64)
+              status_code=$(curl --location --request GET "${url}" \
+                --header "Authorization: Basic ${token}" \
+                -o "${FILE_PATH}" \
+                -w "%{http_code}" -s)
+
+              if [[ "$status_code" -ne 200 ]]; then
+                echo "##[error] Error downloading file, status code: $status_code"
+                cat "${FILE_PATH}"
+                exit 1
+              else
+                echo "##[debug] File downloaded successfully with status code: $status_code"
+              fi
+              file ${FILE_PATH}
+              echo "##[debug] Files Downloaded successfully!!"
+
+              mkdir -p tmp
+              tar -zxvf "${FILE_PATH}" -C tmp
+              chmod +x tmp/framework/setup/*.sh
+
+              echo "##[debug] Copying files to ${SSH_SERVER}:${SSH_PATH}/${PROJECT_NAME}/${NEW_VERSION}/"
+              echo "##[command] ssh ${SSH_USER}@${SSH_SERVER}"
+              ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no "${SSH_USER}@${SSH_SERVER}" \
+                "ls ${SSH_PATH}/${PROJECT_NAME} && (rm -rf ${SSH_PATH}/.rollback-${PROJECT_NAME} && mv ${SSH_PATH}/${PROJECT_NAME}/ ${SSH_PATH}/.rollback-${PROJECT_NAME}) || echo '##[debug] No Old Version Available'"
+              scp -i "${SSH_KEY}" -o StrictHostKeyChecking=no -r ./tmp "${SSH_USER}@${SSH_SERVER}:${SSH_PATH}/${PROJECT_NAME}/"
+              echo "##[debug] Executing installation script"
+              {
+                ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no "${SSH_USER}@${SSH_SERVER}" \
+                  "chmod 775 -R ${SSH_PATH}/${PROJECT_NAME} && \
+                  /bin/bash ${SSH_PATH}/${PROJECT_NAME}/framework/setup/install.sh"
+              } || {
+                echo "##[debug] Error during installation, doing rollback..."
+                ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no "${SSH_USER}@${SSH_SERVER}" "${SSH_PATH}/${PROJECT_NAME}/framework/setup/rollback.sh" && \
+                  echo "##[error] Rollback was Successful, but the job finished with an error because the deploy was not successful" ||
+                  echo "##[error] Rollback was not successful, please check the logs"
+                exit 1
+              }
+              echo "##[debug] Script executed successfully"

@@ -1,0 +1,92 @@
+jobs:
+- job: publish
+  pool: GeneralPurposeLinuxAgentsCI
+  workspace:
+    clean: all
+  condition: true
+  steps:
+  - template: /tech_products/hdop/templates/steps/version_update.yaml
+  - task: Docker@2
+    displayName: 'Login to Docker Registry'
+    inputs:
+      command: 'login'
+      containerRegistry: registry-telefonicabigdata
+  - task: Bash@3
+    name: 'build'
+    displayName: 'Build Go Binaries'
+    inputs:
+      targetType: 'inline'
+      script: |
+        run_go_command(){
+          command=$1
+          echo "##[debug] Running go command: $command"
+          docker run --rm -v $PWD:/app \
+            -e command="$command" \
+            registry.telefonicabigdata.com/golang:alpine \
+            sh -c "cd /app && $command"
+          if [ $? -ne 0 ]; then
+            echo "##vso[task.logissue type=error] Failed to run go command: $1"
+            echo "##vso[task.complete result=Failed;]"
+            exit 1
+          fi
+          echo "##[debug] $command finished"
+        }
+        run_go_command "go mod download"
+        OUTPUT_FILES=()
+        rm -rf bin || true
+        mkdir -p bin
+        PACKAGE_NAME=$(basename ${GO_PACKAGE})
+        for platform in ${GO_PLATFORM_LIST//,/ }; do
+          GOOS=$(echo $platform | cut -d'/' -f1)
+          GOARCH=$(echo $platform | cut -d'/' -f2)
+          output_name="${PACKAGE_NAME}-${GOOS}-${GOARCH}"
+          if [ "$GOOS" == "windows" ]; then
+            output_name="${output_name}.exe"
+          fi
+          echo "##[debug] Building for $GOOS/$GOARCH..."
+          run_go_command "CGO_ENABLED=0 GOOS=$GOOS GOARCH=$GOARCH go build -o bin/$output_name ${GO_PACKAGE}"
+          echo "Bin ${output_name} was successfully generated!"
+          OUTPUT_FILES+=("bin/${output_name}")
+        done
+        echo "All bins were successfully generated!"
+        echo "##[debig] OUTPUT_FILES: ${OUTPUT_FILES[*]}"
+        echo "##vso[task.setvariable variable=OUTPUT_FILES]${OUTPUT_FILES[*]}"
+    env:
+      GO_PACKAGE: $(PROJECT_NAME)
+      GO_PLATFORM_LIST: $(GO_PLATFORM_LIST)
+  - script: |
+        upload_artifact(){
+          local FILE_PATH="$1"
+          local NEXUS_SUB_ARTIFACT_ID=$(basename $FILE_PATH)
+          local URL="$NEXUS_PROTOCOL://$NEXUS_URL/repository/$NEXUS_GROUP_NAME/$NEXUS_GROUP_ID/$NEXUS_SUB_ARTIFACT_ID/$SET_VERSION_VERSION/$NEXUS_SUB_ARTIFACT_ID-$SET_VERSION_VERSION"
+          echo "##[debug] Uploading artifact: $FILE_PATH"
+          echo "##[debug] Uploading to: $URL"
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -u $NEXUS_USERNAME:$NEXUS_PASSWORD \
+            --upload-file $FILE_PATH $URL)
+          
+          if [[ $HTTP_STATUS -ge 200 && $HTTP_STATUS -lt 300 ]]; then
+            echo "##[debug] Upload successful with status code $HTTP_STATUS"
+          else
+            echo "##vso[task.logissue type=error] Upload failed with status code $HTTP_STATUS"
+            echo "##vso[task.logissue type=error] File path: $FILE_PATH"
+            echo "##vso[task.logissue type=error] Nexus URL: $NEXUS_PROTOCOL://$NEXUS_URL/repository/$NEXUS_GROUP_NAME/$NEXUS_GROUP_ID/$NEXUS_SUB_ARTIFACT_ID/$SET_VERSION_VERSION/$NEXUS_SUB_ARTIFACT_ID-$SET_VERSION_VERSION.tar.gz"
+            echo "##vso[task.logissue type=error] curl response: $HTTP_RESPONSE"
+            echo "##vso[task.complete result=Failed;]"
+            exit 1
+          fi
+        }
+        echo "##[debug] OUTPUT_FILES: ${OUTPUT_FILES}"
+        for file in ${OUTPUT_FILES}; do
+            echo "##[debug] Uploading artifact: $file"
+            upload_artifact "$file"
+        done
+# TODO: Add a task to publish the sha1 and md5 checksums of the artifact to Nexus
+    displayName: 'Upload Artifact to Nexus'
+    env:
+      NEXUS_USERNAME: $(NEXUS_USERNAME)
+      NEXUS_PASSWORD: $(NEXUS_PASSWORD)
+      NEXUS_PROTOCOL: $(NEXUS_PROTOCOL)
+      NEXUS_URL: $(NEXUS_URL)
+      NEXUS_GROUP_NAME: $(NEXUS_GROUP_NAME)
+      NEXUS_GROUP_ID: $(NEXUS_GROUP_ID)
+      OUTPUT_FILES: $(BUILD_OUTPUT_FILES)

@@ -1,0 +1,484 @@
+parameters:
+#JAVA|NODE|PYTHON
+- name: stack
+  type: string
+  values:
+  - JAVA
+  - NODE
+  - PYTHON
+
+- name: serviceConnectionName
+  default: $(SONARQUBE_SERVICE_CONNECTION_NAME)
+
+- name: configFile
+  default: $(SONARQUBE_CONFIG_FILE)
+
+- name: workdirArtifacts
+  default: $(DEFAULT_WORKDIR_ARTIFACTS)
+
+- name: artifactName
+  default: 'app'
+
+- name: artifactType
+  default: 'build'
+  type: string
+  values:
+  - build
+  - pipeline
+
+- name: librariesPath
+  default: $(LIBRARIES_PATH)
+
+- name: projectKey
+  default: $(SONAR_PROJECT_KEY)
+
+- name: version
+  default: $(APP_VERSION)
+
+- name: pythonVersion
+  default: '3.9'
+
+- name: javaVersion
+  default: "openjdk-11.0.2"
+
+- name: nodeVersion
+  default: "v16.20.0"
+
+- name: qualityGate
+  default: $(SONARQUBE_PROJECT_QUALITYGATE)
+
+- name: eslintPath
+  default: lint-report.json
+
+- name: continuePipelineOnQualityGateError
+  default: true
+
+- name: getVersionFromEnvVar
+  default: false
+
+- name: overrideCoveragePathDefault
+  default: true
+
+steps:
+
+- task: AzureKeyVault@2
+  displayName: 'Getting AKV credentials'
+  timeoutInMinutes: 1
+  retryCountOnTaskFailure: 5
+  inputs:
+    azureSubscription: DevOpsSharedResources
+    KeyVaultName: $(AKV_DEVOPS_NAME)
+    SecretsFilter: 'SONARQUBE-TOKEN, SONARQUBE-TOKEN-TAG'
+    condition: ne(variables['SONAR_SELF_HOSTED'], 'true')
+
+- ${{ if eq(parameters['artifactType'], 'build') }}:
+  - task: DownloadBuildArtifacts@1
+    displayName: 'Download Build Artifacts'
+    inputs:
+      artifactName: ${{ parameters.artifactName }}
+      parallelizationLimit: 20
+      extractTars: true
+
+- ${{ if eq(parameters['artifactType'], 'pipeline') }}:
+  - task: DownloadPipelineArtifact@2
+    displayName: 'Download Pipeline Artifacts'
+    inputs:
+      artifactName: ${{ parameters.artifactName }}
+      targetPath: ${{ parameters.workdirArtifacts }}
+
+  - template: /tech_products/ecmc/core-pipelines/global/general/set-output-variable.yml
+    parameters:
+      variable: LIBRARIES_PATH
+      command: $(echo $(MAVEN_CACHE_FOLDER))
+
+# NODE STACK
+- ${{ if eq(parameters['stack'], 'NODE')}}:
+  - template: /tech_products/ecmc/core-pipelines/global/general/set-output-variable.yml
+    parameters:
+      variable: APP_VERSION
+      command: $(DOCKER_CMD_EXTRACT_PACKAGE_JSON_VERSION)
+
+- bash: |
+    echo "[section]APP_VERSION : ${APP_VERSION}"
+  displayName: 'Show new app version'
+  env:
+    APP_VERSION: $(APP_VERSION)
+
+# PYTHON STACK
+- ${{ if and(eq(parameters['stack'], 'PYTHON'), eq(parameters.getVersionFromEnvVar, false)) }}:
+  - template: /tech_products/ecmc/core-pipelines/global/general/set-output-variable.yml
+    parameters:
+      variable: APP_VERSION
+      command: $(CMD_EXTRACT_PYTHON_SETUP_VERSION)
+
+
+- bash: |
+    # If not set SONARQUBE_QUALITYGATE_TIMEOUT default to 300 seconds
+    SONARQUBE_QUALITYGATE_TIMEOUT=300
+    echo "##vso[task.setvariable variable=SONARQUBE_QUALITYGATE_TIMEOUT]$SONARQUBE_QUALITYGATE_TIMEOUT"
+    echo "##[debug] Set Sonar Timeout:..........: $SONARQUBE_QUALITYGATE_TIMEOUT"
+  env:
+    SONARQUBE_QUALITYGATE_TIMEOUT: $(SONARQUBE_QUALITYGATE_TIMEOUT)
+  condition: eq(variables.SONARQUBE_QUALITYGATE_TIMEOUT, '')
+  displayName: 'Set default timeout'
+
+- bash: |
+    # Set value for timeout variable to SonarQube
+    echo "##[debug] Sonar Timeout:..........: $SONARQUBE_QUALITYGATE_TIMEOUT"
+
+    SET_BRANCH=$(Build.SourceBranch)
+    SONAR_FILE="${{ parameters.configFile }}"
+
+    if [[ "$(Build.Reason)" == "PullRequest" ]]; then
+      SET_BRANCH=$(System.PullRequest.SourceBranch)
+      echo "" >> $SONAR_FILE
+      echo "sonar.pullrequest.key=$(System.PullRequest.PullRequestId)" >> $SONAR_FILE
+
+      TARGET_BRANCH=$(System.PullRequest.targetBranchName)
+      TARGET_BRANCH=$(echo "$TARGET_BRANCH" | sed 's/refs\/heads\///g')
+      echo "sonar.pullrequest.base=$TARGET_BRANCH" >> $SONAR_FILE
+
+      echo "" >> $SONAR_FILE
+
+      echo "sonar.pullrequest.branch=$(Build.SourceBranch)" >> $SONAR_FILE
+      echo "" >> $SONAR_FILE
+    fi
+
+    SET_BRANCH=$(echo "$SET_BRANCH" | sed 's/refs\/heads\///g')
+    echo "" >> $SONAR_FILE
+    echo "sonar.analysis.branch=$SET_BRANCH" >> $SONAR_FILE
+
+    cat $SONAR_FILE
+  displayName: 'Setup Branch'
+
+- bash: |
+    # Set value for timeout variable to SonarQube
+    echo "##[debug] Sonar Timeout:..........: $SONARQUBE_QUALITYGATE_TIMEOUT"
+
+    URL="$(SONARQUBE_URL)"
+    TOKEN="${SONARQUBE_TOKEN}"
+    PROJECT_KEY="${{parameters.projectKey}}"
+    PROJECT_NAME="$(System.TeamProject)-$(Build.Repository.Name)"
+    APP_QUALITY_GATE="${{parameters.qualityGate}}"
+    DEFAULT_QUALITY_GATE="$(SONARQUBE_DEFAULT_QUALITYGATE)"
+
+    if [[ "$(SONAR_SELF_HOSTED)" == "true" ]]; then
+      TOKEN="${SONARQUBE_TOKEN_SELF_HOSTED}"
+    fi
+
+    # If no custom quality gate was provided, use default.
+    if [[ -z $APP_QUALITY_GATE ]]; then
+        APP_QUALITY_GATE="$DEFAULT_QUALITY_GATE"
+    fi
+
+    # Checks if the project exists. If not, creates it.
+    PROJECT_EXISTS=$(curl -s -X GET -u "${TOKEN}:" "$URL/api/projects/search?projects=${PROJECT_KEY}" | jq '.paging.total' | sed 's/null/0/g')
+
+    if [ "$PROJECT_EXISTS" -ne 1 ]; then
+      PROJECT_STATUS=$(curl -s -X POST -o ./.tmp.sonar.out -w "%{http_code}" -u "${TOKEN}:" "${URL}/api/projects/create?name=${PROJECT_NAME}&project=${PROJECT_KEY}&visibility=public")
+
+      if [ "$PROJECT_STATUS" -eq 200 ]; then
+          echo "SonarQube project created for ${PROJECT_NAME}"
+      else
+          echo "Error creating SonarQube project for ${PROJECT_NAME}...($(cat ./.tmp.sonar.out | jq '.errors[0].msg'))"
+      fi
+    fi
+
+    # Checks if the project's Quality Gate exists. If not, use default.
+    APP_QUALITY_GATE_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -u $TOKEN: "${URL}/api/qualitygates/show?name=${APP_QUALITY_GATE}")
+
+    if [ "$APP_QUALITY_GATE_STATUS" -eq 200 ]; then
+        echo "Quality Gate found (${APP_QUALITY_GATE})"
+    else
+        echo "Quality Gate not found (${APP_QUALITY_GATE}). Using default..."
+
+        APP_QUALITY_GATE="${DEFAULT_QUALITY_GATE}"
+    fi
+
+    # Links the project to its Quality Gate
+    echo "Ensuring project is linked to Quality Gate..."
+
+    status=$(curl -s -X POST -o /dev/null -w "%{http_code}" -u "$TOKEN:" "$URL/api/qualitygates/select?gateName=${APP_QUALITY_GATE}&projectKey=${PROJECT_KEY}")
+
+    if [ "$status" -ne 204 ]; then
+        echo "Error while linking application to Quality Gate!"
+    fi
+
+    rm -rf ./.tmp.sonar.out
+  displayName: 'Setup Project & Quality Gate (Node js)'
+  env:
+    SONARQUBE_TOKEN: $(SONARQUBE-TOKEN)
+    SONARQUBE_QUALITYGATE_TIMEOUT: $(SONARQUBE_QUALITYGATE_TIMEOUT)
+    SONARQUBE_TOKEN_SELF_HOSTED: $(SONARQUBE_TOKEN_SELF_HOSTED)
+    SONARQUBE_TOKEN_TAG_SELF_HOSTED: $(SONARQUBE_TOKEN_TAG_SELF_HOSTED)
+
+- template: /tech_products/ecmc/core-pipelines/tasks/gates/setup_labels.yml
+  parameters:
+    projectKey: ${{ parameters.projectKey }}
+
+- ${{ if eq(parameters['stack'], 'JAVA')}}:
+  - task: SonarQubePrepare@7
+    displayName: 'Prepare analysis on SonarQube'
+    inputs:
+      SonarQube: "${{ parameters.serviceConnectionName }}"
+      scannerMode: CLI
+      configFile: "${{ parameters.configFile }}"
+      extraProperties: |
+        sonar.scm.disabled=True
+        sonar.projectBaseDir=${{parameters.workdirArtifacts}}
+        sonar.inclusions=**
+        sonar.projectKey=${{parameters.projectKey}}
+        sonar.projectName=$(System.TeamProject)-$(Build.Repository.Name)
+        sonar.projectDescription=Projeto $(Build.Repository.Name)
+        sonar.projectVersion=${{ parameters.version }}
+        sonar.analysis.repositoryName=$(Build.Repository.Name)
+        sonar.analysis.buildId=$(Build.BuildId)
+        sonar.analysis.repositoryId=$(Build.Repository.ID)
+        sonar.analysis.projectName=$(System.TeamProject)
+        sonar.analysis.projectId=$(System.TeamProjectId)
+        sonar.links.homepage=$(System.TeamFoundationCollectionUri)$(System.TeamProject)
+        sonar.links.ci=$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)&_a=summary
+        sonar.links.issue=$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_workitems
+        sonar.links.scm=$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_git/$(Build.Repository.Name)
+        sonar.scanner.metadataFilePath=$(Agent.TempDirectory)/sonar/$(Build.BuildId)/report-task.txt
+        sonar.qualitygate.wait=$(SONAR_BREAK_ENABLED)
+        sonar.qualitygate.timeout=$(SONARQUBE_QUALITYGATE_TIMEOUT)
+
+- ${{ if eq(parameters['stack'], 'NODE')}}:
+  - bash: |
+      if [ -e "${WORKDIR_ARTIFACTS}/.nvmrc" ]; then
+        echo "File .nvmrc found. Version: $(cat ${WORKDIR_ARTIFACTS}/.nvmrc)"
+        echo "##vso[task.setvariable variable=NODE_VERSION;]$(cat ${WORKDIR_ARTIFACTS}/.nvmrc)"
+      else
+        echo "File .nvmrc not found. Using default: ${{ parameters.nodeVersion }}"
+        echo "##vso[task.setvariable variable=NODE_VERSION;]${{ parameters.nodeVersion }}"
+      fi
+    displayName: 'Getting NodeJS version'
+    env:
+      WORKDIR_ARTIFACTS: ${{ parameters.workdirArtifacts }}
+
+  - task: NodeTool@0
+    displayName: 'Configuring NodeJS'
+    inputs:
+      versionSource: 'spec'
+      versionSpec: '$(NODE_VERSION)'
+    env:
+      HTTPS_PROXY: $(PROXY_AGENT_HTTPS)
+      HTTP_PROXY: $(PROXY_AGENT_HTTP)
+      NO_PROXY: $(PROXY_AGENT_NO_PROXY)
+
+  - task: SonarQubePrepare@7
+    displayName: 'Prepare analysis on SonarQube'
+    env:
+      SONARQUBE_URL: $(SONARQUBE_URL)
+      SONARQUBE_TOKEN: $(SONARQUBE_TOKEN)
+    inputs:
+      SonarQube: "${{ parameters.serviceConnectionName }}"
+      scannerMode: CLI
+      configFile: "${{ parameters.configFile }}"
+      extraProperties: |
+        sonar.scm.disabled=True
+        sonar.eslint.reportPaths=${{ parameters.eslintPath }}
+        sonar.eslint.configPath=${{ parameters.eslintPath }}
+        sonar.projectBaseDir=${{ parameters.workdirArtifacts }}
+        sonar.inclusions=**
+        sonar.projectKey=${{ parameters.projectKey }}
+        sonar.projectName=$(System.TeamProject)-$(Build.Repository.Name)
+        sonar.projectDescription=Projeto $(Build.Repository.Name)
+        sonar.analysis.repositoryName=$(Build.Repository.Name)
+        sonar.analysis.buildId=$(Build.BuildId)
+        sonar.analysis.repositoryId=$(Build.Repository.ID)
+        sonar.analysis.projectName=$(System.TeamProject)
+        sonar.analysis.projectId=$(System.TeamProjectId)
+        sonar.links.homepage=$(System.TeamFoundationCollectionUri)$(System.TeamProject)
+        sonar.links.ci=$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)&_a=summary
+        sonar.links.issue=$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_workitems
+        sonar.links.scm=$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_git/$(Build.Repository.Name)
+        sonar.scanner.metadataFilePath=$(Agent.TempDirectory)/sonar/$(Build.BuildId)/report-task.txt
+        sonar.qualitygate.timeout=$(SONARQUBE_QUALITYGATE_TIMEOUT)
+        sonar.qualitygate.wait=true
+        sonar.projectVersion=${{ parameters.version }}
+
+- ${{ if eq(parameters['stack'], 'PYTHON') }}:
+  - ${{ if eq(parameters['overrideCoveragePathDefault'], true) }}:
+    - bash: |
+        docker run --rm \
+          --log-driver none \
+          --entrypoint xq \
+          -e SOURCE_DIR=${SOURCE_DIR} \
+          -v $(DEFAULT_WORKDIR_ARTIFACTS)/coverage.xml:/report/coverage.xml \
+          -w /report \
+          vcr-group.nexus.telefonica.com.br/linuxserver/yq -i -x '(.coverage.sources.source) |= "'${SOURCE_DIR}'"' coverage.xml
+      displayName: 'Override Coverage source path'
+      env:
+        SOURCE_DIR: $(SOURCE_DIR)
+  - ${{ else }}:
+    - template: /tech_products/ecmc/core-pipelines/tasks/artifacts/download_app_with_copy.yml
+      parameters:
+        downloadPath: "$(System.ArtifactsDirectory)"
+        workingDirectory: "$(Build.SourcesDirectory)"
+        filesToCopy: "coverage.xml"
+    - bash: |
+        if [ ! -e "$(Build.SourcesDirectory)/coverage.xml" ]; then
+          echo "[warning]File coverage.xml not found. Skipping override of coverage source path."
+          echo "[warning]Ignoring override of coverage source path. Continuing pipeline execution."
+          exit 0
+        fi
+        docker run --rm \
+          --log-driver none \
+          --entrypoint xq \
+          -e SOURCE_DIR=${SOURCE_DIR} \
+          -v $(Build.SourcesDirectory)/coverage.xml:/report/coverage.xml \
+          -w /report \
+          vcr-group.nexus.telefonica.com.br/linuxserver/yq -i -x '(.coverage.sources.source) |= "'${SOURCE_DIR}'"' coverage.xml
+
+      displayName: 'Override Coverage source path'
+      workingDirectory: $(Build.SourcesDirectory)
+      env:
+        SOURCE_DIR: $(SOURCE_DIR)
+
+  - task: SonarQubePrepare@7
+    displayName: 'Prepare analysis on SonarQube'
+    inputs:
+      SonarQube: "${{ parameters.serviceConnectionName }}"
+      scannerMode: CLI
+      configFile: "${{ parameters.configFile }}"
+      extraProperties: |
+        sonar.scm.disabled=True
+        sonar.projectBaseDir=./
+        sonar.inclusions=**
+        sonar.projectKey=${{ parameters.projectKey }}
+        sonar.projectName=$(System.TeamProject)-$(Build.Repository.Name)
+        sonar.projectDescription=Projeto $(Build.Repository.Name)
+        sonar.projectVersion=${{ parameters.version }}
+        sonar.analysis.repositoryName=$(Build.Repository.Name)
+        sonar.analysis.buildId=$(Build.BuildId)
+        sonar.analysis.repositoryId=$(Build.Repository.ID)
+        sonar.analysis.projectName=$(System.TeamProject)
+        sonar.analysis.projectId=$(System.TeamProjectId)
+        sonar.links.homepage=$(System.TeamFoundationCollectionUri)$(System.TeamProject)
+        sonar.links.ci=$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)&_a=summary
+        sonar.links.issue=$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_workitems
+        sonar.links.scm=$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_git/$(Build.Repository.Name)
+        sonar.python.version=${{ parameters.pythonVersion }}
+        sonar.scanner.metadataFilePath=$(Agent.TempDirectory)/sonar/$(Build.BuildId)/report-task.txt
+        sonar.qualitygate.wait=$(SONAR_BREAK_ENABLED)
+        sonar.qualitygate.timeout=$(SONARQUBE_QUALITYGATE_TIMEOUT)
+
+- script: |
+    echo "##[debug] SONAR_PROJECT_KEY...........: ${SONAR_PROJECT_KEY}"
+  displayName: Show sonar project key
+  env:
+    SONAR_PROJECT_KEY: ${{ parameters.projectKey }}
+
+- task: SonarQubeAnalyze@7
+  displayName: 'Run Code Analysis'
+  continueOnError: true
+  inputs:
+    jdkversion: "JAVA_HOME_17_X64"
+  env:
+    ASDF_JAVA_VERSION: '${{ parameters.javaVersion }}'
+
+- script: |
+    echo "##[debug] REPORT_TASK_NAME....: $(pwd)/${REPORT_TASK_NAME}"
+    cat ${REPORT_TASK_NAME}
+
+    SONAR_TASK_ID="$(cat ${REPORT_TASK_NAME} | grep -o 'ceTaskId=[^,]*' | awk -F= '{print $2}')"
+    echo "##[debug] SONAR_TASK_ID.......: ${SONAR_TASK_ID}"
+
+    echo "##vso[task.setvariable variable=SONAR_TASK_ID;isOutput=true]${SONAR_TASK_ID}"
+  displayName: Get Sonar TaskId
+  name: sonar_task_id
+  continueOnError: true
+  workingDirectory: $(Agent.TempDirectory)/sonar/$(Build.BuildId)
+  env:
+    REPORT_TASK_NAME: "report-task.txt"
+
+- task: SonarQubePublish@7
+  displayName: 'Publish Quality Gate Result'
+  continueOnError: true
+  inputs:
+    pollingTimeoutSec: $(SONARQUBE_QUALITYGATE_TIMEOUT)
+  env:
+    NODE_EXTRA_CA_CERTS: $(CACORP_LOCATION)
+  condition: or(eq(variables.SONAR_SELF_HOSTED_BREAK_ENABLED, true),eq(variables.SONAR_BREAK_ENABLED, true))
+
+- script: |
+    echo "##[debug] SONAR_BREAK_ENABLED.........: ${SONAR_BREAK_ENABLED}"
+    echo "##[debug] SONAR_TASK_ID...............: ${SONAR_TASK_ID}"
+
+    if [[ "$(SONAR_SELF_HOSTED)" == "true" ]]; then
+      SONARQUBE_TOKEN="${SONARQUBE_TOKEN_SELF_HOSTED}"
+    fi
+
+    SONAR_TASK_URL="${SONARQUBE_URL}/api/ce/task?id=${SONAR_TASK_ID}"
+    echo "##[debug] SONAR_TASK_URL..............: ${SONAR_TASK_URL}"
+    ANALYSIS_ID="$(curl -s -u "${SONARQUBE_TOKEN}:" "${SONAR_TASK_URL}" | jq -r '.task.analysisId')"
+    echo "##[debug] ANALYSIS_ID.................: ${ANALYSIS_ID}"
+    ANALYSIS_STATUS="null"
+
+
+    SONAR_PROJECT_STATUS_URL="${SONARQUBE_URL}/api/qualitygates/project_status?analysisId=${ANALYSIS_ID}"
+
+    echo "##[debug] SONAR_PROJECT_STATUS_URL....: ${SONAR_PROJECT_STATUS_URL}"
+
+    RESPONSE_CODE=$(curl -s -u "${SONARQUBE_TOKEN}:" "${SONAR_PROJECT_STATUS_URL}" -w "%{http_code}" -o response.json)
+
+    cat response.json
+    if [ "${RESPONSE_CODE}" == 200 ]; then
+      ANALYSIS_STATUS=$(cat response.json | jq -r '.projectStatus.status')
+      METRICKEYS_STATUS=$(cat response.json | jq -r '.projectStatus.conditions[] | "##[debug] \(.metricKey)=\(.status)"')
+
+      if [[ "${ANALYSIS_STATUS}" == "null" && "${BUILD_REASON}" == "PullRequest" ]]; then
+        ERROR_MESSAGE="Failed to get data from Sonar Analysis - View details on step Run Code Analysis."
+        echo "##vso[task.logissue type=error;] $ERROR_MESSAGE"
+        echo "##vso[task.complete result=Failed;]"
+      fi
+
+      echo "##[debug] ANALYSIS_STATUS.............: ${ANALYSIS_STATUS}"
+      echo "##[debug] METRICKEYS_STATUS...........: "
+      echo "${METRICKEYS_STATUS}"
+
+      echo "##vso[task.setvariable variable=SONARQUBE_ANALYSIS_STATUS;isoutput=true]$ANALYSIS_STATUS"
+      echo "##vso[task.setvariable variable=SONARQUBE_ANALYSIS_METRICKEYS_STATUS;isoutput=true]$METRICKEYS_STATUS"
+
+      if [[ "${ANALYSIS_STATUS}" == "ERROR" && "${BUILD_REASON}" == "PullRequest" ]]; then
+        ERROR_MESSAGE="Sonar Quality Gate status is ERROR - View details on step Run Code Analysis."
+        echo "##[error]$ERROR_MESSAGE"
+        echo "##vso[task.logissue type=error;] $ERROR_MESSAGE"
+        echo "##vso[task.complete result=Failed;]"
+      fi
+    else
+      ERROR_MESSAGE="Failed to get data from Sonar Analysis - HTTP RESPONSE CODE is ${RESPONSE_CODE}."
+      echo "##[error]$ERROR_MESSAGE"
+      if [[ "${ANALYSIS_STATUS}" == "null" && "${BUILD_REASON}" == "PullRequest" ]]; then
+        echo "##vso[task.logissue type=error;]$ERROR_MESSAGE."
+        echo "##vso[task.complete result=Failed;]"
+      fi
+    fi
+
+  displayName: 'Break build on quality gate failure'
+  name: break_build_on_quality_gate_failure
+  continueOnError: ${{ parameters.continuePipelineOnQualityGateError }}
+  env:
+    SONARQUBE_TOKEN: $(SONARQUBE-TOKEN)
+    SONARQUBE_URL: $(SONARQUBE_URL)
+    SONAR_TASK_ID: $(sonar_task_id.SONAR_TASK_ID)
+    BUILD_REASON: $(Build.Reason)
+    SONARQUBE_TOKEN_SELF_HOSTED: $(SONARQUBE_TOKEN_SELF_HOSTED)
+    SONARQUBE_TOKEN_TAG_SELF_HOSTED: $(SONARQUBE_TOKEN_TAG_SELF_HOSTED)
+
+- bash: |
+    echo "##[error]Errors found in SonarQube analysis. Pipeline stopped."
+    echo "##[error]View details on \"Break build on quality gate failure\"."
+    echo "##[debug]Agent.JobStatus: .............................: $(Agent.JobStatus)"
+    echo "##[debug]SONAR_BREAK_ENABLED ..........................: $SONAR_BREAK_ENABLED"
+    echo "##[debug]Build.SourceBranch ...........................: $(Build.SourceBranch)"
+    exit 1
+  displayName: 'Info about Code Analysis Break'
+  condition: and(
+              in(variables['Agent.JobStatus'], 'SucceededWithIssues', 'Failed'),
+              eq(variables.SONAR_BREAK_ENABLED, true),
+              startsWith(variables['Build.SourceBranch'], 'refs/pull/'),
+              notIn(variables['Build.SourceBranch'], 'refs/heads/main', 'refs/heads/master')
+            )

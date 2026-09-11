@@ -1,0 +1,174 @@
+stages:
+- stage: ci_package
+  displayName: "CI - Package"  
+  pool:
+    name: $(PRIVATE_AGENT_DEFAULT)
+  dependsOn:
+  - environment_init
+  - ci_build
+  - ci_publish
+  condition: succeeded()
+
+  ## -> Loads variables from other stages.
+  variables:
+    - name: APP_VERSION
+      value: $[ stageDependencies.ci_build.build.outputs['new_version.NEW_VERSION'] ]
+    - name: ARTIFACT_FILE
+      value: $[ stageDependencies.ci_build.build.outputs['artifact_name.ARTIFACT_FILE'] ]
+    - name: ARTIFACT_NAME
+      value: $[ stageDependencies.ci_build.build.outputs['artifact_name.ARTIFACT_NAME'] ]
+
+    - template: /tech_products/oss/initialize/variables_catalog_info.yml
+
+    ## -> Override global variables, with variables set in Library/Variable Groups (Pipelines)
+    ## -> Use this to change the variables on runtime
+    - group: "${{ variables['Build.DefinitionName'] }}"    
+
+  jobs:
+
+  - job: package
+    displayName: "Package" 
+    condition: and(
+              succeeded(), 
+              or(
+              eq(variables['Build.SourceBranchName'],'master'),
+              eq(variables['Build.SourceBranchName'],'main'),
+              eq(variables['Build.SourceBranchName'],'prodlike'),
+              eq(variables['Build.SourceBranchName'],'preprod'),
+              eq(variables['Build.SourceBranchName'],'esteira1'),
+              eq(variables['Build.SourceBranchName'],'esteira2'),
+              eq(variables['Build.SourceBranchName'],'dev')))       
+    steps:
+    
+    ## -> Checkout code
+    - checkout: none
+    
+    ## -> Download and uncompress the downloaded artifact.         
+    - task: DownloadBuildArtifacts@1
+      displayName: 'Download Build Artifacts'
+      inputs:
+        artifactName: $(ARTIFACT_NAME)
+        cleanDestinationFolder: false
+        extractTars: true
+        parallelizationLimit: 8
+        downloadPath: $(System.ArtifactsDirectory)
+        
+    - task: CmdLine@2
+      displayName: "Define Docker Variables"
+      name: docker_metadata
+      inputs:
+        workingDirectory: '$(DEFAULT_WORKDIR_ARTIFACTS)/$(ARTIFACT_NAME)/'
+        script: |
+          
+          targetPath="/target"
+          echo "##[group] Folder content ( $(DEFAULT_WORKDIR_ARTIFACTS)/$(ARTIFACT_NAME)/ )"
+          echo "$(ls -lah)"
+          echo "##[endgroup]"
+                           
+          echo "##[group] .azuredevops content"
+          echo "$(ls -lah ./.azuredevops)"
+
+          runtimeDockerfilePath="./.azuredevops/runtime.Dockerfile"
+
+          if [ -s $runtimeDockerfilePath  ]; then
+            DOCKER_FILE=$(DEFAULT_WORKDIR_ARTIFACTS)/$(ARTIFACT_NAME)/.azuredevops/runtime.Dockerfile                        
+          else
+            echo "##[error] runtime.Dockerfile not found."
+            echo "##[error] Check if the file exists and has the correct name."            
+            exit 1;
+          fi          
+          echo "##[endgroup]"
+
+          echo "##[group] Docker metadata"
+          echo "##[debug] DOCKER_REGISTRY............: ${DOCKER_REGISTRY}"
+          echo "##[debug] DOCKER_SERVICE_CONNECTION..: ${DOCKER_SERVICE_CONNECTION}"   
+          echo "##[debug] DOCKER_IMAGE_NAME..........: ${GOV_APP_ACRONYM}/${APP_NAME}"   
+          echo "##[debug] DOCKER_IMAGE_FULL_NAME. ...: ${DOCKER_REGISTRY}/${GOV_APP_ACRONYM}/${APP_NAME}"
+          echo "##[debug] DOCKER_BUILD_CONTEXT.......: $(DEFAULT_WORKDIR_ARTIFACTS)/$(ARTIFACT_NAME)/"
+          echo "##[debug] APPLICATION_NAME...........: $(APP_NAME)"
+          echo "##[debug] APPLICATION_PATH...........: $(DEFAULT_WORKDIR_ARTIFACTS)/$(ARTIFACT_NAME)/"
+          echo "##[debug] TARGET_PATH................: $targetPath"
+          echo "##[debug] ARTIFACT_FILE..............: $(ARTIFACT_FILE)"
+          echo "##[debug] ARTIFACT_NAME..............: $(ARTIFACT_NAME)"                    
+          echo "##[debug] DOCKER_FILE................: ${DOCKER_FILE}"
+          
+          echo "##vso[task.setvariable variable=TARGET_PATH;isOutput=true]$targetPath"
+          echo "##vso[task.setvariable variable=DOCKER_FILE]${DOCKER_FILE}"
+          echo "##vso[task.setvariable variable=DOCKER_IMAGE_NAME;isOutput=true]${GOV_APP_ACRONYM}/${APP_NAME}"
+          echo "##vso[task.setvariable variable=DOCKER_IMAGE_FULL_NAME;isOutput=true]"${DOCKER_REGISTRY}/${GOV_APP_ACRONYM}/${APP_NAME}""
+          echo "##vso[task.setvariable variable=DOCKER_IMAGE_TAG;isOutput=true]${APP_VERSION}"                    
+
+          echo "##[endgroup]"
+
+    - task: CmdLine@2
+      displayName: "Check for package.json"
+      name: check_package_json
+      inputs:
+        workingDirectory: '$(DEFAULT_WORKDIR_ARTIFACTS)/$(ARTIFACT_NAME)/'
+        script: |
+          
+          packageJson="./package.json"
+
+          if [ -s $packageJson  ]; then
+            
+            echo "##[debug] It is a NodeJS application..."
+            echo "##[debug] Starting npm install for dependencies..."
+           
+            export NPM_CONFIG_USERCONFIG=$(Agent.TempDirectory)/.npmrc
+           
+            npm install
+
+          else
+            echo "##[debug] It is not a NodeJs application, continue..."
+          fi
+
+    # ==================================================================
+    # [Compliance] Verifica se o repositório está em conformidade com as políticas de configuração
+    # ==================================================================
+    - task: VivoDevOpsConfigCompliance@1
+      displayName: 'Check DevOps Config Compliance'
+      inputs:
+        workDir: $(DEFAULT_WORKDIR_ARTIFACTS)/$(ARTIFACT_NAME)
+        policySets: |
+          image-definition-files
+
+    - task: Docker@2
+      displayName: Docker Build
+      condition: succeeded()
+      inputs:
+        containerRegistry: $(DOCKER_SERVICE_CONNECTION)
+        command: build
+        repository: $(docker_metadata.DOCKER_IMAGE_NAME)
+        Dockerfile: $(DOCKER_FILE)
+        buildContext: $(DEFAULT_WORKDIR_ARTIFACTS)/$(ARTIFACT_NAME)/
+        arguments: --no-cache --build-arg APPLICATION_NAME=$(APP_NAME) --build-arg APPLICATION_PATH=$(DEFAULT_WORKDIR_ARTIFACTS)/$(ARTIFACT_NAME)/ --build-arg TARGET_PATH=$(docker_metadata.TARGET_PATH) --build-arg ARTIFACT_FILE=$(ARTIFACT_FILE) --build-arg ARTIFACT_NAME=$(ARTIFACT_NAME) --build-arg HTTP_PROXY="$(PROXY_AGENT_HTTP)" --build-arg HTTPS_PROXY="$(PROXY_AGENT_HTTPS)" --build-arg NO_PROXY="$(PROXY_AGENT_NO_PROXY)"
+        tags: >
+          $(docker_metadata.DOCKER_IMAGE_TAG)
+          
+    - task: Docker@2
+      displayName: Docker Push
+      name: dockerPushImage
+      condition: succeeded()
+      inputs:
+        containerRegistry: $(DOCKER_SERVICE_CONNECTION)
+        command: push
+        repository: $(docker_metadata.DOCKER_IMAGE_NAME)
+        addPipelineData: true
+        addBaseImageData: true
+        tags: >
+          $(docker_metadata.DOCKER_IMAGE_TAG)
+
+    - task: CmdLine@2
+      displayName: Export Image Digest
+      name: docker_digest
+      env:
+        DOCKER_OUTPUT: $(dockerPushImage.DockerOutput)
+      inputs:
+        script: |
+          echo "##[group] ${DOCKER_OUTPUT}"
+          cat ${DOCKER_OUTPUT}
+          echo "##[endgroup]"
+
+          DOCKER_DIGEST="$(cat ${DOCKER_OUTPUT} | grep "digest" | awk -F ' ' '{print $3}')"
+          echo "##[debug] DOCKER_DIGEST..........: ${DOCKER_DIGEST}"
+          echo "##vso[task.setvariable variable=DOCKER_DIGEST;isOutput=true]${DOCKER_DIGEST}"

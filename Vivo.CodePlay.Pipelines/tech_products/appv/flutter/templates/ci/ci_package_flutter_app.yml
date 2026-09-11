@@ -1,0 +1,1979 @@
+parameters:
+  - name: qa_environment
+  - name: target
+  - name: skip_signing
+  - name: skip_protect
+  - name: use_flutter_version_latest
+    default: false
+
+stages:
+  - stage: package
+    dependsOn:
+      - build_test
+      - gates
+      - security
+    displayName: "Build & Package"
+    pool: $(PRIVATE_AGENT_SHARED)
+    jobs:
+      - job: config_env
+        displayName: "Configure Arguments"
+        steps:
+          # Configure the arguments to be used in the Flutter build        
+          - bash: |
+              echo "##[debug]Environment: ${{ parameters.qa_environment }}"
+              echo "##[debug]Skip Signing: ${{ parameters.skip_signing }}"
+              extra_args_flutter=''
+              xcode_config=''
+
+              # Determinar modo de build (release vs profile)
+              if [[ ("$(Build.SourceBranch)" == "refs/heads/develop") && "${{ parameters.skip_signing }}" == "True" ]]; then
+                build_mode="--profile"
+                xcode_config="Profile-beta"
+              else
+                if [[ "$(Build.SourceBranch)" != "refs/heads/develop" ]]; then
+                  echo "##[debug]Branch is not 'develop'. Building with release mode (with signing)"
+                fi
+                build_mode="--release"
+              fi
+
+              # Determinar flavor, .env e xcode configuration por environment
+              case "${{ parameters.qa_environment }}" in
+                preprod)
+                  echo "##[debug]Setting BETA config variables"
+                  extra_args_flutter="$build_mode --flavor=beta --dart-define-from-file=config/beta/.env --dart-define-from-file=config/beta/.env_beta_firebase"
+                  if [[ "$build_mode" == "--release" ]]; then
+                    xcode_config="Release-beta"
+                  fi
+                  ;;
+                producao)
+                  echo "##[debug]Setting PRODUCAO config variables"
+                  extra_args_flutter="--release --flavor=prd --dart-define-from-file=config/prd/.env --dart-define-from-file=config/prd/.env_prod_firebase"
+                  xcode_config="Release-prd"
+                  ;;
+                *)
+                  echo "##[warning]Invalid Environment: ${{ parameters.qa_environment }}, defaulting to PREPROD"
+                  extra_args_flutter="$build_mode --flavor=beta --dart-define-from-file=config/beta/.env --dart-define-from-file=config/beta/.env_beta_firebase"
+                  if [[ "$build_mode" == "--release" ]]; then
+                    xcode_config="Release-beta"
+                  fi
+                  ;;
+              esac
+
+              echo "##[debug]EXTRA_ARGS_FLUTTER: $extra_args_flutter"
+              echo "##[debug]XCODE_CONFIG: $xcode_config"
+              echo "##vso[task.setvariable variable=EXTRA_ARGS_FLUTTER;isOutput=true;]$extra_args_flutter"
+              echo "##vso[task.setvariable variable=XCODE_CONFIG;isOutput=true;]$xcode_config"
+
+            name: export_variables
+            displayName: "Set Variables"
+
+      - job: akv_secrets
+        displayName: Get AKV Secrets
+        steps:
+          - task: AzureKeyVault@2
+            displayName: "Getting AKV credentials"
+            timeoutInMinutes: 1
+            retryCountOnTaskFailure: 5
+            inputs:
+              azureSubscription: DevOpsSharedResources
+              KeyVaultName: $(AKV_DEVOPS_NAME)
+              SecretsFilter: "ANDROID-SIGNING-KEY-JKS, ANDROID-SIGNING-KEY-PASSWORD, ANDROID-SIGNING-STORE-PASSWORD, IOS-TESTFLIGHT-API-KEY-ID, IOS-TESTFLIGHT-API-ISSUER, IOS-TESTFLIGHT-API-TOKEN"
+
+          - bash: |
+
+              echo "##[debug]Exporting 'ANDROID-SIGNING-KEY-JKS' secret to 'ANDROID_SIGNING_KEY_JKS' var"
+              echo "##vso[task.setvariable variable=ANDROID_SIGNING_KEY_JKS;issecret=true;isOutput=true;]$(ANDROID-SIGNING-KEY-JKS)"
+
+              echo "##[debug]Exporting 'ANDROID-SIGNING-KEY-PASSWORD' secret to 'ANDROID_SIGNING_KEY_PASSWORD' var"
+              echo "##vso[task.setvariable variable=ANDROID_SIGNING_KEY_PASSWORD;issecret=true;isOutput=true;]$(ANDROID-SIGNING-KEY-PASSWORD)"
+
+              echo "##[debug]Exporting 'ANDROID-SIGNING-STORE-PASSWORD' secret to 'ANDROID_SIGNING_STORE_PASSWORD' var"
+              echo "##vso[task.setvariable variable=ANDROID_SIGNING_STORE_PASSWORD;issecret=true;isOutput=true;]$(ANDROID-SIGNING-STORE-PASSWORD)"
+
+              echo "##[debug]Exporting 'IOS-TESTFLIGHT-API-KEY-ID' secret to 'IOS_TESTFLIGHT_API_KEY_ID' var"
+              echo "##vso[task.setvariable variable=IOS_TESTFLIGHT_API_KEY_ID;issecret=true;isOutput=true;]$(IOS-TESTFLIGHT-API-KEY-ID)"
+
+              echo "##[debug]Exporting 'IOS-TESTFLIGHT-API-ISSUER' secret to 'IOS_TESTFLIGHT_API_ISSUER' var"
+              echo "##vso[task.setvariable variable=IOS_TESTFLIGHT_API_ISSUER;issecret=true;isOutput=true;]$(IOS-TESTFLIGHT-API-ISSUER)"
+
+              echo "##[debug]Exporting 'IOS-TESTFLIGHT-API-TOKEN' secret to 'IOS_TESTFLIGHT_API_TOKEN' var"
+              echo "##vso[task.setvariable variable=IOS_TESTFLIGHT_API_TOKEN;issecret=true;isOutput=true;]$(IOS-TESTFLIGHT-API-TOKEN)"
+
+            name: export_secrets
+            displayName: Exporting Secrets
+
+      - job: "Package_android"
+        dependsOn:
+          - config_env
+          - akv_secrets
+        condition: |
+          and(
+            succeeded(),
+            in(dependencies.config_env.result, 'Succeeded', 'Skipped'),
+            in(dependencies.akv_secrets.result, 'Succeeded', 'Skipped'),
+            in('${{ parameters.target }}', 'android', 'both')
+          )
+        displayName: "Package (Android)"
+        variables:
+          ANDROID_SIGNING_KEY_JKS: $[ dependencies.akv_secrets.outputs['export_secrets.ANDROID_SIGNING_KEY_JKS'] ]
+          ANDROID_SIGNING_KEY_PASSWORD: $[ dependencies.akv_secrets.outputs['export_secrets.ANDROID_SIGNING_KEY_PASSWORD'] ]
+          ANDROID_SIGNING_STORE_PASSWORD: $[ dependencies.akv_secrets.outputs['export_secrets.ANDROID_SIGNING_STORE_PASSWORD'] ]
+          EXTRA_ARGS_FLUTTER: $[ dependencies.config_env.outputs['export_variables.EXTRA_ARGS_FLUTTER'] ]
+        pool: $(PRIVATE_AGENT_SHARED)
+        steps:
+          - checkout: self
+            persistCredentials: true
+            clean: true
+
+          - task: Cache@2
+            displayName: "Flutter Pub Cache"
+            inputs:
+              key: 'flutter pub v4 | "${{ parameters.qa_environment }}" | "$(Agent.OS)" | pubspec.yaml'
+              path: "$(Agent.ToolsDirectory)/.pub-cache"
+              cacheHitVar: PUB_CACHE_RESTORED
+
+          - script: |
+              mkdir -p $(Agent.ToolsDirectory)/.pub-cache
+              export PUB_CACHE=$(Agent.ToolsDirectory)/.pub-cache
+            displayName: "Create and Export Pub Cache"
+
+          - ${{ if eq(parameters.use_flutter_version_latest, 'True' ) }}:
+              # Install Flutter
+              - task: FlutterInstall@0
+                displayName: "Install Flutter SDK"
+                inputs:
+                  mode: "auto"
+                  channel: "stable"
+                  version: "custom"
+                  customVersion: $(FLUTTER_VERSION_LATEST)
+
+          - ${{ else }}:
+              # Install Flutter
+              - task: FlutterInstall@0
+                displayName: "Install Flutter SDK"
+                inputs:
+                  mode: "auto"
+                  channel: "stable"
+                  version: "custom"
+                  customVersion: $(FLUTTER_VERSION)
+
+          # Key Properties File contains storePassword, keyPassword and keyAlias for Android Signing
+          - task: DownloadSecureFile@1
+            name: keyprop
+            displayName: Download key properties file
+            inputs:
+              secureFile: "key.properties"
+
+          # Key File contains the keystore file for Android Signing
+          - task: DownloadSecureFile@1
+            name: key
+            displayName: Download signing key
+            inputs:
+              secureFile: "key.jks"
+
+          # App Cert File contains the certificate for the app to login
+          - task: DownloadSecureFile@1
+            name: appCert
+            displayName: Download App Cert
+            inputs:
+              secureFile: $(APP_CERT_FILE_NAME)
+
+          # App Key File contains the private key for the app to login
+          - task: DownloadSecureFile@1
+            name: appKey
+            displayName: Download App Key
+            inputs:
+              secureFile: $(APP_KEY_FILE_NAME)
+
+          # Google Services File contains the Google Services for the app
+          - task: DownloadSecureFile@1
+            name: googleServicesPreprod
+            condition: eq('${{ parameters.qa_environment }}', 'preprod')
+            displayName: Download Google Services Pre Producao
+            inputs:
+              secureFile: $(ANDROID_GOOGLE_SERVICES_FILE_NAME_BETA)
+
+          # Google Services File contains the Google Services for the app
+          - task: DownloadSecureFile@1
+            name: googleServices
+            condition: in('${{ parameters.qa_environment }}', 'producao', 'release')
+            displayName: Download Google Services Producao
+            inputs:
+              secureFile: $(ANDROID_GOOGLE_SERVICES_FILE_NAME)
+
+          # Firebase contains the ids and keys for the app to use Firebase services
+          - task: DownloadSecureFile@1
+            name: betafirebase
+            displayName: Download env beta firebase
+            inputs:
+              secureFile: $(ENV_BETA_FIREBASE)
+
+          # Firebase contains the ids and keys for the app to use Firebase services
+          - task: DownloadSecureFile@1
+            name: prodfirebase
+            displayName: Download env prod firebase
+            inputs:
+              secureFile: $(ENV_PROD_FIREBASE)
+
+          # Extract Build Number adding a zero to the left if it is less than 10
+          - task: Bash@3
+            displayName: Extract Build Number
+            inputs:
+              targetType: "inline"
+              script: |
+                number=$(echo "$(Build.BuildNumber)" | cut -d '.' -f 2)
+                if [ "$number" -lt 10 ]; then
+                  # Adicione um zero à esquerda
+                  build_number=$(echo "$(Build.BuildNumber)" | cut -d '.' -f 1)"0"$number
+                else
+                  build_number=$(echo "$(Build.BuildNumber)" | cut -d '.' -f 1)"$number"
+                fi
+                echo "##[debug]Build number: $build_number"
+                echo "##vso[task.setvariable variable=BUILD_NUMBER;]$build_number"
+
+          # Configure Files
+          - task: Bash@3
+            displayName: Config Files
+            inputs:
+              targetType: "inline"
+              script: |
+
+                echo "##[debug]Current environment is: ${{ parameters.qa_environment }}"
+
+                cp $(keyprop.secureFilePath) $(Build.SourcesDirectory)/android/key.properties
+                cp $(key.secureFilePath) $(Build.SourcesDirectory)/android/key.jks
+                echo "##[debug]key.properties copied to $(Build.SourcesDirectory)/android/key.properties"
+                echo "##[debug]key.jks copied to $(Build.SourcesDirectory)/android/key.jks"
+
+                if [[ ${{ parameters.qa_environment }} == "preprod" ]]; then
+
+                  echo "##[debub]Copying firebase beta files"
+                  echo "##[debug]Skipping secure-file copy for firebase_options.dart — using repository file"
+                  # cp $(firebaseOptionsPreprod.secureFilePath) $(Build.SourcesDirectory)/lib/firebase_options.dart
+                  cp $(googleServicesPreprod.secureFilePath) $(Build.SourcesDirectory)/android/app/google-services.json
+                  echo "##[debug]Using repository lib/firebase_options.dart"
+
+                  echo "##[debug]Copying key and cert files to beta"
+                  echo "##[debug]$(APP_CERT_FILE_NAME) copied to $(Build.SourcesDirectory)/config/beta/certs/cert.crt"
+                  echo "##[debug]$(APP_KEY_FILE_NAME) copied to $(Build.SourcesDirectory)/config/beta/certs/private.pem"
+                  cp $(appCert.secureFilePath) $(Build.SourcesDirectory)/config/beta/certs/cert.crt
+                  cp $(appKey.secureFilePath) $(Build.SourcesDirectory)/config/beta/certs/private.pem
+                  
+                  cp $(betafirebase.secureFilePath) $(Build.SourcesDirectory)/config/beta/.env_beta_firebase
+                  echo "##[debug]Preprod firebase env copied to $(Build.SourcesDirectory)/config/beta/.env_beta_firebase"
+
+                  # Update ELK tokens
+                  echo "##[debug]Update tokens beta"
+                  sed -i 's/#{ELK_LOG_USER_PRE}#/$(ELK_LOG_USER_PRE)/g' $(Build.SourcesDirectory)/config/beta/.env
+                  sed -i 's/#{ELK_LOG_PASSWORD_PRE}#/$(ELK_LOG_PASSWORD_PRE)/g' $(Build.SourcesDirectory)/config/beta/.env
+
+                  # Update pubspec token if #{MAPP_PAYMENT_REF}# exists in pubspec.yaml
+                  if grep -q '#{MAPP_PAYMENT_REF}#' $(Build.SourcesDirectory)/pubspec.yaml; then
+                    echo "##[debug]Update mapp_payment ref pubspec token with snapshot-"
+                    sed -i 's/#{MAPP_PAYMENT_REF}#/$(MAPP_PAYMENT_REF)/g' $(Build.SourcesDirectory)/pubspec.yaml
+                  else
+                    echo "##[debug]No mapp_payment ref token found in pubspec.yaml"
+                  fi
+
+                elif [[ ${{ parameters.qa_environment }} == "producao" ]]; then
+
+                  echo "##[debub]Copying firebase prod files"
+                  echo "##[debug]Skipping secure-file copy for firebase_options.dart — using repository file"
+                  # cp $(firebaseOptions.secureFilePath) $(Build.SourcesDirectory)/lib/firebase_options.dart
+                  cp $(googleServices.secureFilePath) $(Build.SourcesDirectory)/android/app/google-services.json
+                  echo "##[debug]Using repository lib/firebase_options.dart"
+
+                  echo "##[debug]Copying key and cert files to prod"
+                  echo "##[debug]$(APP_CERT_FILE_NAME) copied to $(Build.SourcesDirectory)/config/prd/certs/cert.crt"
+                  echo "##[debug]$(APP_KEY_FILE_NAME) copied to $(Build.SourcesDirectory)/config/prd/certs/private.pem"
+                  echo "##[debug]Prod firebase env copied to $(Build.SourcesDirectory)/config/prd/.env_prod_firebase"
+                  cp $(prodfirebase.secureFilePath) $(Build.SourcesDirectory)/config/prd/.env_prod_firebase
+                  cp $(appCert.secureFilePath) $(Build.SourcesDirectory)/config/prd/certs/cert.crt
+                  cp $(appKey.secureFilePath) $(Build.SourcesDirectory)/config/prd/certs/private.pem
+
+                  # Update token
+                  echo "##[debug]Update tokens"
+                  sed -i 's/#{ELK_LOG_USER}#/$(ELK_LOG_USER)/g' $(Build.SourcesDirectory)/config/prd/.env
+                  sed -i 's/#{ELK_LOG_PASSWORD}#/$(ELK_LOG_PASSWORD)/g' $(Build.SourcesDirectory)/config/prd/.env
+                  sed -i 's/#{FLUTTER_LOGIN_CLIENT_ID}#/$(FLUTTER_LOGIN_CLIENT_ID)/g' $(Build.SourcesDirectory)/config/prd/.env
+
+                  # Clear pubspec token
+                  echo "##[debug]Clear mapp_payment ref pubspec token"
+                  sed -i 's/#{MAPP_PAYMENT_REF}#//g' $(Build.SourcesDirectory)/pubspec.yaml
+
+                fi
+
+                # Update Google Maps token
+                sed -i 's/#{GOOGLE_MAPS_API_KEY}#/$(GOOGLE_MAPS_API_KEY)/g' $(Build.SourcesDirectory)/android/app/src/main/AndroidManifest.xml
+
+          - task: Bash@3
+            displayName: "Agent Optimization"
+            inputs:
+              targetType: inline
+              script: |
+                echo "##[section]Agent Optimization"
+
+                PUB_CACHE_DIR="$(Agent.ToolsDirectory)/.pub-cache"
+                export PUB_CACHE="$PUB_CACHE_DIR"
+                echo "##[debug]Setting PUB_CACHE to: $PUB_CACHE"
+
+                # Status do cache
+                echo "##[debug]Cache Status:"
+                echo "##[debug]- Pub Cache: $(PUB_CACHE_RESTORED)"
+
+                # Build condicional baseado em cache
+                if [ "$(PUB_CACHE_RESTORED)" = "true" ]; then
+                  echo "##[debug]Cache hit - skipping clean operations"
+                  SKIP_CLEAN=true
+                else
+                  echo "##[debug]Cache miss - performing selective clean"
+                  SKIP_CLEAN=false
+                fi
+
+                # Clean condicional (economia de tempo)
+                if [ "$SKIP_CLEAN" = "false" ]; then
+                  echo "##[debug]Performing flutter clean..."
+                  flutter clean
+                else
+                  echo "##[debug]Skipping flutter clean due to cache hit"
+                fi
+
+                echo "##[debug]Fetching pubspec dependencies..."
+
+                # Configurar git para usar System Access Token para autenticação com Azure Repos
+
+                # Usa System.CollectionUri para extrair a organização
+                COLLECTION_URI="$(System.CollectionUri)"
+                # Remove 'https://' e trailing '/'
+                ORG_PATH=${COLLECTION_URI#https://}
+                ORG_PATH=${ORG_PATH%/}
+
+                # Extrai apenas o nome da organização
+                ORG_NAME=$(echo "$ORG_PATH" | cut -d'/' -f2)
+
+                echo "##[debug]Collection: $COLLECTION_URI"
+                echo "##[debug]Organização: $ORG_NAME"
+
+                # Configura Git com autenticação via System Access Token
+                export GIT_CONFIG_COUNT=1
+                export GIT_CONFIG_KEY_0="url.https://$(System.AccessToken)@dev.azure.com/${ORG_NAME}/.insteadOf"
+                export GIT_CONFIG_VALUE_0="https://${ORG_NAME}@dev.azure.com/${ORG_NAME}/"
+
+                flutter pub upgrade
+                flutter pub get --no-example --verbose
+
+          # Build Flutter APK
+          - task: FlutterBuild@0
+            displayName: "Build Application APK"
+            inputs:
+              target: "apk"
+              projectDirectory: "$(Build.SourcesDirectory)"
+              extraArgs: $(EXTRA_ARGS_FLUTTER)
+              buildName: "$(Build.BuildNumber)"
+              buildNumber: "$(BUILD_NUMBER)"
+            env:
+              ASDF_JAVA_VERSION: "openjdk-17.0.2"
+              TOPAZ_AWS_SECRET_KEY: "$(TOPAZ_AWS_SECRET_KEY)"
+              TOPAZ_AWS_ACCESS_KEY: "$(TOPAZ_AWS_ACCESS_KEY)"
+              AWS_ACCESS_KEY_ID: "$(AWS_ACCESS_KEY_ID)"
+              AWS_SECRET_ACCESS_KEY: "$(AWS_SECRET_ACCESS_KEY)"
+              AWS_DEFAULT_REGION: "$(AWS_DEFAULT_REGION)"              
+
+          # Run Flutter Diagnostics if build fails
+          - task: FlutterCommand@0
+            displayName: "Run Flutter diagnostics"
+            condition: failed()
+            inputs:
+              projectDirectory: "."
+              arguments: "doctor -v"
+            env:
+              ASDF_JAVA_VERSION: "openjdk-17.0.2"
+
+          # Skip signing only if: branch is develop AND skip_signing=true
+          - ${{ if and(not(in(parameters.qa_environment, 'producao')), eq(variables['Build.SourceBranch'], 'refs/heads/develop'), eq(parameters.skip_signing, true)) }}:
+              # Rename Build package (profile mode - sem signing)
+              - task: Bash@3
+                inputs:
+                  targetType: "inline"
+                  script: |
+                    mv $(Build.SourcesDirectory)/build/app/outputs/flutter-apk/app-beta-profile.apk $(Build.SourcesDirectory)/build/app/outputs/flutter-apk/$(APP_FILE_NAME_ANDROID).apk
+                displayName: Rename Build
+
+          - ${{ else }}:
+              # Signing and aligning APK
+              - task: AndroidSigning@3
+                displayName: "Signing and aligning APK"
+                inputs:
+                  apkFiles: "**/*.apk"
+                  apksign: true
+                  apksignerKeystoreFile: key.jks
+                  apksignerKeystorePassword: $(ANDROID_SIGNING_STORE_PASSWORD)
+                  apksignerKeystoreAlias: upload
+                  apksignerKeyPassword: $(ANDROID_SIGNING_KEY_PASSWORD)
+                env:
+                  ASDF_JAVA_VERSION: "openjdk-17.0.2"
+                  TOPAZ_AWS_SECRET_KEY: "$(TOPAZ_AWS_SECRET_KEY)"
+                  TOPAZ_AWS_ACCESS_KEY: "$(TOPAZ_AWS_ACCESS_KEY)"
+                  AWS_ACCESS_KEY_ID: "$(AWS_ACCESS_KEY_ID)"
+                  AWS_SECRET_ACCESS_KEY: "$(AWS_SECRET_ACCESS_KEY)"
+                  AWS_DEFAULT_REGION: "$(AWS_DEFAULT_REGION)"                  
+
+              # Rename Build package (release mode - com signing)
+              - task: Bash@3
+                inputs:
+                  targetType: "inline"
+                  script: |
+                    mv $(Build.SourcesDirectory)/build/app/outputs/flutter-apk/$(ANDROID_FLAVOR_FILE_NAME).apk $(Build.SourcesDirectory)/build/app/outputs/flutter-apk/$(APP_FILE_NAME_ANDROID).apk
+                displayName: Rename Build
+
+          - task: CopyFiles@2
+            displayName: "Copy APK to Staging"
+            inputs:
+              sourceFolder: "$(Build.SourcesDirectory)"
+              contents: "**/$(APP_FILE_NAME_ANDROID).apk"
+              targetFolder: "$(Build.StagingDirectory)"
+              flattenFolders: true
+
+          - task: PublishBuildArtifacts@1
+            displayName: "Publish APK"
+            inputs:
+              PathtoPublish: "$(Build.ArtifactStagingDirectory)"
+              ArtifactName: "android_package"
+              publishLocation: "Container"
+
+          ## PACKAGE TO PROD
+          - ${{ if in(parameters.qa_environment, 'release', 'producao') }}:
+              # Check Secure Files
+              - task: Bash@3
+                displayName: Check Files
+                inputs:
+                  targetType: "inline"
+                  script: |
+
+                    echo "##[debug]Current environment is: ${{ parameters.qa_environment }}"
+
+                    echo "##[debug]Check firebase prod files"
+
+                    echo "##[debug]firebase_options.dart:"
+                    cat $(Build.SourcesDirectory)/lib/firebase_options.dart
+
+                    # Apenas para troubleshooting, manter comentado.
+                    # echo "##[debug]google-services.json:"
+                    # cat $(Build.SourcesDirectory)/android/app/google-services.json
+
+                    echo "##[debug]Check pubspec.yaml"
+                    cat $(Build.SourcesDirectory)/pubspec.yaml
+
+              # Build Flutter AAB
+              - task: FlutterBuild@0
+                displayName: "Build AAB Application"
+                inputs:
+                  target: "aab"
+                  projectDirectory: "$(Build.SourcesDirectory)"
+                  extraArgs: $(EXTRA_ARGS_FLUTTER)
+                  buildName: "$(Build.BuildNumber)"
+                  buildNumber: "$(BUILD_NUMBER)"
+                env:
+                  ASDF_JAVA_VERSION: "openjdk-17.0.2"
+                  TOPAZ_AWS_SECRET_KEY: "$(TOPAZ_AWS_SECRET_KEY)"
+                  TOPAZ_AWS_ACCESS_KEY: "$(TOPAZ_AWS_ACCESS_KEY)"
+                  AWS_ACCESS_KEY_ID: "$(AWS_ACCESS_KEY_ID)"
+                  AWS_SECRET_ACCESS_KEY: "$(AWS_SECRET_ACCESS_KEY)"
+                  AWS_DEFAULT_REGION: "$(AWS_DEFAULT_REGION)"                  
+
+              # Run Flutter Diagnostics if build fails
+              - task: FlutterCommand@0
+                displayName: "Run Flutter diagnostics"
+                condition: failed()
+                inputs:
+                  projectDirectory: "."
+                  arguments: "doctor -v"
+                env:
+                  ASDF_JAVA_VERSION: "openjdk-17.0.2"
+
+              # Signing AAB
+              - task: AndroidSigning@3
+                displayName: "Signing AAB"
+                inputs:
+                  apkFiles: "**/*.aab"
+                  apksign: true
+                  apksignerKeystoreFile: key.jks
+                  apksignerKeystorePassword: $(ANDROID_SIGNING_STORE_PASSWORD)
+                  apksignerKeystoreAlias: upload
+                  apksignerKeyPassword: $(ANDROID_SIGNING_KEY_PASSWORD)
+                  apksignerArguments: "--min-sdk-version 24 --v1-signing-enabled true --v2-signing-enabled true --out $(Build.SourcesDirectory)/build/app/outputs/bundle/prdRelease/$(ANDROID_FLAVOR_FILE_NAME).aab"
+                env:
+                  ASDF_JAVA_VERSION: "openjdk-17.0.2"
+
+              - task: CopyFiles@2
+                displayName: "Copy AAB to Staging"
+                inputs:
+                  sourceFolder: "$(Build.SourcesDirectory)"
+                  CleanTargetFolder: true
+                  contents: "**/*.aab"
+                  targetFolder: "$(Build.StagingDirectory)"
+                  flattenFolders: true
+
+              - task: PublishBuildArtifacts@1
+                displayName: "Publish AAB"
+                inputs:
+                  PathtoPublish: "$(Build.ArtifactStagingDirectory)"
+                  ArtifactName: "android_package"
+                  publishLocation: "Container"
+
+      - job: "Protect_android"
+        dependsOn:
+          - akv_secrets
+          - Package_android
+        condition: |
+          and(
+            succeeded(),
+            in(dependencies.Package_android.result, 'Succeeded', 'Skipped'),
+            in('${{ parameters.target }}', 'android', 'both'),
+            or(
+              eq('${{ parameters.skip_protect }}', False),
+              in('${{ parameters.qa_environment }}', 'producao', 'release')
+            )
+          )
+        displayName: "Protect (Android)"
+        pool:
+          #GeneralPurposeLinuxAgentsCI
+          vmImage: "ubuntu-latest"
+        variables:
+          ANDROID_SIGNING_KEY_JKS: $[ dependencies.akv_secrets.outputs['export_secrets.ANDROID_SIGNING_KEY_JKS'] ]
+          ANDROID_SIGNING_KEY_PASSWORD: $[ dependencies.akv_secrets.outputs['export_secrets.ANDROID_SIGNING_KEY_PASSWORD'] ]
+          ANDROID_SIGNING_STORE_PASSWORD: $[ dependencies.akv_secrets.outputs['export_secrets.ANDROID_SIGNING_STORE_PASSWORD'] ]
+        steps:
+          - checkout: self
+            persistCredentials: true
+            clean: true
+
+          - ${{ if eq(parameters.use_flutter_version_latest, 'True' ) }}:
+              - task: Cache@2
+                displayName: "Flutter Install Cache"
+                inputs:
+                  key: 'Flutter | "$(Agent.OS)" | "$(FLUTTER_VERSION_LATEST)"'
+                  path: "$(Agent.ToolsDirectory)/Flutter"
+                  cacheHitVar: FLUTTER_INSTALL_RESTORED
+
+              # Install Flutter
+              - task: FlutterInstall@0
+                displayName: "Install Flutter SDK"
+                inputs:
+                  mode: "auto"
+                  channel: "stable"
+                  version: "custom"
+                  customVersion: $(FLUTTER_VERSION_LATEST)
+
+          - ${{ else }}:
+              - task: Cache@2
+                displayName: "Flutter Install Cache"
+                inputs:
+                  key: 'Flutter | "$(Agent.OS)" | "$(FLUTTER_VERSION_LATEST)"'
+                  path: "$(Agent.ToolsDirectory)/Flutter"
+                  cacheHitVar: FLUTTER_INSTALL_RESTORED
+
+              - task: FlutterInstall@0
+                displayName: "Install Flutter SDK"
+                inputs:
+                  mode: "auto"
+                  channel: "stable"
+                  version: "custom"
+                  customVersion: $(FLUTTER_VERSION)
+
+          - task: JavaToolInstaller@0
+            displayName: "Use Java 17"
+            inputs:
+              jdkArchitectureOption: x64
+              versionSpec: 17
+              jdkSourceOption: PreInstalled
+
+          - task: DownloadSecureFile@1
+            name: keyprop
+            displayName: Download key properties file
+            inputs:
+              secureFile: "key.properties"
+
+          # Download Secure Files
+          # Key File contains the keystore file for Android Signing
+          - task: DownloadSecureFile@1
+            name: key
+            displayName: Download signing key
+            inputs:
+              secureFile: "key.jks"
+
+          # Extract Build Number adding a zero to the left if it is less than 10
+          - task: Bash@3
+            displayName: Extract Build Number
+            inputs:
+              targetType: "inline"
+              script: |
+                number=$(echo "$(Build.BuildNumber)" | cut -d '.' -f 2)
+                if [ "$number" -lt 10 ]; then
+                  # Adicione um zero à esquerda
+                  build_number=$(echo "$(Build.BuildNumber)" | cut -d '.' -f 1)"0"$number
+                else
+                  build_number=$(echo "$(Build.BuildNumber)" | cut -d '.' -f 1)"$number"
+                fi
+                echo "##[debug]Build number: $build_number"
+                echo "##vso[task.setvariable variable=BUILD_NUMBER;]$build_number"
+
+          - task: Bash@3
+            displayName: Config Files
+            inputs:
+              targetType: "inline"
+              script: |
+                cp $(keyprop.secureFilePath) $(Build.SourcesDirectory)/android/key.properties
+                cp $(key.secureFilePath) $(Build.SourcesDirectory)/android/key.jks
+                echo "##[debug]key.properties copied to $(Build.SourcesDirectory)/android/key.properties"
+                echo "##[debug]key.jks copied to $(Build.SourcesDirectory)/android/key.jks"
+
+                echo "##[debug]Current environment is: ${{ parameters.qa_environment }}"
+
+                if [[ ${{ parameters.qa_environment }} == "preprod" ]]; then
+                  # Update blueprint
+                  echo "##[debug]Update blueprint beta"
+                  sed -i 's/#{BUILD_NUMBER}#/$(BUILD_NUMBER)/g' $(Build.SourcesDirectory)/config/beta/arxan/blueprint.json
+
+                  echo "##[debug]View blueprint beta"
+                  cat $(Build.SourcesDirectory)/config/beta/arxan/blueprint.json
+
+                  # Set BLUEPRINT_PATH variable
+                  echo "##[debug]Setting BLUEPRINT_PATH for beta"
+                  echo "##vso[task.setvariable variable=BLUEPRINT_PATH]config/beta/arxan/blueprint.json"
+
+                elif [[ ${{ parameters.qa_environment }} == "producao" ]]; then
+
+                  # Update blueprint
+                  echo "##[debug]Update blueprint prod"
+                  sed -i 's/#{BUILD_NUMBER}#/$(BUILD_NUMBER)/g' $(Build.SourcesDirectory)/config/prd/arxan/blueprint.json
+
+                  echo "##[debug]View blueprint prod"
+                  cat $(Build.SourcesDirectory)/config/prd/arxan/blueprint.json
+
+                else
+
+                  # Update blueprint
+                  echo "##[debug]Update blueprint prd"
+                  sed -i 's/#{BUILD_NUMBER}#/$(BUILD_NUMBER)/g' $(Build.SourcesDirectory)/config/prd/arxan/blueprint.json
+
+                  echo "##[debug]View blueprint prd"
+                  cat $(Build.SourcesDirectory)/config/prd/arxan/blueprint.json
+
+                fi
+
+          - task: DownloadPackage@1
+            displayName: "Download Arxan"
+            inputs:
+              packageType: "upack"
+              feed: "/3d53bc62-8749-4931-ae46-a443b73bc87a"
+              view: "da88d2ff-67d7-44d6-a91b-cc4bffa5fa70"
+              definition: "$(ARXAN_ARTIFACTS_DEFINITION)"
+              version: "$(ARXAN_VERSION)"
+              downloadPath: "$(System.DefaultWorkingDirectory)"
+
+          - task: ExtractFiles@1
+            displayName: "Extract Arxan"
+            inputs:
+              archiveFilePatterns: "$(System.DefaultWorkingDirectory)/$(ARXAN_PACKAGE_FILENAME)"
+              destinationFolder: "$(System.DefaultWorkingDirectory)/protect-android"
+              cleanDestinationFolder: false
+              overwriteExistingFiles: true
+
+          - task: DownloadPipelineArtifact@2
+            displayName: "Download Pipeline Artifact"
+            inputs:
+              buildType: current
+              artifactName: "android_package"
+              targetPath: "$(DEFAULT_WORKDIR_ARTIFACTS)"
+              itemPattern: "**"
+
+          - task: Bash@3
+            displayName: Protect Android
+            inputs:
+              targetType: "inline"
+              script: |
+                $(System.DefaultWorkingDirectory)/protect-android/$(ARXAN_PACKAGE_FOLDER)/bin/protect-android --restrict-app-aware-reporting -b $(Build.SourcesDirectory)/$(BLUEPRINT_PATH) -i $(DEFAULT_WORKDIR_ARTIFACTS)/$(APP_FILE_NAME_ANDROID).apk -o $(Build.SourcesDirectory)/build/app/outputs/flutter-apk
+            env:
+              LICENSE_TOKEN: "$(ARXAN_LICENSE_TOKEN)"
+              ANDROID_HOME: "$(ANDROID_HOME)"
+              ANDROID_SDK_ROOT: "$(ANDROID_HOME)"
+              #ASDF_JAVA_VERSION: "openjdk-17.0.2"
+
+          - task: AndroidSigning@3
+            displayName: "Signing APK"
+            inputs:
+              apkFiles: "$(Build.SourcesDirectory)/build/app/outputs/flutter-apk/$(APP_FILE_NAME_ANDROID)-unaligned-unsigned-protected.apk"
+              apksign: true
+              apksignerKeystoreFile: key.jks
+              apksignerKeystorePassword: $(ANDROID_SIGNING_STORE_PASSWORD)
+              apksignerKeystoreAlias: upload
+              apksignerKeyPassword: $(ANDROID_SIGNING_KEY_PASSWORD)
+              apksignerArguments: --out $(Build.SourcesDirectory)/build/app/outputs/flutter-apk/$(APP_FILE_NAME_ANDROID).apk
+            #env:
+            #  ASDF_JAVA_VERSION: "openjdk-17.0.2"
+
+          - task: CopyFiles@2
+            displayName: "Copy Sign APK to Staging"
+            inputs:
+              sourceFolder: "$(Build.SourcesDirectory)"
+              contents: "**/build/app/outputs/flutter-apk/$(APP_FILE_NAME_ANDROID).apk"
+              targetFolder: "$(Build.StagingDirectory)"
+              flattenFolders: true
+              CleanTargetFolder: true
+
+          - task: PublishBuildArtifacts@1
+            displayName: "Publish Sign APK"
+            inputs:
+              PathtoPublish: "$(Build.ArtifactStagingDirectory)"
+              ArtifactName: "android_package_protected"
+              publishLocation: "Container"
+
+          ## PACKAGE TO PROD
+          - ${{ if in(parameters.qa_environment, 'release', 'producao') }}:
+              - task: DownloadPipelineArtifact@2
+                displayName: "Download Pipeline Artifact"
+                inputs:
+                  buildType: current
+                  artifactName: "android_package"
+                  targetPath: "$(DEFAULT_WORKDIR_ARTIFACTS)"
+                  itemPattern: "**"
+
+              - task: Bash@3
+                displayName: Check blueprint.json
+                inputs:
+                  targetType: "inline"
+                  script: |
+                    md5sum $(Build.SourcesDirectory)/$(BLUEPRINT_PATH)
+                    cat $(Build.SourcesDirectory)/$(BLUEPRINT_PATH) | grep signatureCheck -A10
+
+              - task: Bash@3
+                displayName: Protect Android
+                inputs:
+                  targetType: "inline"
+                  script: |
+                    $(System.DefaultWorkingDirectory)/protect-android/$(ARXAN_PACKAGE_FOLDER)/bin/protect-android --restrict-app-aware-reporting -b $(Build.SourcesDirectory)/$(BLUEPRINT_PATH) -i $(DEFAULT_WORKDIR_ARTIFACTS)/$(ANDROID_FLAVOR_FILE_NAME).aab -o $(Build.SourcesDirectory)/build/app/outputs/flutter-aab
+                env:
+                  LICENSE_TOKEN: "$(ARXAN_LICENSE_TOKEN)"
+                  ANDROID_HOME: "$(ANDROID_HOME)"
+                  ANDROID_SDK_ROOT: "$(ANDROID_HOME)"
+                  #ASDF_JAVA_VERSION: "openjdk-17.0.2"
+
+              - task: AndroidSigning@3
+                displayName: "Signing AAB"
+                inputs:
+                  apkFiles: "$(Build.SourcesDirectory)/build/app/outputs/flutter-aab/$(ANDROID_FLAVOR_FILE_NAME)-unaligned-unsigned-protected.aab"
+                  apksign: true
+                  apksignerKeystoreFile: key.jks
+                  apksignerKeystorePassword: $(ANDROID_SIGNING_STORE_PASSWORD)
+                  apksignerKeystoreAlias: upload
+                  apksignerKeyPassword: $(ANDROID_SIGNING_KEY_PASSWORD)
+                  apksignerArguments: "--min-sdk-version 24 --v1-signing-enabled true --v2-signing-enabled true --out $(Build.SourcesDirectory)/build/app/outputs/flutter-aab/$(APP_FILE_NAME_ANDROID).aab"
+                #env:
+                #  ASDF_JAVA_VERSION: "openjdk-17.0.2"
+
+              - task: CopyFiles@2
+                displayName: "Copy Sign AAB to Staging"
+                inputs:
+                  sourceFolder: "$(Build.SourcesDirectory)"
+                  contents: "**/build/app/outputs/flutter-aab/$(APP_FILE_NAME_ANDROID).aab"
+                  targetFolder: "$(Build.StagingDirectory)"
+                  flattenFolders: true
+                  CleanTargetFolder: true
+
+              - task: PublishBuildArtifacts@1
+                displayName: "Publish Sign AAB"
+                inputs:
+                  PathtoPublish: "$(Build.ArtifactStagingDirectory)"
+                  ArtifactName: "android_package_protected"
+                  publishLocation: "Container"
+
+      - job: "Package_ios"
+        timeoutInMinutes: 60
+        dependsOn:
+          - akv_secrets
+          - config_env
+        condition: |
+          and(
+            succeeded(),
+            in(dependencies.config_env.result, 'Succeeded', 'Skipped'),
+            in(dependencies.akv_secrets.result, 'Succeeded', 'Skipped'),
+            in('${{ parameters.target }}', 'ios', 'both')
+          )
+        displayName: "Package (iOS)"
+        variables:
+          EXTRA_ARGS_FLUTTER: $[ dependencies.config_env.outputs['export_variables.EXTRA_ARGS_FLUTTER'] ]
+          XCODE_CONFIG: $[ dependencies.config_env.outputs['export_variables.XCODE_CONFIG'] ]
+
+        pool: $(PRIVATE_MACOS_AGENT_DEFAULT)
+        workspace:
+          clean: outputs # Preserva Agent.ToolsDirectory (cache do Flutter SDK)
+        steps:
+          - checkout: self
+            persistCredentials: true
+            clean: true
+
+          - task: Bash@3
+            displayName: "Pre-Build Agent Cleanup"
+            continueOnError: true
+            inputs:
+              targetType: inline
+              script: |
+                echo "##[section]Starting Pre-Build Agent Cleanup"
+
+                # Verificar espaço inicial
+                echo "##[debug]Initial disk space:"
+                df -h / | tail -1 | awk '{print "Used: "$3" ("$5") - Available: "$4}'
+
+                # Limpeza de arquivos temporários do sistema
+                echo "##[debug]Cleaning system temp files..."
+                rm -rf /tmp/flutter_* 2>/dev/null || true
+                rm -rf /tmp/xcodebuild_* 2>/dev/null || true
+
+                # # ✅ Limpeza preventiva de zips antigos do Flutter
+                # echo "##[debug]Cleaning old Flutter SDK zip files..."
+                # rm -f ~/Downloads/flutter_*.zip 2>/dev/null || true
+                # find $(Agent.TempDirectory) -name "*flutter*.zip" -type f -mtime +1 -delete 2>/dev/null || true
+
+                # # ✅ Limpeza de builds antigos (mantém apenas os últimos 3 dias)
+                # echo "##[debug]Cleaning old build directories..."
+                # find $(Agent.BuildDirectory)/.. -maxdepth 1 -type d -name "*" -mtime +3 -not -path "$(Agent.BuildDirectory)" -exec rm -rf {} \; 2>/dev/null || true
+
+                # # ✅ Limpeza de Xcode DerivedData antigos (>7 dias)
+                # echo "##[debug]Cleaning old Xcode DerivedData..."
+                # find ~/Library/Developer/Xcode/DerivedData -maxdepth 1 -type d -mtime +7 -exec rm -rf {} \; 2>/dev/null || true
+
+                # # ✅ Limpeza de Xcode Archives antigos (>30 dias)
+                # echo "##[debug]Cleaning old Xcode Archives..."
+                # find ~/Library/Developer/Xcode/Archives -maxdepth 1 -type d -mtime +30 -exec rm -rf {} \; 2>/dev/null || true
+
+                # # ✅ Limpeza de caches do Homebrew (se existir)
+                # echo "##[debug]Cleaning Homebrew caches..."
+                # if command -v brew &> /dev/null; then
+                #   brew cleanup --prune=30 2>/dev/null || true
+                # fi
+
+                # # ✅ Limpeza de caches do CocoaPods antigos
+                # echo "##[debug]Cleaning old CocoaPods caches..."
+                # find ~/Library/Caches/CocoaPods -type f -mtime +30 -delete 2>/dev/null || true
+
+                # Verificar espaço após limpeza
+                echo "##[debug]Disk space after cleanup:"
+                df -h / | tail -1 | awk '{print "Used: "$3" ("$5") - Available: "$4}'
+
+          - task: Cache@2
+            displayName: "Flutter Pub Cache"
+            inputs:
+              key: 'flutter pub v4 | "${{ parameters.qa_environment }}" | "$(Agent.OS)" | pubspec.yaml'
+              path: "$(Agent.ToolsDirectory)/.pub-cache"
+              cacheHitVar: PUB_CACHE_RESTORED
+
+          # Cache CocoaPods - CRÍTICO para iOS
+          - task: Cache@2
+            displayName: "CocoaPods Cache"
+            inputs:
+              key: 'cocoapods v4 | "${{ parameters.qa_environment }}" | "$(Agent.OS)" | ios/Podfile'
+              path: "$(Pipeline.Workspace)/ios-pods-cache"
+              cacheHitVar: PODS_CACHE_RESTORED
+              restoreKeys: |
+                cocoapods v4 | "$(Agent.OS)"
+
+          # Validar e limpar Pods corrompidos se necessário
+          - task: Bash@3
+            displayName: "Validate and Clean Pods Cache"
+            condition: eq(variables['PODS_CACHE_RESTORED'], 'true')
+            inputs:
+              targetType: inline
+              script: |
+                echo "##[section]Validating Pods Cache Integrity"
+
+                # Verificar se diretório Pods existe
+                if [ ! -d "$(Build.SourcesDirectory)/ios/Pods" ]; then
+                  echo "##vso[task.logissue type=warning;]Pods directory not found in cache!"
+                  echo "##vso[task.setvariable variable=PODS_CACHE_RESTORED]false"
+                  exit 0
+                fi
+
+                # Verificar se arquivos críticos existem
+                CRITICAL_PODS=("FirebaseAnalytics" "FirebaseCore" "GoogleUtilities")
+                CORRUPTED=false
+
+                for POD in "${CRITICAL_PODS[@]}"; do
+                  POD_PATH="$(Build.SourcesDirectory)/ios/Pods/$POD"
+                  if [ -d "$POD_PATH" ]; then
+                    # Verificar se tem arquivos .xcframework corrompidos
+                    if find "$POD_PATH" -name "*.xcframework" -type d | while read FRAMEWORK; do
+                      if [ ! -f "$FRAMEWORK/Info.plist" ]; then
+                        echo "##vso[task.logissue type=warning;]Corrupted framework: $FRAMEWORK (missing Info.plist)"
+                        exit 1
+                      fi
+                    done; then
+                      CORRUPTED=true
+                      break
+                    fi
+                  fi
+                done
+
+                if [ "$CORRUPTED" = true ]; then
+                  echo "##[warning]Corrupted Pods detected in cache, forcing clean install"
+                  echo "##vso[task.setvariable variable=PODS_CACHE_RESTORED]false"
+
+                  echo "##[section]Cleaning corrupted Pods and cache"
+                  # Remover Pods corrompidos
+                  echo "##[debug]Removing corrupted Pods directory..."
+                  rm -rf "$(Build.SourcesDirectory)/ios/Pods"
+
+                  # Limpar cache local do CocoaPods (apenas quando há corrupção detectada)
+                  echo "##[debug]Cleaning CocoaPods local cache to prevent reusing corrupted files..."
+                  pod cache clean --all 2>/dev/null || true
+
+                  echo "##[debug]Corrupted Pods cleanup completed"
+                else
+                  echo "##[debug]Pods cache validation passed - using cached dependencies"
+                fi
+
+          - task: Bash@3
+            displayName: "Setup Environment"
+            inputs:
+              targetType: inline
+              script: |
+                echo "##[section]Setting up macOS agent"
+
+                # Configurar diretórios de cache em workspace (persistente)
+                mkdir -p $(Agent.ToolsDirectory)/.pub-cache
+
+                # Exportar como variável de JOB (não apenas de task)
+                echo "##vso[task.setvariable variable=PUB_CACHE_PATH;isOutput=false]$(Agent.ToolsDirectory)/.pub-cache"
+
+                # Exportar também no shell atual
+                export PUB_CACHE="$(Agent.ToolsDirectory)/.pub-cache"
+
+                # Validar que variável foi setada
+                echo "##[debug]PUB_CACHE path configured: $(Agent.ToolsDirectory)/.pub-cache"
+
+                echo "##[section]Setting up CocoaPods symlink"
+
+                PODS_CACHE_DIR="$(Pipeline.Workspace)/ios-pods-cache"
+                PODS_PROJECT_DIR="$(Build.SourcesDirectory)/ios/Pods"
+
+                # Remover Pods do projeto se existir
+                if [ -d "$PODS_PROJECT_DIR" ] || [ -L "$PODS_PROJECT_DIR" ]; then
+                  echo "##[debug]Removing existing Pods directory/symlink..."
+                  rm -rf "$PODS_PROJECT_DIR"
+                fi
+
+                # Criar diretório de cache se não existir (redundante, mas seguro)
+                mkdir -p "$PODS_CACHE_DIR"
+
+                # Criar symlink
+                echo "##[debug]Creating symlink: $PODS_PROJECT_DIR -> $PODS_CACHE_DIR"
+                ln -s "$PODS_CACHE_DIR" "$PODS_PROJECT_DIR"
+
+                # Validar symlink
+                if [ -L "$PODS_PROJECT_DIR" ]; then
+                  echo "##[debug]✅ Symlink created successfully"
+                  ls -la "$(Build.SourcesDirectory)/ios/" | grep Pods
+                else
+                  echo "##vso[task.logissue type=error;]Failed to create symlink"
+                  exit 1
+                fi
+
+                # Status do cache
+                if [ "$(PODS_CACHE_RESTORED)" = "true" ]; then
+                  echo "##[debug]✅ Cache HIT - Pods restored from cache"
+                  echo "##[debug]Pods count: $(find $PODS_CACHE_DIR -maxdepth 1 -type d | wc -l)"
+                else
+                  echo "##[debug]⚠️ Cache MISS - Will install pods"
+                fi
+
+                # Pre-warm sistema
+                echo "##[debug]System info for optimization:"
+                system_profiler SPHardwareDataType SPSoftwareDataType
+
+                # Configurar Xcode para performance máxima
+                defaults write com.apple.dt.XCBuild EnableSwiftBuildSystemIntegration 1
+                defaults write com.apple.dt.XCBuild UseNewBuildSystem -bool YES
+                defaults write com.apple.dt.XCBuild ShowBuildOperationDuration -bool YES
+
+                # Configurar paralelismo máximo
+                CORES=$(sysctl -n hw.ncpu)
+                echo "##vso[task.setvariable variable=PARALLEL_JOBS]$CORES"
+                echo "##[debug]Configured for $CORES parallel jobs"
+
+                # Compilação paralela do Swift
+                echo "##[debug]Configuring Swift compilation for parallelism"
+                echo "##vso[task.setvariable variable=SWIFT_COMPILATION_MODE]wholemodule"
+                echo "##vso[task.setvariable variable=SWIFT_OPTIMIZATION_LEVEL]-O"
+
+                # Desabilitar depuração em builds de release
+                echo "##[debug]Disabling debug information for release builds"
+                echo "##vso[task.setvariable variable=DEBUG_INFORMATION_FORMAT]dwarf"
+
+                # ✅ Habilitar compilação incremental
+                echo "##[debug]Enabling incremental compilation"
+                echo "##vso[task.setvariable variable=COMPILER_INDEX_STORE_ENABLE]NO"
+
+                # Otimizar linking
+                echo "##[debug]Enabling dead code stripping"
+                echo "##vso[task.setvariable variable=DEAD_CODE_STRIPPING]YES"
+                echo "##vso[task.setvariable variable=STRIP_INSTALLED_PRODUCT]YES"
+                echo "##vso[task.setvariable variable=STRIP_SWIFT_SYMBOLS]YES"
+
+          - ${{ if eq(parameters.use_flutter_version_latest, 'True' ) }}:
+              # Set Flutter Env in Vivo Agent
+              - task: FlutterEnv@0
+                displayName: "Flutter Env"
+                inputs:
+                  pathType: flutterDirectory
+                  flutterDirectory: "/Users/svc_devopscorp/.asdf/installs/flutter/$(FLUTTER_VERSION_LATEST)"
+
+          - ${{ else }}:
+              # Set Flutter Env in Vivo Agent
+              - task: FlutterEnv@0
+                displayName: "Flutter Env"
+                inputs:
+                  pathType: flutterDirectory
+                  flutterDirectory: "/Users/svc_devopscorp/.asdf/installs/flutter/$(FLUTTER_VERSION)"
+
+          - task: Bash@3
+            displayName: "Debug iOS Configuration"
+            inputs:
+              targetType: inline
+              script: |
+                echo "##[debug]Current directory: $(pwd)"
+                echo "##[debug]Xcode path:"
+                xcode-select --print-path
+                echo "##[debug]Xcode version:"
+                xcodebuild -version
+                echo "##[debug]List of installed simulators:"
+                xcrun simctl list runtimes
+
+          # Download Secure Files
+          # App Cert File contains the certificate for the app to login
+          - task: DownloadSecureFile@1
+            name: appCert
+            displayName: Download App Cert
+            inputs:
+              secureFile: $(APP_CERT_FILE_NAME)
+
+          # Download Secure Files
+          # App Key File contains the private key for the app to login
+          - task: DownloadSecureFile@1
+            name: appKey
+            displayName: Download App Key
+            inputs:
+              secureFile: $(APP_KEY_FILE_NAME)
+
+          # Install and configure EnsureIT to protect the app
+          - ${{ if or( eq( parameters.skip_protect, False ), in( parameters.qa_environment, 'release', 'producao' ) ) }}:
+              - task: DownloadPackage@1
+                displayName: "Download EnsureIT x86-64"
+                inputs:
+                  packageType: "upack"
+                  feed: "/3d53bc62-8749-4931-ae46-a443b73bc87a"
+                  view: "da88d2ff-67d7-44d6-a91b-cc4bffa5fa70"
+                  definition: '37290c39-1ea5-47fd-b117-9b61fbab90ba'
+                  version: "16.5.0"
+                  downloadPath: "$(System.ArtifactsDirectory)"
+
+              - task: Bash@3
+                displayName: 'Descompactar arquivo EnsureIT'
+                inputs:
+                  targetType: 'inline'
+                  script: |      
+                    echo "##[debug]Descompactando arquivo DMG..."
+                    hdiutil attach $(System.ArtifactsDirectory)/ensureit-16.5.0.3526c77b-macosx-x64-ios-arm.dmg -mountpoint /Volumes/EnsureIT
+                    cp -R /Volumes/EnsureIT/EnsureIT-16.5.0.3526c77b-macosx-x64-ios-arm.app $(System.ArtifactsDirectory)/EnsureIT
+                    hdiutil detach /Volumes/EnsureIT
+                    echo "##[debug]Arquivo DMG descompactado com sucesso!"
+
+              - task: Bash@3
+                displayName: Config Ensure IT
+                inputs:
+                  targetType: 'inline'
+                  script: |           
+                    # source
+                    echo "##[debug]EnsureIT setenv..."
+                    source $(System.ArtifactsDirectory)/EnsureIT/Contents/EnsureIT/bin/setenv.sh
+                    
+                    # Check if EnsureIT is properly configured
+                    echo "##[debug]EnsureIT version details:"
+                    $(System.ArtifactsDirectory)/EnsureIT/Contents/EnsureIT/bin/ensureit --version
+
+                    # Update Token
+                    echo "##[debug]Updating EnsureIt directory token..."
+                    sed -i '' "s|#{ENSUREIT_ARTIFACTS_DIRECTORY}#|$SYSTEM_ARTIFACTSDIRECTORY|g" "$(Build.SourcesDirectory)/ios/EnsureIT.Protection.xcconfig"
+
+                    echo "##[debug]Validating EnsureIt configuration..."
+                    cat $(Build.SourcesDirectory)/ios/EnsureIT.Protection.xcconfig            
+
+                env:
+                  LICENSE_TOKEN: "$(ARXAN_LICENSE_TOKEN)"
+
+              - task: Bash@3
+                displayName: Name iOS Package Protected
+                inputs:
+                  targetType: "inline"
+                  script: |
+                    # source
+                    echo "##[debug]Setting iOS Package Name Pro"
+                    name='package_protected'
+                    echo "##vso[task.setvariable variable=IOS_PACKAGE_NAME]$name"
+
+              # Download EnsureIT Release Config
+              - task: DownloadSecureFile@1
+                name: ensureIT
+                displayName: Download EnsureIT Release Config
+                inputs:
+                  secureFile: $(ENSUREIT_RELEASE_FILE_NAME)
+
+          - ${{ else }}:
+              - task: Bash@3
+                displayName: Name iOS Package
+                inputs:
+                  targetType: "inline"
+                  script: |
+                    # source
+                    echo "##[debug]Setting iOS Package Name"
+                    name='package'
+                    echo "##vso[task.setvariable variable=IOS_PACKAGE_NAME]$name"
+
+          ## PACKAGE TO BETA
+          - ${{ if in( parameters.qa_environment, 'preprod' ) }}:
+              # Download secure files first
+              - task: DownloadSecureFile@1
+                name: p12CertificateDev
+                displayName: "Download P12 Certificate DEV"
+                inputs:
+                  secureFile: $(IOS_P12_SECURE_FILE_DEV)
+
+              - task: DownloadSecureFile@1
+                name: provisioningProfileDev
+                displayName: "Download Provisioning Profile DEV"
+                inputs:
+                  secureFile: $(IOS_PROV_PROFILE_SECURE_FILE_DEV)
+
+              # Install certificate and provisioning profile manually
+              - task: Bash@3
+                displayName: 'Setup iOS Signing (Manual)'
+                inputs:
+                  targetType: inline
+                  script: |
+                    set -e
+                    
+                    echo "##[section]Setting up iOS Code Signing"
+                    
+                    # Create temporary keychain using Azure DevOps temp directory
+                    KEYCHAIN_PATH="$HOME/Library/Keychains/app-signing-$(Build.BuildId).keychain-db"
+                    KEYCHAIN_PASSWORD=$(openssl rand -base64 32)
+                    
+                    echo "##[debug]Removing existing keychain if present..."
+                    security delete-keychain "$KEYCHAIN_PATH" 2>/dev/null || true
+                    
+                    echo "##[debug]Creating new temporary keychain..."
+                    security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+                    
+                    echo "##[debug]Configuring keychain settings..."
+                    security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+                    security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+                    
+                    echo "##[debug]Adding keychain to search list..."
+                    security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | sed s/\"//g)
+                    security default-keychain -s "$KEYCHAIN_PATH"
+                    
+                    echo "##[section]Validating P12 Certificate"
+                    P12_FILE="$(p12CertificateDev.secureFilePath)"
+                    echo "##[debug]P12 file path: $P12_FILE"
+                    echo "##[debug]P12 file exists: $(test -f "$P12_FILE" && echo "YES" || echo "NO")"
+                    echo "##[debug]P12 file size: $(ls -lh "$P12_FILE" | awk '{print $5}')"
+                    echo "##[debug]P12 file permissions: $(ls -l "$P12_FILE" | awk '{print $1}')"
+                    
+                    # Verificar conteúdo do P12 (sem senha)
+                    echo "##[debug]Validating P12 structure..."
+                    openssl pkcs12 -info -in "$P12_FILE" -passin pass:"$(IOS_P12_CERTIFICATE_PWD_DEV)" -noout 2>&1 || {
+                      echo "##vso[task.logissue type=error;]Failed to validate P12 certificate. Password may be incorrect or file corrupted."
+                      exit 1
+                    }
+                    
+                    echo "##[debug]P12 certificate validated successfully"
+                    
+                    echo "##[section]Installing Apple Certificate Chain"
+                    # Download and install Apple Worldwide Developer Relations Certification Authority
+                    echo "##[debug]Downloading Apple WWDR certificate..."
+                    curl -sS https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer -o /tmp/AppleWWDRCAG3.cer
+                    curl -sS https://www.apple.com/certificateauthority/AppleWWDRCAG6.cer -o /tmp/AppleWWDRCAG6.cer
+                    
+                    echo "##[debug]Importing Apple WWDR certificates..."
+                    security import /tmp/AppleWWDRCAG3.cer -k "$KEYCHAIN_PATH" -T /usr/bin/codesign -T /usr/bin/security -A
+                    security import /tmp/AppleWWDRCAG6.cer -k "$KEYCHAIN_PATH" -T /usr/bin/codesign -T /usr/bin/security -A
+                    
+                    echo "##[debug]Importing P12 certificate..."
+                    security import "$P12_FILE" \
+                      -k "$KEYCHAIN_PATH" \
+                      -P "$(IOS_P12_CERTIFICATE_PWD_DEV)" \
+                      -T /usr/bin/codesign \
+                      -T /usr/bin/security \
+                      -A 2>&1 || {
+                      echo "##vso[task.logissue type=error;]Failed to import P12 certificate into keychain"
+                      exit 1
+                    }
+                    
+                    echo "##[debug]Certificate import completed"
+                    
+                    echo "##[debug]Setting key partition list..."
+                    security set-key-partition-list -S apple-tool:,apple:,codesign: \
+                      -s -k "$KEYCHAIN_PASSWORD" \
+                      "$KEYCHAIN_PATH" 2>&1 || {
+                      echo "##vso[task.logissue type=warning;]Failed to set key partition list, trying alternative approach..."
+                      # Alternative: set partition list for all items
+                      security set-key-partition-list -S apple-tool:,apple: \
+                        -k "$KEYCHAIN_PASSWORD" \
+                        "$KEYCHAIN_PATH" 2>&1
+                    }
+                    
+                    echo "##[debug]Verifying certificate installation..."
+                    IDENTITY_OUTPUT=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH")
+                    echo "$IDENTITY_OUTPUT"
+                    
+                    # Check if at least one certificate was found
+                    if echo "$IDENTITY_OUTPUT" | grep -q "0 valid identities found"; then
+                      echo "##vso[task.logissue type=error;]No valid signing identities found in keychain after import!"
+                      echo "##[debug]Keychain contents:"
+                      security dump-keychain "$KEYCHAIN_PATH"
+                      exit 1
+                    fi
+                    
+                    echo "##[debug]Certificate successfully installed and accessible"
+                    
+                    echo "##[section]Installing Provisioning Profile"
+                    
+                    # Get profile UUID from the file
+                    PROFILE_UUID=$(/usr/libexec/PlistBuddy -c "Print :UUID" /dev/stdin <<< $(/usr/bin/security cms -D -i "$(provisioningProfileDev.secureFilePath)"))
+                    echo "##[debug]Profile UUID: $PROFILE_UUID"
+                    
+                    # Get profile name
+                    PROFILE_NAME=$(/usr/libexec/PlistBuddy -c "Print :Name" /dev/stdin <<< $(/usr/bin/security cms -D -i "$(provisioningProfileDev.secureFilePath)"))
+                    echo "##[debug]Profile Name: $PROFILE_NAME"
+                    
+                    # Get profile type
+                    PROFILE_TYPE=$(/usr/libexec/PlistBuddy -c "Print :ProvisionedDevices" /dev/stdin <<< $(/usr/bin/security cms -D -i "$(provisioningProfileDev.secureFilePath)") 2>/dev/null && echo "Development/Ad-Hoc" || echo "App Store")
+                    echo "##[debug]Profile Type: $PROFILE_TYPE"
+                    
+                    # Get expiration date
+                    EXPIRATION_DATE=$(/usr/libexec/PlistBuddy -c "Print :ExpirationDate" /dev/stdin <<< $(/usr/bin/security cms -D -i "$(provisioningProfileDev.secureFilePath)"))
+                    echo "##[debug]Expiration Date: $EXPIRATION_DATE"
+                    
+                    # Get team name
+                    TEAM_NAME=$(/usr/libexec/PlistBuddy -c "Print :TeamName" /dev/stdin <<< $(/usr/bin/security cms -D -i "$(provisioningProfileDev.secureFilePath)"))
+                    echo "##[debug]Team Name: $TEAM_NAME"
+                    
+                    echo "##[debug]Installing provisioning profile..."
+                    mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+                    PROFILE_PATH=~/Library/MobileDevice/Provisioning\ Profiles/${PROFILE_UUID}.mobileprovision
+                    cp "$(provisioningProfileDev.secureFilePath)" "$PROFILE_PATH"
+                    
+                    echo "##[debug]Profile installed at: $PROFILE_PATH"
+                    echo "##[debug]Verifying profile installation..."
+                    ls -la ~/Library/MobileDevice/Provisioning\ Profiles/ | grep "${PROFILE_UUID}"
+                    
+                    # Extract signing identity from certificate
+                    SIGNING_IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | head -1 | grep -o '"[^"]*"' | sed 's/"//g')
+                    echo "##[debug]Signing Identity: $SIGNING_IDENTITY"
+                    
+                    # Export variables for cleanup and later use
+                    echo "##vso[task.setvariable variable=KEYCHAIN_PATH]$KEYCHAIN_PATH"
+                    echo "##vso[task.setvariable variable=KEYCHAIN_PASSWORD;issecret=true]$KEYCHAIN_PASSWORD"
+                    echo "##vso[task.setvariable variable=PROFILE_PATH]$PROFILE_PATH"
+                    echo "##vso[task.setvariable variable=APPLE_PROV_PROFILE_UUID]$PROFILE_UUID"
+                    echo "##vso[task.setvariable variable=APPLE_CERTIFICATE_SIGNING_IDENTITY]$SIGNING_IDENTITY"
+                    
+                    echo "##[section]iOS Code Signing setup completed successfully"
+                env:
+                  IOS_P12_CERTIFICATE_PWD_DEV: $(IOS_P12_CERTIFICATE_PWD_DEV)
+
+              # Firebase Options File contains the Firebase options for the app
+              #USANDO REPOSITORIO
+              # - task: DownloadSecureFile@1
+              #   name: firebaseOptionsPreprod
+              #   condition: eq('${{ parameters.qa_environment }}', 'preprod')
+              #   displayName: Download Firebase Options Pre Producao
+              #   inputs:
+              #     secureFile: $(LIB_FIREBASE_OPTIONS_FILE_NAME_BETA)
+
+              # Firebase App Id File contains the Firebase App Id for the app
+              - task: DownloadSecureFile@1
+                name: firebaseAppIdPreprod
+                condition: eq('${{ parameters.qa_environment }}', 'preprod')
+                displayName: Download Firebase App Id Pre Producao
+                inputs:
+                  secureFile: $(IOS_FIREBASE_APP_ID_FILE_NAME_BETA)
+
+              # Google Service Info File contains the Google Service Info for the app
+              - task: DownloadSecureFile@1
+                name: googleServiceInfoPreprod
+                condition: eq('${{ parameters.qa_environment }}', 'preprod')
+                displayName: Download Google Service Info Pre Producao
+                inputs:
+                  secureFile: $(IOS_GOOGLE_SERVICE_INFO_FILE_NAME_BETA)
+
+              # Firebase contains the ids and keys for the app to use Firebase services
+              - task: DownloadSecureFile@1
+                name: betafirebase
+                displayName: Download env beta firebase
+                inputs:
+                  secureFile: $(ENV_BETA_FIREBASE)
+
+              # Firebase contains the ids and keys for the app to use Firebase services
+              - task: DownloadSecureFile@1
+                name: prodfirebase
+                displayName: Download env prod firebase
+                inputs:
+                  secureFile: $(ENV_PROD_FIREBASE)
+
+              # Manipulate Secure Files
+              - task: Bash@3
+                displayName: Config Files
+                inputs:
+                  targetType: "inline"
+                  script: |
+
+                    echo "##[debug]Current environment is: ${{ parameters.qa_environment }}"
+
+                    if [[ ${{ parameters.qa_environment }} == "preprod" ]]; then
+
+                      echo "##[debug]Copying firebase beta files"
+                      echo "##[debug]Skipping secure-file copy for firebase_options.dart and iOS plist — using repository files"
+                      # cp $(firebaseOptionsPreprod.secureFilePath) $(Build.SourcesDirectory)/lib/firebase_options.dart
+                      cp $(firebaseAppIdPreprod.secureFilePath) $(Build.SourcesDirectory)/ios/firebase_app_id_file.json
+                      cp $(googleServiceInfoPreprod.secureFilePath) $(Build.SourcesDirectory)/ios/Runner/GoogleService-Info.plist
+                      mkdir -p $(Build.SourcesDirectory)/ios/Runner/beta
+                      cp $(googleServiceInfoPreprod.secureFilePath) $(Build.SourcesDirectory)/ios/Runner/beta/GoogleService-Info.plist
+                      echo "##[debug]Using repository lib/firebase_options.dart and iOS plist"
+                      echo "##[debug]$(IOS_GOOGLE_SERVICE_INFO_FILE_NAME_BETA) copied to $(Build.SourcesDirectory)/ios/Runner/GoogleService-Info.plist"
+                      echo "##[debug]$(IOS_GOOGLE_SERVICE_INFO_FILE_NAME_BETA) copied to $(Build.SourcesDirectory)/ios/Runner/beta/GoogleService-Info.plist"
+
+                      echo "##[debug]Copying key and cert files to beta"
+                      echo "##[debug]$(APP_CERT_FILE_NAME) copied to $(Build.SourcesDirectory)/config/beta/certs/cert.crt"
+                      echo "##[debug]$(APP_KEY_FILE_NAME) copied to $(Build.SourcesDirectory)/config/beta/certs/private.pem"
+                      cp $(appCert.secureFilePath) $(Build.SourcesDirectory)/config/beta/certs/cert.crt
+                      cp $(appKey.secureFilePath) $(Build.SourcesDirectory)/config/beta/certs/private.pem
+
+                      cp $(betafirebase.secureFilePath) $(Build.SourcesDirectory)/config/beta/.env_beta_firebase
+                      echo "##[debug]Preprod firebase env copied to $(Build.SourcesDirectory)/config/beta/.env_beta_firebase"
+                      
+                      # Update ELK tokens
+                      echo "##[debug]Update ELK tokens PRE"
+                      sed -i '' 's/#{ELK_LOG_USER_PRE}#/$(ELK_LOG_USER_PRE)/g' $(Build.SourcesDirectory)/config/beta/.env
+                      sed -i '' 's/#{ELK_LOG_PASSWORD_PRE}#/$(ELK_LOG_PASSWORD_PRE)/g' $(Build.SourcesDirectory)/config/beta/.env
+
+                    fi
+
+                    # Update Guard Spec
+                    if [[ ${{ parameters.skip_protect }} == "False" ]]; then
+                      echo "##[debug]EnsureIT protection: enabled Beta Release."
+                      echo "#include \"EnsureIT.Protection.xcconfig\"" >> $(Build.SourcesDirectory)/ios/Flutter/betaRelease.xcconfig
+                      echo "#include \"EnsureIT.Protection.xcconfig\"" >> $(Build.SourcesDirectory)/ios/Flutter/betaProfile.xcconfig
+                      echo "##[debug]Update GUARD SPEC token"
+                      echo "##[debug]GUARD_SPEC_SETTINGS is: $(GUARD_SPEC_SETTINGS)"
+                      sed -i '' 's|#{GUARD_SPEC_SETTINGS}#|$(GUARD_SPEC_SETTINGS)|g' $(Build.SourcesDirectory)/ios/Runner.xcodeproj/project.pbxproj
+                      echo "##[debug]ENSUREIT_COMPILE_FLAG is: $(ENSUREIT_COMPILE_FLAG)"
+                      sed -i '' 's|#{ENSUREIT_COMPILE_FLAG}#|$(ENSUREIT_COMPILE_FLAG)|g' $(Build.SourcesDirectory)/ios/Runner.xcodeproj/project.pbxproj
+
+                      echo "##[debug]$(ENSUREIT_RELEASE_FILE_NAME) copied to $(Build.SourcesDirectory)/ios/Flutter/Release.xcconfig"
+                      cp $(ensureIT.secureFilePath) $(Build.SourcesDirectory)/ios/Flutter/Release.xcconfig
+
+                    else
+                      echo "##[debug]Clear GUARD_SPEC_SETTINGS token"
+                      sed -i '' 's/#{GUARD_SPEC_SETTINGS}#//g' $(Build.SourcesDirectory)/ios/Runner.xcodeproj/project.pbxproj
+                      echo "##[debug]Clear ENSUREIT_COMPILE_FLAG token"
+                      sed -i '' 's/#{ENSUREIT_COMPILE_FLAG}#//g' $(Build.SourcesDirectory)/ios/Runner.xcodeproj/project.pbxproj
+
+                    fi
+
+                    # Update Google Maps token
+                    sed -i '' 's/#{GOOGLE_MAPS_API_KEY}#/$(GOOGLE_MAPS_API_KEY)/g' $(Build.SourcesDirectory)/ios/Runner/AppDelegate.swift
+
+                    # Update pubspec token if #{MAPP_PAYMENT_REF}# exists in pubspec.yaml
+                    if grep -q '#{MAPP_PAYMENT_REF}#' $(Build.SourcesDirectory)/pubspec.yaml; then
+                      echo "##[debug]Update mapp_payment ref pubspec token with snapshot-"
+                      sed -i '' 's/#{MAPP_PAYMENT_REF}#/$(MAPP_PAYMENT_REF)/g' $(Build.SourcesDirectory)/pubspec.yaml
+                    else
+                      echo "##[debug]No mapp_payment ref token found in pubspec.yaml"
+                    fi
+
+                    echo "##[debug]Current project.pbxproj"
+                    cat $(Build.SourcesDirectory)/ios/Runner.xcodeproj/project.pbxproj
+                    echo ""
+                    echo "##[debug]Current Release.xcconfig"
+                    cat $(Build.SourcesDirectory)/ios/Flutter/Release.xcconfig
+                    echo ""
+
+          ## PACKAGE TO PROD
+          - ${{ if in(parameters.qa_environment, 'release', 'producao') }}:
+              # Download secure files first
+              - task: DownloadSecureFile@1
+                name: p12Certificate
+                displayName: "Download P12 Certificate PROD"
+                inputs:
+                  secureFile: $(IOS_P12_SECURE_FILE)
+
+              - task: DownloadSecureFile@1
+                name: provisioningProfile
+                displayName: "Download Provisioning Profile PROD"
+                inputs:
+                  secureFile: $(IOS_PROV_PROFILE_SECURE_FILE)
+
+              # Install certificate and provisioning profile manually
+              - task: Bash@3
+                displayName: 'Setup iOS Signing (Manual)'
+                inputs:
+                  targetType: inline
+                  script: |
+                    set -e
+                    
+                    echo "##[section]Setting up iOS Code Signing"
+                    
+                    # Create temporary keychain using Azure DevOps temp directory
+                    KEYCHAIN_PATH="$HOME/Library/Keychains/app-signing-$(Build.BuildId).keychain-db"
+                    KEYCHAIN_PASSWORD=$(openssl rand -base64 32)
+                    
+                    echo "##[debug]Removing existing keychain if present..."
+                    security delete-keychain "$KEYCHAIN_PATH" 2>/dev/null || true
+                    
+                    echo "##[debug]Creating new temporary keychain..."
+                    security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+                    
+                    echo "##[debug]Configuring keychain settings..."
+                    security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+                    security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+                    
+                    echo "##[debug]Adding keychain to search list..."
+                    security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | sed s/\"//g)
+                    security default-keychain -s "$KEYCHAIN_PATH"
+                    
+                    echo "##[section]Validating P12 Certificate"
+                    P12_FILE="$(p12Certificate.secureFilePath)"
+                    echo "##[debug]P12 file path: $P12_FILE"
+                    echo "##[debug]P12 file exists: $(test -f "$P12_FILE" && echo "YES" || echo "NO")"
+                    echo "##[debug]P12 file size: $(ls -lh "$P12_FILE" | awk '{print $5}')"
+                    echo "##[debug]P12 file permissions: $(ls -l "$P12_FILE" | awk '{print $1}')"
+                    
+                    # Verificar conteúdo do P12 (sem senha)
+                    echo "##[debug]Validating P12 structure..."
+                    openssl pkcs12 -info -in "$P12_FILE" -passin pass:"$(IOS_P12_CERTIFICATE_PWD)" -noout 2>&1 || {
+                      echo "##vso[task.logissue type=error;]Failed to validate P12 certificate. Password may be incorrect or file corrupted."
+                      exit 1
+                    }
+                    
+                    echo "##[debug]P12 certificate validated successfully"
+                    
+                    echo "##[section]Installing Apple Certificate Chain"
+                    # Download and install Apple Worldwide Developer Relations Certification Authority
+                    echo "##[debug]Downloading Apple WWDR certificate..."
+                    curl -sS https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer -o /tmp/AppleWWDRCAG3.cer
+                    curl -sS https://www.apple.com/certificateauthority/AppleWWDRCAG6.cer -o /tmp/AppleWWDRCAG6.cer
+                    
+                    echo "##[debug]Importing Apple WWDR certificates..."
+                    security import /tmp/AppleWWDRCAG3.cer -k "$KEYCHAIN_PATH" -T /usr/bin/codesign -T /usr/bin/security -A
+                    security import /tmp/AppleWWDRCAG6.cer -k "$KEYCHAIN_PATH" -T /usr/bin/codesign -T /usr/bin/security -A
+                    
+                    echo "##[debug]Importing P12 certificate..."
+                    security import "$P12_FILE" \
+                      -k "$KEYCHAIN_PATH" \
+                      -P "$(IOS_P12_CERTIFICATE_PWD)" \
+                      -T /usr/bin/codesign \
+                      -T /usr/bin/security \
+                      -A 2>&1 || {
+                      echo "##vso[task.logissue type=error;]Failed to import P12 certificate into keychain"
+                      exit 1
+                    }
+                    
+                    echo "##[debug]Certificate import completed"
+                    
+                    echo "##[debug]Setting key partition list..."
+                    security set-key-partition-list -S apple-tool:,apple:,codesign: \
+                      -s -k "$KEYCHAIN_PASSWORD" \
+                      "$KEYCHAIN_PATH" 2>&1 || {
+                      echo "##vso[task.logissue type=warning;]Failed to set key partition list, trying alternative approach..."
+                      # Alternative: set partition list for all items
+                      security set-key-partition-list -S apple-tool:,apple: \
+                        -k "$KEYCHAIN_PASSWORD" \
+                        "$KEYCHAIN_PATH" 2>&1
+                    }
+                    
+                    echo "##[debug]Verifying certificate installation..."
+                    IDENTITY_OUTPUT=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH")
+                    echo "$IDENTITY_OUTPUT"
+                    
+                    # Check if at least one certificate was found
+                    if echo "$IDENTITY_OUTPUT" | grep -q "0 valid identities found"; then
+                      echo "##vso[task.logissue type=error;]No valid signing identities found in keychain after import!"
+                      echo "##[debug]Keychain contents:"
+                      security dump-keychain "$KEYCHAIN_PATH"
+                      exit 1
+                    fi
+                    
+                    echo "##[debug]Certificate successfully installed and accessible"
+                    
+                    echo "##[section]Installing Provisioning Profile"
+                    
+                    # Get profile UUID from the file
+                    PROFILE_UUID=$(/usr/libexec/PlistBuddy -c "Print :UUID" /dev/stdin <<< $(/usr/bin/security cms -D -i "$(provisioningProfile.secureFilePath)"))
+                    echo "##[debug]Profile UUID: $PROFILE_UUID"
+                    
+                    # Get profile name
+                    PROFILE_NAME=$(/usr/libexec/PlistBuddy -c "Print :Name" /dev/stdin <<< $(/usr/bin/security cms -D -i "$(provisioningProfile.secureFilePath)"))
+                    echo "##[debug]Profile Name: $PROFILE_NAME"
+                    
+                    # Get profile type
+                    PROFILE_TYPE=$(/usr/libexec/PlistBuddy -c "Print :ProvisionedDevices" /dev/stdin <<< $(/usr/bin/security cms -D -i "$(provisioningProfile.secureFilePath)") 2>/dev/null && echo "Development/Ad-Hoc" || echo "App Store")
+                    echo "##[debug]Profile Type: $PROFILE_TYPE"
+                    
+                    # Get expiration date
+                    EXPIRATION_DATE=$(/usr/libexec/PlistBuddy -c "Print :ExpirationDate" /dev/stdin <<< $(/usr/bin/security cms -D -i "$(provisioningProfile.secureFilePath)"))
+                    echo "##[debug]Expiration Date: $EXPIRATION_DATE"
+                    
+                    # Get team name
+                    TEAM_NAME=$(/usr/libexec/PlistBuddy -c "Print :TeamName" /dev/stdin <<< $(/usr/bin/security cms -D -i "$(provisioningProfile.secureFilePath)"))
+                    echo "##[debug]Team Name: $TEAM_NAME"
+                    
+                    echo "##[debug]Installing provisioning profile..."
+                    mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+                    PROFILE_PATH=~/Library/MobileDevice/Provisioning\ Profiles/${PROFILE_UUID}.mobileprovision
+                    cp "$(provisioningProfile.secureFilePath)" "$PROFILE_PATH"
+                    
+                    echo "##[debug]Profile installed at: $PROFILE_PATH"
+                    echo "##[debug]Verifying profile installation..."
+                    ls -la ~/Library/MobileDevice/Provisioning\ Profiles/ | grep "${PROFILE_UUID}"
+                    
+                    # Extract signing identity from certificate
+                    SIGNING_IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | head -1 | grep -o '"[^"]*"' | sed 's/"//g')
+                    echo "##[debug]Signing Identity: $SIGNING_IDENTITY"
+                    
+                    # Export variables for cleanup and later use
+                    echo "##vso[task.setvariable variable=KEYCHAIN_PATH]$KEYCHAIN_PATH"
+                    echo "##vso[task.setvariable variable=KEYCHAIN_PASSWORD;issecret=true]$KEYCHAIN_PASSWORD"
+                    echo "##vso[task.setvariable variable=PROFILE_PATH]$PROFILE_PATH"
+                    echo "##vso[task.setvariable variable=APPLE_PROV_PROFILE_UUID]$PROFILE_UUID"
+                    echo "##vso[task.setvariable variable=APPLE_CERTIFICATE_SIGNING_IDENTITY]$SIGNING_IDENTITY"
+                    
+                    echo "##[section]iOS Code Signing setup completed successfully"
+                env:
+                  IOS_P12_CERTIFICATE_PWD: $(IOS_P12_CERTIFICATE_PWD)
+              # Firebase Options File contains the Firebase options for the app
+              - task: DownloadSecureFile@1
+                name: firebaseOptions
+                displayName: Download Firebase Options Producao
+                inputs:
+                  secureFile: $(LIB_FIREBASE_OPTIONS_FILE_NAME)
+
+              # Firebase App Id File contains the Firebase App Id for the app
+              - task: DownloadSecureFile@1
+                name: firebaseAppId
+                displayName: Download Firebase App Id Producao
+                inputs:
+                  secureFile: $(IOS_FIREBASE_APP_ID_FILE_NAME)
+
+              # Google Service Info File contains the Google Service Info for the app
+              - task: DownloadSecureFile@1
+                name: googleServiceInfo
+                displayName: Download Google Service Info Producao
+                inputs:
+                  secureFile: $(IOS_GOOGLE_SERVICE_INFO_FILE_NAME)
+
+              # Firebase contains the ids and keys for the app to use Firebase services
+              - task: DownloadSecureFile@1
+                name: prodfirebase
+                displayName: Download env prod firebase
+                inputs:
+                  secureFile: $(ENV_PROD_FIREBASE)
+
+              # Manipulate Secure Files
+              - task: Bash@3
+                displayName: Config Files
+                inputs:
+                  targetType: "inline"
+                  script: |
+
+                    echo "##[debug]Current environment is: ${{ parameters.qa_environment }}"
+
+                    echo "##[debub]Copying firebase prod files"
+                    echo "##[debug]Skipping secure-file copy for firebase_options.dart and iOS plist — using repository files"
+                    # cp $(firebaseOptions.secureFilePath) $(Build.SourcesDirectory)/lib/firebase_options.dart
+                    cp $(firebaseAppId.secureFilePath) $(Build.SourcesDirectory)/ios/firebase_app_id_file.json
+                    cp $(googleServiceInfo.secureFilePath) $(Build.SourcesDirectory)/ios/Runner/GoogleService-Info.plist
+                    mkdir -p $(Build.SourcesDirectory)/ios/Runner/prd
+                    cp $(googleServiceInfo.secureFilePath) $(Build.SourcesDirectory)/ios/Runner/prd/GoogleService-Info.plist
+                    echo "##[debug]Using repository lib/firebase_options.dart and iOS plist"
+                    echo "##[debug]$(IOS_FIREBASE_APP_ID_FILE_NAME) copied to $(Build.SourcesDirectory)/ios/firebase_app_id_file.json"
+                    echo "##[debug]$(IOS_GOOGLE_SERVICE_INFO_FILE_NAME) copied to $(Build.SourcesDirectory)/ios/Runner/GoogleService-Info.plist"                    
+
+                    if [[ ${{ parameters.qa_environment }} == "producao" ]]; then
+
+                      cp $(appCert.secureFilePath) $(Build.SourcesDirectory)/config/prd/certs/cert.crt
+                      cp $(appKey.secureFilePath) $(Build.SourcesDirectory)/config/prd/certs/private.pem
+
+                      echo "##[debub]Copying files to prod"
+                      echo "##[debug]$(APP_CERT_FILE_NAME) copied to $(Build.SourcesDirectory)/config/prd/certs/cert.crt"
+                      echo "##[debug]$(APP_KEY_FILE_NAME) copied to $(Build.SourcesDirectory)/config/prd/certs/private.pem"
+
+                      cp $(prodfirebase.secureFilePath) $(Build.SourcesDirectory)/config/prd/.env_prod_firebase
+                      echo "##[debug]Prod firebase env copied to $(Build.SourcesDirectory)/config/prd/.env_prod_firebase"
+
+                      # Update ELK tokens
+                      echo "##[debug]Update tokens PROD"
+                      sed -i '' 's/#{FLUTTER_LOGIN_CLIENT_ID}#/$(FLUTTER_LOGIN_CLIENT_ID)/g' $(Build.SourcesDirectory)/config/prd/.env
+                      sed -i '' 's/#{ELK_LOG_USER}#/$(ELK_LOG_USER)/g' $(Build.SourcesDirectory)/config/prd/.env
+                      sed -i '' 's/#{ELK_LOG_PASSWORD}#/$(ELK_LOG_PASSWORD)/g' $(Build.SourcesDirectory)/config/prd/.env
+                    fi
+
+                    # Update Google Maps token
+                    sed -i '' 's/#{GOOGLE_MAPS_API_KEY}#/$(GOOGLE_MAPS_API_KEY)/g' $(Build.SourcesDirectory)/ios/Runner/AppDelegate.swift
+
+                    # Clear pubspec token
+                    echo "##[debug]Clear mapp_payment ref pubspec token"
+                    sed -i '' 's/#{MAPP_PAYMENT_REF}#//g' $(Build.SourcesDirectory)/pubspec.yaml
+
+                    # Update Guard Spec
+                    echo "##[debug]EnsureIT protection: enabled Prd Release."
+                    echo "#include \"EnsureIT.Protection.xcconfig\"" >> $(Build.SourcesDirectory)/ios/Flutter/prdRelease.xcconfig
+
+                    echo "##[debug]Update Guard tokens"
+                    echo "##[debug]GUARD_SPEC_SETTINGS is: $(GUARD_SPEC_SETTINGS)"
+                    sed -i '' 's|#{GUARD_SPEC_SETTINGS}#|$(GUARD_SPEC_SETTINGS)|g' $(Build.SourcesDirectory)/ios/Runner.xcodeproj/project.pbxproj
+
+                    echo "##[debug]ENSUREIT_COMPILE_FLAG is: $(ENSUREIT_COMPILE_FLAG)"
+                    sed -i '' 's|#{ENSUREIT_COMPILE_FLAG}#|$(ENSUREIT_COMPILE_FLAG)|g' $(Build.SourcesDirectory)/ios/Runner.xcodeproj/project.pbxproj
+
+                    echo "##[debug]$(ENSUREIT_RELEASE_FILE_NAME) copied to $(Build.SourcesDirectory)/ios/Flutter/Release.xcconfig"
+                    cp $(ensureIT.secureFilePath) $(Build.SourcesDirectory)/ios/Flutter/Release.xcconfig
+
+                    echo "##[debug]Current project.pbxproj"
+                    cat $(Build.SourcesDirectory)/ios/Runner.xcodeproj/project.pbxproj
+                    echo ""
+                    echo "##[debug]Current Release.xcconfig"
+                    cat $(Build.SourcesDirectory)/ios/Flutter/Release.xcconfig
+                    echo ""
+
+          - task: Bash@3
+            displayName: Extract Build Number
+            inputs:
+              targetType: "inline"
+              script: |
+                number=$(echo "$(Build.BuildNumber)" | cut -d '.' -f 2)
+                if [ "$number" -lt 10 ]; then
+                  # Adicione um zero à esquerda
+                  build_number=$(echo "$(Build.BuildNumber)" | cut -d '.' -f 1)"0"$number
+                else
+                  build_number=$(echo "$(Build.BuildNumber)" | cut -d '.' -f 1)"$number"
+                fi
+                echo "##[debug]Build number: $build_number"
+                echo "##vso[task.setvariable variable=BUILD_NUMBER;]$build_number"
+
+          - task: Bash@3
+            displayName: "Agent Optimization"
+            inputs:
+              targetType: inline
+              script: |
+                echo "##[section]Agent Optimization"
+
+                PUB_CACHE_DIR="$(Agent.ToolsDirectory)/.pub-cache"
+                export PUB_CACHE="$PUB_CACHE_DIR"
+                echo "##[debug]Setting PUB_CACHE to: $PUB_CACHE"
+
+                # Status do cache
+                echo "##[debug]Cache Status:"
+                echo "##[debug]- Pub Cache: $(PUB_CACHE_RESTORED)"
+                echo "##[debug]- Pods Cache: $(PODS_CACHE_RESTORED)"
+
+                # Build condicional baseado em cache
+                if [ "$(PUB_CACHE_RESTORED)" = "true" ] && [ "$(PODS_CACHE_RESTORED)" = "true" ]; then
+                  echo "##[debug]Cache hit - skipping clean operations"
+                  SKIP_CLEAN=true
+                else
+                  echo "##[debug]Cache miss - performing selective clean"
+                  SKIP_CLEAN=false
+                fi
+
+                # Clean condicional (economia de tempo)
+                if [ "$SKIP_CLEAN" = "false" ]; then
+                  echo "##[debug]Performing flutter clean..."
+                  flutter clean
+                else
+                  echo "##[debug]Skipping flutter clean due to cache hit"
+                fi
+
+                echo "##[debug]Fetching pubspec dependencies..."
+
+                # Configurar git para usar System Access Token para autenticação com Azure Repos
+
+                # Usa System.CollectionUri para extrair a organização
+                COLLECTION_URI="$(System.CollectionUri)"
+                # Remove 'https://' e trailing '/'
+                ORG_PATH=${COLLECTION_URI#https://}
+                ORG_PATH=${ORG_PATH%/}
+
+                # Extrai apenas o nome da organização
+                ORG_NAME=$(echo "$ORG_PATH" | cut -d'/' -f2)
+
+                echo "##[debug]Collection: $COLLECTION_URI"
+                echo "##[debug]Organização: $ORG_NAME"
+
+                # Configura Git com autenticação via System Access Token
+                export GIT_CONFIG_COUNT=1
+                export GIT_CONFIG_KEY_0="url.https://$(System.AccessToken)@dev.azure.com/${ORG_NAME}/.insteadOf"
+                export GIT_CONFIG_VALUE_0="https://${ORG_NAME}@dev.azure.com/${ORG_NAME}/"
+
+                flutter pub upgrade
+                flutter pub get --no-example --verbose
+          
+          # A task tipo wrapper para instalar as dependências do CocoaPods não funcionou corretamente, então a task foi convertida para bash.
+          - task: Bash@3
+            displayName: "Install CocoaPods dependencies"
+            condition: eq(variables['PODS_CACHE_RESTORED'], 'false')
+            inputs:
+              workingDirectory: "ios"
+              targetType: "inline"
+              script: |
+                set -euo pipefail
+                export PATH="$PATH:$HOME/Library/Python/3.9/bin:$HOME/.local/bin"
+
+                # Git config for AWS CodeCommit credential helper
+                export GIT_CONFIG_COUNT=1
+                export GIT_CONFIG_KEY_0="credential.helper"
+                export GIT_CONFIG_VALUE_0="!aws codecommit credential-helper \$@"
+
+                # Instalar repositório privado do CocoaPods se não existir
+                if [ ! -d "$HOME/.cocoapods/repos/release-mobile-ios-specs" ]; then
+                  echo "Adding private CocoaPods repo: release-mobile-ios-specs"
+                  pod repo add release-mobile-ios-specs codecommit::$AWS_DEFAULT_REGION://release-mobile-ios-specs
+                fi
+
+                echo "##[debug]Running: pod install --repo-update --verbose"
+                pod install --repo-update --verbose
+            env:
+              CODECOMMIT_ACCOUNT: "$(CODECOMMIT_ACCOUNT)"
+              CODECOMMIT_PASSWORD: "$(CODECOMMIT_PASSWORD)"
+              AWS_ACCESS_KEY_ID: "$(AWS_ACCESS_KEY_ID)"
+              AWS_SECRET_ACCESS_KEY: "$(AWS_SECRET_ACCESS_KEY)"
+              AWS_DEFAULT_REGION: "$(AWS_DEFAULT_REGION)"
+
+          # Flutter Build 
+          - task: FlutterBuild@0
+            displayName: "Build application"
+            inputs:
+              target: 'ios'
+              projectDirectory: '$(Build.SourcesDirectory)'
+              buildName: '$(Build.BuildNumber)'
+              buildNumber: '$(BUILD_NUMBER)'
+              iosCodesign: false
+              extraArgs: '$(EXTRA_ARGS_FLUTTER) -v'
+            env:
+              LICENSE_TOKEN: "$(ARXAN_LICENSE_TOKEN)"
+              ANDROID_HOME: "$(ANDROID_HOME)"
+              ANDROID_SDK_ROOT: "$(ANDROID_HOME)"
+              # Variáveis de otimização Swift/Xcode
+              SWIFT_COMPILATION_MODE: "$(SWIFT_COMPILATION_MODE)"
+              SWIFT_OPTIMIZATION_LEVEL: "$(SWIFT_OPTIMIZATION_LEVEL)"
+              DEBUG_INFORMATION_FORMAT: "$(DEBUG_INFORMATION_FORMAT)"
+              DEAD_CODE_STRIPPING: "$(DEAD_CODE_STRIPPING)"
+              STRIP_INSTALLED_PRODUCT: "$(STRIP_INSTALLED_PRODUCT)"
+
+          # Run Flutter Diagnostics if build fails
+          - task: FlutterCommand@0
+            displayName: "Run Flutter diagnostics"
+            condition: failed()
+            inputs:
+              projectDirectory: '.'
+              arguments: 'doctor -v'
+
+          # Manual signing usando Xcode@5
+          - task: Xcode@5
+            displayName: "Manual signing"
+            inputs:
+              actions: 'archive'
+              xcWorkspacePath: 'ios/Runner.xcworkspace'
+              signingOption: 'manual'
+              signingIdentity: '$(APPLE_CERTIFICATE_SIGNING_IDENTITY)'
+              provisioningProfileUuid: '$(APPLE_PROV_PROFILE_UUID)'
+              sdk: 'iphoneos'
+              configuration: '$(XCODE_CONFIG)'
+              scheme: 'Runner'
+              packageApp: true
+              exportPath: '$(Build.SourcesDirectory)/ios/deploy/Runner.ipa'
+              args: >-
+                -verbose
+                -jobs $(PARALLEL_JOBS)
+                -parallelizeTargets
+                SWIFT_COMPILATION_MODE=$(SWIFT_COMPILATION_MODE)
+                SWIFT_OPTIMIZATION_LEVEL=$(SWIFT_OPTIMIZATION_LEVEL)
+                ENABLE_BITCODE=NO
+
+            env:
+              LICENSE_TOKEN: "$(ARXAN_LICENSE_TOKEN)"
+              # Variáveis de otimização Swift/Xcode
+              SWIFT_COMPILATION_MODE: "$(SWIFT_COMPILATION_MODE)"
+              SWIFT_OPTIMIZATION_LEVEL: "$(SWIFT_OPTIMIZATION_LEVEL)"
+              DEBUG_INFORMATION_FORMAT: "$(DEBUG_INFORMATION_FORMAT)"
+              DEAD_CODE_STRIPPING: "$(DEAD_CODE_STRIPPING)"
+              STRIP_INSTALLED_PRODUCT: "$(STRIP_INSTALLED_PRODUCT)"
+
+          # Diagnóstico detalhado em caso de falha do Xcode (código 65)
+          - task: Bash@3
+            displayName: "Xcode Build Failure Diagnostics"
+            condition: failed()
+            continueOnError: true
+            inputs:
+              targetType: "inline"
+              workingDirectory: "ios"
+              script: |
+                echo "##[error]Xcode archive failed with code 65 - Running diagnostics..."
+
+                echo "##[section]1. Verificando estrutura do projeto iOS"
+                ls -la
+
+                echo "##[section]2. Verificando arquivos .xcprivacy problemáticos"
+                find . -name "*.xcprivacy" -type f | while read file; do
+                  echo "##[warning]Found: $file"
+                done
+
+                echo "##[section]3. Verificando configuração do Podfile"
+                if [ -f "Podfile" ]; then
+                  echo "##[debug]Podfile content:"
+                  cat Podfile
+                else
+                  echo "##[error]Podfile not found!"
+                fi
+
+                echo "##[section]4. Verificando targets do projeto Pods"
+                if [ -d "Pods" ]; then
+                  echo "##[debug]Pods installed:"
+                  ls -la Pods/
+
+                  # Verificar build settings dos targets problemáticos
+                  if [ -f "Pods/Pods.xcodeproj/project.pbxproj" ]; then
+                    echo "##[debug]Checking build settings for EXCLUDED_SOURCE_FILE_NAMES:"
+                    grep -A 2 "EXCLUDED_SOURCE_FILE_NAMES" Pods/Pods.xcodeproj/project.pbxproj || echo "Not found in Pods project"
+                  fi
+                else
+                  echo "##[error]Pods directory not found!"
+                fi
+
+                echo "##[section]5. Verificando certificados e provisioning profiles"
+                security find-identity -v -p codesigning || echo "##[error]Failed to list certificates"
+
+                echo "##[section]6. Verificando DerivedData para logs detalhados"
+                DERIVED_DATA="$HOME/Library/Developer/Xcode/DerivedData"
+                if [ -d "$DERIVED_DATA" ]; then
+                  echo "##[debug]Recent build logs:"
+                  find "$DERIVED_DATA" -name "*.xcactivitylog" -mtime -1 | head -5
+                fi
+
+                echo "##[section]Diagnostic complete. Check logs above for specific errors."
+
+          - task: CopyFiles@2
+            displayName: "Copy app to staging directory"
+            inputs:
+              sourceFolder: "$(Build.SourcesDirectory)"
+              contents: "/**/Runner.ipa/*.ipa"
+              targetFolder: "$(Build.StagingDirectory)"
+              CleanTargetFolder: true
+              flattenFolders: true
+
+          - task: PublishBuildArtifacts@1
+            displayName: "Publish IPA file"
+            inputs:
+              PathtoPublish: "$(Build.ArtifactStagingDirectory)"
+              ArtifactName: "ios_$(IOS_PACKAGE_NAME)"
+              publishLocation: "Container"
+
+          - task: Bash@3
+            displayName: "Agent Performance Metrics"
+            condition: always()
+            inputs:
+              targetType: inline
+              script: |
+                echo "##[section]Agent Performance Report"
+
+                # Métricas de cache
+                echo "##[debug]Cache Effectiveness:"
+                echo "##[debug]- Pub Cache Hit: $(PUB_CACHE_RESTORED)"
+                echo "##[debug]- Pods Cache Hit: $(PODS_CACHE_RESTORED)"
+
+                # Calcular eficiência
+                CACHE_HITS=0
+                [ "$(PUB_CACHE_RESTORED)" = "true" ] && CACHE_HITS=$((CACHE_HITS + 1))
+                [ "$(PODS_CACHE_RESTORED)" = "true" ] && CACHE_HITS=$((CACHE_HITS + 1))
+
+                CACHE_EFFICIENCY=$((CACHE_HITS * 50))
+                echo "##[debug]Cache Efficiency: ${CACHE_EFFICIENCY}%"
+
+                # Alertas de performance
+                if [ $CACHE_EFFICIENCY -lt 50 ]; then
+                  echo "##vso[task.logissue type=warning;]Low cache efficiency: ${CACHE_EFFICIENCY}%"
+                fi
+
+          - task: Bash@3
+            displayName: "Post-Build Cleanup & Metrics"
+            condition: always()
+            continueOnError: true
+            inputs:
+              targetType: inline
+              script: |
+                echo "##[section]Starting Post-Build Agent Cleanup"
+
+                # Espaço em disco antes da limpeza
+
+                # Métricas iniciais
+                INITIAL_USAGE=$(df / | tail -1 | awk '{print $5}' | sed 's/%//')
+                INITIAL_AVAILABLE=$(df -g / | tail -1 | awk '{print $4}')
+                echo "##[debug]Initial disk state:"
+                echo "##[debug]- Usage: ${INITIAL_USAGE}%"
+                echo "##[debug]- Available: ${INITIAL_AVAILABLE}GB"
+
+                # Limpeza do build atual
+                echo "##[section]Cleaning Current Build Artifacts"
+                rm -rf $(Build.SourcesDirectory)/build 2>/dev/null || true
+                rm -rf $(Build.SourcesDirectory)/ios/build 2>/dev/null || true
+                rm -rf $(Build.SourcesDirectory)/ios/deploy 2>/dev/null || true
+                rm -rf /tmp/flutter_* /tmp/xcodebuild_* 2>/dev/null || true
+
+                # ✅ Limpar keychain temporário (segurança)
+                if [ -n "$(KEYCHAIN_PATH)" ]; then
+                  echo "##[debug]Cleaning temporary keychain..."
+                  security delete-keychain "$(KEYCHAIN_PATH)" 2>/dev/null || true
+                  echo "##[debug]Keychain removed"
+                fi
+
+                # ✅ Limpar provisioning profile temporário (segurança)
+                if [ -n "$(PROFILE_PATH)" ]; then
+                  echo "##[debug]Cleaning temporary provisioning profile..."
+                  rm -f "$(PROFILE_PATH)" 2>/dev/null || true
+                  echo "##[debug]Provisioning profile removed"
+                fi
+
+                # ✅ Limpar DerivedData do Xcode deste build específico
+                echo "##[debug]Cleaning Xcode DerivedData for this build..."
+                rm -rf ~/Library/Developer/Xcode/DerivedData/Runner-* 2>/dev/null || true
+
+                # ✅ Gestão inteligente do Pub Cache
+                PUB_CACHE_SIZE=$(du -sh $(Agent.ToolsDirectory)/.pub-cache 2>/dev/null | awk '{print $1}')
+                echo "##[debug]Pub cache size: $PUB_CACHE_SIZE"
+
+                # Se pub cache > 7GB, limpar versões antigas
+                PUB_CACHE_SIZE_MB=$(du -sm $(Agent.ToolsDirectory)/.pub-cache 2>/dev/null | awk '{print $1}')
+                if [ "$PUB_CACHE_SIZE_MB" -gt 7168 ]; then
+                  echo "##[warning]Pub cache exceeds 7GB, cleaning old versions..."
+                  find $(Agent.ToolsDirectory)/.pub-cache/hosted -type d -mtime +60 -exec rm -rf {} \; 2>/dev/null || true
+                fi
+
+                # Métricas finais
+                FINAL_USAGE=$(df / | tail -1 | awk '{print $5}' | sed 's/%//')
+                FINAL_AVAILABLE=$(df -g / | tail -1 | awk '{print $4}')
+
+                echo "##[debug]Final disk state:"
+                echo "##[debug]- Usage: ${FINAL_USAGE}%"
+                echo "##[debug]- Available: ${FINAL_AVAILABLE}GB"
+                echo "##[debug]- Pub Cache: $PUB_CACHE_SIZE"
+
+                echo "##[section]Post-build cleanup completed"

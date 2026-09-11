@@ -1,0 +1,98 @@
+steps:
+- download: current
+  artifact: PitestReport
+  displayName: 'Download HTML Report'
+  condition: and(
+                eq(variables.PITEST_IS_ENABLED, True), 
+                eq(variables.JACOCO_EXEC, 'True'),
+                eq(variables.flowIsPullRequest, True),
+                ne(variables['flowIsPRStageWithMasterSapCommerce'], 'true')
+              )
+  continueOnError: false
+
+- bash: |
+    echo "##[section]Iniciando validação do relatório do PiTest..."
+
+    echo "##[debug]Parâmetro JACOCO_EXEC: $(JACOCO_EXEC)"
+
+    if [[ "$(JACOCO_EXEC)" != "True" ]]; then
+      echo "⚠️  ATENÇÃO: A execução dos testes foi pulada, portanto a validação de testes não será aplicada."
+      exit 0
+    fi
+
+    echo "##[debug]Parâmetro PITEST_EXEC: $(PITEST_EXEC)"
+
+    if [[ "$(PITEST_EXEC)" != "True" ]]; then
+      echo "⚠️  ATENÇÃO: A execução do PiTest foi pulada, portanto a validação de cobertura não será aplicada."
+      exit 0
+    fi
+
+    HTML_FILE="$(Pipeline.Workspace)/PitestReport/index.html"
+
+    if [ ! -f "$HTML_FILE" ]; then
+      echo "##[warning]PiTest HTML report não encontrado em: $HTML_FILE. Step será ignorado."
+      exit 0
+    fi
+
+    # Extrai Mutation Coverage (terceira coluna da primeira linha)
+    MUTATION_COVERAGE=$(sed -n '/<h3>Project Summary<\/h3>/,/<h3>Breakdown by Package<\/h3>/p' "$HTML_FILE" | \
+                   grep -A 10 "<tbody>" | \
+                   grep -E "^\s*<tr>" -A 10 | \
+                   grep -E "^\s*<td>" | \
+                   sed -n '3p' | \
+                   grep -o "[0-9]\+%" | \
+                   sed 's/%//')
+
+    MIN_COVERAGE="$(PITEST_MIN_COVERAGE)"+0
+
+    PR_ID=$(System.PullRequest.pullRequestId)
+
+    # Garantir que as variáveis são numéricas
+    PR_ID=${PR_ID:-0}
+    MUTATION_COVERAGE=${MUTATION_COVERAGE:-0}
+
+    # Preparar payload JSON
+    PAYLOAD=$(jq --null-input \
+            --argjson prId $PR_ID \
+            --argjson mutationScore $MUTATION_COVERAGE \
+            '{"prId": $prId, "mutationScore": $mutationScore}')
+
+    echo "##[section]Payload para validação:"
+    echo "$PAYLOAD"
+
+    # Executar curl com timeout e tratamento de erro
+    # A chamada é apenas para registro - não deve impactar o resultado do step
+    RESPONSE=$(curl -s -X POST \
+                --connect-timeout 10 \
+                --max-time 30 \
+                --write-out "HTTPSTATUS:%{http_code}" \
+                --location "${DEVOPS_AZURE_SERVICES_URL}/mutation-score" \
+                --header 'Content-Type: application/json' \
+                --data-raw "$PAYLOAD" \
+                2>&1) || true
+
+    # Extrair HTTP status code da resposta
+    HTTP_STATUS=$(echo "$RESPONSE" | grep -o "HTTPSTATUS:[0-9]*" | cut -d: -f2)
+    BODY=$(echo "$RESPONSE" | sed 's/HTTPSTATUS:[0-9]*$//')
+
+    if [[ -z "$HTTP_STATUS" || "$HTTP_STATUS" -lt 200 || "$HTTP_STATUS" -ge 300 ]]; then
+      echo "##[warning]⚠️ Falha ao registrar mutation score na API (HTTP: ${HTTP_STATUS:-N/A}). Isso não impacta a validação de cobertura."
+      echo "##[debug]Response body: $BODY"
+    else
+      echo "##[section]Mutation score registrado com sucesso (HTTP: $HTTP_STATUS)"
+    fi
+
+    if [[ $MUTATION_COVERAGE -lt $MIN_COVERAGE ]]; then
+      echo "##[error]❌Mutation coverage FAILED: $MUTATION_COVERAGE%"
+      exit 1
+    fi
+
+    echo "##[section]✅Mutation coverage SUCCESS: $MUTATION_COVERAGE%"
+  displayName: 'Mutation Coverage Report'
+  condition: and( 
+                eq(variables.PITEST_IS_ENABLED, True), 
+                eq(variables.JACOCO_EXEC, 'True'),
+                eq(variables.flowIsPullRequest, True),
+                ne(variables['flowIsPRStageWithMasterSapCommerce'], 'true')
+              )
+  continueOnError: false

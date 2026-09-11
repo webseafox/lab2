@@ -1,0 +1,130 @@
+stages:
+- stage: deploy
+  displayName: "Deploy"
+  dependsOn: [ pipeline_init, build_test, quality_gates, security, publish ]
+  variables:
+    PROPERTIES_FILE_NAME: $[ stageDependencies.pipeline_init.get_env_config.outputs['env_configuration.PROPERTIES_FILE_NAME'] ]
+    ANYPOINT_ENVIRONMENT: $[ stageDependencies.pipeline_init.get_env_config.outputs['env_configuration.ANYPOINT_ENVIRONMENT'] ]
+    ANYPOINT_ENVIRONMENT_IN_APPLICATION_NAME: $[ stageDependencies.pipeline_init.get_env_config.outputs['env_configuration.ANYPOINT_ENVIRONMENT_IN_APPLICATION_NAME'] ]
+    ENVIRONMENT_HEALTH_ENDPOINT: $[ stageDependencies.pipeline_init.get_env_config.outputs['env_configuration.ENVIRONMENT_HEALTH_ENDPOINT'] ]
+    ARTIFACT_ID: $[ stageDependencies.pipeline_init.prepare_pipeline.outputs['pom_reference.ARTIFACT_ID'] ]
+  condition: and(not(failed()), not(canceled()), eq(variables.ENABLE_DEPLOY, 'true'), eq(variables['isEnvBranch'], true), eq(variables['SKIP_LEGACY_PIPELINE'], 'false'))
+  pool:
+    name: $(PRIVATE_AGENT_DEFAULT_DEPLOY)
+  jobs:
+  - job: run_deploy
+    displayName: "Running deploy on CloudHub"
+    steps:
+    - task: DownloadPipelineArtifact@2
+      displayName: 'Getting previous stage artifact'
+      inputs:
+        buildType: current
+        artifactName: app
+        targetPath: '$(Build.ArtifactStagingDirectory)'
+
+    - template: /tech_products/mule-fenix/steps/maven/extract_from_pom.yml
+      parameters:
+        name: 'get_version'
+        workingDirectory: '$(Build.ArtifactStagingDirectory)'
+        pomProperty: "project.version"
+        isJobOutput: "false"
+        outputVariable: "POM_VERSION"
+
+    - task: DownloadSecureFile@1
+      displayName: 'Getting settings file'
+      name: muleSettings
+      inputs:
+        secureFile: $(MULE_SETTINGS_FILE)
+
+    - template: /tech_products/mule-fenix/steps/properties/extract_properties.yml
+      parameters:
+        file: src/main/resources/properties/$(PROPERTIES_FILE_NAME)
+        propertiesField: cloudhub
+        outputVariable: CLOUD_HUB_PROPS
+        workingDirectory: '$(Build.ArtifactStagingDirectory)'
+
+    - script: |
+        echo "##[group]🔧 Inferindo nome do grupo de variáveis"
+
+        API_SUFFIX="$(Build.DefinitionName)"
+        BRANCH_SUFFIX="$(Build.SourceBranchName)"
+        VARIABLE_GROUP_NAME="deploy-params-${API_SUFFIX}-${BRANCH_SUFFIX}"
+
+        echo "📛 Nome inferido do grupo: $VARIABLE_GROUP_NAME"
+        echo "##vso[task.setvariable variable=VARIABLE_GROUP_NAME]$VARIABLE_GROUP_NAME"
+        echo "##[endgroup]"
+
+        echo "##[group]📥 Listando e processando variáveis do grupo $VARIABLE_GROUP_NAME"
+
+        # Configuração do Azure DevOps CLI
+        az devops configure --defaults organization="$(System.TeamFoundationCollectionUri)" project="$(System.TeamProject)"
+
+        # Obter variáveis do grupo
+        GROUP_VARS_JSON=$(az pipelines variable-group list --group-name "$VARIABLE_GROUP_NAME" --query "[0].variables" -o json)
+
+        if [ -z "$GROUP_VARS_JSON" ] || [ "$GROUP_VARS_JSON" = "null" ]; then
+          echo "❌ Grupo de variáveis não encontrado: $VARIABLE_GROUP_NAME"
+
+          echo "##vso[task.setvariable variable=ADDITIONAL_PROPERTIES_DEPLOY]"
+
+          exit 0
+        else
+          echo "✅ Grupo de variáveis localizado: $VARIABLE_GROUP_NAME"
+
+          # Listar nomes das variáveis
+          echo "📄 Variáveis disponíveis no grupo:"
+          echo "$GROUP_VARS_JSON" | jq -r 'keys[]'
+
+          # Exportar variáveis para o pipeline
+          echo "📤 Exportando variáveis individualmente:"
+          echo "$GROUP_VARS_JSON" | jq -r 'to_entries[] | "##vso[task.setvariable variable=\(.key)]\(.value.value)"'
+
+          # Montar string para o comando maven
+          ADDITIONAL_PARAMS=$(echo "$GROUP_VARS_JSON" | jq -r 'to_entries[] | "-D\(.key)=\(.value.value)"' | paste -sd' ' -)
+
+          echo "🧩 Comando Maven resultante:"
+          echo "$ADDITIONAL_PARAMS"
+
+          echo "##vso[task.setvariable variable=ADDITIONAL_PROPERTIES_DEPLOY]$ADDITIONAL_PARAMS"
+
+          echo "✅ Variável de pipeline 'ADDITIONAL_PROPERTIES_DEPLOY' definida com sucesso."
+        fi
+
+        echo "##[endgroup]"
+      displayName: "Listar, exportar e montar parâmetros Maven"
+      env:
+        AZURE_DEVOPS_EXT_PAT: $(System.AccessToken)
+        HTTP_PROXY: $(PROXY_AGENT_HTTP)
+        HTTPS_PROXY: $(PROXY_AGENT_HTTPS)
+
+    - task: Maven@4
+      displayName: 'Executing maven deploy on CloudHub'
+      inputs:
+        mavenPOMFile: '$(Build.ArtifactStagingDirectory)/pom.xml'
+        goals: 'mule:deploy'
+        options: '-s $(muleSettings.secureFilePath)
+          -DmuleDeploy
+          -Dmule.artifact=$(Build.ArtifactStagingDirectory)/target/$(ARTIFACT_ID)-$(POM_VERSION)-mule-application.jar
+          -DskipTests
+          -DconnectedAppClientId=$(MULE_APP_CLIENT_ID)
+          -DconnectedAppClientSecret=$(MULE_APP_CLIENT_SECRET)
+          -Denv.short=$(ANYPOINT_ENVIRONMENT_IN_APPLICATION_NAME)
+          -DbusinessGroupId=$(MULE_BUSINESS_GROUP_ID)
+          -Denv=$(ANYPOINT_ENVIRONMENT)
+          -Dsecurity.key=$(MULE_SECURITY_KEY)
+          -Danypoint.platform.client_id=$(MULE_ANYPOINT_CLIENT_ID)
+          -Danypoint.platform.client_secret=$(MULE_ANYPOINT_CLIENT_SECRET)
+          -Dmule.verbose=true
+          $(ADDITIONAL_PROPERTIES_DEPLOY)
+          $(CLOUD_HUB_PROPS)'
+      env:
+        PUB_CREDENTIAL_USR: $(NEXUS-DEFAULT-USR)
+        PUB_CREDENTIAL_PSW: $(NEXUS-DEFAULT-PSW)
+
+  - job: run_master_additional_deploy
+    condition: and(eq(variables['Build.SourceBranch'], 'refs/heads/master'), eq(variables['ENABLE_MASTER_ADDITIONAL_DEPLOY'], 'true'))
+    displayName: "Running master additional deploy on CloudHub"
+    steps:
+    - template: /tech_products/mule-fenix/step_groups/deploy/deploy_steps.yml
+      parameters:
+        envConfig: $(MASTER_ADDITIONAL_DEPLOY_ENV_NAME)

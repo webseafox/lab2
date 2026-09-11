@@ -1,0 +1,129 @@
+parameters:
+- name: fortifyExclusionRepository
+
+stages:
+- stage: security
+  displayName: "Security"
+  #condition: eq(variables['Build.SourceBranch'], 'refs/heads/master')
+  condition: not(or(failed(), canceled()))
+  dependsOn:
+    - pipeline_init
+    - build_test
+  pool: $(GENERAL_PURPOSE_CI_AGENT)
+  jobs:
+  - job: app_config_keys
+    displayName: "Get AppSec Config Keys"
+    steps:
+    - template: /tasks/bash/welcome.yml@CorePipelines
+    - template: /security/get_appconfig_keys.yml
+
+  - job: sca_scan
+    dependsOn: app_config_keys
+    displayName: "SCA Scan"
+    variables:
+      USE_DEPENDENCY_TRACK: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_DEPENDENCY_TRACK'] ]
+      USE_DT_DOCKER: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_DT_DOCKER'] ]
+      USE_CONVISO: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_CONVISO'] ]
+      SKIP_SECURITY_GATE_SCA: $[ dependencies.app_config_keys.outputs['evaluate_flags.SKIP_SECURITY_GATE_SCA'] ]
+    condition: and(
+                  succeeded(),
+                  eq(variables.USE_DEPENDENCY_TRACK, true),
+                  eq(variables.USE_DT_DOCKER, false)
+                )
+    steps:
+      - template: /security/run_sca_scan.yml
+        parameters:
+          vivoFlow: ""
+
+  - job: fortify_scan
+    dependsOn: app_config_keys
+    variables:
+      USE_FORTIFY: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_FORTIFY'] ]
+      USE_CONVISO: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_CONVISO'] ]
+      SKIP_SECURITY_GATE: $[ dependencies.app_config_keys.outputs['evaluate_flags.SKIP_SECURITY_GATE'] ]
+    condition: and(
+                succeeded(),
+                eq(variables.USE_FORTIFY, 'true'),
+                eq(variables.flowIsToReview, true),
+                not(startsWith(variables['Build.SourceBranch'], 'refs/tags/'))
+              )
+    displayName: "Fortify Scan"
+    steps:
+    - template: /security/run_fortify_scan.yml
+      parameters:
+        fortifyExclusionRepository: ${{ parameters.fortifyExclusionRepository }}
+        vivoFlow: ""
+    - template: /tasks/telemetry/telemetry.yml@CorePipelines
+
+  #- job: get_additional_conviso_config
+  #  dependsOn:
+  #  - fortify_scan
+  #  - app_config_keys
+  #  displayName: 'Get Additional Conviso Config'
+  #  variables:
+  #    USE_CONVISO: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_CONVISO'] ]
+  #    ADDITIONAL_BRANCHES: $(ADDITIONAL_CONVISO_BRANCHES) #pipeline_library
+  #  condition: and(
+  #                  succeeded(),
+  #                  eq(variables.USE_CONVISO, 'true')
+  #                )
+  #  steps:
+  #  - script: |
+  #      IFS=',' read -ra ADDB <<< "$(echo "$(ADDITIONAL_BRANCHES)" | sed 's/^ *//;s/ *$//;s/ *, */,/g')"",master,main"
+  #      IS_ALLOWED_BRANCH="false"
+  #      echo "##[debug] Conviso Enabled Branches: ${ADDB[@]}"
+  #      for i in "${ADDB[@]}"; do
+  #        if [[ "$i" == "release" ]]; then
+  #          regex="^refs/heads/release.*$"
+  #        else
+  #          regex=$(echo "$i" | sed -e 's/\*/.*/g' -e 's/^/^refs\/heads\//' -e 's/$/$/')
+  #        fi
+  #        if [[ "${SOURCE_BRANCH}" =~ $regex ]] || [[ "${PR_TARGET_BRANCH}" =~ $regex ]]; then
+  #          IS_ALLOWED_BRANCH="true"
+  #          break
+  #        fi
+  #      done
+  #      echo "##[debug] IS_ALLOWED_BRANCH: $IS_ALLOWED_BRANCH"
+  #      echo "##vso[task.setvariable variable=CONVISO_ENABLED_BRANCH;isOutput=true;]$IS_ALLOWED_BRANCH"
+  #    env:
+  #      SOURCE_BRANCH: $(Build.SourceBranch)
+  #      PR_TARGET_BRANCH: $(System.PullRequest.TargetBranch)
+  #    name: evaluate_flags
+  #    displayName: 'Evaluate Conviso flags'
+
+  #- job: conviso_sync
+  #  dependsOn:
+  #  - fortify_scan
+  #  - app_config_keys
+  #  - get_additional_conviso_config
+  #  variables:
+  #    USE_CONVISO: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_CONVISO'] ]
+  #    SKIP_SECURITY_GATE: $[ dependencies.app_config_keys.outputs['evaluate_flags.SKIP_SECURITY_GATE'] ]
+  #    CONVISO_ENABLED_BRANCH: $[ dependencies.get_additional_conviso_config.outputs['evaluate_flags.CONVISO_ENABLED_BRANCH'] ]
+  #  condition: and(
+  #                  succeeded(),
+  #                  eq(variables.USE_CONVISO, 'true'),
+  #                  eq(variables.CONVISO_ENABLED_BRANCH, 'true')
+  #                )
+  #  displayName: "Conviso Sync"
+  #  steps:
+  #  - template: ../task_groups/security/run_conviso_integration.yml
+  #    parameters:
+  #      skipSecurityGate: $(SKIP_SECURITY_GATE)
+
+  - job: checkmarx_scan
+    dependsOn: app_config_keys
+    variables:
+      USE_CHECKMARX: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_CHECKMARX'] ]
+      SKIP_SECURITY_GATE: $[ or(eq(dependencies.app_config_keys.outputs['evaluate_flags.SKIP_SECURITY_GATE'], 'true'), eq(variables.CHECKMARX_IGNORE_SECURITY_GATE, 'true')) ]
+    condition: and(
+                succeeded(),
+                eq(variables.USE_CHECKMARX, 'true'),
+                eq(variables.flowIsToReview, true),
+                not(startsWith(variables['Build.SourceBranch'], 'refs/tags/'))
+              )
+    displayName: "Checkmarx Scan"
+    steps:
+    - template: /task_groups/security/run_checkmarx_scan.yml@CorePipelines
+      parameters:
+        skipSecurityGate: $(SKIP_SECURITY_GATE)

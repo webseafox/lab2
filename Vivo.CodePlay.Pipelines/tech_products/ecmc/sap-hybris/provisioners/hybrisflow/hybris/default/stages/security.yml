@@ -1,0 +1,65 @@
+parameters:
+- name: fortifyExclusionRepository
+
+stages:
+- stage: security
+  displayName: "Security"
+  isSkippable: false
+  condition: not(or(failed(), canceled()))
+  dependsOn:
+    - pipeline_init
+    - build_test
+  pool: $(PRIVATE_AGENT_DEFAULT)
+  jobs:
+  - job: app_config_keys
+    displayName: "Get AppSec Config Keys"
+    steps:
+    - template: /tasks/bash/welcome.yml@CorePipelines
+    - template: /security/get_appconfig_keys.yml
+
+  - job: sca_scan
+    dependsOn: app_config_keys
+    displayName: "SCA Scan"
+    workspace:
+      clean: all
+    variables:
+      USE_DEPENDENCY_TRACK: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_DEPENDENCY_TRACK'] ]
+      USE_DT_DOCKER: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_DT_DOCKER'] ]
+      USE_CONVISO: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_CONVISO'] ]
+      SKIP_SECURITY_GATE_SCA: $[ dependencies.app_config_keys.outputs['evaluate_flags.SKIP_SECURITY_GATE_SCA'] ]
+    condition: and(
+                  succeeded(),
+                  eq(variables.USE_DEPENDENCY_TRACK, true),
+                  eq(variables.USE_DT_DOCKER, false)
+                )
+    steps:
+      - template: /security/define_appsec_app_version.yml
+      - template: /security/run_sca_scan.yml
+        parameters:
+          appVersion: "$(FORTIFY_APP_VERSION)"
+          vivoFlow: "stage/preprod,stage/prodlike,stage/esteira1,stage/esteira2,project/preprod,project/prodlike,project/esteira1,project/esteira2,merge"
+
+  - job: fortify_scan
+    dependsOn: app_config_keys
+    workspace:
+      clean: all
+    variables:
+      USE_FORTIFY: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_FORTIFY'] ]
+      USE_CONVISO: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_CONVISO'] ]
+      SKIP_SECURITY_GATE: $[ dependencies.app_config_keys.outputs['evaluate_flags.SKIP_SECURITY_GATE'] ]
+    condition: and(
+                succeeded(),
+                eq(variables.USE_FORTIFY, 'true'),
+                eq(variables.flowIsToReview, true),
+                not(startsWith(variables['Build.SourceBranch'], 'refs/tags/'))
+              )
+    displayName: "Fortify Scan"
+    steps:
+    - template: /security/define_appsec_app_version.yml
+    - template: /security/run_fortify_scan.yml
+      parameters:
+        fortifyExclusionRepository: ${{ parameters.fortifyExclusionRepository }}
+        appVersion: "$(FORTIFY_APP_VERSION)"
+        vivoFlow: "stage/preprod,stage/prodlike,stage/esteira1,stage/esteira2,project/preprod,project/prodlike,project/esteira1,project/esteira2,merge"
+
+    - template: /tasks/telemetry/telemetry.yml@CorePipelines

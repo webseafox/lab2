@@ -1,0 +1,177 @@
+﻿# ==================================================================
+# Pipeline: CodePlay Portal - Custom Task Documentation Generator
+# -----------------------------------------------------
+# Pipeline automatizado para geração e atualização da documentação
+# de Custom Tasks do Azure DevOps no Portal CodePlay.
+# -----------------------------------------------------
+# Funcionalidades:
+# ✅ Extração de metadados de tasks (prod e preprod)
+# ✅ Geração automática de documentação em Markdown
+# ✅ Build do Portal Docusaurus
+# ✅ Commit automático das alterações
+
+parameters:
+# ==================================================================
+# Infraestrutura e Ambiente
+# ==================================================================
+- name: agentPool
+  type: string
+  default: GeneralPurposeLinuxAgentsCI
+  displayName: 'Agent Pool para execução'
+
+- name: variableGroup
+  type: string
+  default: pipe-generate-task-docs
+  displayName: 'Variable Group contendo PATs (PAT_PROD, PAT_PREPROD)'
+
+variables:
+  - group: ${{ parameters.variableGroup }}
+
+# ==================================================================
+# Estágios do Pipeline
+# ==================================================================
+stages:
+# ==================================================================
+# Stage: UpdateCatalog - Geração e Atualização da Documentação
+# Descrição: Extrai metadados das tasks, gera documentação,
+#            compila o portal e commita as alterações
+# ==================================================================
+- stage: UpdateCatalog
+  displayName: 'Atualizar Catálogo de Custom Tasks'
+  jobs:
+  - job: GenerateDocs
+    displayName: 'Gerar Documentação das Custom Tasks'
+    pool: ${{ parameters.agentPool }}
+    steps:
+    # ==================================================================
+    # [Configuração Inicial] Checkout do código com credenciais
+    # ==================================================================
+    - checkout: self
+      persistCredentials: true
+
+    # ==================================================================
+    # [Dependências] Instalação de pacotes Python necessários
+    # ==================================================================
+    - task: Bash@3
+      displayName: 'Install Python Dependencies'
+      inputs:
+        targetType: 'inline'
+        script: |
+          python3 --version
+          python -m pip install --upgrade pip
+          pip install requests
+
+    # ==================================================================
+    # [Extração] Geração do JSON com metadados das tasks
+    # Descrição: Extrai informações de todas as tasks instaladas
+    #            nas organizações prod e preprod via API do Azure DevOps
+    # Artefato: scripts/data/relatorio-tasks.json
+    # ==================================================================
+    - task: PythonScript@0
+      displayName: 'Generate Task JSON'
+      inputs:
+        scriptSource: 'filePath'
+        scriptPath: '$(Build.SourcesDirectory)/scripts/extract_tasks.py'
+        workingDirectory: '$(Build.SourcesDirectory)'      
+      env:
+        AZURE_DEVOPS_PAT_PROD: $(PAT_PROD) # Valor vem de ${{ parameters.variableGroup }}
+        AZURE_DEVOPS_PAT_PREPROD: $(PAT_PREPROD) # Valor vem de ${{ parameters.variableGroup }}
+        TASK_OUTPUT_DIR: '$(Build.SourcesDirectory)/scripts/data'
+
+    # ==================================================================
+    # [Geração] Criação dos arquivos Markdown de documentação
+    # Descrição: Gera um arquivo .md para cada task com sintaxe,
+    #            parâmetros, exemplos e pipelines consumidores
+    # Artefato: code/tasks/catalog/*.md
+    # ==================================================================
+    - task: PythonScript@0
+      displayName: 'Generate Task Documentation'
+      inputs:
+        scriptSource: 'filePath'
+        scriptPath: '$(Build.SourcesDirectory)/scripts/generate_task_docs.py'
+        workingDirectory: '$(Build.SourcesDirectory)'
+      env:
+        TASK_DATA_DIR: '$(Build.SourcesDirectory)/scripts/data'
+        TASK_DOCS_OUTPUT_DIR: '$(Build.SourcesDirectory)/code/tasks/catalog'
+
+    # ==================================================================
+    # [Correção] Fix de links quebrados conhecidos
+    # Descrição: Corrige problemas específicos de formatação em
+    #            arquivos gerados que causam erros no build
+    # ==================================================================
+    - task: Bash@3
+      displayName: 'Fix known broken links in generated docs'
+      inputs:
+        targetType: 'inline'
+        script: |
+          # Fix regex101.com link in regexreplace@4.md
+          if [ -f "$(Build.SourcesDirectory)/code/tasks/catalog/regexreplace@4.md" ]; then
+            sed -i 's|(regex101\.com)|(https://regex101.com)|g' $(Build.SourcesDirectory)/code/tasks/catalog/regexreplace@4.md
+            echo "Fixed regex101.com link in regexreplace@4.md"
+          fi
+
+    # ==================================================================
+    # [NPM Auth] Configuração de autenticação para registries privados
+    # ==================================================================
+    - script: |
+        echo "##[debug] Exporting B64_AZURE_DEVOPS_PAT var"
+        B64_AZURE_DEVOPS_PAT=$(echo -n $AZURE_DEVOPS_PAT | base64 -w0)
+        echo "##vso[task.setvariable variable=B64_AZURE_DEVOPS_PAT;isOutput=true;issecret=true]${B64_AZURE_DEVOPS_PAT}"
+      displayName: 'Export Base64 Token'
+      name: setupToken
+      env:
+        AZURE_DEVOPS_PAT: $(System.AccessToken)
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+
+    # ==================================================================
+    # [Instalação] Dependências Node.js do Portal
+    # ==================================================================
+    - task: npm@1
+      displayName: 'npm install'
+      inputs:
+        command: 'install'
+        workingDir: $(Build.SourcesDirectory)
+        customRegistry: 'useNpmrc'
+        customRegistryFile: '.npmrc'
+      env:
+        AZURE_DEVOPS_PAT: $(System.AccessToken)
+        B64_AZURE_DEVOPS_PAT: $(setupToken.B64_AZURE_DEVOPS_PAT)
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+
+    # ==================================================================
+    # [Build] Compilação do Portal Docusaurus
+    # Descrição: Gera site estático com toda documentação atualizada
+    # ==================================================================
+    - task: npm@1
+      displayName: 'npm run build'
+      inputs:
+        command: 'custom'
+        customCommand: 'run build'
+        workingDir: $(Build.SourcesDirectory)
+        customRegistry: 'useNpmrc'
+        customRegistryFile: '.npmrc'
+
+    # ==================================================================
+    # [Versionamento] Commit e push das alterações
+    # Descrição: Commita documentação gerada de volta ao repositório
+    # Condição: Apenas na branch master e se houver mudanças
+    # ==================================================================
+    - task: Bash@3
+      displayName: 'Commit Documentation to Repository'
+      condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/master'))
+      inputs:
+        targetType: 'inline'
+        script: |
+          git config --local user.email "azuredevops@telefonicati.onmicrosoft.com"
+          git config --local user.name "Azure DevOps Documentation"
+          
+          git add code/tasks/catalog/*.md
+          git add src/data/catalog-tasks.json
+          
+          # Only commit if there are changes
+          if [[ -n "$(git status --porcelain)" ]]; then
+            git commit -m "Auto-update task documentation [skip ci]"
+            git push origin HEAD:master
+          else
+            echo "No changes to commit"
+          fi

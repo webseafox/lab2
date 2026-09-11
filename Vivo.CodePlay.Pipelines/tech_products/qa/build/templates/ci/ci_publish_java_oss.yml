@@ -1,0 +1,405 @@
+parameters:
+- name: skipPublish
+  type: boolean
+  default: false
+- name: skipBumpVersion
+  type: boolean
+  default: false
+
+stages:
+- stage: ci_publish
+  displayName: "CI - Publish"
+  pool:
+    name: $(PRIVATE_AGENT_DEFAULT)    
+  dependsOn:
+  - environment_init
+  - ci_build
+  - ci_quality_gate
+  condition: succeeded()
+
+  ## -> Loads variables from other stages.
+  variables:  
+  - name: MAVEN_SETTINGS_LOCATION
+    value: $[ stageDependencies.environment_init.environment.outputs['settings_variables.MAVEN_SETTINGS_LOCATION'] ]
+  - name: MAVEN_CUSTOM_SETTINGS_CONTENT
+    value: $[ stageDependencies.environment_init.environment.outputs['custom_settings.MAVEN_CUSTOM_SETTINGS_CONTENT'] ]
+  - name: NEXUS_DEPS_USR
+    value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEPS_USR'] ]    
+  - name: NEXUS_DEPS_PSW
+    value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEPS_PSW'] ] 
+  - name: NEXUS_DEFAULT_USR
+    value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEFAULT_USR'] ]    
+  - name: NEXUS_DEFAULT_PSW
+    value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEFAULT_PSW'] ] 
+  - name: NEW_VERSION
+    value: $[ stageDependencies.ci_build.build.outputs['new_version.NEW_VERSION'] ]
+  - name: LEGACY_MODE
+    value: $[ stageDependencies.ci_build.build.outputs['java_version.LEGACY_MODE'] ]
+  - name: ARTIFACT_ID
+    value: $[ stageDependencies.ci_build.build.outputs['source_data.ARTIFACT_ID'] ]    
+  - name: GROUP_ID
+    value: $[ stageDependencies.ci_build.build.outputs['source_data.GROUP_ID'] ]
+  - name: ARTIFACT_PATH
+    value: $[ stageDependencies.ci_build.build.outputs['artifact_name.ARTIFACT_PATH'] ]
+  - name: ARTIFACT_FILE
+    value: $[ stageDependencies.ci_build.build.outputs['artifact_name.ARTIFACT_FILE'] ]
+  - name: ARTIFACT_NAME
+    value: $[ stageDependencies.ci_build.build.outputs['artifact_name.ARTIFACT_NAME'] ]
+  - name: skipPublish
+    value: ${{ parameters.skipPublish }}
+  - name: skipBumpVersion
+    value: ${{ parameters.skipBumpVersion }}
+ 
+  jobs:
+  
+  ## -> Using a job of type deployment for publish.
+  - deployment: publish
+    condition: ne(variables.skipPublish, true)
+    displayName: Publish Library    
+    workspace:
+      clean: all
+    environment:
+      name: $(DEPLOY_ENVIRONMENT_LIB)
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+
+          ## -> Download Artifacts
+          - download: none
+
+          ## -> Downlood and uncompress the downloaded artifact.
+          ## -> 30f35852-3f7e-4c0c-9a88-e127b4f97211 is the decorator for download artifact.
+          - task: DownloadBuildArtifacts@1
+            displayName: 'Download Build Artifacts'
+            inputs:
+              artifactName: $(ARTIFACT_NAME)
+              cleanDestinationFolder: false
+              extractTars: true
+              parallelizationLimit: 8
+              downloadPath: $(System.ArtifactsDirectory)
+
+          ## -> Set artifact information to variables.
+          - task: Bash@3
+            displayName: Artifacts Info
+            inputs:
+              workingDirectory: $(DEFAULT_WORKDIR_ARTIFACTS)
+              targetType: inline
+              script: |
+
+                echo "$(tree)"
+                echo "##[debug] ArtifactId: $(ARTIFACT_ID)"
+                echo "##[debug] Artifact name: $(ARTIFACT_NAME)"
+                echo "##[debug] Artifact file: $(ARTIFACT_FILE)"                
+                echo "##[debug] Artifact path: $(ARTIFACT_PATH)"
+
+                echo "##[debug] Extracted tar path: $(pwd)"
+                echo "##[group] Extracted tar content"                
+                echo "$(ls -lh)"
+                echo "##[endgroup]"
+
+                targetDirectory="$(DEFAULT_WORKDIR_ARTIFACTS)/$(ARTIFACT_NAME)/$(ARTIFACT_PATH)"
+                echo "##[debug] Target directory path: $targetDirectory"
+                echo "##[group] Target directory content"
+                echo "$(ls -lh $targetDirectory)"
+                echo "##[endgroup]"
+                echo "##vso[task.setvariable variable=TARGET_DIRECTORY]$targetDirectory"
+
+                extension=$(echo "$(basename '$(ARTIFACT_FILE)')" | awk -F . '{print $NF}')
+                echo "##[debug] Artifact extension: $extension" 
+                echo "##vso[task.setvariable variable=ARTIFACT_EXTENSION]$extension"
+
+          ## -> Publish Artifact to NEXUS.
+          ## -> Only allowed for the specified branches below. Other branches must skip this task.
+          ## -> Using curl to push to nexus. MVN deploy is also possible, but it limited by java (version 11) for now.
+          - task: Bash@3
+            displayName: Publish to Nexus
+            condition: and(
+              succeeded(), 
+              or(
+              eq(variables['Build.SourceBranchName'],'master'),
+              eq(variables['Build.SourceBranchName'],'main'),
+              eq(variables['Build.SourceBranchName'],'prodlike'),
+              eq(variables['Build.SourceBranchName'],'preprod'),
+              eq(variables['Build.SourceBranchName'],'esteira1'),
+              eq(variables['Build.SourceBranchName'],'esteira2'),
+              eq(variables['Build.SourceBranchName'],'dev')))
+            env:              
+              NEXUS_DEPS_USR: $(NEXUS_DEFAULT_USR)
+              NEXUS_DEPS_PSW: $(NEXUS_DEFAULT_PSW)
+              ASDF_JAVA_VERSION: $(JAVA_VERSION_PUBLISH_MVN)
+            inputs:              
+              targetType: inline
+              script: |
+                echo "##[debug]Maven settings.....: $(MAVEN_SETTINGS_LOCATION)."
+                echo "##[debug]Publishing to Repository: $(NEXUS_REPO_LIB_MVN)."
+                echo "##[debug]Default URL: $(NEXUS_REPOSITORY_URL)."
+                echo "##[debug]Deployment Repository: $(NEXUS_REPO_LIB_MVN)::default::$(NEXUS_REPOSITORY_URL)/$(NEXUS_REPO_LIB_MVN)."
+                projectDirectory="$(DEFAULT_WORKDIR_ARTIFACTS)/$(ARTIFACT_NAME)"
+                echo "##[debug] Diretorio projeto: $projectDirectory"
+                mvn -version
+                java -version
+
+                run_mvn_deploy() {
+                  mvn deploy \
+                    -DaltDeploymentRepository=$(NEXUS_REPO_LIB_MVN)::default::$(NEXUS_REPOSITORY_URL)/$(NEXUS_REPO_LIB_MVN) \
+                    -Dmaven.repo.local=$(MAVEN_CACHE_FOLDER) \
+                    -Dmaven.process-resources.skip=true \
+                    -Dmaven.install.skip=true \
+                    -Dmaven.compile.skip=true \
+                    -Dmaven.package.skip=true \
+                    -Dmaven.process-test-resources.skip=true \
+                    -Dmaven.test-compile.skip=true \
+                    -Dmaven.test.skip=true \
+                    -Dmaven.gitcommitid.skip=true \
+                    -Dskip.installnodenpm=true \
+                    -Dskip.npm=true \
+                    -DskipTests \
+                    -s $(MAVEN_SETTINGS_LOCATION)
+                }
+
+                run_curl_deploy() {                  
+                  output=$(curl -v -fail -u "$(NEXUS_DEFAULT_USR):$(NEXUS_DEFAULT_PSW)" \
+                                        "$(NEXUS_ENDPOINT_API_REPOSITORY)/components?repository=$(NEXUS_REPO_LIB_MVN)" \
+                                        -F "maven2.groupId=$(GROUP_ID)" \
+                                        -F "maven2.artifactId=$(ARTIFACT_ID)" \
+                                        -F "maven2.version=$(NEW_VERSION)" \
+                                        -F "maven2.packaging=$(ARTIFACT_EXTENSION)" \
+                                        -F "maven2.asset2.extension=pom" \
+                                        -F "maven2.asset2=@$projectDirectory/pom.xml" \
+                                        -F "maven2.asset1.extension=$(ARTIFACT_EXTENSION)" \
+                                        -F "maven2.asset1=@$(TARGET_DIRECTORY)/$(ARTIFACT_FILE);type=application/java-archive")
+
+                  if [[ $? -ne 0 ]] ; then 
+                    echo '##[error] Error while executing curl command to push artifact to nexus.'
+                    echo '##[error] Check [Lib Publish Failure] job in the pipeline for more information.'
+                    exit 1
+                  fi
+                }
+
+                run_curl_deploy
+        on:
+          success:
+            steps:
+            - task: Bash@3
+              displayName: Lib Publish Success
+              name: t_success_message
+              inputs:
+                targetType: inline
+                script: |
+                  echo "##[section] ================================================================================================================================="
+                  echo "##[section]                                                  SUCCESS LIB PUBLISH"
+                  echo "##[section] ================================================================================================================================="
+                  echo "##[section] Parabéns sua biblioteca foi publicada com sucesso no repositório de artefatos"
+                  echo "##[section] "
+                  echo "##[section] Caso tenha dúvidas sobre essa fase do pipeline acesse a nossa documentação: $(CORPORATE_WIKI_DOC_URL)"
+                  echo "##[section] ================================================================================================================================="
+
+            ## -> In case of successs, creates the GIT tag
+            - task: jabbera.git-tag-on-release-task.git-tag-on-release-task.git-tag-on-release-task@9
+              retryCountOnTaskFailure: 3
+              displayName: "Git tag with version"
+              inputs:
+                staticTagName: $(NEW_VERSION)
+              condition: ne(variables.BUMP_VERSION_ENABLED, true)
+
+          failure:
+            steps:
+            - task: Bash@3
+              displayName: Lib Publish Failure
+              name: t_failure_message
+              inputs:
+                targetType: inline
+                script: |
+                  echo "##[error] ================================================================================================================================="
+                  echo "##[error]                                                  FAILURE LIB PUBLISH"
+                  echo "##[error] ================================================================================================================================="
+                  echo "##[error] Se está vendo essa mensagem é porque aconteceu algo erro durante a publicação da sua biblioteca."
+                  echo "##[error] "
+                  echo "##[error] Segue abaixo umas dicas para o Troubleshooting:"
+                  echo "##[error] $(ALERT_MESSAGE_ARROW) Consulte o log do estágio de publicação do artefato."
+                  echo "##[error] $(ALERT_MESSAGE_ARROW) Verifique se a versão corrente da biblioteca já existe no repositório (sobrescrita não é permitido)."
+                  echo "##[error] $(ALERT_MESSAGE_ARROW) Confira se as informações do repositório e credenciais de acesso estão corretas."
+                  echo "##[error] "
+                  echo "##[error] Caso tenha dúvidas sobre essa fase do pipeline acesse a nossa documentação: $(CORPORATE_WIKI_DOC_URL)"
+                  echo "##[error] ================================================================================================================================="
+
+  - job: push_repo_version_bump
+    displayName: "Push/tag version bump"
+    condition: and(
+      or(succeeded(), eq(variables['skipPublish'], 'true')),
+      ne(variables['skipBumpVersion'], 'true'))
+    steps:
+
+    ## -> Clean the pipeline workspace and checkout the code.
+    ## -> 6d15af64-176c-496d-b583-fd2ae21d4df4 is the decorator for checkout.
+    - task: 6d15af64-176c-496d-b583-fd2ae21d4df4@1
+      condition: eq(variables.BUMP_VERSION_ENABLED, true)
+      inputs:
+        repository: self
+        persistCredentials: "true"
+        clean: true
+
+    ## -> Checkout the last commit that was pushed to the repository. 
+    - task: Bash@3
+      displayName: Checkout Last Commit
+      name: checkout_last_commit
+      condition: eq(variables.BUMP_VERSION_ENABLED, true)
+      inputs:
+        targetType: inline
+        script: |
+          echo "##[debug] Checkout last commit from '$(Build.SourceBranchName)'"
+
+          git config pull.rebase true
+          git fetch -f --depth 1 origin $(Build.SourceBranchName):$(Build.SourceBranchName)
+          git checkout -f $(Build.SourceBranchName)
+    
+    ## -> Load Custom Settings
+    - task: Bash@3
+      displayName: 'Load Custom Settings'
+      name: load_custom_settings
+      condition: and(
+        succeeded(),
+        ne(variables['MAVEN_CUSTOM_SETTINGS_CONTENT'], ''))
+      continueOnError: true
+      inputs:
+        targetType: inline
+        script: |
+          echo "##[debug] Loading custom settings: $(MAVEN_CUSTOM_SETTINGS_CONTENT)"
+          echo "##[debug] Location: ${MAVEN_SETTINGS_LOCATION}"
+          base64 -d <<< "$(MAVEN_CUSTOM_SETTINGS_CONTENT)" > ${MAVEN_SETTINGS_LOCATION}
+    
+    ## -> Bump version for Java <= 7
+    - task: Bash@3
+      displayName: Bump Version on Legacy Mode (Java <= 7)
+      name: bump_java_7_or_less
+      condition: and(
+        succeeded(), 
+        eq(variables.LEGACY_MODE, 'true'),
+        eq(variables.BUMP_VERSION_ENABLED, 'true'))
+      continueOnError: false
+      inputs:
+        targetType: inline
+        script: |
+
+          echo "##[debug] Bumping version on legacy mode..."
+
+          run_docker() {
+            docker run --rm \
+              --log-driver none \
+              --entrypoint xq \
+              -v $(pwd)/"$1":$(pwd)/"$1" \
+              -w $(pwd) vcr-group.nexus.telefonica.com.br/linuxserver/yq \
+              -x "$2" \
+              "$1" > pom_temp.xml
+          }
+          
+          echo "##[debug] Build with version: $(NEW_VERSION)"
+
+          ## -> Try to collect an array of modules
+          modules=$(DOCKER_CMD_EXTRACT_POM_XML_MODULE)
+         
+          if [ $? -gt 0 ]; then
+            echo "##[warning] No modules found or is not an array, switching to string..."            
+            modules=$(DOCKER_CMD_EXTRACT_POM_XML_MODULES)
+            if [ $? -gt 0 ]; then
+              echo "##[warning] No modules found, proceeding to pom parent..."
+            fi
+            dependenciesExpression=".project.dependencies.dependency"
+          else
+            dependenciesExpression=".project.dependencies.dependency[]" 
+          fi;
+
+          for module in $modules; do
+            echo "##[debug] Bumping version for module: $module"
+            if [ -f "$module/pom.xml" ]; then                     
+
+              for dependency in $modules; do                                
+                run_docker "$module/pom.xml" "(try "$dependenciesExpression" | select(.artifactId==\""$dependency"\")).version=\""$(NEW_VERSION)"\""                                
+                if [ -f "pom_temp.xml" ]; then                      
+                  mv pom_temp.xml $(pwd)/"$module/pom.xml"
+                fi
+              done
+
+              run_docker "$module/pom.xml" "(try .project.parent | select(.artifactId==\""$(ARTIFACT_ID)"\")).version=\""$(NEW_VERSION)"\""
+              mv pom_temp.xml $(pwd)/"$module/pom.xml"
+
+              run_docker "$module/pom.xml" ".project.version=\""$(NEW_VERSION)"\""
+              mv pom_temp.xml $(pwd)/"$module/pom.xml"
+              
+              echo "##[group] /$module/pom.xml"
+              cat $(pwd)/$module/pom.xml
+              echo "##[endgroup]"
+
+            else
+              echo "##[warning] No pom.xml file found for module: $module"
+            fi
+
+          done
+
+          echo "##[debug] Bumping version for pom parent"
+
+          run_docker "pom.xml" ".project.version=\""$(NEW_VERSION)"\""
+          mv pom_temp.xml $(pwd)/pom.xml
+          
+          echo "##[group] pom.xml"
+          cat $(pwd)/pom.xml
+          echo "##[endgroup]"
+
+    # ==================================================================
+    # [Compliance] Verifica se o repositório está em conformidade com as políticas de configuração
+    # ==================================================================
+    - task: VivoDevOpsConfigCompliance@1
+      displayName: 'Check DevOps Config Compliance'
+      inputs:
+        policySets: |
+          image-definition-files
+
+    ## -> Bump version in code 
+    - task: Bash@3
+      displayName: Update Source Version
+      condition: and(
+        succeeded(),
+        eq(variables.LEGACY_MODE, 'false'),
+        eq(variables.BUMP_VERSION_ENABLED, 'true'))
+      inputs:
+        targetType: inline
+        script: |
+          BUILDER_IMAGE_NAME="builder/java"
+
+          docker build -t $BUILDER_IMAGE_NAME -f .azuredevops/builder.Dockerfile .
+
+          run_docker() {
+            docker run --rm \
+              --user=$(DOCKER_CMD_USERNAME):$(DOCKER_CMD_GROUP) \
+              --network host \
+              --log-driver none \
+              -e JAVA_OPTS_MEMORY_MAX=$(DEFAULT_MAX_MEMORY_BUILD) \
+              -e TZ="America/Sao_Paulo" \
+              -e SYSTEM_ACCESSTOKEN=$(System.AccessToken) \
+              -e NEXUS_DEPS_USR=$(NEXUS_DEPS_USR) \
+              -e NEXUS_DEPS_PSW=$(NEXUS_DEPS_PSW) \
+              -v $(pwd):/app \
+              -v $HOME/.m2:/.m2 \
+              -v $(MAVEN_SETTINGS_LOCATION):/.m2/settings.xml \
+              -w $(DOCKER_WORKDIR) \
+              "$BUILDER_IMAGE_NAME" sh -c "$1"
+          }
+          
+          echo "##[debug] Pushing NEW_VERSION: $(NEW_VERSION)"
+
+          run_docker "mvn -e -X $MAVEN_OPTS versions:set -DnewVersion=$(NEW_VERSION) -s /.m2/settings.xml -Dmaven.repo.local=/.m2/repository"
+
+
+    ## -> Push new version to git
+    - task: Bash@3
+      displayName: 'Commit Updated Version'
+      condition: and(
+        succeeded(),
+        eq(variables.BUMP_VERSION_ENABLED, 'true'))
+      env:        
+        BRANCH_NAME: "$(Build.SourceBranchName)"
+        TAG_REPO: true
+      inputs:
+        targetType: inline
+        script: "TAG_PUSH_PARAM=\"\"\n\necho \"##[debug] TAG_REPO.....: ${TAG_REPO}\"\n\ngit add .\ngit commit -am \"[CI SKIP] Project version has been updated. Released version '${NEW_VERSION}'\" --author=\"$BUILD_REQUESTEDFOR <$BUILD_REQUESTEDFOREMAIL>\"\n\nif [[ \"${TAG_REPO}\" == \"true\" ]]; then\n  TAG_PUSH_PARAM=\"--tags\"\n\n  git tag ${NEW_VERSION}\nfi\n\ngit status\necho \"##[command] git push origin ${TAG_PUSH_PARAM} ${BRANCH_NAME}\"\ngit push origin ${TAG_PUSH_PARAM} ${BRANCH_NAME}\n\nif [ $? -ne 0 ]; then \n  echo \"##vso[task.logissue type=error;] Git push failed. Permission denied\"\n  echo \"##vso[task.complete result=Failed;]\"\n  exit 1\nfi  \n\necho \"Version updated to ${NEW_VERSION}\"\n"

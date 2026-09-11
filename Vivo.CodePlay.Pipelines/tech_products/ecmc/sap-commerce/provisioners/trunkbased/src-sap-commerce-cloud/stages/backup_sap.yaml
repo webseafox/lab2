@@ -1,0 +1,395 @@
+parameters:
+  - name: environment_code
+    type: string
+    default: ""
+  - name: display_name
+    type: string
+    default: "Create SAP Backup"
+  - name: enable_backup
+    type: boolean
+    default: true
+  - name: timeout_minutes
+    type: number
+    default: 180
+
+jobs:
+- job: backup_environment
+  displayName: "Backup SAP Environment ${{ parameters.environment_code }}"
+  timeoutInMinutes: ${{ parameters.timeout_minutes }}
+  variables:
+  - group: lojaonline-sap-commerce-cloud
+  steps:
+    - bash: |
+        echo "##[section]🚀 Iniciando processo de backup do ambiente ${{ parameters.environment_code }} 🚀"
+        
+        ENVIRONMENT_CODE="${{ parameters.environment_code }}"
+        
+        # Mapeamento de códigos de ambiente para nomes amigáveis
+        case "$ENVIRONMENT_CODE" in
+            "d15")
+                ENVIRONMENT_DISPLAY_NAME="esteira1"
+                ;;
+            "s1")
+                ENVIRONMENT_DISPLAY_NAME="preprod"
+                ;;
+            "d13")
+                ENVIRONMENT_DISPLAY_NAME="prodlike"
+                ;;
+            *)
+                ENVIRONMENT_DISPLAY_NAME="$ENVIRONMENT_CODE"
+                ;;
+        esac
+        
+        echo "##[command]🎯 Ambiente: $ENVIRONMENT_CODE ($ENVIRONMENT_DISPLAY_NAME)"
+        
+        # Debug completo das variáveis
+        echo "##[debug]🔍 Verificando todas as variáveis de ambiente..."
+        echo "##[debug]Variáveis que começam com CCV:"
+        env | grep -i CCV || echo "##[debug]Nenhuma variável CCV encontrada"
+        echo "##[debug]Variáveis que começam com API:"
+        env | grep -i API | head -5
+        echo "##[debug]Variáveis que começam com SUBSCRIPTION:"
+        env | grep -i SUBSCRIPTION || echo "##[debug]Nenhuma variável SUBSCRIPTION encontrada"
+        
+        # Validação das variáveis críticas
+        echo "##[debug]🔍 Validando variáveis críticas..."
+        echo "##[debug]ENVIRONMENT_CODE: '$ENVIRONMENT_CODE'"
+        
+        # Tentar diferentes formas de acessar o CCV_TOKEN
+        echo "##[debug]Tentando diferentes formas de acessar CCV_TOKEN:"
+        echo "##[debug]CCV_TOKEN (direto): '${CCV_TOKEN:-NOT_FOUND}'"
+        echo "##[debug]CCV_TOKEN length: ${#CCV_TOKEN}"
+        
+        # Validação e debug do token CCV_TOKEN
+        if [ -z "${CCV_TOKEN:-}" ]; then
+            echo "##[error]❌ Variável CCV_TOKEN não está definida!"
+            echo "##[error]Verifique se a variável CCV_TOKEN está configurada no grupo de variáveis 'lojaonline-sap-commerce-cloud'"
+            echo "##[error]Grupo de variáveis carregado no job: lojaonline-sap-commerce-cloud"
+            exit 1
+        else
+            
+            # Verificação básica do formato do token
+            CCV_TOKEN_LENGTH=$(echo "${CCV_TOKEN}" | wc -c | tr -d ' ')
+            if [ $CCV_TOKEN_LENGTH -lt 20 ]; then
+                echo "##[warning]⚠️ Token CCV_TOKEN parece muito curto (${CCV_TOKEN_LENGTH} caracteres)"
+                echo "##[warning]Tokens SAP Commerce Cloud geralmente têm mais de 20 caracteres"
+            fi
+            
+            # Verificar se não é um placeholder
+            if [[ "${CCV_TOKEN}" == *"REPLACE"* ]] || [[ "${CCV_TOKEN}" == *"EXAMPLE"* ]] || [[ "${CCV_TOKEN}" == *"TOKEN"* ]]; then
+                echo "##[error]❌ CCV_TOKEN parece ser um placeholder, não um token real"
+                echo "##[error]Substitua o valor por um token válido do SAP Commerce Cloud"
+                exit 1
+            fi
+        fi
+        
+        # Validação das outras variáveis
+        if [ -z "$(SUBSCRIPTION_CODE)" ]; then
+            echo "##[error]❌ Variável SUBSCRIPTION_CODE não está definida!"
+            exit 1
+        fi
+        
+        if [ -z "$ENVIRONMENT_CODE" ]; then
+            echo "##[error]❌ Parâmetro environment_code não foi fornecido!"
+            exit 1
+        fi
+        
+        # URLs da API
+        API_URL_ENVIRONMENTS_BACKUP=$(echo "$API_URL_ENVIRONMENTS_BACKUP" | sed "s/<SUBSCRIPTION_CODE>/$(SUBSCRIPTION_CODE)/" | sed "s/<ENVIRONMENT_CODE>/$ENVIRONMENT_CODE/")
+        BACKUPS_LIST_URL="$(BACKUPS_LIST_URL)"
+        
+        echo "##[debug]🔗 URLs finais:"
+        
+        echo "##[debug]🔍 Verificando status atual dos backups para o ambiente $ENVIRONMENT_CODE..."
+        
+        # Teste de conectividade com a API
+        echo "##[debug]🌐 Testando conectividade com a API SAP Commerce Cloud..."
+        TEST_HTTP_CODE=$(curl -s -o /tmp/test_connection.json -w "%{http_code}" -H "Authorization: ${CCV_TOKEN}" "$BACKUPS_LIST_URL")
+        
+        if [ "$TEST_HTTP_CODE" == "200" ]; then
+            echo "##[debug]✅ Conectividade com a API confirmada"
+            rm -f /tmp/test_connection.json
+        elif [ "$TEST_HTTP_CODE" == "401" ]; then
+            echo "##[error]❌ Token CCV_TOKEN inválido ou expirado (HTTP 401)"
+            echo "##[error]Verifique se o token está correto e não expirou"
+            rm -f /tmp/test_connection.json
+            exit 1
+        elif [ "$TEST_HTTP_CODE" == "403" ]; then
+            echo "##[error]❌ Token sem permissões para acessar o ambiente $ENVIRONMENT_CODE (HTTP 403)"
+            echo "##[error]Verifique as permissões do token no SAP Commerce Cloud"
+            rm -f /tmp/test_connection.json
+            exit 1
+        else
+            echo "##[warning]⚠️ Conectividade com problemas (HTTP $TEST_HTTP_CODE), mas continuando..."
+            echo "##[debug]Response: $(cat /tmp/test_connection.json 2>/dev/null || echo 'N/A')"
+            rm -f /tmp/test_connection.json
+        fi
+        
+        # Função para enviar mensagem via webhook
+        send_teams_message() {
+            local message="$1"
+            local webhook_url="$(WEBHOOK_URL)"
+            local chat_id="$(CHAT_ID)"
+            
+            # Debug da mensagem antes do envio
+            echo "##[debug]📋 Preparando mensagem para envio:"
+            
+            # Escapar aspas duplas e converter quebras de linha para \n literals
+            local escaped_message=$(echo -e "$message" | sed 's/\\/\\\\/g; s/"/\\"/g; s/$/\\n/' | tr -d '\n' | sed 's/\\n$//')
+            
+            # Criar JSON payload corretamente formatado
+            local json_payload="{\"content\": \"$escaped_message\", \"chatId\": \"$chat_id\", \"source\": \"Backup-SAP\"}"
+            
+            echo "##[debug]📋 JSON Payload:"
+            echo "##[debug]$json_payload"
+            
+            echo "##[debug]📤 Enviando mensagem via webhook..."
+            local response=$(curl -s -w "%{http_code}" -o /tmp/webhook_response.json \
+                -X POST \
+                -H "Content-Type: application/json" \
+                --data-raw "$json_payload" \
+                "$webhook_url")
+            
+            local http_code=$(echo $response | tail -c 4)
+            local response_body=$(cat /tmp/webhook_response.json 2>/dev/null || echo "N/A")
+            
+            echo "##[debug]📊 Resultado do webhook:"
+            
+            if [[ "$http_code" == "200" ]] || [[ "$http_code" == "201" ]]; then
+                echo "##[debug]✅ Mensagem enviada com sucesso! (HTTP $http_code)"
+            else
+                echo "##[warning]⚠️ Falha ao enviar mensagem: HTTP $http_code"
+                echo "##[debug]Response: $response_body"
+            fi
+            
+            rm -f /tmp/webhook_response.json
+        }
+        
+        # Função para verificar backups existentes
+        check_existing_backups() {
+            local LIST_FILE="/tmp/backups_check.json"
+            local LIST_HTTP_CODE=$(curl -s -o $LIST_FILE -w "%{http_code}" -H "Authorization: ${CCV_TOKEN}" "$BACKUPS_LIST_URL")
+            
+            if [ "$LIST_HTTP_CODE" == "200" ]; then
+                # Verificar se há backup em execução (CREATING)
+                local CREATING_COUNT=$(cat $LIST_FILE | jq '[.value[] | select(.status == "CREATING")] | length')
+                local CREATING_BACKUP=$(cat $LIST_FILE | jq -r '.value[] | select(.status == "CREATING") | .databackupCode')
+                
+                if [ "$CREATING_COUNT" -gt 0 ]; then
+                    echo "##[warning]⚠️ Já existe um backup em andamento: $CREATING_BACKUP ⚠️"
+                    echo "##[command]Pipeline será finalizada - backup já em execução"
+                    rm -f $LIST_FILE
+                    return 2  # Código específico para backup em andamento
+                fi
+                
+                # Contar total de backups
+                local TOTAL_BACKUPS=$(cat $LIST_FILE | jq '.value | length')
+                echo "##[debug]Total de backups existentes: $TOTAL_BACKUPS"
+                
+                rm -f $LIST_FILE
+                return 0  # Sucesso, sem backup em andamento
+            else
+                echo "##[warning]Falha ao verificar backups existentes. HTTP Code: $LIST_HTTP_CODE"
+                rm -f $LIST_FILE
+                return 1  # Erro na verificação
+            fi
+        }
+        
+        # Função para deletar backup mais antigo
+        delete_oldest_backup() {
+            local LIST_FILE="/tmp/backups_for_delete.json"
+            local LIST_HTTP_CODE=$(curl -s -o $LIST_FILE -w "%{http_code}" -H "Authorization: ${CCV_TOKEN}" "$BACKUPS_LIST_URL")
+            
+            if [ "$LIST_HTTP_CODE" == "200" ]; then
+                local OLDEST_BACKUP=$(cat $LIST_FILE | jq -r '.value | map(select(.status == "CREATED")) | sort_by(.createdTime) | .[0]')
+                
+                if [ "$OLDEST_BACKUP" != "null" ]; then
+                    local OLDEST_BACKUP_CODE=$(echo $OLDEST_BACKUP | jq -r '.databackupCode')
+                    local OLDEST_DATE=$(echo $OLDEST_BACKUP | jq -r '.createdTime')
+                    echo "##[warning]🗑️ Deletando backup mais antigo: $OLDEST_BACKUP_CODE (criado em $OLDEST_DATE)"
+                    
+                    local DELETE_URL="$BACKUPS_LIST_URL/$OLDEST_BACKUP_CODE"
+                    local DELETE_HTTP_CODE=$(curl -s -o /tmp/delete_response.json -w "%{http_code}" -X DELETE -H "Authorization: ${CCV_TOKEN}" "$DELETE_URL")
+                    
+                    if [ "$DELETE_HTTP_CODE" == "204" ] || [ "$DELETE_HTTP_CODE" == "200" ]; then
+                        echo "##[command]✅ Backup $OLDEST_BACKUP_CODE deletado com sucesso"
+                        rm -f $LIST_FILE /tmp/delete_response.json
+                        return 0
+                    else
+                        echo "##[error]❌ Falha ao deletar backup: $OLDEST_BACKUP_CODE. HTTP Code: $DELETE_HTTP_CODE"
+                        echo "##[error]Response: $(cat /tmp/delete_response.json)"
+                        rm -f $LIST_FILE /tmp/delete_response.json
+                        return 1
+                    fi
+                else
+                    echo "##[warning]⚠️ Nenhum backup com status CREATED encontrado para deletar"
+                    rm -f $LIST_FILE
+                    return 1
+                fi
+            else
+                echo "##[error]❌ Falha ao listar backups para deleção. HTTP Code: $LIST_HTTP_CODE"
+                rm -f $LIST_FILE
+                return 1
+            fi
+        }
+        
+        # Função para criar backup
+        create_backup() {
+            echo "##[debug]🚀 Iniciando criação de backup..."
+            echo "##[debug]URL de destino: '$API_URL_ENVIRONMENTS_BACKUP'"
+            
+            local REQUEST_BODY=$(cat <<EOF
+        {
+          "description": "Backup do ambiente ${ENVIRONMENT_CODE} - $(date '+%Y-%m-%d %H:%M:%S')"
+        }
+        EOF
+        )
+            
+            
+            local SAP_API_RESPONSE_FILE="/tmp/backup_response.json"
+            local BACKUP_RESPONSE=$(curl -X POST \
+                -s -o $SAP_API_RESPONSE_FILE \
+                -w "%{http_code}" \
+                -H "Content-Type: application/json" \
+                -H "Authorization: ${CCV_TOKEN}" \
+                -d "$REQUEST_BODY" \
+                "$API_URL_ENVIRONMENTS_BACKUP")
+            
+            local HTTP_CODE=$(echo $BACKUP_RESPONSE | tail -n1)
+            local RESPONSE_BODY=$(cat $SAP_API_RESPONSE_FILE && rm -f $SAP_API_RESPONSE_FILE)
+            
+            echo "##[debug]HTTP_CODE recebido: '$HTTP_CODE'"
+            echo "##[debug]RESPONSE_BODY: '$RESPONSE_BODY'"
+            
+            case "$HTTP_CODE" in
+                201)
+                    echo "##[section]🚀 Backup iniciado com sucesso!"
+                    echo "##[debug]SUBSCRIPTION_CODE: $(echo $RESPONSE_BODY | jq -r '.subscriptionCode')"
+                    echo "##[debug]ENVIRONMENT_CODE: $(echo $RESPONSE_BODY | jq -r '.environmentCode')"
+                    echo "##[debug]DATABACKUP_CODE: $(echo $RESPONSE_BODY | jq -r '.databackupCode')"
+                    
+                    BACKUP_CODE=$(echo $RESPONSE_BODY | jq -r '.databackupCode')
+                    ENV_CODE=$(echo $RESPONSE_BODY | jq -r '.environmentCode')
+                    CREATED_TIME=$(date '+%Y-%m-%d %H:%M:%S')
+                    
+                    echo "##[command]📋 Backup Code: $BACKUP_CODE"
+                    echo "##[command]🌍 Environment: $ENV_CODE"
+                    echo "##[command]⏰ Iniciado em: $CREATED_TIME"
+                    echo "##[section]✅ Pipeline finalizada - backup criado e em execução"
+                    
+                    # Enviar mensagem de sucesso
+                    send_teams_message "✅ Backup SAP $ENVIRONMENT_DISPLAY_NAME Iniciado com Sucesso\n\n🚀 Backup do ambiente **$ENVIRONMENT_DISPLAY_NAME** ($ENV_CODE) foi criado e iniciado com sucesso\n\n📋 Backup Code: \`$BACKUP_CODE\`\n\n🔄 Status: O backup está sendo processado em background\n\n🎯 Pipeline: Finalizada com sucesso"                    exit 0
+                    ;;
+                423)
+                    echo "##[section]✅ Backup já em andamento no ambiente $ENVIRONMENT_CODE ✅"
+                    echo "##[command]📋 Um backup já está sendo processado para este ambiente"
+                    echo "##[section]✅ Pipeline finalizada - backup já em execução"
+                    
+                    # Enviar mensagem informativa
+                    send_teams_message "ℹ️ Backup SAP $ENVIRONMENT_DISPLAY_NAME Já em Andamento
+                                        📋 Um backup já está sendo processado no ambiente **$ENVIRONMENT_DISPLAY_NAME** ($ENVIRONMENT_CODE)
+                                        🎯 Status: Pipeline finalizada sem executar novo backup"
+
+                    exit 0
+                    ;;
+                401|400)
+                    echo "##[warning]⚠️ Erro $HTTP_CODE detectado: $(echo $RESPONSE_BODY | jq -r '.message // .error // "Erro desconhecido"')"
+                    echo "##[debug]🔍 Detalhes completos do erro:"
+                    echo "##[warning]🧹 Tentando limpeza e nova tentativa..."
+                    return 3  # Código para retry com cleanup
+                    ;;
+                403)
+                    echo "##[error]🔐 Acesso negado (HTTP 403) - Token sem permissões para o ambiente $ENVIRONMENT_CODE"
+                    echo "##[error]Verifique as permissões do token no SAP Commerce Cloud"
+                    return 1
+                    ;;
+                *)
+                    echo "##[error]❌ Erro não tratado: HTTP $HTTP_CODE"
+                    echo "##[error]Response: $RESPONSE_BODY"
+                    return 1
+                    ;;
+            esac
+        }
+        
+        # FLUXO PRINCIPAL DE EXECUÇÃO
+        echo "##[command]🔍 Etapa 1: Verificando backups existentes..."
+        check_existing_backups
+        CHECK_RESULT=$?
+        
+        if [ $CHECK_RESULT -eq 2 ]; then
+            # Há backup em andamento - apenas informar e finalizar
+            echo "##[section]✅ Backup já em andamento no ambiente $ENVIRONMENT_CODE ✅"
+            
+            # Buscar informações do backup em andamento
+            ACTIVE_BACKUP_CODE=$(curl -s -H "Authorization: ${CCV_TOKEN}" "$BACKUPS_LIST_URL" | jq -r '.value[] | select(.status == "CREATING") | .databackupCode')
+            ACTIVE_BACKUP_DATE=$(curl -s -H "Authorization: ${CCV_TOKEN}" "$BACKUPS_LIST_URL" | jq -r '.value[] | select(.status == "CREATING") | .createdTime')
+            
+            if [ -n "$ACTIVE_BACKUP_CODE" ] && [ "$ACTIVE_BACKUP_CODE" != "null" ]; then
+                echo "##[command]📋 Backup ativo: $ACTIVE_BACKUP_CODE"
+                echo "##[command]📅 Iniciado em: $ACTIVE_BACKUP_DATE"
+                echo "##[section]✅ Pipeline finalizada - backup já está sendo processado"
+                
+                # Enviar mensagem informativa
+                send_teams_message "ℹ️ Backup SAP $ENVIRONMENT_DISPLAY_NAME Já em Andamento\n\n📋 Um backup já está sendo processado no ambiente **$ENVIRONMENT_DISPLAY_NAME** ($ENVIRONMENT_CODE)\n\n🆔 Backup Code: \`$ACTIVE_BACKUP_CODE\`\n\n🎯 Status: Pipeline finalizada sem executar novo backup"
+                
+                exit 0
+            else
+                echo "##[warning]⚠️ Backup em andamento detectado, mas não foi possível obter detalhes"
+                echo "##[section]✅ Pipeline finalizada - backup já detectado em execução"
+                exit 0
+            fi
+        fi
+        
+        # Tentar criar novo backup
+        echo "##[command]🚀 Etapa 2: Criando novo backup..."
+        create_backup
+        CREATE_RESULT=$?
+        
+        if [ $CREATE_RESULT -eq 3 ]; then
+            # Erro 401/400 - tentar limpeza e retry
+            echo "##[command]🧹 Etapa 2b: Tentando limpeza e nova criação..."
+            
+            if delete_oldest_backup; then
+                echo "##[command]🔄 Tentando criar backup após limpeza..."
+                sleep 10  # Aguardar propagação da deleção
+                create_backup
+                CREATE_RESULT=$?
+            else
+                echo "##[error]❌ Falha na limpeza de backups antigos"
+                CREATE_RESULT=1
+            fi
+        elif [ $CREATE_RESULT -eq 2 ]; then
+            # Backup em andamento detectado durante criação - apenas informar e finalizar
+            echo "##[section]✅ Backup detectado em andamento durante tentativa de criação ✅"
+            ACTIVE_BACKUP_CODE=$(curl -s -H "Authorization: ${CCV_TOKEN}" "$BACKUPS_LIST_URL" | jq -r '.value[] | select(.status == "CREATING") | .databackupCode')
+            
+            if [ -n "$ACTIVE_BACKUP_CODE" ] && [ "$ACTIVE_BACKUP_CODE" != "null" ]; then
+                echo "##[command]📋 Backup ativo detectado: $ACTIVE_BACKUP_CODE"
+                echo "##[section]✅ Pipeline finalizada - backup já está sendo processado"
+                
+                # Enviar mensagem informativa
+                send_teams_message "ℹ️ Backup SAP $ENVIRONMENT_DISPLAY_NAME Já em Execução\n\n📋 Durante a tentativa de criação, detectamos que já existe um backup em andamento no ambiente **$ENVIRONMENT_DISPLAY_NAME** ($ENVIRONMENT_CODE)\n\n🆔 Backup Code: \`$ACTIVE_BACKUP_CODE\`\n\n🎯 Status: Pipeline finalizada sem executar novo backup"
+                
+                exit 0
+            else
+                echo "##[section]✅ Pipeline finalizada - backup em andamento detectado"
+                exit 0
+            fi
+        fi
+        
+        if [ $CREATE_RESULT -ne 0 ]; then
+            echo "##[error]❌ Falha na criação do backup"
+            
+            # Enviar mensagem de erro
+            send_teams_message "❌ Falha na Criação de Backup SAP $ENVIRONMENT_DISPLAY_NAME\n\n⛔ Falha ao criar backup do ambiente **$ENVIRONMENT_DISPLAY_NAME** ($ENVIRONMENT_CODE)\n\n🔍 Ação necessária: Verificar logs da pipeline e permissões do token\n\n🎯 Status: Pipeline finalizada com erro"
+            
+            exit 1
+        fi
+        
+        # Pipeline finalizada - backup criado ou detectado com sucesso
+        echo "##[section]✅ Processo de backup concluído com sucesso"
+      env:
+        CCV_TOKEN: $(CCV_TOKEN)
+        SUBSCRIPTION_CODE: $(SUBSCRIPTION_CODE)
+        API_URL_ENVIRONMENTS_BACKUP: $(API_URL_ENVIRONMENTS_BACKUP)
+      displayName: 'Backup Completo - ${{ parameters.environment_code }}'

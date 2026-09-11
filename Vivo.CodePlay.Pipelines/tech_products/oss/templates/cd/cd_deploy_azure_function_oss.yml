@@ -1,0 +1,230 @@
+parameters:
+- name: environment
+- name: deployAppsettings
+- name: serviceConnection
+- name: packageVersion
+  type: string
+  default: 'none'
+
+stages:
+- stage: cd_deploy
+  displayName: "CD - Deploy ${{ parameters.environment }}"
+  pool:
+    name: $(AGENT_POOL_CD)
+
+  ${{ if eq(parameters.packageVersion, 'none') }}:
+    dependsOn:
+    - environment_init
+    - ci_build
+    - ci_publish
+  ${{ else }}:
+    dependsOn:
+    - environment_init
+
+  ## -> Loads variables from other stages.
+  variables:
+  - name: NEXUS_DEPS_USR
+    value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEPS_USR'] ]
+  - name: NEXUS_DEPS_PSW
+    value: $[ stageDependencies.environment_init.environment.outputs['credentials.NEXUS_DEPS_PSW'] ]
+  - template: /tech_products/oss/initialize/variables_catalog_info.yml
+  - template: /tech_products/oss/initialize/variables_source_data.yml
+
+  jobs:
+
+  - deployment: deploy
+    displayName: 'Deploy'
+    condition: and(
+      succeeded(),
+      or(
+      eq(variables['Build.SourceBranchName'],'master'),
+      eq(variables['Build.SourceBranchName'],'main'),
+      startsWith(variables['Build.SourceBranchName'],'hotfix'),
+      eq(variables['Build.SourceBranchName'],'prodlike'),
+      eq(variables['Build.SourceBranchName'],'preprod'),
+      eq(variables['Build.SourceBranchName'],'esteira1'),
+      eq(variables['Build.SourceBranchName'],'esteira2'),
+      eq(variables['Build.SourceBranchName'],'dev')))
+    environment:
+      name: deploy-${{ parameters.environment }}
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+
+          ## -> Skip Download
+          - download: none
+
+          ## -> Checkout the source code.
+          - checkout: self
+            displayName: Checkout Source Code
+            name: checkout_source_code
+            clean: true
+
+          - ${{ if eq(parameters.packageVersion, 'none') }}:
+            ## -> Download and uncompress the downloaded artifact.
+            - task: DownloadBuildArtifacts@1
+              displayName: 'Download Build Artifacts'
+              inputs:
+                artifactName: $(ARTIFACT_NAME)
+                cleanDestinationFolder: false
+                extractTars: true
+                parallelizationLimit: 8
+                downloadPath: $(System.ArtifactsDirectory)
+
+          - ${{ else }}:
+            ## -> Download Artifact from Nexus
+            - task: Bash@3
+              displayName: 'Download Artifact from Nexus'
+              inputs:
+                targetType:
+                  inline
+                script: |
+                  echo "##[debug] Source GROUP_ID    : $GROUP_ID"
+                  echo "##[debug] Source ARTIFACT_ID : $ARTIFACT_ID"
+                  echo "##[debug] Source Repository  : $(NEXUS_REPO_LIB_MVN)."
+
+                  nexusURL="$(NEXUS_ENDPOINT_API_REPOSITORY)/search/assets?repository=$(NEXUS_REPO_LIB_MVN)&group=${GROUP_ID}&name=${ARTIFACT_ID}&version=${{ parameters.packageVersion }}"
+
+                  if [ -z $nexusURL ]; then
+                    echo "##[error] Cannot find the package - please check if the package version $(ARTIFACT_ID)-${{ parameters.packageVersion }} exist in the repository"
+                    exit 1
+                  fi
+
+                  echo "##[debug] Search NEXUS URL   : $nexusURL"
+
+                  downloadUrl=$(curl -s -f -u "$(NEXUS_DEPS_USR):$(NEXUS_DEPS_PSW)" "$nexusURL" | \
+                    jq -r '.items[] | select(.downloadUrl | test("\\.(zip)$")) | .downloadUrl')
+
+                  if [ -z $downloadUrl ]; then
+                    echo "##[error] Cannot find the package - please check if the package version $(ARTIFACT_ID)-${{ parameters.packageVersion }} exist in the repository"
+                    exit 1
+                  fi
+
+                  echo "##[debug] Download URL       : $downloadUrl"
+                  echo "##vso[task.setvariable variable=ARTIFACT_NAME]$(APP_NAME)"
+                  echo "##vso[task.setvariable variable=ARTIFACT_PATH]$artifactPath"
+
+                  ##-> Create target directory as it is in CI_CD pipeline
+                  targetDirectory=$(DEFAULT_WORKDIR_ARTIFACTS)/$(APP_NAME)/$artifactPath
+                  echo "##[debug] Target Directory   : $targetDirectory"
+                  mkdir -p $targetDirectory
+
+                  cd $targetDirectory
+
+                  curl -s -u $(NEXUS_DEPS_USR):$(NEXUS_DEPS_PSW) -L $downloadUrl -o "$targetDirectory/$(basename $downloadUrl)"
+
+                  echo "##[group]Target Directory:"
+                  ls -la $targetDirectory
+                  echo "##[endgroup]"
+
+          ## -> Get source code data
+          - task: CmdLine@2
+            displayName: Get Source Data
+            name: source_data
+            condition: succeeded()
+            continueOnError: false
+            inputs:
+              targetType: inline
+              script: |
+
+                targetDirectory="$(DEFAULT_WORKDIR_ARTIFACTS)/$(ARTIFACT_NAME)/$(ARTIFACT_PATH)"
+
+                echo "##[group]Target Directory:"
+                echo "##[debug] $targetDirectory"
+                ls -la $targetDirectory
+                echo "##[endgroup]"
+
+                artifactfile=$(find $targetDirectory -type f -name '*.zip' | head -n 1)
+                echo "##vso[task.setvariable variable=ARTIFACT_FILE]$artifactfile"
+
+                echo "##[debug] Artifact File      : $(basename $artifactfile)"
+                echo "##[debug] Resrouce Group     : $(RESOURCE_GROUP)"
+                echo "##[debug] Function Name      : $(FUNCTION_NAME)"
+                echo "##[debug] Service Connection : ${{parameters.serviceConnection}}"
+
+          ## -> Deploy to Azure Function
+          - task: AzureCLI@2
+            displayName: 'Deploy to Azure Function'
+            inputs:
+              azureSubscription: ${{parameters.serviceConnection}}
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                az functionapp deployment source config-zip --resource-group $(RESOURCE_GROUP) --name $(FUNCTION_NAME) --src $(ARTIFACT_FILE)
+              env:
+              HTTP_PROXY: $(AZURE_HTTP_PROXY)
+              HTTPS_PROXY: $(AZURE_HTTPS_PROXY)
+              NO_PROXY: $(AZURE_NO_PROXY)
+
+          - ${{ if eq(parameters.deployAppsettings, 'true') }}:
+            ## -> Download AppSettings from Secure Files
+            - task: DownloadSecureFile@1
+              name: appsettings
+              displayName: 'Download AppSettings from Secure Files'
+              inputs:
+                secureFile: appsettings_${{variables['Build.DefinitionName']}}_${{parameters.environment}}.json
+
+            ## -> Deploy AppSettings
+            - task: AzureCLI@2
+              displayName: 'Deploy AppSettings'
+              inputs:
+                azureSubscription: ${{parameters.serviceConnection}}
+                scriptType: 'bash'
+                scriptLocation: 'inlineScript'
+                workingDirectory: '$(Agent.TempDirectory)'
+                inlineScript: |
+                  az functionapp config appsettings set -g $(RESOURCE_GROUP) -n $(FUNCTION_NAME) --settings @appsettings_${{variables['Build.DefinitionName']}}_${{parameters.environment}}.json > /dev/null
+                env:
+                HTTP_PROXY: $(AZURE_HTTP_PROXY)
+                HTTPS_PROXY: $(AZURE_HTTPS_PROXY)
+                NO_PROXY: $(AZURE_NO_PROXY)
+
+        on:
+          success:
+            steps:
+            ## -> Publish Success message
+            - task: Bash@3
+              displayName: Publish Success
+              name: t_success_message
+              inputs:
+                targetType: inline
+                script: |
+                  echo "##[section] ================================================================================================================================="
+                  echo "##[section]                                                      DEPLOY WAS SUCCESSFUL! "
+                  echo "##[section] ================================================================================================================================="
+                  echo "##[section] Parabéns sua aplicação foi implantada com sucesso no ambiente de runtime."
+                  echo "##[section] Acesse a url da sua aplicação e valide  se sua nova versão foi entregue com sucesso."
+                  echo "##[section] "
+                  echo "##[section] $(ALERT_MESSAGE_ARROW) Sua aplicação foi implantada com sucesso no ambiente."
+                  echo "##[section] $(ALERT_MESSAGE_ARROW) Verifique com o responsável técnico como acessar acessar a sua aplicação."
+                  echo "##[section] $(ALERT_MESSAGE_ARROW) Caso não esteja conseguindo acessar a sua aplicação entre em contato com suporte."
+                  echo "##[section] "
+                  echo "##[section] Caso tenha dúvidas sobre essa fase do pipeline acesse a nossa documentação: $(CORPORATE_WIKI_DOC_URL)"
+                  echo "##[section]================================================================================================================================="
+
+                  ## -> Set Pipeline Tag on success
+                  echo "##vso[build.addbuildtag]deploy-${{ parameters.environment }}=succeeded"
+          failure:
+            steps:
+            ## -> Publish Failure message
+            - task: Bash@3
+              displayName: Publish Failure
+              name: t_failure_message
+              inputs:
+                targetType: inline
+                script: |
+                  echo "##[error] ================================================================================================================================="
+                  echo "##[error]                                                    DEPLOY WAS NOT SUCCESSFUL! "
+                  echo "##[error] ================================================================================================================================="
+                  echo "##[error] Se está vendo essa mensagem é porque aconteceu algo erro durante a impplantação da sua apliação."
+                  echo "##[error] "
+                  echo "##[error] Segue abaixo umas dicas para o Troubleshooting:"
+                  echo "##[error] $(ALERT_MESSAGE_ARROW) Consulte o log do estágio de deploy da aplicação."
+                  echo "##[error] $(ALERT_MESSAGE_ARROW) Verifique com o responsável técnico como proceder em caso de falha de ambiente."
+                  echo "##[error] "
+                  echo "##[error] Caso tenha dúvidas sobre essa fase do pipeline acesse a nossa documentação: $(CORPORATE_WIKI_DOC_URL)"
+                  echo "##[error] ================================================================================================================================="
+
+                  ## -> Set Pipeline Tag on failure
+                  echo "##vso[build.addbuildtag]deploy-${{ parameters.environment }}=failed"

@@ -1,0 +1,417 @@
+parameters:
+- name: components_to_install
+#- name: version_to_install
+- name: qa_environment
+- name: skip_deploy
+
+stages:
+- stage: deploy
+  displayName: "Deploy ${{ parameters.qa_environment }}"
+  dependsOn:
+  - package
+  pool: $(PRIVATE_AGENT_DEFAULT)
+  jobs:
+  - job: bundles_to_install
+    displayName: Select Bundles
+    condition: eq('${{ parameters.skip_deploy }}', false)
+    variables:
+      - template: /.azuredevops/config/${{ parameters.qa_environment }}/environments_variables.yml@self
+    steps:
+    - download: none 
+    - checkout: self
+
+    ## ARTIFACTS ANOTHER BUILD ID
+    - ${{ if startsWith(variables['Build.SourceBranch'], 'refs/tags') }}:
+      - bash: |
+          build_id=$(yq '.buildId' $(Build.SourcesDirectory)/.azuredevops/build.yaml)
+          echo "##vso[task.setvariable variable=BUILD_ID]$build_id"
+          echo "##[debug] Exporting variable 'BUILD_ID': $build_id"
+        name: export_build_id
+        displayName: Extract Build ID 
+
+      - task: DownloadBuildArtifacts@1
+        displayName: 'Download Specific Build Artifact'
+        inputs:
+          buildType: specific
+          project: '$(PROJECT_NAME)' 
+          pipeline: '$(PIPELINE_NAME)' 
+          buildVersionToDownload: specific
+          buildId: '$(BUILD_ID)' 
+          artifactName: 'bundles' 
+          downloadPath: '$(System.ArtifactsDirectory)'
+    ## ARTIFACTS CURRENT BUILD ID
+    - ${{ else }}:
+      - task: DownloadBuildArtifacts@1
+        displayName: 'Download Pipeline Artifact'
+        inputs:
+          buildType: current
+          artifactName: 'bundles'
+          downloadPath: '$(System.ArtifactsDirectory)'
+          
+    - task: Bash@3
+      name: package_bundles
+      displayName: 'Package Bundles'
+      inputs:
+        targetType: inline
+        script: |
+          mkdir bundles_temp_dir
+          tar -xmf $(System.ArtifactsDirectory)/bundles/bundles.tar -C bundles_temp_dir
+          
+          mkdir selected_bundles
+          for file in $(echo ${{variables.APPLICATION_BINARIES}} | sed 's/nof-queue-[^,]*,//' | tr "," "\n")
+          do
+            cp bundles_temp_dir/$file selected_bundles/    
+            
+            if [ -f selected_bundles/$file ]; then
+              echo "##[debug] The copy of the $file file was successful."
+            else
+              echo "##[error] Error: The copy of the $file file failed."
+              echo "##vso[task.complete result=Failed;]"
+              echo "##vso[task.setvariable variable=INVALID_COMPONENT_TO_INSTALL;isOutput=true;]true"
+              echo "##[debug] Exporting variable 'INVALID_COMPONENT_TO_INSTALL': true"                                            
+
+              exit 1
+            fi                 
+          done
+          
+          echo "##[debug] Copy new_component"
+          cp new_component selected_bundles
+          echo "##[debug] List selected bundles:"
+          ls -la selected_bundles
+
+          echo "##vso[task.setvariable variable=INVALID_COMPONENT_TO_INSTALL;isOutput=true;]false"
+          echo "##[debug] Exporting variable 'INVALID_COMPONENT_TO_INSTALL': false"                    
+
+    - task: CopyFiles@2
+      displayName: Copy Bundles Files Staging Directory
+      inputs:
+        SourceFolder: '$(System.DefaultWorkingDirectory)/selected_bundles'
+        Contents: |
+          new_component
+          *.jar
+          *.war
+        TargetFolder: '$(Build.ArtifactStagingDirectory)'
+        CleanTargetFolder: true
+        OverWrite: true
+        flattenFolders: true
+
+    - task: PublishBuildArtifacts@1
+      displayName: Publish Bundles Artifacts
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+        ArtifactName: bundles
+        StoreAsTar: true
+
+  - deployment: ${{ parameters.qa_environment }}
+    dependsOn: 
+    - bundles_to_install
+    variables:
+      - template: /.azuredevops/config/${{ parameters.qa_environment }}/environments_variables.yml@self
+      - name: currentDate
+        value: $[ format('{0:yyyy}.{0:MM}.{0:dd}', pipeline.startTime) ]
+    condition: and(succeeded(), eq('${{ parameters.skip_deploy }}', false))
+    workspace:
+      clean: all
+    displayName: Deploy ${{ parameters.qa_environment }}
+
+    ${{ if or(contains(parameters.qa_environment, 'teste'), contains(parameters.qa_environment, 'lab')) }}:
+      environment:
+        name: "deploy-nof_lab"
+        resourceType: VirtualMachine
+    ${{ else }}:
+      environment: "deploy-${{ parameters.qa_environment }}"
+
+    strategy:
+      runOnce:      
+        deploy:
+          steps:
+          - download: none
+          - checkout: none
+
+          - task: DownloadBuildArtifacts@1
+            displayName: 'Download Pipeline Artifact'
+            inputs:
+              buildType: current
+              artifactName: 'bundles'
+              downloadPath: '$(System.ArtifactsDirectory)'
+
+          - template: /tech_products/ocs/templates/cd/smartnotifications/cd_create_backup.yml
+            parameters:
+              qa_environment: ${{ parameters.qa_environment }}
+              components_to_install: ${{ parameters.components_to_install }}
+              currentDate: ${{ variables.currentDate }}
+              BACKUP_RECEIVER_PAR_SERVERS: ${{ variables.BACKUP_RECEIVER_PAR_SERVERS }}
+              BACKUP_RECEIVER_IMPAR_SERVERS: ${{ variables.BACKUP_RECEIVER_IMPAR_SERVERS }}
+              BACKUP_RECEIVER_SERVERS: ${{ variables.BACKUP_RECEIVER_SERVERS }}
+              BACKUP_ENGINE_PAR_SERVERS: ${{ variables.BACKUP_ENGINE_PAR_SERVERS }}
+              BACKUP_ENGINE_IMPAR_SERVERS: ${{ variables.BACKUP_ENGINE_IMPAR_SERVERS }}
+              BACKUP_ENGINE_SERVERS: ${{ variables.BACKUP_ENGINE_SERVERS }}
+              BACKUP_PUBLISHER_PAR_SERVERS: ${{ variables.BACKUP_PUBLISHER_PAR_SERVERS }}
+              BACKUP_PUBLISHER_IMPAR_SERVERS: ${{ variables.BACKUP_PUBLISHER_IMPAR_SERVERS }}
+              BACKUP_PUBLISHER_SERVERS: ${{ variables.BACKUP_PUBLISHER_SERVERS }}
+              BACKUP_COLLECTOR_PAR_SERVERS: ${{ variables.BACKUP_COLLECTOR_PAR_SERVERS }}
+              BACKUP_COLLECTOR_IMPAR_SERVERS: ${{ variables.BACKUP_COLLECTOR_IMPAR_SERVERS }}
+              BACKUP_COLLECTOR_SERVERS: ${{ variables.BACKUP_COLLECTOR_SERVERS }}
+              BACKUP_CONFIGURATIONMANAGER_SERVERS: ${{ variables.BACKUP_CONFIGURATIONMANAGER_SERVERS }}
+              BACKUP_ZOOKEEPER_SERVERS: ${{ variables.BACKUP_ZOOKEEPER_SERVERS }}
+              BACKUP_KAFKA_SERVERS: ${{ variables.BACKUP_KAFKA_SERVERS }}
+              BACKUP_QUEUEMANAGER_SERVERS: ${{ variables.BACKUP_QUEUEMANAGER_SERVERS }}
+              BACKUP_ENRICHER_SERVERS: ${{ variables.BACKUP_ENRICHER_SERVERS }}
+              CLIENT_ID: ${{ variables.CLIENT_ID }}
+              CLIENT_SECRET: ${{ variables.CLIENT_SECRET }}
+              CREDENTIAL_ID1: ${{ variables.CREDENTIAL_ID1 }}
+              CREDENTIAL_ID2: ${{ variables.CREDENTIAL_ID2 }}
+              CREDENTIAL_ID3: ${{ variables.CREDENTIAL_ID3 }}
+              SMART_KEY: ${{ variables.SMART_KEY }}    
+
+          - template: /tech_products/ocs/templates/cd/smartnotifications/cd_install_bundles.yml
+            parameters:
+              qa_environment: ${{ parameters.qa_environment }}
+              components_to_install: ${{ parameters.components_to_install }}
+              currentDate: ${{ variables.currentDate }}
+              BACKUP_RECEIVER_PAR_SERVERS: ${{ variables.BACKUP_RECEIVER_PAR_SERVERS }}
+              BACKUP_RECEIVER_IMPAR_SERVERS: ${{ variables.BACKUP_RECEIVER_IMPAR_SERVERS }}
+              BACKUP_RECEIVER_SERVERS: ${{ variables.BACKUP_RECEIVER_SERVERS }}
+              BACKUP_ENGINE_PAR_SERVERS: ${{ variables.BACKUP_ENGINE_PAR_SERVERS }}
+              BACKUP_ENGINE_IMPAR_SERVERS: ${{ variables.BACKUP_ENGINE_IMPAR_SERVERS }}
+              BACKUP_ENGINE_SERVERS: ${{ variables.BACKUP_ENGINE_SERVERS }}
+              BACKUP_PUBLISHER_PAR_SERVERS: ${{ variables.BACKUP_PUBLISHER_PAR_SERVERS }}
+              BACKUP_PUBLISHER_IMPAR_SERVERS: ${{ variables.BACKUP_PUBLISHER_IMPAR_SERVERS }}
+              BACKUP_PUBLISHER_SERVERS: ${{ variables.BACKUP_PUBLISHER_SERVERS }}
+              BACKUP_COLLECTOR_PAR_SERVERS: ${{ variables.BACKUP_COLLECTOR_PAR_SERVERS }}
+              BACKUP_COLLECTOR_IMPAR_SERVERS: ${{ variables.BACKUP_COLLECTOR_IMPAR_SERVERS }}
+              BACKUP_COLLECTOR_SERVERS: ${{ variables.BACKUP_COLLECTOR_SERVERS }}
+              BACKUP_CONFIGURATIONMANAGER_SERVERS: ${{ variables.BACKUP_CONFIGURATIONMANAGER_SERVERS }}
+              BACKUP_ZOOKEEPER_SERVERS: ${{ variables.BACKUP_ZOOKEEPER_SERVERS }}
+              BACKUP_KAFKA_SERVERS: ${{ variables.BACKUP_KAFKA_SERVERS }}
+              BACKUP_QUEUEMANAGER_SERVERS: ${{ variables.BACKUP_QUEUEMANAGER_SERVERS }}
+              BACKUP_ENRICHER_SERVERS: ${{ variables.BACKUP_ENRICHER_SERVERS }}
+
+          - template: /tech_products/ocs/templates/cd/smartnotifications/cd_stop_application.yml
+            parameters:
+              qa_environment: ${{ parameters.qa_environment }}
+              components_to_install: ${{ parameters.components_to_install }}
+              version_to_install: "$(ls /opt/interfaces/nof/bin/nof-*.jar | sed 's/[^0-9.]*//g' | sed 's/.$//' | sort -V | tail -n 2 | head -n 1)"
+              currentDate: ${{ variables.currentDate }}
+              STOP_RECEIVER_PAR_SERVERS: ${{ variables.STOP_RECEIVER_PAR_SERVERS }}
+              STOP_RECEIVER_IMPAR_SERVERS: ${{ variables.STOP_RECEIVER_IMPAR_SERVERS }}
+              STOP_RECEIVER_SERVERS: ${{ variables.STOP_RECEIVER_SERVERS }}
+              STOP_ENGINE_PAR_SERVERS: ${{ variables.STOP_ENGINE_PAR_SERVERS }}
+              STOP_ENGINE_IMPAR_SERVERS: ${{ variables.STOP_ENGINE_IMPAR_SERVERS }}
+              STOP_ENGINE_SERVERS: ${{ variables.STOP_ENGINE_SERVERS }}
+              STOP_PUBLISHER_PAR_SERVERS: ${{ variables.STOP_PUBLISHER_PAR_SERVERS }}
+              STOP_PUBLISHER_IMPAR_SERVERS: ${{ variables.STOP_PUBLISHER_IMPAR_SERVERS }}
+              STOP_PUBLISHER_SERVERS: ${{ variables.STOP_PUBLISHER_SERVERS }}
+              STOP_COLLECTOR_PAR_SERVERS: ${{ variables.STOP_COLLECTOR_PAR_SERVERS }}
+              STOP_COLLECTOR_IMPAR_SERVERS: ${{ variables.STOP_COLLECTOR_IMPAR_SERVERS }}
+              STOP_COLLECTOR_SERVERS: ${{ variables.STOP_COLLECTOR_SERVERS }}
+              STOP_CONFIGURATIONMANAGER_SERVERS: ${{ variables.STOP_CONFIGURATIONMANAGER_SERVERS }}
+              STOP_ZOOKEEPER_SERVERS: ${{ variables.STOP_ZOOKEEPER_SERVERS }}
+              STOP_KAFKA_SERVERS: ${{ variables.STOP_KAFKA_SERVERS }}
+              STOP_QUEUEMANAGER_SERVERS: ${{ variables.STOP_QUEUEMANAGER_SERVERS }}
+              STOP_ENRICHER_SERVERS: ${{ variables.STOP_ENRICHER_SERVERS }}
+
+          - template: /tech_products/ocs/templates/cd/smartnotifications/cd_start_application.yml
+            parameters:
+              qa_environment: ${{ parameters.qa_environment }}
+              components_to_install: ${{ parameters.components_to_install }}
+              version_to_install: "$(ls /opt/interfaces/nof/bin/nof-*.jar | sed 's/[^0-9.]*//g' | sed 's/.$//' | sort -V | tail -n 1 | head -n 1)"
+              currentDate: ${{ variables.currentDate }}
+              START_RECEIVER_PAR_SERVERS: ${{ variables.START_RECEIVER_PAR_SERVERS }}
+              START_RECEIVER_IMPAR_SERVERS: ${{ variables.START_RECEIVER_IMPAR_SERVERS }}
+              START_RECEIVER_SERVERS: ${{ variables.START_RECEIVER_SERVERS }}
+              START_ENGINE_PAR_SERVERS: ${{ variables.START_ENGINE_PAR_SERVERS }}
+              START_ENGINE_IMPAR_SERVERS: ${{ variables.START_ENGINE_IMPAR_SERVERS }}
+              START_ENGINE_SERVERS: ${{ variables.START_ENGINE_SERVERS }}
+              START_PUBLISHER_PAR_SERVERS: ${{ variables.START_PUBLISHER_PAR_SERVERS }}
+              START_PUBLISHER_IMPAR_SERVERS: ${{ variables.START_PUBLISHER_IMPAR_SERVERS }}
+              START_PUBLISHER_SERVERS: ${{ variables.START_PUBLISHER_SERVERS }}
+              START_COLLECTOR_PAR_SERVERS: ${{ variables.START_COLLECTOR_PAR_SERVERS }}
+              START_COLLECTOR_IMPAR_SERVERS: ${{ variables.START_COLLECTOR_IMPAR_SERVERS }}
+              START_COLLECTOR_SERVERS: ${{ variables.START_COLLECTOR_SERVERS }}
+              START_CONFIGURATIONMANAGER_SERVERS: ${{ variables.START_CONFIGURATIONMANAGER_SERVERS }}
+              START_ZOOKEEPER_SERVERS: ${{ variables.START_ZOOKEEPER_SERVERS }}
+              START_KAFKA_SERVERS: ${{ variables.START_KAFKA_SERVERS }}
+              START_QUEUEMANAGER_SERVERS: ${{ variables.START_QUEUEMANAGER_SERVERS }}
+              START_ENRICHER_SERVERS: ${{ variables.START_ENRICHER_SERVERS }}
+
+  - deployment: rollback_${{ parameters.qa_environment }}
+    displayName: Rollback Bundles
+
+    dependsOn:
+    - bundles_to_install
+    - ${{ parameters.qa_environment }}
+
+    variables:
+      - template: /.azuredevops/config/${{ parameters.qa_environment }}/environments_variables.yml@self
+      - name: INVALID_COMPONENT_TO_INSTALL
+        value: $[ dependencies.bundles_to_install.outputs['package_bundles.INVALID_COMPONENT_TO_INSTALL'] ]
+      - name: currentDate
+        value: $[ format('{0:yyyy}.{0:MM}.{0:dd}', pipeline.startTime) ]
+
+    condition: and(failed(), eq(variables.INVALID_COMPONENT_TO_INSTALL, false), eq('${{ parameters.skip_deploy }}', false))
+
+    ${{ if or(contains(parameters.qa_environment, 'teste'), contains(parameters.qa_environment, 'lab')) }}:
+      environment:
+        name: "deploy-nof_lab"
+        resourceType: VirtualMachine
+    ${{ else }}:
+      environment: "deploy-${{ parameters.qa_environment }}"
+
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+            - download: none
+            - checkout: none
+
+            - template: /tech_products/ocs/templates/cd/smartnotifications/cd_rollback_binaries.yml
+              parameters:
+                qa_environment: ${{ parameters.qa_environment }}
+                components_to_install: ${{ parameters.components_to_install }}
+                currentDate: ${{ variables.currentDate }}
+                BACKUP_RECEIVER_PAR_SERVERS: ${{ variables.BACKUP_RECEIVER_PAR_SERVERS }}
+                BACKUP_RECEIVER_IMPAR_SERVERS: ${{ variables.BACKUP_RECEIVER_IMPAR_SERVERS }}
+                BACKUP_RECEIVER_SERVERS: ${{ variables.BACKUP_RECEIVER_SERVERS }}
+                BACKUP_ENGINE_PAR_SERVERS: ${{ variables.BACKUP_ENGINE_PAR_SERVERS }}
+                BACKUP_ENGINE_IMPAR_SERVERS: ${{ variables.BACKUP_ENGINE_IMPAR_SERVERS }}
+                BACKUP_ENGINE_SERVERS: ${{ variables.BACKUP_ENGINE_SERVERS }}
+                BACKUP_PUBLISHER_PAR_SERVERS: ${{ variables.BACKUP_PUBLISHER_PAR_SERVERS }}
+                BACKUP_PUBLISHER_IMPAR_SERVERS: ${{ variables.BACKUP_PUBLISHER_IMPAR_SERVERS }}
+                BACKUP_PUBLISHER_SERVERS: ${{ variables.BACKUP_PUBLISHER_SERVERS }}
+                BACKUP_COLLECTOR_PAR_SERVERS: ${{ variables.BACKUP_COLLECTOR_PAR_SERVERS }}
+                BACKUP_COLLECTOR_IMPAR_SERVERS: ${{ variables.BACKUP_COLLECTOR_IMPAR_SERVERS }}
+                BACKUP_COLLECTOR_SERVERS: ${{ variables.BACKUP_COLLECTOR_SERVERS }}
+                BACKUP_CONFIGURATIONMANAGER_SERVERS: ${{ variables.BACKUP_CONFIGURATIONMANAGER_SERVERS }}
+                BACKUP_ZOOKEEPER_SERVERS: ${{ variables.BACKUP_ZOOKEEPER_SERVERS }}
+                BACKUP_KAFKA_SERVERS: ${{ variables.BACKUP_KAFKA_SERVERS }}
+                BACKUP_QUEUEMANAGER_SERVERS: ${{ variables.BACKUP_QUEUEMANAGER_SERVERS }}
+                BACKUP_ENRICHER_SERVERS: ${{ variables.BACKUP_ENRICHER_SERVERS }}
+
+            - template: /tech_products/ocs/templates/cd/smartnotifications/cd_stop_application.yml
+              parameters:
+                qa_environment: ${{ parameters.qa_environment }}
+                components_to_install: ${{ parameters.components_to_install }}
+                version_to_install: "$(ls /opt/interfaces/nof/bin/nof-*.jar | sed 's/[^0-9.]*//g' | sed 's/.$//' | sort -V | tail -n 1 | head -n 1)"
+                currentDate: ${{ variables.currentDate }}
+                STOP_RECEIVER_PAR_SERVERS: ${{ variables.STOP_RECEIVER_PAR_SERVERS }}
+                STOP_RECEIVER_IMPAR_SERVERS: ${{ variables.STOP_RECEIVER_IMPAR_SERVERS }}
+                STOP_RECEIVER_SERVERS: ${{ variables.STOP_RECEIVER_SERVERS }}
+                STOP_ENGINE_PAR_SERVERS: ${{ variables.STOP_ENGINE_PAR_SERVERS }}
+                STOP_ENGINE_IMPAR_SERVERS: ${{ variables.STOP_ENGINE_IMPAR_SERVERS }}
+                STOP_ENGINE_SERVERS: ${{ variables.STOP_ENGINE_SERVERS }}
+                STOP_PUBLISHER_PAR_SERVERS: ${{ variables.STOP_PUBLISHER_PAR_SERVERS }}
+                STOP_PUBLISHER_IMPAR_SERVERS: ${{ variables.STOP_PUBLISHER_IMPAR_SERVERS }}
+                STOP_PUBLISHER_SERVERS: ${{ variables.STOP_PUBLISHER_SERVERS }}
+                STOP_COLLECTOR_PAR_SERVERS: ${{ variables.STOP_COLLECTOR_PAR_SERVERS }}
+                STOP_COLLECTOR_IMPAR_SERVERS: ${{ variables.STOP_COLLECTOR_IMPAR_SERVERS }}
+                STOP_COLLECTOR_SERVERS: ${{ variables.STOP_COLLECTOR_SERVERS }}
+                STOP_CONFIGURATIONMANAGER_SERVERS: ${{ variables.STOP_CONFIGURATIONMANAGER_SERVERS }}
+                STOP_ZOOKEEPER_SERVERS: ${{ variables.STOP_ZOOKEEPER_SERVERS }}
+                STOP_KAFKA_SERVERS: ${{ variables.STOP_KAFKA_SERVERS }}
+                STOP_QUEUEMANAGER_SERVERS: ${{ variables.STOP_QUEUEMANAGER_SERVERS }}
+                STOP_ENRICHER_SERVERS: ${{ variables.STOP_ENRICHER_SERVERS }}
+
+            - template: /tech_products/ocs/templates/cd/smartnotifications/cd_start_application.yml
+              parameters:
+                qa_environment: ${{ parameters.qa_environment }}
+                components_to_install: ${{ parameters.components_to_install }}
+                version_to_install: "$(ls /opt/interfaces/nof/bin/nof-*.jar | sed 's/[^0-9.]*//g' | sed 's/.$//' | sort -V | tail -n 2 | head -n 1)"
+                currentDate: ${{ variables.currentDate }}
+                START_RECEIVER_PAR_SERVERS: ${{ variables.START_RECEIVER_PAR_SERVERS }}
+                START_RECEIVER_IMPAR_SERVERS: ${{ variables.START_RECEIVER_IMPAR_SERVERS }}
+                START_RECEIVER_SERVERS: ${{ variables.START_RECEIVER_SERVERS }}
+                START_ENGINE_PAR_SERVERS: ${{ variables.START_ENGINE_PAR_SERVERS }}
+                START_ENGINE_IMPAR_SERVERS: ${{ variables.START_ENGINE_IMPAR_SERVERS }}
+                START_ENGINE_SERVERS: ${{ variables.START_ENGINE_SERVERS }}
+                START_PUBLISHER_PAR_SERVERS: ${{ variables.START_PUBLISHER_PAR_SERVERS }}
+                START_PUBLISHER_IMPAR_SERVERS: ${{ variables.START_PUBLISHER_IMPAR_SERVERS }}
+                START_PUBLISHER_SERVERS: ${{ variables.START_PUBLISHER_SERVERS }}
+                START_COLLECTOR_PAR_SERVERS: ${{ variables.START_COLLECTOR_PAR_SERVERS }}
+                START_COLLECTOR_IMPAR_SERVERS: ${{ variables.START_COLLECTOR_IMPAR_SERVERS }}
+                START_COLLECTOR_SERVERS: ${{ variables.START_COLLECTOR_SERVERS }}
+                START_CONFIGURATIONMANAGER_SERVERS: ${{ variables.START_CONFIGURATIONMANAGER_SERVERS }}
+                START_ZOOKEEPER_SERVERS: ${{ variables.START_ZOOKEEPER_SERVERS }}
+                START_KAFKA_SERVERS: ${{ variables.START_KAFKA_SERVERS }}
+                START_QUEUEMANAGER_SERVERS: ${{ variables.START_QUEUEMANAGER_SERVERS }}
+                START_ENRICHER_SERVERS: ${{ variables.START_ENRICHER_SERVERS }}
+
+  - job: manual_rollback_${{ parameters.qa_environment }}
+    displayName: Manual Rollback Bundles
+    pool: server
+    dependsOn:
+    - bundles_to_install
+    - ${{ parameters.qa_environment }}
+    - rollback_${{ parameters.qa_environment }}
+    condition: and( 
+                  failed('rollback_${{ parameters.qa_environment }}'),
+                  eq('${{ parameters.skip_deploy }}', false)
+                )
+    steps:
+    - task: ManualValidation@0
+      inputs:
+        notifyUsers: 'vinicius.silva1@telefonica.com'
+        instructions: 'Instruções: service conn '
+        onTimeout: 'resume'
+
+  - job: governance_deploy
+    displayName: Governance Deploy
+    pool: $(PRIVATE_AGENT_DEFAULT)
+    
+    dependsOn: 
+    - ${{ parameters.qa_environment }}
+    condition: and(succeeded(), eq('${{ parameters.skip_deploy }}', false))    
+    steps:
+    - download: none 
+    - checkout: self
+
+    - script: |
+        if [ ! -f "catalog-info.yaml" ]; then
+          echo "##vso[task.logissue type=error] Unable to find catalog-info.yaml file (path=$(pwd))."
+        fi
+
+        COMPONENT_NAME="$(yq -r 'select(documentIndex == 0) | .metadata.name | select (.!=null)' catalog-info.yaml)"
+        echo "##vso[task.setvariable variable=COMPONENT_NAME]${COMPONENT_NAME}"
+        echo "##vso[task.setvariable variable=CATALOG_INFO_FILE_CONTENT]$(cat catalog-info.yaml)"
+      name: export_catalog_info
+      displayName: Reading Catalog Info File
+
+    - bash: |
+        version=$(grep version pom.xml | grep -v '<?xml' | grep '<version>'|head -n 1|awk '{print $1}'| cut -d'>' -f 2 | cut -d'<' -f 1)
+        echo "##vso[task.setvariable variable=APP_VERSION]$version"
+        echo "##[debug] Exporting variable 'APP_VERSION': $version"
+      name: export_current_version
+      displayName: Extract App Version 
+
+    ## DEPLOY TO PROD
+    - ${{ if startsWith(parameters.qa_environment, 'producao_') }}:
+      - task: VivoGovernance@1
+        inputs:
+          breakglass: $(GOVAPP_BREAK_GLASS)
+          cluster: "$(GOVAPP_CLUSTER)"
+          component: "$(COMPONENT_NAME)"
+          deployment: "$(COMPONENT_NAME)"
+          environment: "producao"
+          namespace: "$(GOVAPP_NAMESPACE)"
+          operation: "deploy"
+          serverEndpoint: $(GOVAPP_SERVICE_CONNECTION_NAME)
+          version: "$(APP_VERSION)"
+          catalogInfo: $(CATALOG_INFO_FILE_CONTENT)
+        continueOnError: true
+        condition: eq(lower(variables.GOVAPP_INTEGRATION_ENABLED), 'true')
+
+    - ${{ else }}:
+      - task: VivoGovernance@1
+        inputs:
+          breakglass: $(GOVAPP_BREAK_GLASS)
+          cluster: "$(GOVAPP_CLUSTER)"
+          component: "$(COMPONENT_NAME)"
+          deployment: "$(COMPONENT_NAME)"
+          environment: "${{ parameters.qa_environment }}"
+          namespace: "$(GOVAPP_NAMESPACE)"
+          operation: "deploy"
+          serverEndpoint: $(GOVAPP_SERVICE_CONNECTION_NAME)
+          version: "$(APP_VERSION)"
+          catalogInfo: $(CATALOG_INFO_FILE_CONTENT)
+        continueOnError: true
+        condition: eq(lower(variables.GOVAPP_INTEGRATION_ENABLED), 'true')

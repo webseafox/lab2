@@ -1,0 +1,252 @@
+parameters:
+- name: environment
+- name: parity
+  type: string
+  default: ''
+steps:
+
+  ## -> Skip Download
+  - download: none
+
+  ## -> Checkout the source code.
+  - checkout: self
+    displayName: Checkout Source Code
+    name: checkout_source_code
+    clean: true
+    path: source_code
+    submodules: recursive
+
+  - task: Bash@3
+    displayName: Stop Start Set Up
+    inputs:
+      targetType: 'inline'
+      script: |
+
+        echo "##vso[task.setvariable variable=PARITY_LOWER]$(echo ${{ parameters.parity }} | tr '[:upper:]' '[:lower:]')"
+        
+        if [ "${{ parameters.parity }}" == "EVEN" ]; then
+          echo "##[warning] Properties file was already transfered on ODD restart servers job..."
+          echo "##[warning] Setting TRANSFER_FILE_DONE variable to prevent redundant backups and transfers..."
+          echo "##[debug] TRANSFER_FILE_DONE: true"
+          echo "##vso[task.setvariable variable=TRANSFER_FILE_DONE]true"
+        fi
+
+  - task: LegacySSH@0
+    displayName: Get Weblogic Servers Info - ${{ parameters.parity }}
+    condition: succeeded()
+    continueOnError: true
+    inputs:
+      sshEndpoint: 'weblogic_${{ parameters.environment }}'
+      runOptions: 'commands'
+      commands: >
+          sudo -u weblogic /opt/web/wl/current/oracle_common/common/bin/wlst.sh
+          $(WEBLOGIC_SCRIPTS_SERVER_PATH)/python/GetMachinesInfo.py
+          $(WEBLOGIC_USER)
+          $(WEBLOGIC_PASS)
+          $(WEBLOGIC_ADMIN_SERVER_URL)
+          $(WEBLOGIC_SCRIPTS_SERVER_PATH)
+          $(PARITY_LOWER)
+      readyTimeout: '60000'
+
+  - task: Bash@3
+    displayName: Capture and Process Output
+    inputs:
+      targetType: 'inline'
+      script: |
+
+         echo "##[debug] Capturing output from previous tasks..."
+
+          sshOutput=$(sshpass -p $(WEBLOGIC_SSH_PASS) ssh -o StrictHostKeyChecking=no $(WEBLOGIC_SSH_USER)@$(WEBLOGIC_ADMIN_SERVER_IP) 'cat $(WEBLOGIC_SCRIPTS_SERVER_PATH)/weblogic_machines_info.txt')
+          if [ $? -ne 0 ]; then
+            echo "##[error] Failed to capture output from SSH command."
+            echo "##[error] Check if WEBLOGIC_SSH_USER and WEBLOGIC_SSH_PASS are correctly added and filled in the library variables."
+            echo "##[error] WEBLOGIC_SSH_USER and WEBLOGIC_SSH_PASS must use the OS (Operating System) user."
+            exit 1
+          fi
+
+          if [ -z "$sshOutput" ]; then
+              echo "##[error] Captured output is empty or blank."
+              echo "##[error] Failed to capture output from SSH command."
+              echo "##[error] The last task probably failed to authenticate within the script or there is an internal problem in WebLogic Admin Server."
+              echo "##[error] Check if WEBLOGIC_USER and WEBLOGIC_PASS are correctly added and filled in the library variables."
+              echo "##[error] WEBLOGIC_USER and WEBLOGIC_PASS must use the WebLogic Console user."
+            exit 1
+          fi
+
+          echo "$sshOutput" > weblogic_machines_info.txt
+
+          echo "##[debug] Contents of weblogic_machines_info.txt"
+          cat weblogic_machines_info.txt
+
+  - task: LegacySSH@0
+    displayName: Shutdown Servers - ${{ parameters.parity }}
+    continueOnError: true
+    inputs:
+      sshEndpoint: weblogic_${{ parameters.environment }}
+      runOptions: 'commands'
+      commands: >
+          sudo -u weblogic /opt/web/wl/current/oracle_common/common/bin/wlst.sh
+          $(WEBLOGIC_SCRIPTS_SERVER_PATH)/python/ShutdownServers.py
+          $(WEBLOGIC_USER)
+          $(WEBLOGIC_PASS)
+          $(WEBLOGIC_ADMIN_SERVER_URL)
+          $(WEBLOGIC_TIMEOUT)
+          $(PARITY_LOWER)
+      readyTimeout: '60000'
+
+  - task: Bash@3
+    displayName: Backup Properties - ${{ parameters.parity }}
+    name: backup_properties
+    condition: and(
+        succeeded(),
+        ne(variables['ALL_AVAILABLE_PROPERTIES'], ''),
+        eq(variables['TRANSFER_FILE_DONE'], ''))
+    inputs:
+      targetType: 'inline'
+      script: |
+
+          backup_properties() {
+            local server_ip=$1
+            local file_path=$2
+            local file_name=$3
+            local new_file_name=$4
+            echo "##[debug] Starting SSH to $server_ip ..."
+            sshpass -p $(WEBLOGIC_SSH_PASS) ssh -T -o StrictHostKeyChecking=no $(WEBLOGIC_SSH_USER)@$server_ip  <<- ENDSSH
+              cd $file_path
+              if [ -f $file_name ]; then
+                mv $file_name $new_file_name
+                echo "##[debug] Properties file $file_name found and backed up as $new_file_name."
+              else
+                echo "##[error] No properties file found on server $server_ip."
+                exit 1
+              fi
+          ENDSSH
+          }
+          
+          newFileNameSuffix=$(date +"%d%m%Y%H%M")
+          filePath=$(WEBLOGIC_PROPERTIES_SERVER_PATH)
+
+          echo "##[debug] Starting backup of properties files ..."
+          echo "##[debug] Backup at folder:" $filePath
+
+          IFS=',' read -ra propertiesFiles <<< "$(ALL_AVAILABLE_PROPERTIES)"
+          for propertiesFile in "${propertiesFiles[@]}"; do
+            
+            propertiesFileNewName="${propertiesFile}_${newFileNameSuffix}"
+
+            echo "##[group] $propertiesFile"
+            echo "##[debug] New properties file name: $propertiesFileNewName"
+            while IFS=';' read -r domain_name server_name server_alias server_ip; do
+              echo "##[section] Connecting to server $server_name (domain: $domain_name, IP: $server_ip)"
+              backup_properties $server_ip $filePath $propertiesFile $propertiesFileNewName
+              if [ $? -ne 0 ]; then
+                echo "##[error] Failed to backup file on server $server_name (domain: $domain_name, IP: $server_ip)."
+              else
+                echo "##[debug] Properties file backed up on server $server_name (domain: $domain_name, IP: $server_ip)"
+              fi
+            done < weblogic_machines_info.txt
+            echo "##[endgroup]"
+          done
+
+  - task: qetza.replacetokens.replacetokens-task.replacetokens@5
+    displayName: 'Configuring properties file'
+    condition: and(
+        succeeded(),
+        ne(variables['ALL_AVAILABLE_PROPERTIES'], ''),
+        eq(variables['TRANSFER_FILE_DONE'], ''))
+    inputs:
+        targetFiles: '$(ALL_AVAILABLE_PROPERTIES)'
+        rootDirectory: '$(DEFAULT_WORKDIR_WEBLOGIC_CONFIG)/${{ parameters.environment }}/'
+    env:
+        NEXUS_DEPS_USR: $(NEXUS_DEPS_USR)
+
+  - task: Bash@3
+    displayName: Transferring Properties - ${{ parameters.parity }}
+    name: transfer_properties
+    condition: and(
+        succeeded(),
+        ne(variables['ALL_AVAILABLE_PROPERTIES'], ''),
+        eq(variables['TRANSFER_FILE_DONE'], ''))
+    inputs:
+      targetType: 'inline'
+      script: |
+
+          transfer_properties() {
+            local server_ip=$1
+            local fileToTransfer=$2
+            local targetFolder=$3
+            echo "##[debug] Starting SCP to $server_ip for file $fileToTransfer ..."
+            sshpass -p $(WEBLOGIC_SSH_PASS) scp -o StrictHostKeyChecking=no -r $fileToTransfer $(WEBLOGIC_SSH_USER)@$server_ip:$targetFolder
+          }
+
+          echo "##[debug] Starting transfer of properties files ..."
+          fromPropertiesPath="$(DEFAULT_WORKDIR_WEBLOGIC_CONFIG)/${{ parameters.environment }}/"
+          targetFolder=$(WEBLOGIC_PROPERTIES_SERVER_PATH)
+
+          IFS=',' read -ra propertiesFiles <<< "$(ALL_AVAILABLE_PROPERTIES)"
+          for propertiesFile in "${propertiesFiles[@]}"; do
+            
+            fileToTransfer=$(find $fromPropertiesPath -name "$propertiesFile")
+            
+            echo "##[group] $propertiesFile"
+            echo "##[debug] File to transfer: $fileToTransfer"
+            while IFS=';' read -r domain_name server_name server_alias server_ip; do
+              echo "##[section] Connecting to server $server_name (domain: $domain_name, IP: $server_ip)"
+              transfer_properties $server_ip $fileToTransfer $targetFolder
+              if [ $? -ne 0 ]; then
+                echo "##[error] Failed to transfer properties file $propertiesFile to server $server_name (domain: $domain_name, IP: $server_ip)."
+                exit 1
+              else
+                echo "##[debug] Properties file $propertiesFile successfully transferred to server $server_ip"
+              fi
+            done < weblogic_machines_info.txt
+            echo "##[endgroup]"
+          done
+
+  - task: Bash@3
+    displayName: Clear Servers Cache - ${{ parameters.parity }}
+    condition: and(
+        succeeded(),
+        ne(variables['ALL_AVAILABLE_PROPERTIES'], ''))
+    inputs:
+      targetType: 'inline'
+      script: |
+        clear_cache() {
+          local server_ip=$1
+          local domain_name=$2
+          local server_name=$3
+          echo "##[debug] Starting SSH to $server_ip ..."
+          sshpass -p $(WEBLOGIC_SSH_PASS) ssh -T -o StrictHostKeyChecking=no $WEBLOGIC_SSH_USER@$server_ip <<- ENDSSH
+            echo "##[warning] Executing /opt/web/scripts/jvm_cache_clean.sh"
+            echo "##[warning] This script is maintained by the Middleware team"
+            sudo -u weblogic /opt/web/scripts/jvm_cache_clean.sh $domain_name $server_name
+        ENDSSH
+        }
+        
+        echo "##[debug] Starting to clear weblogic's cache, stage and tmp folders..."
+        while IFS=';' read -r domain_name server_name server_alias server_ip; do
+          echo "##[section] Connecting to server $server_name (domain: $domain_name, IP: $server_ip)"
+          clear_cache $server_ip $domain_name $server_name
+          if [ $? -ne 0 ]; then
+            echo "##[error] Failed to clear cache on server $server_name (domain: $domain_name, IP: $server_ip)."
+            exit 1
+          else
+            echo "##[debug] Environment clean for server $server_name (domain: $domain_name, IP: $server_ip)"
+          fi
+        done < weblogic_machines_info.txt
+
+  - task: LegacySSH@0
+    displayName: Start Servers - ${{ parameters.parity }} - Post Shutdown
+    condition: always()
+    continueOnError: true
+    inputs:
+      sshEndpoint: weblogic_${{ parameters.environment }}
+      runOptions: 'commands'
+      commands: >
+          sudo -u weblogic /opt/web/wl/current/oracle_common/common/bin/wlst.sh
+          $(WEBLOGIC_SCRIPTS_SERVER_PATH)/python/StartServers.py
+          $(WEBLOGIC_USER)
+          $(WEBLOGIC_PASS)
+          $(WEBLOGIC_ADMIN_SERVER_URL)
+          $(WEBLOGIC_TIMEOUT)
+      readyTimeout: '60000'

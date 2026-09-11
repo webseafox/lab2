@@ -1,0 +1,98 @@
+﻿parameters:
+- name: sourceRepo
+  type: string
+  default: "self"
+- name: sourceRef
+  type: string
+  default: $(Build.SourceBranchName)
+- name: typeRef
+  type: string
+  default: heads
+- name: targetRepo
+  type: string
+- name: targetBranches
+  type: object
+- name: commitMsg
+  type: string
+  default: "Added pipeline configuration"
+- name: files
+  type: object
+  default:
+    .azuredevops/**/*
+    catalog-info.yaml
+- name: search
+  type: string
+  default: "[component_name]"
+- name: replace
+  type: string
+- name: path
+  type: object
+  default:
+    .azuredevops/**/*
+    catalog-info.yaml
+
+steps:
+- checkout: ${{ parameters.sourceRepo }}
+  persistCredentials: true
+  path: sourceRepo
+  fetchDepth: 0
+
+- checkout: git://$(System.TeamProject)/${{parameters.targetRepo}}
+  persistCredentials: true
+  path: targetRepo
+  fetchDepth: 0
+
+- script: |
+    #!/bin/bash
+    git checkout ${{ parameters.sourceRef }}
+
+    # Cria uma pasta temporária para os arquivos selecionados
+    TEMP_DIR=$(mktemp -d)
+    
+    # Copia os arquivos selecionados para a pasta temporária
+    for file in ${{ parameters.files }}; do
+        git ls-files -- $file | xargs -I {} cp -rv {} $TEMP_DIR
+    done
+    echo $(ls -lR $TEMP_DIR)
+  displayName: "Copiar Arquivos do Branch de Origem"
+  workingDirectory: $(Pipeline.Workspace)/sourceRepo
+
+- script: |
+    #!/bin/bash
+    SEARCH_STRING="${{ parameters.search }}"
+    REPLACE_STRING="${{ parameters.replace }}"
+    IFS=$'\n' read -d '' -ra FILES <<< "$(find $TEMP_DIR/${{ parameters.path }})"
+
+    for file in "${FILES[@]}"; do
+        if grep -q "$SEARCH_STRING" "$file"; then
+            sed -i "s/$SEARCH_STRING/$REPLACE_STRING/g" "$file"
+        fi
+    done
+  displayName: "Preparar Arquivos de Configuração"
+  workingDirectory: $(Pipeline.Workspace)/sourceRepo
+
+- script: |
+    #!/bin/bash
+    git config user.email "ecomb2b.devops@telefonicati.onmicrosoft.com"
+    git config user.name "DevOps AEM Pipeline "
+    # Verifica e cria o branch se não existir, depois aplica os arquivos
+    for branch in ${{ parameters.targetBranches }}
+    do
+        if git rev-parse --verify $branch; then
+            git checkout $branch
+        else
+            git checkout -b $branch
+        fi
+        cp -r $(Pipeline.Workspace)/sourceRepo/$TEMP_DIR/* .
+        git add .
+        git commit -am "${{ parameters.commitMsg }}"
+        git push origin $branch
+    done
+  displayName: "Copiar Arquivos Selecionados para Branches"
+  workingDirectory: $(Pipeline.Workspace)/targetRepo
+
+- script: |
+    # Limpa
+    rm -rf sourceRepo targetRepo
+  displayName: Cleanup
+  workingDirectory: $(Pipeline.Workspace)

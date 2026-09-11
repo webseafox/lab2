@@ -1,0 +1,105 @@
+parameters:
+- name: packageVersion
+  type: string
+  default: ''
+
+stages:
+- stage: environment_init
+  displayName: "Initializing Pipeline"
+  jobs:
+  - job: environment
+    displayName: "Setup Environment"
+    pool:
+      name: GeneralPurposeLinuxAgentsCI
+    steps:
+    ## -> Validate parameters
+    - task: Bash@3
+      displayName: "Validate Params"
+      name: validate_parameters
+      condition: succeeded()
+      continueOnError: false
+      inputs:
+        targetType: inline
+        script: |
+
+          packageVersion="${{ parameters.packageVersion }}"
+          
+          if [[ "$packageVersion" =~ ^[[:space:]]+ || "$packageVersion" =~ [[:space:]]+$ ]]; then
+            echo "##[error] Parameter packageVersion contain spaces. Please check and rerun."
+            exit 1
+          else
+            echo "##[debug] Parameters are OK."
+          fi
+
+    ## -> Clean the pipeline workspace and checkout the code.
+    - checkout: self
+      displayName: "Checkout Code"
+      name: checkout_code
+      submodules: true
+      persistCredentials: true
+      path: source_code
+
+    ## -> Checkout the working branch.
+    - task: Bash@3
+      displayName: "Checkout Commit"
+      name: checkout_last_commit
+      condition: succeeded()
+      continueOnError: false
+      inputs:
+        workingDirectory: $(Agent.BuildDirectory)/source_code
+        targetType: inline
+        script: |
+          echo "##[debug] Checkout Branch '$(Build.SourceBranch)'"
+          
+          git config pull.rebase true
+          git fetch -f --depth 1 origin $(Build.SourceBranch):$(Build.SourceBranch)
+          git checkout -f $(Build.SourceBranch)
+
+    ## -> Initialize Catalog-Info
+    - template: /tech_products/hrcl/templates/common/initialize/catalog-info_environment.yml
+      parameters:
+        workingDirectory: $(Agent.BuildDirectory)/source_code
+
+    ## -> Download NEXUS Credentials
+    - task: AzureKeyVault@2
+      displayName: 'Get AKV Secrets'
+      timeoutInMinutes: 1
+      retryCountOnTaskFailure: 5
+      inputs:
+        workingDirectory: $(Agent.BuildDirectory)/source_code
+        azureSubscription: DevOpsSharedResources
+        KeyVaultName: $(AKV_DEVOPS_NAME)
+        SecretsFilter: 'NEXUS-DEPS-USR, NEXUS-DEPS-PSW, NEXUS-DEFAULT-USR, NEXUS-DEFAULT-PSW'
+
+    ## -> Set NEXUS credentials to variables. This allows it to used in other stages, jobs or tasks.
+    ## -> NEXUS_DEPS_USR and NEXUS_DEPS_PSW, use these to download dependencies.
+    ## -> NEXUS_DEFAULT_USR and NEXUS_DEFAULT_PSW, use these to upload artifacts.
+    - task: Bash@3
+      displayName: 'Set Secrets Vars'
+      name: credentials
+      condition: and(
+        succeeded(),
+        ne(variables['NEXUS-DEPS-USR'], ''), ne(variables['NEXUS-DEPS-PSW'], ''),
+        ne(variables['NEXUS-DEFAULT-USR'], ''), ne(variables['NEXUS-DEFAULT-PSW'], ''))
+      continueOnError: false
+      inputs:
+        workingDirectory: $(Agent.BuildDirectory)/source_code
+        targetType: 'inline'
+        script: |
+          echo "##[group] Variables to DOWNLOAD dependencies from NEXUS"
+          echo "##[debug] NEXUS-DEPS-USR: $(NEXUS-DEPS-USR). Use as >> NEXUS_DEPS_USR."
+          echo "##vso[task.setvariable variable=NEXUS_DEPS_USR;isOutput=true;isSecret=true]$(NEXUS-DEPS-USR)"
+          echo "##[debug] NEXUS-DEPS-PSW: $(NEXUS-DEPS-PSW). Use as >> NEXUS_DEPS_PSW"
+          echo "##vso[task.setvariable variable=NEXUS_DEPS_PSW;isOutput=true;isSecret=true]$(NEXUS-DEPS-PSW)"
+          echo "##[endgroup]"
+
+          echo "##[group] Variables to PUBLISH artifacts to NEXUS"
+          echo "##[debug] NEXUS-DEFAULT-USR: $(NEXUS-DEFAULT-USR). Use as >> NEXUS_DEFAULT_USR"
+          echo "##vso[task.setvariable variable=NEXUS_DEFAULT_USR;isOutput=true;isSecret=true]$(NEXUS-DEFAULT-USR)"
+          echo "##[debug] NEXUS-DEFAULT-PSW: $(NEXUS-DEFAULT-PSW). Use as >> NEXUS_DEFAULT_PSW"
+          echo "##vso[task.setvariable variable=NEXUS_DEFAULT_PSW;isOutput=true;isSecret=true]$(NEXUS-DEFAULT-PSW)"
+          echo "##[endgroup]"
+          echo "##[debug] To open and check the information above, click the arrows on the left."
+
+        KeyVaultName: $(AKV_DEVOPS_NAME)
+        SecretsFilter: 'NEXUS-DEPS-USR, NEXUS-DEPS-PSW, NEXUS-DEFAULT-USR, NEXUS-DEFAULT-PSW'

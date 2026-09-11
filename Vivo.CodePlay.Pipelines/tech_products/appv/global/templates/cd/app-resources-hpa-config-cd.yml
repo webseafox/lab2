@@ -1,0 +1,242 @@
+parameters:
+  - name: setEnvironment
+    type: string
+    displayName: "Target Environment for Resources"
+  - name: resourcesAndHpaValues
+    type: object
+    displayName: "Resources and HPA Values (CPU, Memory, Replicas)"
+
+steps:
+  - task: Bash@3
+    displayName: Pull Manifests from GitOps Repository
+    name: pull_gitops_manifests
+    inputs:
+      targetType: inline
+      script: |
+        echo "##[debug] Pulling manifests from GitOps repository for environment: $(remap_env.REMAPPED_ENVIRONMENT)"
+
+        GITOPS_PATH="$(Pipeline.Workspace)/gitops/src/$(remap_env.REMAPPED_ENVIRONMENT)/apps/$(APPLICATION_NAME)/manifests.yaml"
+        echo "##[debug] Constructed GitOps path: $GITOPS_PATH"
+
+        echo "##[debug] GitOps path exists: $GITOPS_PATH"
+        echo "##[debug] Listing contents of GitOps path:"
+        ls -la "$GITOPS_PATH"
+
+        echo "##vso[task.setvariable variable=MANIFESTS_FILE]$GITOPS_PATH"
+        echo "##[group] Manifests File Content"
+        cat "$GITOPS_PATH"
+        echo "##[endgroup]"
+
+  - task: Bash@3
+    displayName: Validate Params for Empty Strings
+    name: validate_resources_and_hpa_params
+    inputs:
+      targetType: inline
+      script: |
+        fail=false
+
+        echo "##[debug] Parameter value should be a valid value or the keyword 'unchanged'."
+        check_empty() {
+          value="$1"; desc="$2"
+          echo "##[debug] resourcesAndHpaValues.$desc: $value"
+          if [ "$value" = '' ]; then
+            echo "##vso[task.logissue type=error] resourcesAndHpaValues.$desc is set to empty string (''). This indicates invalid YAML format: check for invalid indentation/nesting in input."
+            fail=true
+          fi
+        }
+
+        check_empty '${{ parameters.resourcesAndHpaValues.resources.requests.cpu }}' "resources.requests.cpu"
+        check_empty '${{ parameters.resourcesAndHpaValues.resources.requests.memory }}' "resources.requests.memory"
+        check_empty '${{ parameters.resourcesAndHpaValues.resources.limits.cpu }}' "resources.limits.cpu"
+        check_empty '${{ parameters.resourcesAndHpaValues.resources.limits.memory }}' "resources.limits.memory"
+        check_empty '${{ parameters.resourcesAndHpaValues.hpa.minReplicas }}' "hpa.minReplicas"
+        check_empty '${{ parameters.resourcesAndHpaValues.hpa.maxReplicas }}' "hpa.maxReplicas"
+        check_empty '${{ parameters.resourcesAndHpaValues.hpa.targetCPUUtilizationPercentage }}' "hpa.targetCPUUtilizationPercentage"
+        check_empty '${{ parameters.resourcesAndHpaValues.hpa.targetMemoryUtilizationPercentage }}' "hpa.targetMemoryUtilizationPercentage"
+
+        if [ "$fail" = true ]; then
+          exit 1
+        fi
+
+        echo "##[debug] Input resource and HPA values not set to empty string ('')"
+
+  - task: Bash@3
+    displayName: Extract and Merge Resource and HPA Values
+    name: merge_values
+    inputs:
+      targetType: inline
+      script: |
+        echo "##[debug] Merging parameters with manifests values file: $(MANIFESTS_FILE)"
+
+        MANIFESTS_FILE="$(MANIFESTS_FILE)"
+        APP_NAME="$(APPLICATION_NAME)"
+
+        PARAM_CPU_REQ="${{ parameters.resourcesAndHpaValues.resources.requests.cpu }}"
+        PARAM_MEM_REQ="${{ parameters.resourcesAndHpaValues.resources.requests.memory }}"
+        PARAM_CPU_LIM="${{ parameters.resourcesAndHpaValues.resources.limits.cpu }}"
+        PARAM_MEM_LIM="${{ parameters.resourcesAndHpaValues.resources.limits.memory }}"
+        PARAM_HPA_MIN="${{ parameters.resourcesAndHpaValues.hpa.minReplicas }}"
+        PARAM_HPA_MAX="${{ parameters.resourcesAndHpaValues.hpa.maxReplicas }}"
+        PARAM_HPA_CPU_TARGET="${{ parameters.resourcesAndHpaValues.hpa.targetCPUUtilizationPercentage }}"
+        PARAM_HPA_MEM_TARGET="${{ parameters.resourcesAndHpaValues.hpa.targetMemoryUtilizationPercentage }}"
+
+        echo "##[debug] Splitting multi-document YAML for container: $APP_NAME"
+
+        DEPLOYMENT_FILE="/tmp/deployment-${APP_NAME}-$$.yaml"
+        HPA_FILE="/tmp/hpa-${APP_NAME}-$$.yaml"
+
+        yq eval-all 'select(.kind == "Deployment")' "$MANIFESTS_FILE" > "$DEPLOYMENT_FILE"
+        yq eval-all 'select(.kind == "HorizontalPodAutoscaler")' "$MANIFESTS_FILE" > "$HPA_FILE"
+
+        echo "##[debug] Split files created: $DEPLOYMENT_FILE, $HPA_FILE"
+
+        FILE_CPU_REQ=$(yq eval ".spec.template.spec.containers[] | select(.name == \"$APP_NAME\") | .resources.requests.cpu // \"\"" "$DEPLOYMENT_FILE")
+        FILE_MEM_REQ=$(yq eval ".spec.template.spec.containers[] | select(.name == \"$APP_NAME\") | .resources.requests.memory // \"\"" "$DEPLOYMENT_FILE")
+        FILE_CPU_LIM=$(yq eval ".spec.template.spec.containers[] | select(.name == \"$APP_NAME\") | .resources.limits.cpu // \"\"" "$DEPLOYMENT_FILE")
+        FILE_MEM_LIM=$(yq eval ".spec.template.spec.containers[] | select(.name == \"$APP_NAME\") | .resources.limits.memory // \"\"" "$DEPLOYMENT_FILE")
+
+        FILE_HPA_MIN=$(yq eval '.spec.minReplicas // ""' "$HPA_FILE")
+        FILE_HPA_MAX=$(yq eval '.spec.maxReplicas // ""' "$HPA_FILE")
+        FILE_HPA_CPU_TARGET=$(yq eval '.spec.metrics[] | select(.resource.name == "cpu") | .resource.target.averageUtilization // ""' "$HPA_FILE")
+        FILE_HPA_MEM_TARGET=$(yq eval '.spec.metrics[] | select(.resource.name == "memory") | .resource.target.averageUtilization // ""' "$HPA_FILE")
+
+        rm -f "$DEPLOYMENT_FILE" "$HPA_FILE"
+        echo "##[debug] Cleaned up temporary files"
+
+        FINAL_CPU_REQ=$(echo "$FILE_CPU_REQ" | xargs); [[ "$PARAM_CPU_REQ" != "unchanged" && -n "$PARAM_CPU_REQ" ]] && FINAL_CPU_REQ=$(echo "$PARAM_CPU_REQ" | xargs)
+        FINAL_MEM_REQ=$(echo "$FILE_MEM_REQ" | xargs); [[ "$PARAM_MEM_REQ" != "unchanged" && -n "$PARAM_MEM_REQ" ]] && FINAL_MEM_REQ=$(echo "$PARAM_MEM_REQ" | xargs)
+        FINAL_CPU_LIM=$(echo "$FILE_CPU_LIM" | xargs); [[ "$PARAM_CPU_LIM" != "unchanged" && -n "$PARAM_CPU_LIM" ]] && FINAL_CPU_LIM=$(echo "$PARAM_CPU_LIM" | xargs)
+        FINAL_MEM_LIM=$(echo "$FILE_MEM_LIM" | xargs); [[ "$PARAM_MEM_LIM" != "unchanged" && -n "$PARAM_MEM_LIM" ]] && FINAL_MEM_LIM=$(echo "$PARAM_MEM_LIM" | xargs)
+        FINAL_HPA_MIN=$(echo "$FILE_HPA_MIN" | xargs); [[ "$PARAM_HPA_MIN" != "unchanged" && -n "$PARAM_HPA_MIN" ]] && FINAL_HPA_MIN=$(echo "$PARAM_HPA_MIN" | xargs)
+        FINAL_HPA_MAX=$(echo "$FILE_HPA_MAX" | xargs); [[ "$PARAM_HPA_MAX" != "unchanged" && -n "$PARAM_HPA_MAX" ]] && FINAL_HPA_MAX=$(echo "$PARAM_HPA_MAX" | xargs)
+        FINAL_HPA_CPU_TARGET=$(echo "$FILE_HPA_CPU_TARGET" | xargs); [[ "$PARAM_HPA_CPU_TARGET" != "unchanged" && -n "$PARAM_HPA_CPU_TARGET" ]] && FINAL_HPA_CPU_TARGET=$(echo "$PARAM_HPA_CPU_TARGET" | xargs)
+        FINAL_HPA_MEM_TARGET=$(echo "$FILE_HPA_MEM_TARGET" | xargs); [[ "$PARAM_HPA_MEM_TARGET" != "unchanged" && -n "$PARAM_HPA_MEM_TARGET" ]] && FINAL_HPA_MEM_TARGET=$(echo "$PARAM_HPA_MEM_TARGET" | xargs)
+
+        echo "##[group] Merged values"
+        echo "##[debug] resources.requests.cpu: ${FINAL_CPU_REQ} (param: '${PARAM_CPU_REQ}' | file: '${FILE_CPU_REQ}')"
+        echo "##[debug] resources.requests.memory: ${FINAL_MEM_REQ} (param: '${PARAM_MEM_REQ}' | file: '${FILE_MEM_REQ}')"
+        echo "##[debug] resources.limits.cpu: ${FINAL_CPU_LIM} (param: '${PARAM_CPU_LIM}' | file: '${FILE_CPU_LIM}')"
+        echo "##[debug] resources.limits.memory: ${FINAL_MEM_LIM} (param: '${PARAM_MEM_LIM}' | file: '${FILE_MEM_LIM}')"
+        echo "##[debug] hpa.minReplicas: ${FINAL_HPA_MIN} (param: '${PARAM_HPA_MIN}' | file: '${FILE_HPA_MIN}')"
+        echo "##[debug] hpa.maxReplicas: ${FINAL_HPA_MAX} (param: '${PARAM_HPA_MAX}' | file: '${FILE_HPA_MAX}')"
+        echo "##[debug] hpa.targetCPUUtilizationPercentage: ${FINAL_HPA_CPU_TARGET} (param: '${PARAM_HPA_CPU_TARGET}' | file: '${FILE_HPA_CPU_TARGET}')"
+        echo "##[debug] hpa.targetMemoryUtilizationPercentage: ${FINAL_HPA_MEM_TARGET} (param: '${PARAM_HPA_MEM_TARGET}' | file: '${FILE_HPA_MEM_TARGET}')"
+        echo "##[endgroup]"
+
+        echo "##vso[task.setvariable variable=FINAL_CPU_REQ;isOutput=true]$FINAL_CPU_REQ"
+        echo "##vso[task.setvariable variable=FINAL_MEM_REQ;isOutput=true]$FINAL_MEM_REQ"
+        echo "##vso[task.setvariable variable=FINAL_CPU_LIM;isOutput=true]$FINAL_CPU_LIM"
+        echo "##vso[task.setvariable variable=FINAL_MEM_LIM;isOutput=true]$FINAL_MEM_LIM"
+        echo "##vso[task.setvariable variable=FINAL_HPA_MIN;isOutput=true]$FINAL_HPA_MIN"
+        echo "##vso[task.setvariable variable=FINAL_HPA_MAX;isOutput=true]$FINAL_HPA_MAX"
+        echo "##vso[task.setvariable variable=FINAL_HPA_CPU_TARGET;isOutput=true]$FINAL_HPA_CPU_TARGET"
+        echo "##vso[task.setvariable variable=FINAL_HPA_MEM_TARGET;isOutput=true]$FINAL_HPA_MEM_TARGET"
+
+  - task: Bash@3
+    displayName: Validate Resource and HPA Values
+    name: validate_values
+    inputs:
+      targetType: inline
+      script: |
+        echo "##[debug] Validating trimmed merged resource and HPA parameters"
+
+        CPU_REQ="$(merge_values.FINAL_CPU_REQ)"
+        MEM_REQ="$(merge_values.FINAL_MEM_REQ)"
+        CPU_LIM="$(merge_values.FINAL_CPU_LIM)"
+        MEM_LIM="$(merge_values.FINAL_MEM_LIM)"
+        HPA_MIN="$(merge_values.FINAL_HPA_MIN)"
+        HPA_MAX="$(merge_values.FINAL_HPA_MAX)"
+        HPA_CPU_TARGET="$(merge_values.FINAL_HPA_CPU_TARGET)"
+        HPA_MEM_TARGET="$(merge_values.FINAL_HPA_MEM_TARGET)"
+
+        validate_cpu() { [[ "$1" =~ ^[0-9]+(\.[0-9]+)?(m)?$ ]]; }
+        validate_memory() { [[ "$1" =~ ^[0-9]+(\.[0-9]+)?(Mi|Gi|Ki|M|G|K|Ti|T|Pi|P|Ei|E)?$ ]]; }
+        validate_integer() { [[ "$1" =~ ^[0-9]+$ ]]; }
+        validate_percentage() { [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 100 ]; }
+
+        log_error() { echo "##vso[task.logissue type=error]$1"; HAS_ERROR=true; }
+
+        HAS_ERROR=false
+
+        [ -n "$CPU_REQ" ] && ! validate_cpu "$CPU_REQ" && log_error "Invalid CPU requests: '$CPU_REQ'. Expected: number with optional 'm' (e.g., 100m, 1)"
+        [ -n "$MEM_REQ" ] && ! validate_memory "$MEM_REQ" && log_error "Invalid memory requests: '$MEM_REQ'. Expected: number with unit (e.g., 128Mi, 1Gi)"
+        [ -n "$CPU_LIM" ] && ! validate_cpu "$CPU_LIM" && log_error "Invalid CPU limits: '$CPU_LIM'. Expected: number with optional 'm' (e.g., 100m, 1)"
+        [ -n "$MEM_LIM" ] && ! validate_memory "$MEM_LIM" && log_error "Invalid memory limits: '$MEM_LIM'. Expected: number with unit (e.g., 128Mi, 1Gi)"
+        [ -n "$HPA_MIN" ] && ! validate_integer "$HPA_MIN" && log_error "Invalid HPA minReplicas: '$HPA_MIN'. Expected: integer"
+        [ -n "$HPA_MAX" ] && ! validate_integer "$HPA_MAX" && log_error "Invalid HPA maxReplicas: '$HPA_MAX'. Expected: integer"
+        [ -n "$HPA_CPU_TARGET" ] && ! validate_percentage "$HPA_CPU_TARGET" && log_error "Invalid HPA targetCPUUtilizationPercentage: '$HPA_CPU_TARGET'. Expected: 1-100"
+        [ -n "$HPA_MEM_TARGET" ] && ! validate_percentage "$HPA_MEM_TARGET" && log_error "Invalid HPA targetMemoryUtilizationPercentage: '$HPA_MEM_TARGET'. Expected: 1-100"
+
+        [ -n "$HPA_MIN" ] && [ -n "$HPA_MAX" ] && [ "$HPA_MIN" -gt "$HPA_MAX" ] && log_error "HPA minReplicas ($HPA_MIN) must be <= maxReplicas ($HPA_MAX)"
+        [ -n "$CPU_REQ" ] && [ -n "$CPU_LIM" ] && [ "${CPU_REQ%m}" -gt "${CPU_LIM%m}" ] && log_error "CPU requests ($CPU_REQ) must be <= limits ($CPU_LIM)"
+        [ -n "$MEM_REQ" ] && [ -n "$MEM_LIM" ] && [ "${MEM_REQ%Mi}" -gt "${MEM_LIM%Mi}" ] && log_error "Memory requests ($MEM_REQ) must be <= limits ($MEM_LIM)"
+
+        [ "$HAS_ERROR" = "true" ] && { echo "##[error] Parameter validation failed"; exit 1; }
+
+        echo "##[debug] All parameters validated successfully"
+
+  - task: Bash@3
+    displayName: Remove Resources and HPA from Values File
+    name: remove_resources_hpa
+    inputs:
+      targetType: inline
+      script: |
+        echo "##[debug] Removing resources and HPA from values file: $(VALUES_FILE)"
+
+        yq -i 'del(.resources)' "$(VALUES_FILE)"
+        yq -i 'del(.hpa)' "$(VALUES_FILE)"
+
+        echo "##[debug] Removed resources and HPA sections from values file."
+        echo "##[debug] Updated values file: $(VALUES_FILE)"
+
+        echo "##[group] Values file after removal"
+        cat "$(VALUES_FILE)"
+        echo "##[endgroup]"
+
+  - task: Bash@3
+    displayName: Override Resources and HPA in Values File
+    name: override_resources_hpa
+    inputs:
+      targetType: inline
+      script: |
+        echo "##[debug] Applying merged resource and HPA values to values file: $(VALUES_FILE)"
+
+        VALUES_FILE="$(VALUES_FILE)"
+
+        CPU_REQ="$(merge_values.FINAL_CPU_REQ)"
+        MEM_REQ="$(merge_values.FINAL_MEM_REQ)"
+        CPU_LIM="$(merge_values.FINAL_CPU_LIM)"
+        MEM_LIM="$(merge_values.FINAL_MEM_LIM)"
+        HPA_MIN="$(merge_values.FINAL_HPA_MIN)"
+        HPA_MAX="$(merge_values.FINAL_HPA_MAX)"
+        HPA_CPU_TARGET="$(merge_values.FINAL_HPA_CPU_TARGET)"
+        HPA_MEM_TARGET="$(merge_values.FINAL_HPA_MEM_TARGET)"
+
+        apply_value() {
+          local path=$1 value=$2 name=$3
+          # Strip surrounding quotes if present and check if truly empty
+          local stripped_value="${value%\"}"
+          stripped_value="${stripped_value#\"}"
+
+          if [ -n "$stripped_value" ] && [ "$stripped_value" != " " ]; then
+            echo "##[debug] Setting $path = $value"
+            yq -i ".$path = $value" "$VALUES_FILE" || { echo "##vso[task.logissue type=error]Failed to set $name"; exit 1; }
+          else
+            echo "##[debug] Skipping $path - value is blank"
+          fi
+        }
+
+        apply_value "resources.limits.cpu" "\"$CPU_LIM\"" "resources.limits.cpu"
+        apply_value "resources.limits.memory" "\"$MEM_LIM\"" "resources.limits.memory"
+        apply_value "resources.requests.cpu" "\"$CPU_REQ\"" "resources.requests.cpu"
+        apply_value "resources.requests.memory" "\"$MEM_REQ\"" "resources.requests.memory"
+        apply_value "hpa.minReplicas" "$HPA_MIN" "hpa.minReplicas"
+        apply_value "hpa.maxReplicas" "$HPA_MAX" "hpa.maxReplicas"
+        apply_value "hpa.targetCPUUtilizationPercentage" "$HPA_CPU_TARGET" "hpa.targetCPUUtilizationPercentage"
+        apply_value "hpa.targetMemoryUtilizationPercentage" "$HPA_MEM_TARGET" "hpa.targetMemoryUtilizationPercentage"
+
+        echo "##[debug] Successfully applied all non-blank resource and HPA values"
+        echo "##[debug] Updated values file: $VALUES_FILE"
+        echo "##[group] Values file after overrides"
+        cat "$VALUES_FILE"
+        echo "##[endgroup]"

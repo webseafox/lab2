@@ -1,0 +1,119 @@
+# Node.js
+# Build a general Node.js project with npm.
+# Add steps that analyze code, save build artifacts, deploy, and more:
+# https://docs.microsoft.com/azure/devops/pipelines/languages/javascript
+
+# SAP MTA Pipeline
+# Builds and deploys an SAP Application with an MTA
+
+parameters:
+  - name: deploy_environment
+    displayName: Defina para qual ambiente será feito o deploy
+    type: string
+    default: dev
+    values:
+      - dev
+      - homologation
+      - production
+      
+  - name: environment_map
+    type: object
+    default:
+      dev: DEV
+      homologation: QA
+      production: PRODUCTION
+
+variables:
+  - name: mtarFileName
+    value: app.mtar
+
+  - group: "btp-config-${{ parameters.environment_map[parameters.deploy_environment] }}"
+stages:
+  - stage: Build
+    displayName: "Build Stage"
+    pool: GeneralPurposeLinuxAgentsCI
+    jobs:
+      - job: BuildApp
+        displayName: "Build SAP CAP Application"
+        steps:
+          - checkout: self
+
+          - task: NodeTool@0
+            inputs:
+              versionSpec: '22.x'
+            displayName: '🔧 Impl Node 22.x'
+
+          - script: |
+              npm install -g mbt
+            displayName: '📦 Install MBT'
+
+          - script: |
+              npm install
+            displayName: '📦 Install Dependencies'
+
+          - script: |
+              # Define Used Java Version
+              export ASDF_JAVA_VERSION=sapmachine-17.0.10
+              echo "##vso[task.setvariable variable=ASDF_JAVA_VERSION]sapmachine-17.0.10"
+
+            displayName: '🔧 Define Build Dependencies Versions'
+
+          - script: |
+              mbt build --mtar $(mtarFileName)
+            displayName: '🛠️ Build Application'
+
+          - task: PublishPipelineArtifact@1
+            inputs:
+              targetPath: '$(Build.SourcesDirectory)/mta_archives/$(mtarFileName)'
+              artifact: 'mtar'
+              publishLocation: 'pipeline'
+            displayName: '📦 Publish Build Artifact'
+
+  - stage: Deploy
+    displayName: "Deploy Stage"
+    dependsOn: Build
+    jobs:
+      - deployment: DeployApp
+        pool: GeneralPurposeLinuxAgentsCD
+        displayName: "🚀 Deploy Application"
+        environment: ${{ format('deploy-{0}', parameters.deploy_environment) }}
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: none
+                - task: DownloadPipelineArtifact@2
+                  inputs:
+                    artifactName: 'mtar'
+                    targetPath: '$(Pipeline.Workspace)'
+                  displayName: '📥 Download MTAR Artifact'
+
+                - script: |
+                    echo "##[section]Informações do deployment:"
+                    echo "🎯 Ambiente: ${{parameters.deploy_environment}}"
+                    echo "🌍 Organização: $(BTP_CLOUD_FOUNDRY_ORGANIZATION)"
+                    echo "🖼️ Space: $(BTP_CLOUD_FOUNDRY_SPACE)"
+                    echo "👤 Username: $(BTP_CLOUD_FOUNDRY_USERNAME)"
+                    echo "📁 MTA Name: $(mtarFileName )"
+                  displayName: '🎯 Deployment Information'
+                
+                - script: |
+                    echo "##vso[task.setvariable variable=ASDF_CF_CLI_VERSION]8.3.0"
+                  displayName: '🔧 Set Cloud Foundry CLI version'
+
+                - script: |
+                    cf install-plugin multiapps -f
+                    cf install-plugin html5-plugin -f
+                  displayName: '📦 Install CF Plugins'
+
+                - script: |
+                    cf login --skip-ssl-validation -a $(BTP_CLOUD_FOUNDRY_API) -u $(BTP_CLOUD_FOUNDRY_USERNAME) -p '$(BTP_CLOUD_FOUNDRY_PASSWORD)' -o $(BTP_CLOUD_FOUNDRY_ORGANIZATION) -s $(BTP_CLOUD_FOUNDRY_SPACE)
+                  displayName: '🔑 Log into BTP Cloud Foundry'
+
+                - script: |
+                    cf deploy $(Pipeline.Workspace)/$(mtarFileName) -f
+                  displayName: '🚀 Deploy Application'
+
+                - script: |
+                    cf logout
+                  displayName: '🔒 Logout from BTP Cloud Foundry'

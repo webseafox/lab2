@@ -1,0 +1,137 @@
+
+stages:
+- stage:
+  displayName: 'Push to Repositories'
+  pool: GeneralPurposeLinuxAgentsCI
+  variables:
+  - name: System.debug
+    value: "true"
+  jobs:
+  - job:
+    displayName: 'Push to Docker (SNAPSHOT)'
+    variables:
+    - name: HTTP_PROXY
+      value: 'http://10.240.58.39:3128'
+    - name: HTTPS_PROXY
+      value: 'http://10.240.58.39:3128'
+    - name: NO_PROXY
+      value: 
+        localhost,
+        0.0.0.0,
+        127.0.0.1,
+        10.244.0.0/16,
+        192.168.0.0/16,
+        10.129.178.173,
+        nexus.telefonica.com.br,
+        acrsharedservices01.azurecr.io,
+        appcs-azdevops-shared.azconfig.io,
+        vcr-docker.nexus.telefonica.com.br,
+        scm.azurewebsites.net
+
+    steps:
+    - checkout: none
+
+    # - task: DownloadBuildArtifacts@1
+    #   displayName: 'Get new pom.xml'
+    #   inputs:
+    #     buildType: "current"
+    #     downloadPath: "$(System.ArtifactsDirectory)"
+
+    - task: DownloadBuildArtifacts@1
+      displayName: 'Download Artifact'
+      inputs:
+        project: 'MIGR-Processum2'
+        pipeline: 'src.src-apuracao-codeplay-v2-ci'
+        buildVersionToDownload: 'specific'
+        buildId: '379700'
+        buildType: 'specific'
+        # itemPattern: |
+        #   bin/**/*.*ar
+        #   bin/**/pom.xml
+        downloadPath: '$(System.ArtifactsDirectory)'
+        cleanDestinationFolder: true
+
+
+
+    - task: XmlParseFromVivo@4
+      displayName: 'Get Main Info'
+      inputs:
+        type: 'file'
+        origin: $(System.ArtifactsDirectory)/bin/pom.xml
+        jpaths: |
+          var POM_XML_VERSION = .project.version._text
+          var POM_XML_ARTIFACT_ID = .project.artifactId._text
+          var POM_XML_GROUP_ID = .project.groupId._text
+
+    - task: YamlParseFromVivo@4
+      displayName: 'Get Metadata Info'
+      inputs:
+        type: 'file'
+        origin: $(System.ArtifactsDirectory)/bin/catalog-info.yaml
+        jpaths: |
+          var CATALOG_YAML_ACRONYM = .metadata.annotations['techarch.governance-app.acronym']
+          var CATALOG_YAML_MODULE = .metadata.annotations['techarch.governance-app.module']
+          var CATALOG_YAML_SONAR_PROJECT_KEY = .metadata.annotations['sonarqube.org/project-key']
+          var CATALOG_YAML_JAVA_LANGUAGE_VERSION = .metadata.annotations['arqtech.telefonica.com.br/language-version']
+          var CATALOG_YAML_NAME = .metadata.name
+
+    - task: ListFilesAndFolders@4
+      displayName: 'Find "sonar.java.binaries"'
+      inputs:
+        scriptSource: 'text'
+        separator: ','
+        script: |
+          var://DOCKERFILE_1 = $(System.ArtifactsDirectory)/**/runtime.Dockerfile
+          var://DOCKERFILE_2 = $(System.ArtifactsDirectory)/**/Dockerfile
+        dot: true
+
+    - task: NunjucksInline@4
+      displayName: 'Bind Variables'
+      inputs:
+        sourceType: 'text'
+        source: |
+          var DOCKERFILE = {{ (DOCKERFILE_1 or DOCKERFILE_2 or 'Dockerfile').split(',')[0] }}
+
+    # ==================================================================
+    # [Compliance] Verifica se o repositório está em conformidade com as políticas de configuração
+    # ==================================================================
+    - task: VivoDevOpsConfigCompliance@1
+      displayName: 'Check DevOps Config Compliance'
+      inputs:
+        workDir: $(System.ArtifactsDirectory)/bin
+        policySets: |
+          image-definition-files
+
+    - task: Docker@2
+      displayName: 'Docker Build'
+      condition: succeeded()
+      inputs:
+        containerRegistry: VCR-DOCKER
+        command: build
+        repository: $(CATALOG_YAML_ACRONYM)/$(Build.Repository.Name)
+        Dockerfile: $(DOCKERFILE)
+        buildContext: $(System.ArtifactsDirectory)/bin
+        arguments: >-
+          --no-cache 
+          --build-arg APPLICATION_NAME=$(CATALOG_YAML_NAME)
+          --build-arg APP_VERSION=$(POM_XML_VERSION) 
+          --build-arg APPLICATION_PATH=target 
+          --build-arg HTTP_PROXY="$(HTTP_PROXY)"
+          --build-arg HTTPS_PROXY="$(HTTPS_PROXY)"
+          --build-arg NO_PROXY="$(NO_PROXY)"
+
+        tags: >
+          $(POM_XML_VERSION)-SNAPSHOT
+
+    - task: Docker@2
+      displayName: 'Docker Push'
+      condition: succeeded()
+      inputs:
+        containerRegistry: VCR-DOCKER
+        command: push
+        repository: $(CATALOG_YAML_ACRONYM)/$(Build.Repository.Name)
+        addPipelineData: true
+        addBaseImageData: true
+        tags: >
+          $(POM_XML_VERSION)-SNAPSHOT
+

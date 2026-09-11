@@ -1,0 +1,72 @@
+parameters:
+- name: fortifyExclusionRepository
+
+stages:
+
+- stage: security
+  displayName: "Security"
+  dependsOn: 
+  - build_test 
+  pool: $(PRIVATE_AGENT_SHARED)
+  jobs:
+  - job: app_config_keys
+    displayName: "Get AppSec Config Keys"
+    steps:
+
+    - template: /security/get_appconfig_keys.yml
+
+
+  - job: sast_scan
+    displayName: "SAST Scan"
+    dependsOn: 
+    - app_config_keys
+    variables:
+      USE_FORTIFY: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_FORTIFY'] ]          
+      USE_CONVISO: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_CONVISO'] ]          
+      USE_CHECKMARX: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_CHECKMARX'] ]          
+      SKIP_SECURITY_GATE: $[ dependencies.app_config_keys.outputs['evaluate_flags.SKIP_SECURITY_GATE'] ]          
+    condition: |
+               and(
+                  succeeded(),
+                  eq(variables.USE_FORTIFY, 'true')
+                )
+    steps:
+
+    - template: /security/define_appsec_app_version.yml
+
+    - task: Bash@3
+      displayName: "Defining Flutter Fortify Scan Exclusion Parameters"
+      inputs:
+        targetType: 'inline'
+        script: |
+
+          echo "##vso[task.setvariable variable=EXCLUDE_FLUTTER_PARAM]-exclude \"README.md\" -exclude \"**/README.md\" -exclude \"**/test/**\" -exclude \"**/ios/**\" -exclude \"**/android/**\" "
+          echo "Exporting Flutter exclusion parameters to variable EXCLUDE_FLUTTER_PARAM."
+
+    - template: /security/run_fortify_scan.yml
+      parameters: 
+        fortifyExclusionRepository: FortifyExclusion
+        appVersion: "$(FORTIFY_APP_VERSION)"
+
+  - job: sca_scan
+    displayName: "SCA Scan"
+    dependsOn: 
+    - app_config_keys
+    variables:
+      USE_DEPENDENCY_TRACK: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_DEPENDENCY_TRACK'] ]          
+      USE_CONVISO: $[ dependencies.app_config_keys.outputs['evaluate_flags.USE_CONVISO'] ]
+      SKIP_SECURITY_GATE_SCA: $[ dependencies.app_config_keys.outputs['evaluate_flags.SKIP_SECURITY_GATE_SCA'] ]         
+    condition: |
+               and(
+                  succeeded(),
+                  eq(variables.USE_DEPENDENCY_TRACK, 'true')
+                )
+    steps:
+
+    - template: /security/define_appsec_app_version.yml   
+
+    - template: /security/run_sca_scan.yml
+      parameters: 
+        skipSecurityGate: ${{ variables['SKIP_SECURITY_GATE_SCA'] }}
+        appVersion: "$(FORTIFY_APP_VERSION)"
+        vivoFlow: "develop"

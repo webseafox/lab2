@@ -1,0 +1,440 @@
+parameters:
+  - name: environment_code
+    type: string
+    default: ""
+  - name: display_name
+    type: string
+    default: "Create SAP Backup"
+  - name: enable_backup
+    type: boolean
+    default: true
+  - name: timeout_minutes
+    type: number
+    default: 180
+
+jobs:
+  - job: get_token
+    displayName: "Get SAP TU Token"
+    steps:
+      - template: /tech_products/ecmc/sap-commerce/tasks/security/get_sap_tu_token.yaml
+        parameters:
+          displayName: "Get SAP TU token for backup"
+          exportAsOutput: true
+          stepName: "get_sap_tu_token"
+
+      - bash: |
+          echo "##[section]Access token reutilizado (valor oculto)"
+          echo "##vso[task.setvariable variable=SAP_TU_ACCESS_TOKEN;issecret=true;isOutput=true]${SAP_TU_ACCESS_TOKEN}"
+          echo "##vso[task.setvariable variable=SAP_TU_TOKEN_EXPIRATION;isOutput=true]${SAP_TU_TOKEN_EXPIRATION}"
+        displayName: "Export SAP TU token"
+        name: export_token
+        env:
+          SAP_TU_ACCESS_TOKEN: $(SAP_TU_ACCESS_TOKEN)
+          SAP_TU_TOKEN_EXPIRATION: $(SAP_TU_TOKEN_EXPIRATION)
+
+  - job: backup_environment
+    dependsOn: get_token
+    displayName: "Backup SAP Environment ${{ parameters.environment_code }}"
+    timeoutInMinutes: ${{ parameters.timeout_minutes }}
+    variables:
+      - name: SAP_TU_ACCESS_TOKEN
+        value: $[ dependencies.get_token.outputs['export_token.SAP_TU_ACCESS_TOKEN'] ]
+      - name: SAP_TU_TOKEN_EXPIRATION
+        value: $[ dependencies.get_token.outputs['export_token.SAP_TU_TOKEN_EXPIRATION'] ]
+      - group: "lojaonline-sap-commerce-cloud"
+    steps:
+      - bash: |
+          echo "##[section]🚀 Iniciando processo de backup do ambiente ${{ parameters.environment_code }} 🚀"
+
+          ENVIRONMENT_CODE="${{ parameters.environment_code }}"
+
+          case "$ENVIRONMENT_CODE" in
+              "d15")
+                  ENVIRONMENT_DISPLAY_NAME="esteira1"
+                  ;;
+              "s1")
+                  ENVIRONMENT_DISPLAY_NAME="preprod"
+                  ;;
+              "d13")
+                  ENVIRONMENT_DISPLAY_NAME="prodlike"
+                  ;;
+              *)
+                  ENVIRONMENT_DISPLAY_NAME="$ENVIRONMENT_CODE"
+                  ;;
+          esac
+
+          echo "##[command]🎯 Ambiente: $ENVIRONMENT_CODE ($ENVIRONMENT_DISPLAY_NAME)"
+
+          echo "##[debug]🔍 Verificando todas as variáveis de ambiente..."
+          echo "##[debug]Variáveis que começam com SAP_TU:"
+          env | grep -i SAP_TU || echo "##[debug]Nenhuma variável SAP_TU encontrada"
+          echo "##[debug]Variáveis que começam com API:"
+          env | grep -i API | head -5 || echo "##[debug]Nenhuma variável API encontrada"
+          echo "##[debug]Variáveis que começam com SUBSCRIPTION:"
+          env | grep -i SUBSCRIPTION || echo "##[debug]Nenhuma variável SUBSCRIPTION encontrada"
+
+          echo "##[debug]🔍 Validando variáveis críticas..."
+          echo "##[debug]ENVIRONMENT_CODE: '$ENVIRONMENT_CODE'"
+
+          if [ -z "${SAP_TU_ACCESS_TOKEN:-}" ]; then
+              echo "##[error]❌ Variável SAP_TU_ACCESS_TOKEN não está definida!"
+              echo "##[error]Verifique se a variável SAP_TU_ACCESS_TOKEN está configurada no grupo de variáveis 'lojaonline-sap-commerce-cloud'"
+              exit 1
+          else
+              if [[ "${SAP_TU_ACCESS_TOKEN}" == *"REPLACE"* ]] || [[ "${SAP_TU_ACCESS_TOKEN}" == *"EXAMPLE"* ]] || [[ "${SAP_TU_ACCESS_TOKEN}" == *"TOKEN"* ]]; then
+                  echo "##[error]❌ SAP_TU_ACCESS_TOKEN parece ser um placeholder, não um token real"
+                  echo "##[error]Substitua o valor por um token válido do SAP Commerce Cloud"
+                  exit 1
+              fi
+          fi
+
+          if [ -z "${SUBSCRIPTION_CODE:-}" ]; then
+              echo "##[error]❌ Variável SUBSCRIPTION_CODE não está definida!"
+              exit 1
+          fi
+
+          if [ -z "$ENVIRONMENT_CODE" ]; then
+              echo "##[error]❌ Parâmetro environment_code não foi fornecido!"
+              exit 1
+          fi
+
+          call_api_get() {
+              local url="$1"
+              local token="$2"
+              local output_file="$3"
+              
+              curl -s -o "$output_file" -w "%{http_code}" \
+                  --compressed \
+                  -H "x-approuter-authorization: Bearer $token" \
+                  "$url"
+          }
+
+          call_api_delete() {
+              local url="$1"
+              local token="$2"
+              local output_file="$3"
+              
+              curl -s -o "$output_file" -w "%{http_code}" \
+                  --compressed \
+                  -X DELETE \
+                  -H "x-approuter-authorization: Bearer $token" \
+                  "$url"
+          }
+
+          call_api_post() {
+              local url="$1"
+              local token="$2"
+              local output_file="$3"
+              local request_body="$4"
+              
+              curl -X POST -s -o "$output_file" -w "%{http_code}" \
+                  --compressed \
+                  -H "x-approuter-authorization: Bearer $token" \
+                  -H "Content-Type: application/json" \
+                  -d "$request_body" \
+                  "$url"
+          }
+
+          API_URL_ENVIRONMENTS_BACKUP=$(echo "$API_URL_ENVIRONMENTS_BACKUP" | sed "s/<SUBSCRIPTION_CODE>/$(SUBSCRIPTION_CODE)/" | sed "s/<ENVIRONMENT_CODE>/$ENVIRONMENT_CODE/")
+          BACKUPS_LIST_URL="$(BACKUPS_LIST_URL)"
+
+          echo "##[debug]🔗 URLs finais:"
+          echo "##[debug]API_URL_ENVIRONMENTS_BACKUP: $API_URL_ENVIRONMENTS_BACKUP"
+          echo "##[debug]BACKUPS_LIST_URL: $BACKUPS_LIST_URL"
+
+          echo "##[debug]🌐 Testando conectividade com a API SAP Commerce Cloud..."
+          TEST_HTTP_CODE=$(call_api_get "$BACKUPS_LIST_URL" "$SAP_TU_ACCESS_TOKEN" "/tmp/test_connection.json")
+
+          if [ "$TEST_HTTP_CODE" == "200" ]; then
+              echo "##[debug]✅ Conectividade com a API confirmada"
+              if jq empty "/tmp/test_connection.json" 2>/dev/null; then
+                  echo "##[debug]✅ Resposta JSON válida"
+              else
+                  echo "##[warning]⚠️ Resposta não é JSON válido, mas continuar..."
+              fi
+              rm -f /tmp/test_connection.json
+          elif [ "$TEST_HTTP_CODE" == "401" ]; then
+              echo "##[error]❌ Token SAP_TU_ACCESS_TOKEN inválido ou expirado (HTTP 401)"
+              echo "##[error]Verifique se o token está correto e não expirou"
+              rm -f /tmp/test_connection.json
+              exit 1
+          elif [ "$TEST_HTTP_CODE" == "403" ]; then
+              echo "##[error]❌ Token sem permissões para acessar o ambiente $ENVIRONMENT_CODE (HTTP 403)"
+              echo "##[error]Verifique as permissões do token no SAP Commerce Cloud"
+              rm -f /tmp/test_connection.json
+              exit 1
+          else
+              echo "##[warning]⚠️ Conectividade com problemas (HTTP $TEST_HTTP_CODE), mas continuando..."
+              if [ -s "/tmp/test_connection.json" ]; then
+                  echo "##[debug]Response: $(cat /tmp/test_connection.json 2>/dev/null | head -c 200)"
+              fi
+              rm -f /tmp/test_connection.json
+          fi
+
+          send_teams_message() {
+              local message="$1"
+              local webhook_url="${WEBHOOK_URL:-}"
+              local chat_id="${CHAT_ID:-}"
+              
+              if [ -z "$webhook_url" ] || [ -z "$chat_id" ]; then
+                  echo "##[warning]⚠️ WEBHOOK_URL ou CHAT_ID não configurados, pulando notificação"
+                  return 0
+              fi
+              
+              echo "##[debug]📋 Preparando mensagem para envio via webhook..."
+              
+              local escaped_message=$(echo -e "$message" | sed 's/\\/\\\\/g; s/"/\\"/g; s/$/\\n/' | tr -d '\n' | sed 's/\\n$//')
+              
+              local json_payload="{\"content\": \"$escaped_message\", \"chatId\": \"$chat_id\", \"source\": \"Backup-SAP\"}"
+              
+              echo "##[debug]📋 JSON Payload:"
+              echo "##[debug]$json_payload"
+              
+              echo "##[debug]📤 Enviando mensagem via webhook..."
+              local http_code=$(curl -s -o /tmp/webhook_response.json -w "%{http_code}" \
+                  -X POST \
+                  -H "Content-Type: application/json" \
+                  -d "$json_payload" \
+                  "$webhook_url")
+              
+              local response_body=$(cat /tmp/webhook_response.json 2>/dev/null || echo "N/A")
+              
+              echo "##[debug]📊 Resultado do webhook:"
+              
+              if [[ "$http_code" == "200" ]] || [[ "$http_code" == "201" ]]; then
+                  echo "##[debug]✅ Mensagem enviada com sucesso! (HTTP $http_code)"
+              else
+                  echo "##[warning]⚠️ Falha ao enviar mensagem: HTTP $http_code"
+                  echo "##[debug]Response: $response_body"
+              fi
+              
+              rm -f /tmp/webhook_response.json
+          }
+
+          check_existing_backups() {
+              local LIST_FILE="/tmp/backups_check.json"
+              local LIST_HTTP_CODE=$(call_api_get "$BACKUPS_LIST_URL" "$SAP_TU_ACCESS_TOKEN" "$LIST_FILE")
+              
+              echo "##[debug]📄 Arquivo salvo: $(wc -c < "$LIST_FILE") bytes"
+              
+              if [ "$LIST_HTTP_CODE" == "200" ]; then
+                  echo "##[debug]✅ HTTP 200 recebido"
+                  
+                  if ! jq empty "$LIST_FILE" 2>/dev/null; then
+                      echo "##[error]❌ JSON inválido"
+                      rm -f "$LIST_FILE"
+                      return 1
+                  fi
+                  
+                  local CREATING_COUNT=$(jq '[.value[] | select(.status == "CREATING")] | length' "$LIST_FILE" 2>/dev/null)
+                  local TOTAL_BACKUPS=$(jq '.value | length' "$LIST_FILE" 2>/dev/null)
+                  
+                  echo "##[debug]Total de backups: $TOTAL_BACKUPS"
+                  echo "##[debug]Backups em CREATING: $CREATING_COUNT"
+                  
+                  if [ "$CREATING_COUNT" -gt 0 ]; then
+                      echo "##[warning]⚠️ Já existe um backup em andamento"
+                      rm -f "$LIST_FILE"
+                      return 2
+                  fi
+                  
+                  rm -f "$LIST_FILE"
+                  return 0
+              else
+                  echo "##[error]❌ HTTP $LIST_HTTP_CODE (esperado 200)"
+                  rm -f "$LIST_FILE"
+                  return 1
+              fi
+          }
+
+          delete_oldest_backup() {
+              local LIST_FILE="/tmp/backups_for_delete.json"
+              local LIST_HTTP_CODE=$(call_api_get "$BACKUPS_LIST_URL" "$SAP_TU_ACCESS_TOKEN" "$LIST_FILE")
+              
+              if [ "$LIST_HTTP_CODE" == "200" ]; then
+                  if ! jq empty "$LIST_FILE" 2>/dev/null; then
+                      echo "##[error]❌ Resposta não é JSON válido"
+                      rm -f "$LIST_FILE"
+                      return 1
+                  fi
+                  
+                  local OLDEST_BACKUP=$(cat "$LIST_FILE" | jq -r '.value | map(select(.status == "CREATED")) | sort_by(.createdTime) | .[0]')
+                  
+                  if [ "$OLDEST_BACKUP" != "null" ] && [ -n "$OLDEST_BACKUP" ]; then
+                      local OLDEST_BACKUP_CODE=$(echo "$OLDEST_BACKUP" | jq -r '.databackupCode')
+                      local OLDEST_DATE=$(echo "$OLDEST_BACKUP" | jq -r '.createdTime')
+                      echo "##[warning]🗑️ Deletando backup mais antigo: $OLDEST_BACKUP_CODE (criado em $OLDEST_DATE)"
+                      
+                      local DELETE_URL="$BACKUPS_LIST_URL/$OLDEST_BACKUP_CODE"
+                      local DELETE_HTTP_CODE=$(call_api_delete "$DELETE_URL" "$SAP_TU_ACCESS_TOKEN" "/tmp/delete_response.json")
+                      
+                      if [ "$DELETE_HTTP_CODE" == "204" ] || [ "$DELETE_HTTP_CODE" == "200" ]; then
+                          echo "##[command]✅ Backup $OLDEST_BACKUP_CODE deletado com sucesso"
+                          rm -f "$LIST_FILE" /tmp/delete_response.json
+                          return 0
+                      else
+                          echo "##[error]❌ Falha ao deletar backup: $OLDEST_BACKUP_CODE. HTTP Code: $DELETE_HTTP_CODE"
+                          if [ -s "/tmp/delete_response.json" ]; then
+                              echo "##[error]Response: $(cat /tmp/delete_response.json | head -c 200)"
+                          fi
+                          rm -f "$LIST_FILE" /tmp/delete_response.json
+                          return 1
+                      fi
+                  else
+                      echo "##[warning]⚠️ Nenhum backup com status CREATED encontrado para deletar"
+                      rm -f "$LIST_FILE"
+                      return 1
+                  fi
+              else
+                  echo "##[error]❌ Falha ao listar backups para deleção. HTTP Code: $LIST_HTTP_CODE"
+                  rm -f "$LIST_FILE"
+                  return 1
+              fi
+          }
+
+          create_backup() {
+              echo "##[debug]🚀 Iniciando criação de backup..."
+              echo "##[debug]URL de destino: '$API_URL_ENVIRONMENTS_BACKUP'"
+              
+              local REQUEST_BODY="{\"description\": \"Backup do ambiente ${ENVIRONMENT_CODE} - $(date '+%Y-%m-%d %H:%M:%S')\"}"
+              echo "##[debug]📦 Headers:"
+              echo "##[debug]  - x-approuter-authorization: Bearer ***[HIDDEN]***"
+              echo "##[debug]  - Content-Type: application/json"
+              echo "##[debug]📝 Payload: $REQUEST_BODY"
+              
+              local SAP_API_RESPONSE_FILE="/tmp/backup_response.json"              
+              local SAP_API_HEADERS_FILE="/tmp/backup_headers.txt"
+            
+              local HTTP_CODE=$(call_api_post "$API_URL_ENVIRONMENTS_BACKUP" "$SAP_TU_ACCESS_TOKEN" "$SAP_API_RESPONSE_FILE" "$REQUEST_BODY")
+
+              local RESPONSE_BODY=$(cat "$SAP_API_RESPONSE_FILE" 2>/dev/null || echo "{}")
+              
+              rm -f "$SAP_API_RESPONSE_FILE"
+              
+              echo "##[debug]HTTP Response: $HTTP_CODE"
+              echo "##[debug]Response Body: $RESPONSE_BODY"
+              
+              case "$HTTP_CODE" in
+                  201)
+                      echo "##[section]🚀 Backup iniciado com sucesso!"
+                      
+                      BACKUP_CODE=$(echo "$RESPONSE_BODY" | jq -r '.databackupCode // "UNKNOWN"')
+                      ENV_CODE=$(echo "$RESPONSE_BODY" | jq -r '.environmentCode // "'$ENVIRONMENT_CODE'"')
+                      CREATED_DATE=$(date '+%Y-%m-%d %H:%M:%S')
+                      
+                      echo "##[debug]SUBSCRIPTION_CODE: $SUBSCRIPTION_CODE"
+                      echo "##[debug]ENVIRONMENT_CODE: $ENV_CODE"
+                      echo "##[debug]DATABACKUP_CODE: $BACKUP_CODE"
+                      echo "##[command]📋 Backup Code: $BACKUP_CODE"
+                      echo "##[command]🌍 Environment: $ENV_CODE"
+                      echo "##[command]⏰ Iniciado em: $CREATED_DATE"
+                      echo "##[section]✅ Pipeline finalizada - backup criado e em execução"
+                      
+                      send_teams_message "✅ Backup SAP $ENVIRONMENT_DISPLAY_NAME Iniciado com Sucesso\n\n🚀 Backup do ambiente **$ENVIRONMENT_DISPLAY_NAME** ($ENV_CODE) foi criado e iniciado com sucesso\n\n📋 Backup Code: \`$BACKUP_CODE\`\n\n🔄 Status: O backup está sendo processado em background\n\n🎯 Pipeline: Finalizada com sucesso"
+                      
+                      return 0
+                      ;;
+                      
+                  423)
+                      echo "##[section]✅ Backup já em andamento no ambiente $ENVIRONMENT_CODE ✅"
+                      echo "##[command]📋 Um backup já está sendo processado para este ambiente"
+                      echo "##[section]✅ Pipeline finalizada - backup já em execução"
+                      
+                      send_teams_message "ℹ️ Backup SAP $ENVIRONMENT_DISPLAY_NAME Já em Andamento\n\n📋 Um backup já está sendo processado no ambiente **$ENVIRONMENT_DISPLAY_NAME** ($ENVIRONMENT_CODE)\n\n🎯 Status: Pipeline finalizada sem executar novo backup"
+                      
+                      return 0
+                      ;;
+                      
+                  400)
+                      echo "##[error]❌ Bad Request (400)"
+                      echo "##[debug]Response: $RESPONSE_BODY"
+                      return 1
+                      ;;
+                      
+                  401)
+                      echo "##[error]❌ Token inválido ou expirado (HTTP 401)"
+                      return 1
+                      ;;
+                      
+                  403)
+                      echo "##[error]🔐 Acesso negado (HTTP 403)"
+                      return 1
+                      ;;
+                      
+                  *)
+                      echo "##[error]❌ Erro não tratado: HTTP $HTTP_CODE"
+                      echo "##[debug]Response: $RESPONSE_BODY"
+                      return 1
+                      ;;
+              esac
+          }
+
+          echo "##[command]🔍 Etapa 1: Verificando backups existentes..."
+          check_existing_backups
+          CHECK_RESULT=$?
+
+          if [ $CHECK_RESULT -eq 2 ]; then
+              echo "##[section]✅ Backup já em andamento no ambiente $ENVIRONMENT_CODE ✅"
+              
+              TEMP_LIST_FILE="/tmp/active_backup_check.json"
+              call_api_get "$BACKUPS_LIST_URL" "$SAP_TU_ACCESS_TOKEN" "$TEMP_LIST_FILE" > /dev/null
+              
+              if jq empty "$TEMP_LIST_FILE" 2>/dev/null; then
+                  ACTIVE_BACKUP_CODE=$(cat "$TEMP_LIST_FILE" | jq -r '.value[] | select(.status == "CREATING") | .databackupCode' | head -1)
+                  ACTIVE_BACKUP_DATE=$(cat "$TEMP_LIST_FILE" | jq -r '.value[] | select(.status == "CREATING") | .createdTime' | head -1)
+                  
+                  if [ -n "$ACTIVE_BACKUP_CODE" ] && [ "$ACTIVE_BACKUP_CODE" != "null" ]; then
+                      echo "##[command]📋 Backup ativo: $ACTIVE_BACKUP_CODE"
+                      echo "##[command]📅 Iniciado em: $ACTIVE_BACKUP_DATE"
+                      echo "##[section]✅ Pipeline finalizada - backup já está sendo processado"
+                      
+                      rm -f "$TEMP_LIST_FILE"
+                      exit 0
+                  fi
+              fi
+              
+              rm -f "$TEMP_LIST_FILE"
+              exit 0
+          fi
+
+          echo "##[command]🚀 Etapa 2: Criando novo backup..."
+          create_backup
+          CREATE_RESULT=$?
+
+          if [ $CREATE_RESULT -ne 0 ]; then
+              echo "##[warning]🧹 Tentando limpeza e nova tentativa..."
+              echo "##[warning]🧹 Etapa 2b: Tentando limpeza e nova criação..."
+              
+              delete_oldest_backup
+              DELETE_RESULT=$?
+              
+              if [ $DELETE_RESULT -eq 0 ]; then
+                  echo "##[debug]🔄 Tentando criar backup após limpeza..."
+                  create_backup
+                  RETRY_RESULT=$?
+                  
+                  if [ $RETRY_RESULT -ne 0 ]; then
+                      echo "##[error]❌ Falha na criação do backup mesmo após limpeza"
+                      
+                      send_teams_message "❌ Falha na Criação de Backup SAP $ENVIRONMENT_DISPLAY_NAME\n\n⛔ Falha ao criar backup do ambiente **$ENVIRONMENT_DISPLAY_NAME** ($ENVIRONMENT_CODE) mesmo após limpeza\n\n🔍 Ação necessária: Verificar logs da pipeline e permissões do token\n\n🎯 Status: Pipeline finalizada com erro"
+                      
+                      exit 1
+                  fi
+              else
+                  echo "##[error]❌ Falha na limpeza de backups antigos"
+                  
+                  send_teams_message "❌ Falha na Criação de Backup SAP $ENVIRONMENT_DISPLAY_NAME\n\n⛔ Falha ao criar backup do ambiente **$ENVIRONMENT_DISPLAY_NAME** ($ENVIRONMENT_CODE)\n\n🔍 Ação necessária: Verificar logs da pipeline e permissões do token\n\n🎯 Status: Pipeline finalizada com erro"
+                  
+                  exit 1
+              fi
+          fi
+
+          echo "##[section]✅ Processo de backup concluído com sucesso"
+        displayName: "Backup Completo - ${{ parameters.environment_code }}"
+        env:
+          SAP_TU_ACCESS_TOKEN: $(SAP_TU_ACCESS_TOKEN)
+          SUBSCRIPTION_CODE: $(SUBSCRIPTION_CODE)
+          API_URL_ENVIRONMENTS_BACKUP: $(API_URL_ENVIRONMENTS_BACKUP)
+          BACKUPS_LIST_URL: $(BACKUPS_LIST_URL)
+          WEBHOOK_URL: $(WEBHOOK_URL)
+          CHAT_ID: $(CHAT_ID)

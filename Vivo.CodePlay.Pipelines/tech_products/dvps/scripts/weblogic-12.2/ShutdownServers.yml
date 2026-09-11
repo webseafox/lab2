@@ -1,0 +1,169 @@
+#########################################
+##  Script: ShutdownServers.yml        ##
+##  Weblogic 12.2                      ##
+#########################################
+
+parameters:  
+  - name: WEBLOGIC_USER
+    default: ''
+  - name: WEBLOGIC_PASS
+    default: ''
+  - name: WEBLOGIC_ADMIN_SERVER_URL
+    default: ''
+  - name: WEBLOGIC_TIMEOUT
+    default: ''
+  - name: EVEN_OR_ODD
+    default: ''
+
+steps:
+  - task: Bash@3
+    displayName: Shutdown Servers Weblogic
+    name: shutdown_servers_weblogic
+    condition: succeeded()
+    inputs:
+      targetType: inline
+      workingDirectory: $(Pipeline.Workspace)
+      script: |
+
+        CYAN='\033[96m'
+        RED='\033[91m'
+        RESET='\033[0m'
+
+        echo -e "${CYAN}==========================================="
+        echo -e "         Starting ShutdownServers          "
+        echo -e "===========================================${RESET}"
+
+        # Configurações iniciais
+
+        wlsAdmin=${{ parameters.WEBLOGIC_USER }}
+        wlsPassword=${{ parameters.WEBLOGIC_PASS }}
+        wlsUrl=${{ parameters.WEBLOGIC_ADMIN_SERVER_URL }}
+        wlsTimeOut=${{ parameters.WEBLOGIC_TIMEOUT }}
+        EVEN_OR_ODD=${{ parameters.EVEN_OR_ODD }}
+        echo -e "wlsAdmin: $wlsAdmin \n wlsPassword: $wlsPassword \n wlsUrl: $wlsUrl \n wlsTimeOut: $wlsTimeOut \n EVEN_OR_ODD: $EVEN_OR_ODD"
+
+        if [ -z "$wlsAdmin" ] || [ -z "$wlsPassword" ] || [ -z "$wlsUrl" ] || [ -z "$wlsTimeOut" ] || [ -z "$EVEN_OR_ODD" ]; then
+            echo -e "${RED} Um dos parametros wlsAdmin, wlsPassword, wlsUrl, wlsTimeOut ou EVEN_OR_ODD não estão definidos!${RESET}"
+                exit 1  # Sair com erro
+        fi
+        
+        # Função para fazer chamadas REST (autenticação básica)
+        function call_rest_api() {
+            local url=$1
+            local method=$2
+            local data=$3
+
+            if [[ -n "$data" ]]; then
+                # Se houver dados, incluí-los na chamada curl
+                curl -s -u "$wlsAdmin:$wlsPassword" -X "$method" -H "X-Requested-By: curl" -H "Accept: application/json" -H "Content-Type: application/json" -d "$data" "$url"
+            else
+                # Se não houver dados, fazer chamada curl sem -d
+                curl -s -u "$wlsAdmin:$wlsPassword" -X "$method" -H "X-Requested-By: curl" -H "Accept: application/json" "$url"
+            fi
+        }
+
+        # Função para desligar servidores
+        function shutdown_server() {
+            local server_name=$1
+            echo -e "${CYAN}Starting shutdown for server...${RESET} $server_name"
+            response=$(call_rest_api "$wlsUrl/management/weblogic/latest/domainRuntime/serverLifeCycleRuntimes/$server_name/forceShutdown" "POST")
+            taskStatus=$(echo "$response" | jq -r '.taskStatus')
+            # Verificando se o status é diferente de "TASK COMPLETED"
+            if [ "$taskStatus" != "TASK COMPLETED" ]; then
+                echo "Task Status: $taskStatus"
+                echo -e "${RED}Erro para efetuar o STOP na instancia $server_name !${RESET}"
+                echo "Response: $response"
+            fi
+        }
+
+        # Função para verificar estado do servidor
+        function get_server_state() {
+            local server_name=$1
+            call_rest_api "$wlsUrl/management/weblogic/latest/domainRuntime/serverLifeCycleRuntimes/$server_name" "GET" | jq -r '.state'
+        }
+
+
+        # Verifica se o último argumento é 'even' ou 'odd'
+        if [[ "$EVEN_OR_ODD" != "even" && "$EVEN_OR_ODD" != "odd" ]]; then
+            echo "${RED}Error: The last argument must be 'even' or 'odd'.${RESET}"
+            exit 1
+        fi
+
+        echo "Stopping servers based on even or odd criteria!"
+
+        # Pega a lista de servidores via API REST
+        servers=$(call_rest_api "$wlsUrl/management/weblogic/latest/domainRuntime/serverLifeCycleRuntimes" "GET" | jq -r '.items[].name')
+
+        # Desliga servidores com base no critério par/ímpar
+        for server_name in $servers; do
+            last_char=${server_name: -1}
+            if [[ $last_char =~ [0-9] ]]; then
+                is_even=$((last_char % 2))
+                if [[ ("$EVEN_OR_ODD" == "even" && $is_even -eq 0) || ("$EVEN_OR_ODD" == "odd" && $is_even -ne 0) ]]; then
+                    server_state=$(get_server_state "$server_name")
+                    if [[ "$server_state" != "SHUTDOWN" ]]; then
+                        shutdown_server "$server_name" &
+                    fi
+                fi
+            fi
+        done
+
+        sleep 5
+        echo "Please wait for the servers to stop or for the timeout to occur..."
+        timeout=0
+        running=1
+
+        # Aguardando o shutdown ou timeout
+        while [[ $timeout -le $wlsTimeOut && $running -ne 0 ]]; do
+            running=0
+            for server_name in $servers; do
+                last_char=${server_name: -1}
+                if [[ $last_char =~ [0-9] ]]; then
+                    is_even=$((last_char % 2))
+                    if [[ ("$EVEN_OR_ODD" == "even" && $is_even -eq 0) || ("$EVEN_OR_ODD" == "odd" && $is_even -ne 0) ]]; then
+                        server_state=$(get_server_state "$server_name")
+                        if [[ "$server_state" != "SHUTDOWN" ]]; then
+                            running=1
+                            timeout=$((timeout + 5))
+                            echo "Timeout: $timeout seconds"
+                            sleep 5
+                            break
+                        fi
+                    fi
+                fi
+            done
+        done
+
+        # Verificação final de timeout
+        if [[ $timeout -ge $wlsTimeOut ]]; then
+            echo -e "${RED}Timeout occurred while stopping the servers!${RESET}"
+            echo -e "${RED}Manual intervention required to check servers' shutdown status.${RESET}"
+            exit 1
+        fi
+
+        # Verificação final do estado dos servidores
+        for server_name in $servers; do
+            last_char=${server_name: -1}
+            if [[ $last_char =~ [0-9] ]]; then
+                is_even=$((last_char % 2))
+                if [[ ("$EVEN_OR_ODD" == "even" && $is_even -eq 0) || ("$EVEN_OR_ODD" == "odd" && $is_even -ne 0) ]]; then
+                    server_state=$(get_server_state "$server_name")
+                    if [[ "$server_state" == "SHUTDOWN" ]]; then
+                        echo -e "${CYAN}Server $server_name has been correctly shut down.${RESET}"
+                    else
+                        echo -e "${RED}Server $server_name is still running. Attempting to kill the process.${RESET}"
+                        echo -e "${RED}Please check the clear cache script for force kill procedures.${RESET}"
+                    fi
+                fi
+            fi
+        done
+
+
+
+        echo "Stop completed!"
+
+        
+
+        
+
+          

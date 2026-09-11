@@ -1,0 +1,59 @@
+parameters:
+- name: adobeRemoteUrl
+  type: string
+  default: $(adobe_remote_url)
+- name: adobeBranch
+  type: string
+  default: ''
+
+variables:
+- template: /tech_products/ecmc/adbb-aem/provisioners/aem/b2b/lib_default/variables/load.yml
+
+resources:
+  repositories:
+    - repository: FortifyExclusion
+      name: DevOps/Vivo.Fortify.Exclusions
+      type: git
+      ref: refs/heads/master
+      endpoint: CorePipelines
+    - repository: CorePipelines
+      name: DevOps/Vivo.Core.Pipelines
+      type: git
+      ref: refs/tags/v1
+      endpoint: CorePipelines
+
+stages:
+- ${{ if or(in(variables['Build.SourceBranch'], 'refs/heads/master', 'refs/heads/main', 'refs/heads/master-migracao'), startsWith(variables['Build.SourceBranch'], 'refs/heads/release')) }}:
+  - template: /tech_products/ecmc/adbb-aem/provisioners/aem/b2b/lib_default/stages/check_version.yml
+
+- template: /tech_products/ecmc/adbb-aem/provisioners/aem/b2b/lib_default/stages/build.yml
+  parameters:
+    ${{ if or(in(variables['Build.SourceBranch'], 'refs/heads/master', 'refs/heads/main', 'refs/heads/master-migracao'), startsWith(variables['Build.SourceBranch'], 'refs/heads/release')) }}:
+      dependsOn: [check_version]
+    ${{ else }}:
+      dependsOn: []
+
+- ${{ if notIn(variables['Build.SourceBranch'], 'refs/heads/master', 'refs/heads/main', 'refs/heads/master-migracao') }}:
+  - template: /tech_products/ecmc/adbb-aem/provisioners/aem/b2b/lib_default/stages/quality_gates.yml
+
+- ${{ if notIn(variables['Build.SourceBranch'], 'refs/heads/master', 'refs/heads/main', 'refs/heads/master-migracao') }}:
+  - template: /tech_products/ecmc/adbb-aem/provisioners/aem/b2b/lib_default/stages/security.yml
+    parameters:
+      fortifyExclusionRepository: FortifyExclusion
+
+# Publica artifacts apenas quando vem da master/main/release
+- ${{ if or(in(variables['Build.SourceBranch'], 'refs/heads/master', 'refs/heads/main', 'refs/heads/master-migracao'), startsWith(variables['Build.SourceBranch'], 'refs/heads/release')) }}:
+  - template: /tech_products/ecmc/adbb-aem/provisioners/aem/b2b/lib_default/stages/publish.yml
+    parameters:
+      dependsOn: [check_version, build]
+
+- template: /tech_products/ecmc/adbb-aem/provisioners/aem/b2b/lib_default/stages/sync.yml
+  parameters:
+    adobeRemoteUrl: "${{parameters.adobeRemoteUrl}}"
+    adobeBranch: "${{parameters.adobeBranch}}"
+    ${{ if and(not(eq(variables['Build.Reason'], 'PullRequest')), or(in(variables['Build.SourceBranch'], 'refs/heads/master', 'refs/heads/main', 'refs/heads/master-migracao'), startsWith(variables['Build.SourceBranch'], 'refs/heads/release'))) }}:
+      dependsOn: [publish_maven]
+    ${{ elseif and(eq(variables['Build.Reason'], 'PullRequest'), notIn(variables['Build.SourceBranch'], 'refs/heads/master', 'refs/heads/main', 'refs/heads/master-migracao')) }}:
+      dependsOn: [quality_gates, security]
+    ${{ else }}:
+      dependsOn: [build]

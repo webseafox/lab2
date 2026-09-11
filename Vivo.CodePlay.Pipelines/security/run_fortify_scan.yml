@@ -1,0 +1,1328 @@
+parameters:
+- name: fortifyExclusionRepository
+- name: convisoCompany
+  default: 430
+- name: appVersion
+  type: string
+  default: "DevSecOps"
+- name: vivoFlow
+  type: string
+  default: "master,main,develop,dev,preprod,homolog,staging,prodlike,release"
+- name: fortifyArtifactName
+  type: string
+  default: "fortify-log-$(System.JobAttempt)"
+- name: fortifyArtifactNameToPublish
+  type: string
+  default: "fortify-vulnerabilities-report-$(System.JobAttempt)"
+- name: repositoryAlias
+  type: string
+  default: ''
+- name: repositoryName
+  type: string
+  default: "$(Build.Repository.Name)"
+- name: branchName
+  type: string
+  default: ''
+- name: enableFortifyExclusions
+  type: boolean
+  default: true
+- name: appLanguage
+  type: string
+  default: 'other'
+- name: azureSubscription
+  default: "$(APP_CONFIGURATION_AZURE_SUBSCRIPTION)"
+
+steps:
+  - ${{ if or(eq(parameters.vivoFlow, 'none'),and(ne(parameters.vivoFlow, 'none'),or(eq(variables['Build.SourceBranchName'], 'master'),eq(variables['Build.SourceBranchName'], 'main'),contains(parameters.vivoFlow, variables['Build.SourceBranchName']),and(eq(variables['Build.Reason'], 'PullRequest'),contains(parameters.vivoFlow, replace(variables['System.PullRequest.TargetBranch'], 'refs/heads/', '')))))) }}:
+
+    ## -> Taks the explain this job
+    - task: Bash@3
+      displayName: 'About the Job'
+      inputs:
+        targetType: inline
+        script: |
+
+          RED='\033[0;31m'
+          GREEN='\033[0;32m'
+          BLUE='\033[0;34m'
+          YELLOW='\033[1;33m'
+          BG_GREEN='\033[42;1;37m'
+          NC='\033[0m'
+
+          echo ' ================================================================================================================================'
+          echo '|                                                      _____             _______                                                 |'
+          echo '|                                    /\               / ____|           |__   __|                                                |'
+          echo '|                                   /  \   _ __  _ __| (___   ___  ___     | | ___  __ _ _ __ ___                                |'
+          echo '|                                  / /\ \ |  _ \|  _ \\___ \ / _ \/ __|    | |/ _ \/ _  |  _   _ \                               |'
+          echo '|                                 / ____ \| |_) | |_) |___) |  __/ (__     | |  __/ (_| | | | | | |                              |'
+          echo '|                                /_/    \_\ .__/| .__/_____/ \___|\___|    |_|\___|\__,_|_| |_| |_|                              |'
+          echo '|                                         | |   | |                                                                              |'
+          echo '|                                         |_|   |_|                                                                              |'
+          echo ' ================================================================================================================================'
+          echo "                                                                                                      powered by Vivo AppSec Team"
+          echo "                                                                    restructured to OSS pipeline standards by the Devops OSS Team"
+          echo ""
+
+          printf "
+          =================================================================================================================================
+          ${GREEN}                                                 ${SYSTEM_JOBDISPLAYNAME}
+          =================================================================================================================================
+
+          ${YELLOW}The objective of this stage is to assess whether there are vulnerabilities in the source code of this application..
+          ${YELLOW}If you have any questions about this phase of the pipeline, access the documentation https://wikicorp.telefonica.com.br/pages/viewpage.action?pageId=524036659
+
+          ================================================================================================================================="
+
+    - task: DownloadPipelineArtifact@2
+      displayName: 'Download AppSec Endpoints Artifact'
+      inputs:
+        buildType: 'current'
+        artifactName: 'AppSecEndpoints'
+        targetPath: '$(Pipeline.Workspace)/AppSecEndpoints'
+
+    - task: Bash@3
+      displayName: 'Set SAST Security Variables'
+      env:
+        REPOSITORY_NAME: "${{ parameters.repositoryName }}"
+      inputs:
+        targetType: inline
+        script: |
+          ENDPOINTS_FILE="$(Pipeline.Workspace)/AppSecEndpoints/appsec_endpoints.json"
+          
+          if [ ! -f "$ENDPOINTS_FILE" ]; then
+            echo "##vso[task.logissue type=error]AppSec Endpoints artifact not found!"
+            echo "##[error]The required artifact 'AppSecEndpoints' containing the configuration JSON could not be found."
+            exit 1
+          fi
+
+          echo "##[debug] Parsing endpoints from artifact..."
+          USE_FORTIFY_LOCAL_SCANCENTRAL_VERSION=$(jq -r '.FORTIFY_LOCAL_SCANCENTRAL_VERSION // empty' "$ENDPOINTS_FILE")
+          USE_FORTIFY_SSC_ENDPOINT=$(jq -r '.FORTIFY_SSC_ENDPOINT // empty' "$ENDPOINTS_FILE")
+          USE_FORTIFY_SCANCENTRAL_CONTROLLER_ENDPOINT=$(jq -r '.FORTIFY_SCANCENTRAL_CONTROLLER_ENDPOINT // empty' "$ENDPOINTS_FILE")
+          
+          if [ -z "$USE_FORTIFY_LOCAL_SCANCENTRAL_VERSION" ] || [ -z "$USE_FORTIFY_SSC_ENDPOINT" ] || [ -z "$USE_FORTIFY_SCANCENTRAL_CONTROLLER_ENDPOINT" ]; then
+            echo "##vso[task.logissue type=error]Missing required variables in AppSec Endpoints artifact!"
+            exit 1
+          fi
+
+          echo "=================================================================="
+          echo "AppSec Endpoints Loaded:"
+          echo "FORTIFY_LOCAL_SCANCENTRAL_VERSION.......: $USE_FORTIFY_LOCAL_SCANCENTRAL_VERSION"
+          echo "FORTIFY_SSC_ENDPOINT....................: $USE_FORTIFY_SSC_ENDPOINT"
+          echo "FORTIFY_SCANCENTRAL_CONTROLLER_ENDPOINT.: $USE_FORTIFY_SCANCENTRAL_CONTROLLER_ENDPOINT"
+          echo "=================================================================="
+
+          echo "##vso[task.setvariable variable=FORTIFY_SSC_ENDPOINT]$USE_FORTIFY_SSC_ENDPOINT"
+          echo "##vso[task.setvariable variable=FORTIFY_SCANCENTRAL_CONTROLLER_ENDPOINT]$USE_FORTIFY_SCANCENTRAL_CONTROLLER_ENDPOINT"
+          echo "##vso[task.setvariable variable=FORTIFY_APP_DEFAULT_NAME]$(System.TeamProject)-${REPOSITORY_NAME}"
+          echo "##vso[task.setvariable variable=FORTIFY_APP_DEFAULT_VERSION]DevSecOps"
+          echo "##vso[task.setvariable variable=FORTIFY_EXCLUSION_FILE]sast_fortify_exclude_files.json"
+          echo "##vso[task.setvariable variable=FORTIFY_LOCAL_SCANCENTRAL_VERSION]$USE_FORTIFY_LOCAL_SCANCENTRAL_VERSION"
+          echo "##vso[task.setvariable variable=FORTIFY_LOCAL_SCANCENTRAL_PATH]/devops/fortify/scancentral/"
+          echo "##vso[task.setvariable variable=FORTIFY_LOCAL_SCANCENTRAL_SCRIPT]/bin/scancentral"
+
+          # Resolve REPO_ROOT uma vez e expõe para todos os steps seguintes
+          if [ -d "$(Build.SourcesDirectory)/${REPOSITORY_NAME}" ]; then
+            REPO_ROOT_VALUE="$(Build.SourcesDirectory)/${REPOSITORY_NAME}"
+          else
+            REPO_ROOT_VALUE="$(Build.SourcesDirectory)"
+          fi
+          echo "##vso[task.setvariable variable=FORTIFY_REPO_ROOT]$REPO_ROOT_VALUE"
+          echo "##[debug] FORTIFY_REPO_ROOT: $REPO_ROOT_VALUE"
+
+          echo "Security variables for this job have been set."
+
+    - ${{ if eq(parameters.enableFortifyExclusions, true) }}:
+      ## -> Checkout FortifyExclusion repository
+      - checkout: ${{ parameters.fortifyExclusionRepository }}
+        path: 'fortify-exclusions'
+        fetchDepth: 1
+
+    ## -> Checkout project
+    - ${{ if or(eq(parameters.repositoryAlias, ''), eq(parameters.branchName, '')) }}:
+      - checkout: self
+        fetchDepth: 0
+
+    - ${{ else }}:
+
+      - checkout: ${{ parameters.repositoryAlias }}
+        clean: true
+        fetchDepth: 0
+        fetchTags: false
+        persistCredentials: true
+    
+      - bash: |
+          cd $(Build.SourcesDirectory)/${{ parameters.repositoryName  }}
+          git pull origin $BRANCH_NAME
+          git fetch --no-tags origin "$BRANCH_NAME:$BRANCH_NAME" -f
+          git checkout "$BRANCH_NAME"
+        displayName: "Get source of ${{ parameters.repositoryAlias  }} (branch ${{parameters.branchName }})"
+        env:
+          BRANCH_NAME: ${{ parameters.branchName }}
+
+
+    ## -> Download Security Tokens
+    - task: AzureKeyVault@2
+      displayName: 'Getting AKV Security Credentials'
+      timeoutInMinutes: 1
+      retryCountOnTaskFailure: 5
+      inputs:
+        azureSubscription: DevOpsSharedResources
+        KeyVaultName: kv-azdevops-shared
+        SecretsFilter: 'FORTIFY-SSC-CLI-TOKEN, CONVISO-API-KEY, ASPM-BASE-URL, ASPM-OAUTH-CLIENT-ID, ASPM-OAUTH-CLIENT-SECRET'
+      condition: and(eq(variables['FORTIFY-SSC-CLI-TOKEN'], ''), eq(variables['CONVISO-API-KEY'], ''))
+
+    - ${{ if eq(parameters.enableFortifyExclusions, true) }}:
+      ## -> Setup FORTIFY exclusions
+      - task: Bash@3
+        displayName: 'Setup FORTIFY Exclusions'
+        name: fortify_exclusions
+        condition: succeeded()
+        continueOnError: false
+        env:
+          REPOSITORY_NAME: "${{ parameters.repositoryName }}"
+        inputs:
+          targetType: inline
+          script: |
+
+            fortifyRepositoryTech="${APP_LANGUAGE}"
+            project_name="${SYSTEM_TEAMPROJECT}"
+            repository_name="${REPOSITORY_NAME}"
+            excludeFileParam=""
+            excludel=""
+
+            # Workaround to avoid interpreting wildcards as disk paths
+            mkdir -p $(Pipeline.Workspace)/fortify-exclusions/tmp
+            cd $(Pipeline.Workspace)/fortify-exclusions/tmp
+
+            json=$(jq -c '.' < $(Pipeline.Workspace)/fortify-exclusions/${FORTIFY_EXCLUSION_FILE})
+
+            # search exclusions based on (PROJECT/REPOSITORY)
+            excludeList=$(echo "$json" | jq -r --arg project_name "${project_name:-0}" --arg repository_name "${repository_name:-0}" '.[$project_name + "/" + $repository_name]')
+
+            if [ "$excludeList" != "null" ]; then
+              excludel=($(grep -oE '\S+' <<< "$excludeList"))
+              echo -e "\033[0;32mEXCLUSION KEY: ${project_name}/${repository_name}"
+            else
+              #seach exclusions based on technology
+              if [[ -n "$fortifyRepositoryTech" && "$fortifyRepositoryTech" != "null" ]]; then
+                repository_type=$fortifyRepositoryTech
+                query_origin="Library"
+                excludeList=$(echo "$json" | jq -r --arg repository_type ${repository_type:-0} '.[$repository_type]')
+                if [[ "$excludeList" == "null" || -z "$excludeList" ]]; then
+                  echo -e "Tecnologia ${repository_type} não cadastrada no Regex"
+                  repository_type="other"
+                  excludeList=$(echo "$json" | jq -r --arg repository_type ${repository_type:-0} '.[$repository_type]')
+                fi
+                  excludel=($(grep -oE '\S+' <<< "$excludeList"))
+                  echo -e "\033[0;32mEXCLUSION KEY: ${repository_type} (FROM: $query_origin)"
+              else
+                #Usa Other caso a tecnologia nem o nome seja encontrado
+                repository_type="other"
+                excludeList=$(echo "$json" | jq -r --arg repository_type ${repository_type:-0} '.[$repository_type]')
+                query_origin="Library"
+                excludel=($(grep -oE '\S+' <<< "$excludeList"))
+                echo -e "\033[0;32mEXCLUSION KEY: ${repository_type} (FROM: $query_origin)"
+              fi
+            fi
+
+            ## -> Validade Exclusion Query
+            if [[ -n "$excludel" && "$excludel" != "null" ]]; then
+                echo "##[debug] Will be excluded from FORTIFY scan:"
+              for arg in "${excludel[@]}"; do
+                excludeFileParam+="-exclude \"${arg}\" "
+                echo "[Excluded]: $arg"
+              done
+            else
+              echo "##[debug] None of the keys were found in the exclusions files."
+              echo "##[debug] Keys: ${project_name}/${repository_name}, ${repository_type}"
+            fi
+            echo "##vso[task.setvariable variable=EXCLUDE_FILE_PARAM;isreadonly=true]$excludeFileParam"
+
+    - ${{ else }}:
+      - task: Bash@3
+        displayName: 'Set Default FORTIFY Exclusions'
+        inputs:
+          targetType: inline
+          script: |
+            appLanguage="${{ parameters.appLanguage }}"
+            case "$appLanguage" in
+              java)
+                excludeFileParam='-exclude "**/*test*" -exclude "**/*test*/**/*" -exclude "**/*spec*/**/*" -exclude "**/*stryker*" -exclude "**/*spec*" -exclude "**/*mock*" -exclude "**/*swagger*"'
+                ;;
+              nodejs)
+                excludeFileParam='-exclude "**/*test*" -exclude "**/*test*/**/*" -exclude "**/*spec*/**/*" -exclude "**/*stryker*" -exclude "**/*spec*" -exclude "**/*mock*" -exclude "**/*swagger*"'
+                ;;
+              *)
+                excludeFileParam='-exclude "**/*test*" -exclude "**/*test*/**/*" -exclude "**/*spec*/**/*" -exclude "**/*stryker*" -exclude "**/*spec*" -exclude "**/*mock*" -exclude "**/*swagger*"'
+                ;;
+            esac
+
+            echo "##[debug] Default Fortify exclusions for '$appLanguage': $excludeFileParam"
+            echo "##vso[task.setvariable variable=EXCLUDE_FILE_PARAM;isreadonly=true]$excludeFileParam"
+
+    ## -> Defines the version name for the scan
+    - task: Bash@3
+      displayName: 'Defining App Version'
+      name: scan_version_name
+      condition: succeeded()
+      continueOnError: false
+      inputs:
+        targetType: inline
+        script: |
+
+          echo "##[debug] FORTIFY APP VERSION...........: ${{ parameters.appVersion }}"
+
+          appVersion="${{ parameters.appVersion }}"
+
+          echo "##vso[task.setvariable variable=FORTIFY_APP_VERSION]$appVersion"
+          echo "##[debug] FORTIFY_APP_VERSION: $appVersion."
+
+
+     ## -> Search FORTIFY Project/Project Version ID
+    - task: Bash@3
+      displayName: 'Search FORTIFY Project/Project Version ID'
+      name: search_fortify_project
+      condition: succeeded()
+      continueOnError: false
+      inputs:
+        targetType: inline
+        script: |
+
+          rawName="$(FORTIFY_APP_DEFAULT_NAME)"
+
+          fortifyAppDefaultName=$(echo -n "$rawName" | jq -sRr @uri)
+
+
+          fortifyToken=$(echo -n $(FORTIFY-SSC-CLI-TOKEN) | base64)
+
+          echo "##[debug] FORTIFY rawName...............: $rawName"
+          echo "##[debug] FORTIFY URL encoded...........: $fortifyAppDefaultName"
+
+          requestQuery="project.name:$fortifyAppDefaultName"
+          requestParams="fields=id,name,project&q=$requestQuery"
+
+          response=$(curl -s -g \
+          -X GET "$(FORTIFY_SSC_ENDPOINT)api/v1/projectVersions?$requestParams" \
+          --header 'Accept: application/json' \
+          --header "Authorization: FortifyToken $fortifyToken")
+
+          echo "##[debug] Response....: $response"
+
+          projectId=$(echo "$response" | jq -r '.data[0].project.id // empty')
+          projectVersionId=$(echo "$response" | jq -r '.data[] | select(.name == "'$(FORTIFY_APP_VERSION)'") | .id // empty')
+
+          echo "##vso[task.setvariable variable=FORTIFY_PROJECT_ID]$projectId"
+          echo "##[debug] FORTIFY_PROJECT_ID: $projectId."
+
+          echo "##vso[task.setvariable variable=FORTIFY_PROJECT_VERSION_ID]$projectVersionId"
+          echo "##[debug] FORTIFY_PROJECT_VERSION_ID: $projectVersionId."
+
+     ## -> Create Fortify Project/Project Version
+    - task: Bash@3
+      displayName: 'Create FORTIFY Project/Project Version ID'
+      name: create_fortify_project
+      condition: and(
+        succeeded(),
+        eq(variables.FORTIFY_PROJECT_VERSION_ID, ''))
+      continueOnError: false
+      inputs:
+        targetType: inline
+        script: |
+
+          fortifyToken=$(echo -n $(FORTIFY-SSC-CLI-TOKEN) | base64)
+
+          ## -> If the Project already exists, it will only be necessary to create the version
+          if [[ -n "$(FORTIFY_PROJECT_ID)" ]]; then
+            echo "##[debug] Project already exists, creating Project Version Id..."
+            requestBodyProject='{ "id": $(FORTIFY_PROJECT_ID) }'
+          else
+            echo "##[debug] Creating both Project and Project Version Id..."
+            requestBodyProject='{
+              "name": "$(FORTIFY_APP_DEFAULT_NAME)",
+              "issueTemplateId": "Prioritized-HighRisk-Project-Template",
+              "auditEnabled": true
+            }'
+          fi
+
+          requestData='{
+            "name": "'$(FORTIFY_APP_VERSION)'",
+            "issueTemplateId": "Prioritized-HighRisk-Project-Template",
+            "project": '$requestBodyProject',
+            "customTagValuesAutoApply": true,
+            "autoPredict": true,
+            "predictionPolicy": "Telefonica-Policy-v2"
+          }'
+
+          responseProject=$(curl -s -g \
+          -X POST "$(FORTIFY_SSC_ENDPOINT)api/v1/projectVersions" \
+          --header 'Accept: application/json' \
+          --header 'Content-Type: application/json' \
+          --header "Authorization: FortifyToken $fortifyToken" \
+          --data "$requestData")
+
+          projectVersionId=$(echo $responseProject | jq .data.id)
+          projectId=$(echo $responseProject | jq .data.project.id)
+
+          if [[ -n $projectVersionId ]]; then
+            echo "##[debug] Success while creating both Project and Project Version Id..."
+
+            echo "##vso[task.setvariable variable=FORTIFY_PROJECT_ID]$projectId"
+            echo "##[debug] FORTIFY_PROJECT_ID: $projectId."
+
+            echo "##vso[task.setvariable variable=FORTIFY_PROJECT_VERSION_ID]$projectVersionId"
+            echo "##[debug] FORTIFY_PROJECT_VERSION_ID: $projectVersionId."
+
+          else
+            echo "##[error] Error while creating both Project and Project Version Id..."
+            echo $responseProject | jq .message
+            exit -1
+          fi
+
+          #Regras de processamento
+          response=$(curl -sS -k \
+          -X PUT "$(FORTIFY_SSC_ENDPOINT)api/v1/projectVersions/$projectVersionId/resultProcessingRules" \
+          -H "Content-Type: application/json" \
+          -H "Accept: application/json" \
+          -H "Authorization: FortifyToken $fortifyToken" \
+          --data '[{"displayName":"Require approval if the Build Project is different between scans.","identifier":"com.fortify.manager.BLL.processingrules.BuildProjectProcessingRule","enabled":false,"displayable":true},{"displayName":"Check external metadata file versions in scan against versions on server.","identifier":"com.fortify.manager.BLL.processingrules.ExternalListVersionProcessingRule","enabled":true,"displayable":true},{"displayName":"Require approval if file count decreases by more than 10%. (File count of previous scan must be at least 1).","identifier":"com.fortify.manager.BLL.processingrules.FileCountDecreaseProcessingRule","enabled":false,"displayable":true},{"displayName":"Require approval if file count increases by more than 10%. (File count of previous scan must be at least 1).","identifier":"com.fortify.manager.BLL.processingrules.FileCountIncreaseProcessingRule","enabled":false,"displayable":true},{"displayName":"Require approval if result has Fortify Java Annotations.","identifier":"com.fortify.manager.BLL.processingrules.FortifyAnnotationsProcessingRule","enabled":false,"displayable":true},{"displayName":"Require approval if line count decreases by more than 10%. (Line count of previous scan must be at least 1).","identifier":"com.fortify.manager.BLL.processingrules.LineCountDecreaseProcessingRule","enabled":false,"displayable":true},{"displayName":"Require approval if line count increases by more than 10%. (Line count of previous scan must be at least 1).","identifier":"com.fortify.manager.BLL.processingrules.LineCountIncreaseProcessingRule","enabled":false,"displayable":true},{"displayName":"Require approval if the engine version of a scan is newer than the engine version of the previous scan.","identifier":"com.fortify.manager.BLL.processingrules.NewerEngineVersionProcessingRule","enabled":false,"displayable":true},{"displayName":"Ignore SCA quick scan results and SCA speed dial results performed with a setting of less than four.","identifier":"com.fortify.manager.BLL.processingrules.QuickScanProcessingRule","enabled":true,"displayable":true},{"displayName":"Require approval if the rulepacks used in the scan do not match the rulepacks used in the previous scan.","identifier":"com.fortify.manager.BLL.processingrules.RulePackVersionProcessingRule","enabled":false,"displayable":true},{"displayName":"Require approval if the rulepacks used in the scan are older than the rulepacks installed in SSC.","identifier":"com.fortify.manager.BLL.processingrules.SscRulePackVersionMatchProcessingRule","enabled":false,"displayable":true},{"displayName":"Require approval if SCA or WebInspect Agent scan does not have valid certification.","identifier":"com.fortify.manager.BLL.processingrules.ValidCertificationProcessingRule","enabled":false,"displayable":true},{"displayName":"Require approval if result has analysis warnings.","identifier":"com.fortify.manager.BLL.processingrules.WarningProcessingRule","enabled":false,"displayable":true},{"displayName":"Perform Force Instance ID migration on upload.","identifier":"com.fortify.manager.BLL.processingrules.ForceMigrationProcessingRule","enabled":false,"displayable":true},{"displayName":"Automatically perform Instance ID migration on upload.","identifier":"com.fortify.manager.BLL.processingrules.MigrationProcessingRule","enabled":true,"displayable":true},{"displayName":"Warn if audit information includes unknown custom tag.","identifier":"com.fortify.manager.BLL.processingrules.UnknownOrDisallowedAuditedAttrChecker","enabled":true,"displayable":true},{"displayName":"Require the issue audit permission to upload audited analysis files.","identifier":"com.fortify.manager.BLL.processingrules.AuditedAnalysisRule","enabled":false,"displayable":true},{"displayName":"Disallow upload of analysis results that change values of hidden tags.","identifier":"com.fortify.manager.BLL.processingrules.HiddenTagAuditsAnalysisRule","enabled":false,"displayable":true},{"displayName":"Disallow upload of analysis results if there is one pending approval.","identifier":"com.fortify.manager.BLL.processingrules.PendingApprovalChecker","enabled":false,"displayable":true},{"displayName":"Disallow approval for processing if an earlier artifact requires approval. When unchecked, the approval of latest artifacts will cause older scans to automatically get approved and processed.","identifier":"com.fortify.manager.BLL.processingrules.VetoCascadingApprovalProcessingRule","enabled":false,"displayable":true}]')
+
+          status_code=$(echo "$response" | jq -r '.responseCode')
+          if [ "$status_code" -eq 200 ]; then
+            echo "Ativo Configurado automaticamente"
+          else
+            echo "##[error]Erro ao configurar as regras de processamento. Por favor, chame um Security Champion."
+          fi
+
+    ## -> Define FORTIFY Attributes to Project Version
+    - task: Bash@3
+      displayName: 'Define FORTIFY Attributes'
+      name: define_fortify_attributes
+      condition: succeeded()
+      continueOnError: false
+      env:
+        FORTIFY_ATTRIBUTES_FILE_NAME: "fortify-attributes"
+      inputs:
+        targetType: inline
+        script: |
+          cat <<EOF >>${FORTIFY_ATTRIBUTES_FILE_NAME}
+          [
+            {
+              "attributeDefinitionId":"1",
+              "values":[
+                {
+                  "guid": "High",
+                  "name": "High",
+                  "description": "High Business Risk. This application is critical to the primary business goals of the organization.",
+                  "inUse": true
+                }
+              ],
+              "guid": "BusinessRisk"
+            },
+            {
+              "attributeDefinitionId": 2,
+              "values": [
+                {
+                  "guid": "NONE",
+                  "name": "None",
+                  "description": "There are no known legal compliance obligations",
+                  "inUse": true
+                }
+              ],
+              "guid": "Compliance"
+            },
+            {
+              "attributeDefinitionId": 3,
+              "values": [
+                {
+                  "guid": "Unknown",
+                  "name": "Unknown Data",
+                  "description": "Interacts with data of an unknown classification type. Data of this type should be assumed to at least be Restricted. ",
+                  "inUse": true
+                }
+              ],
+              "guid": "InfoClassification"
+            },
+            {
+              "attributeDefinitionId": 4,
+              "values": [
+                {
+                  "guid": "Pro",
+                  "name": "Product",
+                  "description": "Product delivery and confirmation",
+                  "inUse": true
+                },
+                {
+                  "guid": "Sales",
+                  "name": "Sales",
+                  "description": "Customer relationship management and transaction processing",
+                  "inUse": true
+                },
+                {
+                  "guid": "Services",
+                  "name": "Services",
+                  "description": "Customer support and service delivery improvement systems",
+                  "inUse": true
+                }
+              ],
+              "guid": "ProjectClassification"
+            },
+            {
+              "attributeDefinitionId": 5,
+              "values": [
+                {
+                  "guid": "New",
+                  "name": "New",
+                  "description": "This application has just begun development and has not had a production release.",
+                  "inUse": true
+                }
+              ],
+              "guid": "DevPhase"
+            },
+            {
+              "attributeDefinitionId": 6,
+              "values": [
+                {
+                  "guid": "Partial",
+                  "name": "Partially Outsourced",
+                  "description": "Development duties partially outsourced. Design, management, development, and support duties are split between internal employees and an outsourced resource.",
+                  "inUse": true
+                }
+              ],
+              "guid": "DevStrategy"
+            },
+            {
+              "attributeDefinitionId": 7,
+              "values": [
+                {
+                  "guid": "externalpublicnetwork",
+                  "name": "External Public Network Access Required",
+                  "description": "Interaction can occur from an untrusted public network (e.g. the public internet).",
+                  "inUse": true
+                }
+              ],
+              "guid": "Accessibility"
+            },
+            {
+              "attributeDefinitionId": 8,
+              "values": [
+                {
+                  "guid": "ApplicationComponent",
+                  "name": "Application Component",
+                  "description": "A module which performs a business function that is not a self contained application",
+                  "inUse": true
+                }
+              ],
+              "guid": "ProjectType"
+            },
+            {
+              "attributeDefinitionId": 9,
+              "values": [
+                {
+                  "guid": "NA",
+                  "name": "Platform Neutral",
+                  "description": "Application does not rely on any operating system",
+                  "inUse": true
+                }
+              ],
+              "guid": "TargetPlatform"
+            },
+            {
+              "attributeDefinitionId": 10,
+              "values": [
+                {
+                  "guid": "API",
+                  "name": "Programmatic API",
+                  "description": "Logic is only available through programmatic API access.",
+                  "inUse": true
+                }
+              ],
+              "guid": "Interfaces"
+            },
+            {
+              "attributeDefinitionId": 12,
+              "values": [
+                {
+                  "guid": "Custom",
+                  "name": "Custom",
+                  "description": "",
+                  "inUse": true
+                }
+              ],
+              "guid": "AuthenticationSystem"
+            },
+            {
+              "attributeDefinitionId": 14,
+              "values": [
+                {
+                  "guid": "Operations",
+                  "name": "Operations",
+                  "description": "Operations business unit",
+                  "inUse": true
+                }
+              ],
+              "guid": "BusinessUnit"
+            },
+            {
+              "attributeDefinitionId": 15,
+              "values": [
+                {
+                  "guid": "Retail",
+                  "name": "Retail",
+                  "description": "Retail industry",
+                  "inUse": true
+                }
+              ],
+              "guid": "Industry"
+            },
+            {
+              "attributeDefinitionId": 16,
+              "values": [
+                {
+                  "guid": "Americas",
+                  "name": "Americas",
+                  "description": "The Americas region",
+                  "inUse": true
+                }
+              ],
+              "guid": "Region"
+            }
+          ]
+          EOF
+
+    ## -> Prepare FORTIFY Project Version Fields
+    - task: Bash@3
+      displayName: 'Prepare Fortify Project Version Fields'
+      name: prepare_fortify
+      condition: succeeded()
+      continueOnError: false
+      env:
+        FORTIFY_ATTRIBUTES_FILE_NAME: "fortify-attributes"
+      inputs:
+        targetType: inline
+        script: |
+
+          fortifyToken=$(echo -n $(FORTIFY-SSC-CLI-TOKEN) | base64)
+
+          # Export project id for Conviso sync
+          echo "##vso[task.setvariable variable=PROJECT_ID;isoutput=true]$(FORTIFY_PROJECT_VERSION_ID)"
+
+          echo "##[debug] Adding/updating attributes in the Project Version."
+          response=$(curl -s -g \
+          -X PUT "$(FORTIFY_SSC_ENDPOINT)api/v1/projectVersions/$(FORTIFY_PROJECT_VERSION_ID)/attributes" \
+          --header 'Accept: application/json' \
+          --header 'Content-Type: application/json' \
+          --header "Authorization: FortifyToken $fortifyToken" \
+          --data @${FORTIFY_ATTRIBUTES_FILE_NAME})
+
+          counter=$(echo $response | jq .count)
+          echo "##[debug] Added/updated attributes. Total: $counter"
+
+          echo "##[debug] Updating 'committed' field..."
+          reponseUpdate=$(curl -s -g \
+          -X PUT "$(FORTIFY_SSC_ENDPOINT)api/v1/projectVersions/$(FORTIFY_PROJECT_VERSION_ID)" \
+          --header 'Accept: application/json' \
+          --header 'Content-Type: application/json' \
+          --header "Authorization: FortifyToken $fortifyToken" \
+          --data '{"committed": true}')
+
+          commitedProjectVersionId=$(echo $reponseUpdate | jq .data.id)
+          if [[ -n "$commitedProjectVersionId" ]]; then
+            echo "##[debug] Project Version 'committed' field updated."
+          else
+            echo "##[error] Error while updating Project Version 'committed' field."
+            echo $reponseUpdate | jq .message
+            exit 1;
+          fi
+
+    ## -> Run FORTIFY
+    - task: Bash@3
+      displayName: 'Run Fortify SAST (client)'
+      name: run_fortify
+      condition: succeeded()
+      continueOnError: false
+      env:
+        ASDF_JAVA_VERSION: "openjdk-17.0.2"
+        FORTIFY_LOCAL_SCANCENTRAL_VERSION: "$(FORTIFY_LOCAL_SCANCENTRAL_VERSION)"
+      inputs:
+        targetType: inline
+        script: |
+
+          # Primeiro, verificamos o caso padrão (checkout: self)
+          if [ -d "$(Build.SourcesDirectory)/${{ parameters.repositoryName }}" ]; then
+            echo "##[debug] Entrando no diretório do repositório: $(Build.SourcesDirectory)/${{ parameters.repositoryName }}"
+            cd "$(Build.SourcesDirectory)/${{ parameters.repositoryName }}"
+          else
+            # Caso contrário, apenas usamos o diretório de sources (onde o 'checkout: self' padrão roda)
+            echo "##[debug] Permanecendo no diretório de sources: $(Build.SourcesDirectory)"
+            cd "$(Build.SourcesDirectory)"
+          fi
+
+          echo "##[debug] Running FORTIFY scan with local ScanCentral Client version ${FORTIFY_LOCAL_SCANCENTRAL_VERSION}..."
+
+          scancentralCMD=$(FORTIFY_LOCAL_SCANCENTRAL_PATH)${FORTIFY_LOCAL_SCANCENTRAL_VERSION}$(FORTIFY_LOCAL_SCANCENTRAL_SCRIPT)
+
+          echo "##[command] $scancentralCMD"
+          echo "##[debug] FORTIFY_SCANCENTRAL_CONTROLLER_ENDPOINT...: $(FORTIFY_SCANCENTRAL_CONTROLLER_ENDPOINT)"
+          echo "##[debug] FORTIFY_SSC_ENDPOINT......................: $(FORTIFY_SSC_ENDPOINT)"
+          echo "##[debug] EXCLUDE_FILE_PARAM........................: $(EXCLUDE_FILE_PARAM)"
+          echo "##[debug] FORTIFY_LOCAL_SCANCENTRAL_VERSION.........: $(FORTIFY_LOCAL_SCANCENTRAL_VERSION)"
+          echo "##[debug] FORTIFY_APP_DEFAULT_NAME..................: $(FORTIFY_APP_DEFAULT_NAME)"
+          echo "##[debug] FORTIFY_APP_VERSION.......................: $(FORTIFY_APP_VERSION)"
+
+          $scancentralCMD -url $(FORTIFY_SCANCENTRAL_CONTROLLER_ENDPOINT) -sscurl $(FORTIFY_SSC_ENDPOINT) \
+          -ssctoken $(FORTIFY-SSC-CLI-TOKEN) \
+          start $(EXCLUDE_FILE_PARAM) -upload -skipBuild -bt none -block -pool 00000000-0000-0000-0000-000000000002 \
+          --log-file "$(Build.SourcesDirectory)/$(FORTIFY_APP_DEFAULT_NAME)-$(System.JobAttempt)-fortify.log" --overwrite \
+          --application "$(FORTIFY_APP_DEFAULT_NAME)" --application-version "$(FORTIFY_APP_VERSION)" \
+          -uptoken $(FORTIFY-SSC-CLI-TOKEN)
+
+          if [ $? -eq 0 ]; then
+            echo "##[debug] Fortify scan completed successfully."
+          else
+            echo "##vso[task.logissue type=error;] Fortify scan exited with errors."
+            echo "##vso[task.complete result=Failed;]"
+          fi
+
+    ## -> Publish Scan log
+    - task: PublishPipelineArtifact@1
+      displayName: "Publish Scan log"
+      inputs:
+        targetPath: "$(FORTIFY_APP_DEFAULT_NAME)-$(System.JobAttempt)-fortify.log"
+        artifactName: "${{ parameters.fortifyArtifactName }}"
+        publishLocation: pipeline
+
+    ## -> Setup Custom Tag 'Author'
+    - task: Bash@3
+      displayName: 'Setup Custom Tag Author'
+      name: setup_custom_tag_author
+      condition: succeeded()
+      continueOnError: false
+      inputs:
+        targetType: inline
+        script: |
+          
+          echo "=================================================================="
+          echo "Iniciando a configuração da Custom Tag 'Author'"
+          echo "=================================================================="
+
+          fortifyToken=$(echo -n $(FORTIFY-SSC-CLI-TOKEN) | base64)
+          
+          guid="8ddec2a8-6407-4731-951a-f366cb84c597"
+          
+          echo "##[debug] Usando Custom Tag 'Author' com GUID fixo: $guid"
+          echo "##vso[task.setvariable variable=AUTHOR_TAG_GUID]$guid"
+
+          # Verifica as custom tags aplicadas atualmente no projeto
+          echo "##[debug] Verificando Custom Tags aplicadas atualmente para o projeto..."
+          response=$(curl -s -w "%{http_code}" \
+          -H "Authorization: FortifyToken $fortifyToken" \
+          "$(FORTIFY_SSC_ENDPOINT)api/v1/projectVersions/$(FORTIFY_PROJECT_VERSION_ID)/customTags?start=0&limit=100")
+
+          code="${response: -3}"
+          body="${response::-3}"
+
+          if [ "$code" != "200" ]; then
+              echo "##[error] Falha ao consultar Custom tags do projeto (HTTP $code)"
+              exit 1
+          fi
+
+          echo "$body" | jq empty >/dev/null 2>&1 || { echo "##[error] JSON inválido recebido"; exit 1; }
+          
+          aplicada=$(echo "$body" | jq -r --arg guid "$guid" '.data[] | select(.guid==$guid) | .guid')
+
+          if [ -n "$aplicada" ]; then
+              echo "##[debug] A Custom Tag 'Author' já está habilitada no projeto."
+          else
+              echo "##[debug] A Custom Tag 'Author' ainda não está habilitada. Aplicando..."
+              payload=$(echo "$body" | jq -r '.data[].guid' | jq -R . | jq -s 'map({guid:.})' | jq --arg guid "$guid" '. + [{"guid":$guid}]')
+
+              applyResponse=$(curl -s -w "%{http_code}" -X PUT \
+              -H "Authorization: FortifyToken $fortifyToken" \
+              -H "Content-Type: application/json" -d "$payload" \
+              "$(FORTIFY_SSC_ENDPOINT)api/v1/projectVersions/$(FORTIFY_PROJECT_VERSION_ID)/customTags")
+
+              applyCode="${applyResponse: -3}"
+              
+              if [ "$applyCode" == "200" ]; then
+                  echo "##[debug] Custom Tag 'Author' aplicada com sucesso!"
+              else
+                  echo "##[warning] Falha ao aplicar Custom Tag 'Author' (HTTP $applyCode)"
+              fi
+          fi
+
+## -> Get Fortify Report (OTIMIZADO COM CONTROLES DE SEGURANÇA E RATE LIMIT)
+    - task: Bash@3
+      displayName: 'Get Fortify Report'
+      name: process_report
+      condition: succeeded()
+      continueOnError: false
+      env:
+        REPOSITORY_NAME: "${{ parameters.repositoryName }}"
+      inputs:
+        targetType: inline
+        script: |
+          
+          # Preparando Variáveis de Ambiente para a função de background
+          export API_ENDPOINT="$(FORTIFY_SSC_ENDPOINT)"
+          export PROJ_VER_ID="$(FORTIFY_PROJECT_VERSION_ID)"
+          export AUTH_TOKEN=$(echo -n $(FORTIFY-SSC-CLI-TOKEN) | base64)
+
+          echo "##[debug] Waiting for FORTIFY to process the report..."
+          
+          # RESOLUÇÃO [003]: Backoff exponencial para o Polling
+          i="0"
+          retries="30"
+          sleep_time=3
+          
+          T_POLL_START=$(date +%s)
+
+          while [[ $i -lt $retries ]]; do
+            responseArtifact=$(curl -s -g --compressed \
+            -X GET "${API_ENDPOINT}api/v1/projectVersions/${PROJ_VER_ID}/artifacts?limit=1" \
+            --header 'Accept: application/json' \
+            --header 'Content-Type: application/json' \
+            --header "Authorization: FortifyToken $AUTH_TOKEN")
+
+            status=$(echo "$responseArtifact" | jq -r .data[0].status)
+            echo "##[debug] Process status: $status (tentativa $((i+1))/$retries)"
+
+            if [[ "$status" == "REQUIRE_AUTH" ]]; then
+                # RESOLUÇÃO [006]: Reintroduzindo links e mensagens completas de suporte
+                echo "##vso[task.logissue type=error] There is a pending approval on the Fortify portal."
+                echo "To proceed with approval, contact AppSec by email (appsec_vivo.br@telefonica.com) or access your Conviso Dashboard."
+                exit 1;
+            elif [[ "$status" == "PROCESS_COMPLETE" ]]; then
+                echo "##[debug] Process complete!"
+                break
+            else
+                # Backoff Exponencial (5s, 10s, 20s... até máx de 30s)
+                sleep $sleep_time
+                sleep_time=$((sleep_time * 2))
+                [[ $sleep_time -gt 30 ]] && sleep_time=30
+            fi
+
+            i=$((i+1))
+          done
+
+          T_POLL_END=$(date +%s)
+          echo "##[debug] ⏱ Tempo de polling (aguardando o SSC processar): $((T_POLL_END - T_POLL_START))s"
+          if [[ "$status" != "PROCESS_COMPLETE" ]]; then
+            echo "##vso[task.logissue type=warning] Fortify não finalizou o processamento após $retries tentativas (último status: $status). O relatório pode estar incompleto."
+          fi
+
+          echo "##[debug] Get FORTIFY report result"
+
+          T_FETCH_START=$(date +%s)
+
+          responseIssues=$(curl -s -g --compressed \
+          -X GET "${API_ENDPOINT}api/v1/projectVersions/${PROJ_VER_ID}/issues?start=0&limit=-1&orderby=id&q=%5Bfortify%20priority%20order%5D%3Acritical%20%5Bfortify%20priority%20order%5D%3Ahigh&qm=issues&showhidden=false&showremoved=false&showsuppressed=false" \
+          --header 'Accept: application/json' \
+          --header "Authorization: FortifyToken $AUTH_TOKEN")
+
+          T_FETCH_END=$(date +%s)
+          echo "##[debug] ⏱ Tempo de busca da lista de issues: $((T_FETCH_END - T_FETCH_START))s"
+
+          ## -> Export the fortify response vulnerabilities to an file
+          fortifyVulnerabilitiesFileName="${REPOSITORY_NAME}_fortify_vulnerabilities-$(System.JobAttempt).json"
+          VULN_FILE_ABSOLUTE_PATH="$(Pipeline.Workspace)/s/${fortifyVulnerabilitiesFileName}"
+          echo "$responseIssues" > "$VULN_FILE_ABSOLUTE_PATH"
+          echo "##vso[task.setvariable variable=FORTIFY_VULNERABILITIES_FILE]$VULN_FILE_ABSOLUTE_PATH"
+
+          T_COUNT_START=$(date +%s)
+
+          read -r criticalNotReviewed highNotReviewed criticalExploitable highExploitable totalIssuesFetched <<< "$(echo "$responseIssues" | jq -r '
+            .data as $d
+            | ($d | length) as $total
+            | ($d | map(select(.enginePriority=="Critical" and (.issueStatus=="Unreviewed" or .issueStatus=="Under Review"))) | length) as $c1
+            | ($d | map(select(.enginePriority=="High" and (.issueStatus=="Unreviewed" or .issueStatus=="Under Review"))) | length) as $c2
+            | ($d | map(select(.enginePriority=="Critical" and .primaryTag=="Exploitable" and (.issueStatus!="Unreviewed" and .issueStatus!="Under Review"))) | length) as $c3
+            | ($d | map(select(.enginePriority=="High" and .primaryTag=="Exploitable" and (.issueStatus!="Unreviewed" and .issueStatus!="Under Review"))) | length) as $c4
+            | "\($c1) \($c2) \($c3) \($c4) \($total)"
+          ')"
+
+          totalVulnerabilities=$((criticalNotReviewed + highNotReviewed + criticalExploitable + highExploitable))
+
+          T_COUNT_END=$(date +%s)
+          echo "##[debug] ⏱ Tempo de contagem local (jq): $((T_COUNT_END - T_COUNT_START))s — total de issues Critical/High retornadas: $totalIssuesFetched"
+
+          echo "##[debug] Valores distintos de primaryTag (Analysis) nesta execução:"
+
+          echo "$responseIssues" | jq -r '.data | group_by(.primaryTag // "NULL_OU_AUSENTE") | map("\(length) \(.[0].primaryTag // "NULL_OU_AUSENTE")") | .[]'
+
+          echo "##[debug] Valores distintos de issueStatus nesta execução:"
+
+          echo "$responseIssues" | jq -r '.data | group_by(.issueStatus // "NULL_OU_AUSENTE") | map("\(length) \(.[0].issueStatus // "NULL_OU_AUSENTE")") | .[]'
+
+          if [[ $totalVulnerabilities -gt 0 ]]; then
+            echo "##vso[task.logissue type=error;] Critical and/or high vulnerabilities were found in this project. Number of identified violations: ${totalVulnerabilities}"
+            echo "For more details and remediation steps, check the Fortify SSC dashboard."
+          else
+            echo "##[debug] No violations identified"
+          fi
+
+          echo "##vso[task.setvariable variable=CRITICAL_VULNERABILITIES_EXPLOITABLE;isreadonly=true]$criticalExploitable"
+          echo "##vso[task.setvariable variable=CRITICAL_VULNERABILITIES_NOT_REVIEWED;isreadonly=true]$criticalNotReviewed"
+          echo "##vso[task.setvariable variable=HIGH_VULNERABILITIES_EXPLOITABLE;isreadonly=true]$highExploitable"
+          echo "##vso[task.setvariable variable=HIGH_VULNERABILITIES_NOT_REVIEWED;isreadonly=true]$highNotReviewed"
+
+          if [ -d "$(Build.SourcesDirectory)/${REPOSITORY_NAME}" ]; then
+            cd "$(Build.SourcesDirectory)/${REPOSITORY_NAME}"
+          else
+            cd "$(Build.SourcesDirectory)"
+          fi
+          
+          # Reutiliza o diretório já resolvido no step 'Set SAST Security Variables'
+          cd "$(FORTIFY_REPO_ROOT)"
+
+          if [ ! -f "$VULN_FILE_ABSOLUTE_PATH" ]; then
+            echo "##[warning] Vulnerability report file not found at '$VULN_FILE_ABSOLUTE_PATH'."
+            exit 0
+          fi
+
+          echo ""
+          echo "##[section]## Blocking vulnerabilities report with Author ##"
+          echo ""
+
+          echo "Link para acesso das vulnerabilidades documentadas: ${API_ENDPOINT}html/ssc/version/${PROJ_VER_ID}/audit?filterset=a243b195-0a59-3f8b-1403-d55b7a7d78e6&orderby=friority&viewTab=code"
+          echo ""
+
+
+          # RESOLUÇÃO [002 e 007]: Função para disparar os CURLs com log de falhas e suporte ao xargs
+          export TAG_RESULT_FILE=$(mktemp)
+          post_payload() {
+            local payload="$1"
+            local response
+            local responseCode
+            local responseBody
+
+            response=$(curl -s -w "\n%{http_code}" -X POST \
+              -H "Content-Type: application/json" \
+              -H "Authorization: FortifyToken $AUTH_TOKEN" \
+              -d "$payload" \
+              "${API_ENDPOINT}api/v1/projectVersions/${PROJ_VER_ID}/issues/action?silent=true")
+
+            responseCode=$(echo "$response" | tail -n1)
+            responseBody=$(echo "$response" | sed '$d')
+
+            if [ "$responseCode" != "200" ]; then
+                echo "##[warning] Falha HTTP $responseCode ao aplicar Custom Tag. Payload: $payload | Resposta: $responseBody"
+                echo "FAIL" >> "$TAG_RESULT_FILE"
+            else
+                echo "OK" >> "$TAG_RESULT_FILE"
+            fi
+          }
+          export -f post_payload
+
+          # Arquivo temporário para guardar todos os payloads JSON que criaremos
+          PAYLOAD_FILE=$(mktemp)
+          guid="8ddec2a8-6407-4731-951a-f366cb84c597"
+
+          TAG_INPUT_TMP=$(mktemp)
+
+          # bash trata tab como IFS whitespace: campos vazios (null do jq em @tsv) colapsam tabs
+          # consecutivos e deslocam os campos seguintes (ex.: primaryTag null fazia issueId assumir
+          # o valor de revision, e vice-versa). \x1f (unit separator) não sofre esse colapso.
+          FIELD_SEP=$(printf '\x1f')
+          mapfile -t vulnRows < <(jq -r --arg sep "$FIELD_SEP" '.data[] | [.fullFileName, .lineNumber, .issueName, .enginePriority, .primaryLocation, .issueStatus, .primaryTag, .id, .revision] | map(if . == null then "" elif type == "number" then (.|tostring) else . end) | join($sep)' "$VULN_FILE_ABSOLUTE_PATH")
+
+          totalLoopItems=${#vulnRows[@]}
+          echo "##[debug] Total de issues a processar no loop de git blame: $totalLoopItems"
+          T_BLAME_START=$(date +%s)
+
+          declare -A fileLines=()
+          for row in "${vulnRows[@]}"; do
+            
+            IFS="$FIELD_SEP" read -r filePath lineNumber _ _ _ _ _ _ _ <<< "$row"
+            
+            repoName="${REPOSITORY_NAME}"
+            fixedPath="${filePath#$repoName/}"
+            if [ -f "$fixedPath" ] && [ "$lineNumber" != "null" ] && [ "$lineNumber" -gt 0 ]; then
+              fileLines["$fixedPath"]+=" $lineNumber"
+            fi
+          done
+
+          FILE_LINES_TMP=$(mktemp)
+          for fixedPath in "${!fileLines[@]}"; do
+            uniqueLinesCsv=$(echo "${fileLines[$fixedPath]}" | tr ' ' '\n' | sort -un | paste -sd, -)
+            printf '%s\t%s\n' "$fixedPath" "$uniqueLinesCsv" >> "$FILE_LINES_TMP"
+          done
+          uniqueFileCount=$(wc -l < "$FILE_LINES_TMP")
+
+          export BLAME_RESULT_TMP=$(mktemp)
+          blame_one_file() {
+            local line="$1"
+            local fixedPath uniqueLinesCsv
+            fixedPath="${line%%$'\t'*}"
+            uniqueLinesCsv="${line#*$'\t'}"
+
+            local blameArgs=()
+            local lns=()
+            IFS=',' read -ra lns <<< "$uniqueLinesCsv"
+            for ln in "${lns[@]}"; do
+              blameArgs+=(-L "${ln},${ln}")
+            done
+
+            local blameOutput
+            blameOutput=$(git blame "${blameArgs[@]}" --porcelain "$fixedPath" 2>/dev/null || true)
+
+            local currentHash="" currentFinalLine=""
+            local -A hashToEmail=()
+            while IFS= read -r bline; do
+              if [[ "$bline" =~ ^([0-9a-f]{40})\ [0-9]+\ ([0-9]+) ]]; then
+                currentHash="${BASH_REMATCH[1]}"
+                currentFinalLine="${BASH_REMATCH[2]}"
+                echo -e "${fixedPath}\t${currentFinalLine}\t${hashToEmail[$currentHash]:-}"
+              elif [[ "$bline" == author-mail\ * ]]; then
+                local email="${bline#author-mail }"
+                email="${email//[\<\>]/}"
+                hashToEmail["$currentHash"]="$email"
+                echo -e "${fixedPath}\t${currentFinalLine}\t${email}"
+              fi
+            done <<< "$blameOutput"
+          }
+          export -f blame_one_file
+
+          cat "$FILE_LINES_TMP" | xargs -d '\n' -I {} -P 4 bash -c 'blame_one_file "$@"' _ {} >> "$BLAME_RESULT_TMP"
+          rm -f "$FILE_LINES_TMP"
+
+          declare -A blameResult=()
+          while IFS=$'\t' read -r rFile rLine rEmail; do
+            blameResult["$rFile|$rLine"]="$rEmail"
+          done < "$BLAME_RESULT_TMP"
+          rm -f "$BLAME_RESULT_TMP"
+
+          echo "##[debug] git blame em lote + paralelo (-P 4): $uniqueFileCount arquivo(s) único(s) processado(s) para $totalLoopItems issue(s)."
+
+          for row in "${vulnRows[@]}"; do
+            IFS="$FIELD_SEP" read -r filePath lineNumber issueName enginePriority primaryLocation issueStatus primaryTag issueId revision <<< "$row"
+
+
+            repoName="${REPOSITORY_NAME}"
+            fixedPath="${filePath#$repoName/}"
+            authorMail="N/A"
+
+            # RESOLUÇÃO [005]: Verificação robusta de arquivo existente
+            if [ -f "$fixedPath" ] && [ "$lineNumber" != "null" ] && [ "$lineNumber" -gt 0 ]; then
+
+              foundMail="${blameResult["$fixedPath|$lineNumber"]:-}"
+
+              if [ -n "$foundMail" ]; then
+                authorMail=$foundMail
+              fi
+            else
+              echo "##[debug] Arquivo $fixedPath ou histórico não encontrado para git blame. (Verifique se a pipeline usa fetchDepth: 0)"
+            fi
+
+            # Verificar se é vulnerabilidade bloqueante para logar
+            if [[ ("$enginePriority" == "Critical" || "$enginePriority" == "High") && ("$issueStatus" == "Unreviewed" || "$issueStatus" == "Under Review" || "$primaryTag" == "Exploitable") ]]; then
+              echo "----------------------------------------------"
+              echo "Severity: ${enginePriority}"
+              echo "Status: ${issueStatus}"
+              echo "Tag: ${primaryTag}"
+              echo "File: ${primaryLocation}"
+              echo "Line: ${lineNumber}"
+              echo "Issue Name: ${issueName}"
+              echo "Project ID: '${PROJ_VER_ID}'"
+              echo "Revision: ${revision}"
+              echo "Author: ${authorMail}"
+              echo "Issue ID: ${issueId}"
+              echo "Dúvidas sobre a triagem? Acesse a Wiki de Segurança da Vivo."
+            fi
+
+            if [ "$authorMail" != "N/A" ]; then
+              # RESOLUÇÃO [004]: Validação rigorosa dos IDs numéricos antes de rodar o jq tonumber
+              if [[ "$issueId" =~ ^[0-9]+$ && "$revision" =~ ^[0-9]+$ ]]; then
+
+                printf '%s\t%s\t%s\n' "$issueId" "$revision" "$authorMail" >> "$TAG_INPUT_TMP"
+
+              else
+                echo "##[warning] Issue ID ($issueId) ou Revisão ($revision) inválido para $issueName. A tag não será aplicada."
+              fi
+            fi
+          done
+
+          if [ -s "$TAG_INPUT_TMP" ]; then
+            jq -R -c --arg guid "$guid" '
+              split("\t") as $f |
+              {
+                  type: "AUDIT_ISSUE",
+                  values: {
+                      issues: [{id: ($f[0]|tonumber), revision: ($f[1]|tonumber)}],
+                      customTagAudit: [{customTagGuid: $guid, textValue: $f[2]}],
+                      comment: "",
+                      hasTagComment: false
+                  }
+              }
+            ' "$TAG_INPUT_TMP" >> "$PAYLOAD_FILE"
+          fi
+          rm -f "$TAG_INPUT_TMP"
+          T_BLAME_END=$(date +%s)
+          echo "##[debug] ⏱ Tempo do loop de git blame ($totalLoopItems issues, $uniqueFileCount arquivo(s) único(s), em lote por arquivo): $((T_BLAME_END - T_BLAME_START))s"
+
+          T_TAGS_START=$(date +%s)
+
+          # RESOLUÇÃO [002]: Disparo assíncrono controlado via xargs
+          if [ -s "$PAYLOAD_FILE" ]; then
+            echo "##[debug] Processando payloads para aplicar Custom Tags de Autoria..."
+            PARALLELISM="${FORTIFY_TAG_PARALLELISM:-4}"
+            cat "$PAYLOAD_FILE" | xargs -d '\n' -I {} -P "$PARALLELISM" bash -c 'post_payload "$@"' _ {}
+          fi
+
+          rm -f "$PAYLOAD_FILE"
+
+          T_TAGS_END=$(date +%s)
+          okCount=$(grep -c "^OK$" "$TAG_RESULT_FILE" 2>/dev/null)
+          failCount=$(grep -c "^FAIL$" "$TAG_RESULT_FILE" 2>/dev/null)
+          echo "##[debug] ⏱ Tempo de envio das Custom Tags (paralelo, -P 4): $((T_TAGS_END - T_TAGS_START))s — $okCount sucesso(s), $failCount falha(s) de $((okCount + failCount)) tentativa(s)."
+          echo "##[debug] ⏱ Resumo do step: polling=$((T_POLL_END - T_POLL_START))s | busca_issues=$((T_FETCH_END - T_FETCH_START))s | contagem=$((T_COUNT_END - T_COUNT_START))s | git_blame=$((T_BLAME_END - T_BLAME_START))s | envio_tags=$((T_TAGS_END - T_TAGS_START))s"
+          rm -f "$TAG_RESULT_FILE"
+
+
+    ## -> Publish Fortify Report
+    - task: PublishPipelineArtifact@1
+      displayName: "Publish Fortify Report"
+      continueOnError: true
+      inputs:
+        targetPath: "$(FORTIFY_VULNERABILITIES_FILE)"
+        artifactName: "${{ parameters.fortifyArtifactNameToPublish }}"
+        publishLocation: pipeline
+
+    ## -> APPSEC METRICS callback — unitary sync after PROCESS_COMPLETE
+    - task: Bash@3
+      displayName: "APPSEC METRICS CALLBACK — Fortify"
+      condition: succeeded()
+      continueOnError: true
+      env:
+        ASPM_BASE_URL: "$(ASPM-BASE-URL)"
+        ASPM_CLIENT_ID: "$(ASPM-OAUTH-CLIENT-ID)"
+        ASPM_CLIENT_SECRET: "$(ASPM-OAUTH-CLIENT-SECRET)"
+      inputs:
+        targetType: inline
+        script: |
+          set -euo pipefail
+          [ -n "${ASPM_BASE_URL:-}" ] || { echo "##vso[task.logissue type=error]ASPM_BASE_URL ausente"; exit 1; }
+          [ -n "${ASPM_CLIENT_ID:-}" ] || { echo "##vso[task.logissue type=error]ASPM_OAUTH_CLIENT_ID ausente"; exit 1; }
+          [ -n "${ASPM_CLIENT_SECRET:-}" ] || { echo "##vso[task.logissue type=error]ASPM_OAUTH_CLIENT_SECRET ausente"; exit 1; }
+          ASPM_BASE_URL="${ASPM_BASE_URL%/}"
+          echo "##[debug] ASPM callback: base_url=$ASPM_BASE_URL client_id_configurado=sim client_secret_configurado=sim"
+
+          token_raw=$(curl -sS -w "\n%{http_code}" -X POST "$ASPM_BASE_URL/api/v1/oauth/token" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -nc --arg id "$ASPM_CLIENT_ID" --arg secret "$ASPM_CLIENT_SECRET" '{grant_type:"client_credentials",client_id:$id,client_secret:$secret}')")
+          token_http="${token_raw##*$'\n'}"
+          token_body="${token_raw%$'\n'*}"
+          if [ "$token_http" != "200" ]; then
+            safe_body=$(printf '%s' "$token_body" | jq -c . 2>/dev/null || printf 'resposta nao-JSON: %.800s' "$token_body")
+            echo "##vso[task.logissue type=error]ASPM OAuth falhou (HTTP $token_http): $safe_body"
+            exit 1
+          fi
+          token=$(printf '%s' "$token_body" | jq -er '.access_token') || {
+            echo "##vso[task.logissue type=error]ASPM OAuth respondeu 200 sem access_token"
+            exit 1
+          }
+
+          payload=$(jq -nc \
+            --arg event "fortify:$(Build.BuildId):$(prepare_fortify.PROJECT_ID)" \
+            --arg org "$(System.CollectionUri)" \
+            --arg projectId "$(System.TeamProjectId)" \
+            --arg project "$(System.TeamProject)" \
+            --arg repoId "$(Build.Repository.ID)" \
+            --arg repo "$(Build.Repository.Name)" \
+            --arg branch "$(Build.SourceBranchName)" \
+            --arg commit "$(Build.SourceVersion)" \
+            --arg run "$(Build.BuildId)" \
+            --arg unit "$(prepare_fortify.PROJECT_ID)" \
+            --arg name "$(FORTIFY_APP_DEFAULT_NAME) $(FORTIFY_APP_VERSION)" \
+            '{event_key:$event,source:"fortify",azure_org:$org,azure_project_id:$projectId,azure_project_name:$project,azure_repo_id:$repoId,azure_repo_name:$repo,branch:$branch,commit_sha:$commit,pipeline_run_id:$run,external_unit_id:$unit,external_unit_name:$name}')
+
+          callback_raw=$(curl -sS -w "\n%{http_code}" -X POST "$ASPM_BASE_URL/api/v1/aspm/pipeline/callback" \
+            -H "Authorization: Bearer $token" -H "Content-Type: application/json" -d "$payload")
+          callback_http="${callback_raw##*$'\n'}"
+          callback_body="${callback_raw%$'\n'*}"
+          if [ "$callback_http" != "202" ]; then
+            safe_body=$(printf '%s' "$callback_body" | jq -c . 2>/dev/null || printf 'resposta nao-JSON: %.800s' "$callback_body")
+            echo "##vso[task.logissue type=error]APPSEC METRICS CALLBACK falhou (HTTP $callback_http): $safe_body"
+            exit 1
+          fi
+          echo "##[section]ASPM callback accepted"
+          printf '%s' "$callback_body" | jq '{event_key, run_id, status, duplicate}'
+    ## -> Results Sync With Conviso Platform
+    - task: convisoAzureSyncTask@1
+      displayName: "Conviso Sync"
+      condition: and(succeeded(), eq(variables.USE_CONVISO, 'true'), ne(variables['prepare_fortify.PROJECT_ID'], ''))
+      continueOnError: true
+      inputs:
+        API_KEY: "$(CONVISO-API-KEY)"
+        PROJECT_ID: "$(prepare_fortify.PROJECT_ID)"
+        INTEGRATION: "FORTIFY"
+        COMPANY_ID: ${{ parameters.convisoCompany }}
+
+    ## -> Conviso Tags and Teams Sync
+    - template: /security/update_conviso_assets.yml
+      parameters:
+        convisoApiKey: "$(CONVISO-API-KEY)"
+        systemTeamProject: "$(System.TeamProject)"
+        convisoAssetName: "$(FORTIFY_APP_DEFAULT_NAME) $(FORTIFY_APP_VERSION)"
+        companyId: "${{ parameters.convisoCompany }}"
+
+    ## -> Evaluate SAST Security Gate
+    - task: Bash@3
+      displayName: 'Evaluate Security Gate'
+      name: evaluate_security_gate
+      continueOnError: false
+      inputs:
+        targetType: inline
+        script: |
+          build_reason="$(Build.Reason)"
+          isGateBranch=false
+          
+          if [[ "$build_reason" == "PullRequest" ]]; then
+            eval_ref="$(System.PullRequest.TargetBranch)"
+            eval_name="${eval_ref#refs/heads/}"
+          else
+            eval_ref="$(Build.SourceBranch)"
+            eval_name="$(Build.SourceBranchName)"
+          fi
+          
+          if [[ "$eval_name" == "master" || "$eval_name" == "main" || "$eval_ref" == refs/heads/release* || "$eval_ref" == refs/heads/stage* ]]; then
+            isGateBranch=true
+          fi
+
+          skipSecurityGate=$(SKIP_SECURITY_GATE)
+
+          if [[ ! "${skipSecurityGate}" =~ ^(T|t)rue$ ]]; then
+
+            ## -> Analyze Security Gate data
+            declare -i criticalVulnerabilitiesExploitable=$(CRITICAL_VULNERABILITIES_EXPLOITABLE)
+            declare -i criticalVulnerabilitiesNotReviewed=$(CRITICAL_VULNERABILITIES_NOT_REVIEWED)
+            declare -i highVulnerabilitiesExploitable=$(HIGH_VULNERABILITIES_EXPLOITABLE)
+            declare -i highVulnerabilitiesNotReviewed=$(HIGH_VULNERABILITIES_NOT_REVIEWED)
+
+            totalVulnerabilities=$((criticalVulnerabilitiesExploitable + criticalVulnerabilitiesNotReviewed + highVulnerabilitiesExploitable + highVulnerabilitiesNotReviewed))
+
+            if [[ $criticalVulnerabilitiesExploitable -gt 0 || $criticalVulnerabilitiesNotReviewed -gt 0 || $highVulnerabilitiesExploitable -gt 0 || $highVulnerabilitiesNotReviewed -gt 0 ]]; then
+              echo ""
+              if [[ "$isGateBranch" == "true" ]]; then
+                echo "════════════════════════════════════════════════════════════════════════════════"
+                echo "##[error]❌ SECURITY GATE FAILED"
+                echo "════════════════════════════════════════════════════════════════════════════════"
+                echo ""
+                echo "##vso[task.logissue type=error;] Security Gate failed! Check below or the publish report to see the violations."
+                echo "##[debug] If after hours support is needed, please, contact the following number for support. Evernow +55(11)5028-1152."
+              else
+                echo "════════════════════════════════════════════════════════════════════════════════"
+                echo "##[warning]⚠️ VULNERABILIDADES ENCONTRADAS — Gate não bloqueia em branch não produtiva"
+                echo "##vso[task.logissue type=warning;]⚠️ ATENÇÃO: O bloqueio do Security Gate está habilitado apenas para as branches principais (main, master, release* e stage*). Recomendamos fortemente a correção imediata destas vulnerabilidades. Caso não sejam corrigidas agora, sua pipeline será BLOQUEADA ao tentar realizar o merge/commit para as branches principais."
+                echo "════════════════════════════════════════════════════════════════════════════════"
+                echo ""
+                echo "##vso[task.logissue type=warning;] Vulnerabilidades críticas/altas encontradas em branch não produtiva. Corrija antes do PR para não ser bloqueado nas branches principais."
+              fi
+              
+              echo ""
+              echo "📊 Resumo das vulnerabilidades:"
+              echo "   🔴 Critical Exploitable  : $criticalVulnerabilitiesExploitable"
+              echo "   🔴 Critical Não Revisado : $criticalVulnerabilitiesNotReviewed"
+              echo "   🟠 High Exploitable      : $highVulnerabilitiesExploitable"
+              echo "   🟠 High Não Revisado     : $highVulnerabilitiesNotReviewed"
+              echo "   ──────────────────────────────────────────"
+              echo "   ⚠️  Total                : ${totalVulnerabilities}"
+              echo ""
+              echo "👉 Para detalhes completos (arquivos, linhas, categorias de vulnerabilidades), consulte a task"
+              echo "   'Get Fortify Report' acima nesta pipeline."
+              echo ""
+              echo "════════════════════════════════════════════════════════════════════════════════"
+
+              echo ""
+              echo "##[section]## Vulnerabilities that failed the Security Gate ##"
+
+              cat "$(FORTIFY_VULNERABILITIES_FILE)" | jq -r '
+                .data[] | select(
+                  (.enginePriority == "High" or .enginePriority == "Critical") and
+                  (.primaryTag == "Exploitable" or .issueStatus == "Unreviewed" or .issueStatus == "Under Review")
+                ) |
+                "┌─ [\(.enginePriority | ascii_upcase)] \(.issueName)\n" +
+                "│  Arquivo  : \(.fullFileName // .primaryLocation):\(.lineNumber)\n" +
+                "│  Kingdom  : \(.kingdom // "N/A")  |  Status: \(.issueStatus)\n" +
+                "│  Vulnerabilidade: \(if .scanStatus == "NEW" then "NOVA" elif .scanStatus == "REINTRODUCED" then "REINTRODUZIDA" else "RECORRENTE" end)  |  Detectada em: \(.foundDate[:10])\n" +
+                "└────────────────────────────────────────────────────────────────\n"
+              '
+
+              if [ -n "$CONVISO_ASSET_ID" ]; then
+                echo "🔗 Para detalhes completos das vulnerabilidades, acesse a listagem na Conviso Platform:"
+                echo "   https://app.convisoappsec.com/spa/company/${{ parameters.convisoCompany }}/vulnerabilities?assetIds=$CONVISO_ASSET_ID&severities=HIGH&severities=CRITICAL&failureTypes=SAST_FINDING&statuses=IDENTIFIED&statuses=CREATED&page=1&perPage=100"
+              else
+                echo "⚠️  Não foi possível obter o link das vulnerabilidades na Conviso."
+              fi
+
+              echo ""
+              echo "════════════════════════════════════════════════════════════════════════════════"
+              echo "📢 NOVO CANAL DE SUPORTE APPSEC / NEW APPSEC SUPPORT CHANNEL"
+              echo "════════════════════════════════════════════════════════════════════════════════"
+              echo "👉 Acesse nosso Centro de Excelência: https://telefonicacorp.sharepoint.com/sites/SuporteSecurityChampions.TMBNL/SitePages/Home.aspx"
+              echo "Dúvidas sobre como corrigir essas vulnerabilidades? Nosso suporte agora é centralizado no Teams para garantir um melhor atendimento!"
+              echo "(Questions on how to fix these vulnerabilities? Our support is now centralized on Teams to ensure a better support experience!)"
+              echo ""
+              echo "1️⃣ Primeiro acesso? Cadastre-se rápido aqui:"
+              echo "   First access? Register quickly here:"
+              echo "   👉 https://protect.checkpoint.com/v2/r02/___https://forms.office.com/Pages/ResponsePage.aspx?id=DmBElwQ-Lkm6oSXsJFxvEIEUqkLE2nxJo9w5p_Ap3pBUQlUzV00zTTg5Rk1KSDVGSFUxTjMyR0g0UC4u___.YzJlOnRlbGVmb25pY2FicmF6aWw6YzpvOjE5ZDMxODQ5YTI2ODEyYzAzNzZhYjM4MTI0NmU3NTM2Ojc6YmY5MDplZDUwOWM3Y2IzOWY3MDU1YjlhZTE0NzI4NTI5OTEwNmNkZDE2MmFlNDJhOGQ5N2E0NDQyYmM3ZjkwYTk5ZGFiOmg6VDpG"
+              echo ""
+              echo "2️⃣ Acesse o Centro De Excelência AppSec Vivo (Teams):"
+              echo "   Access the AppSec Vivo Center of Excellence (Teams):"
+              echo "   👉 https://protect.checkpoint.com/v2/r02/___https://teams.microsoft.com/l/team/19%3A5umImaIp9MNp2h-NjxPlAXYxUdm5Y-ez-2jWOCyH-6A1*40thread.tacv2/conversations?groupId=f337901f-f683-4b96-bf88-71d273fbb61e&tenantId=9744600e-3e04-492e-baa1-25ec245c6f10___.YzJlOnRlbGVmb25pY2FicmF6aWw6YzpvOjE5ZDMxODQ5YTI2ODEyYzAzNzZhYjM4MTI0NmU3NTM2Ojc6NzBiMzo0YTgzNzQ1ZDU4ZTA5MDUwMDAzZWZkMzFhODEzMWE3Y2Q2ODM4NjZjYmU2ZWUwOGY1ZjU1NTBjMTVkMmFhYTZiOmg6VDpG"
+              echo "════════════════════════════════════════════════════════════════════════════════"
+              echo "📧 E-mail / Email: appsec_vivo.br@telefonica.com"
+              echo "🌙 Plantão / After-hours support (Evernow): +55 (11) 5028-1152"
+              echo ""
+
+              if [[ "$isGateBranch" == "true" ]]; then
+                echo "##vso[task.complete result=Failed;]Security Gate falhou na branch principal."
+                exit 1
+              else
+                echo ""
+                echo "##vso[task.complete result=SucceededWithIssues;]Vulnerabilidades críticas/altas encontradas, mas o gate não bloqueia nesta branch."
+                exit 0
+              fi
+            else
+              echo "##[debug] Security Gate has been reached!"
+            fi
+          else
+            echo "##vso[task.logissue type=warning;] Security Gate is OFF and Gate validation has been skipped! "
+            echo "##[warning] Even if the Security Gate is turned off at the moment this does not mean that it cannot be turned on again in the near future."
+            echo "##[warning] Please analyze the Critical and High vulnerabilities and try to fix them as soon as possible. "
+            echo "##vso[task.complete result=SucceededWithIssues;]"
+          fi
+
+    - template: check_conviso_risks.yml
+      parameters:
+        convisoAssetName: "$(FORTIFY_APP_DEFAULT_NAME) $(FORTIFY_APP_VERSION)"
+        companyId: "${{ parameters.convisoCompany }}"
+        scanType: "SAST"
+
+  - ${{ else }}:
+
+    - task: Bash@3
+      displayName: 'Security Scan Skipped'
+      inputs:
+        targetType: inline
+        script: |
+          YELLOW='\033[1;33m'
+          BLUE='\033[0;34m'
+          NC='\033[0m' # No Color
+          
+          if [[ "$(Build.Reason)" == "PullRequest" ]]; then
+            TARGET_BRANCH=$(echo "$(System.PullRequest.TargetBranch)" | sed 's/refs\/heads\///')
+            BRANCH_INFO="Target: $TARGET_BRANCH (via PR)"
+          else
+            BRANCH_INFO="$(Build.SourceBranchName)"
+          fi
+
+          echo -e "${YELLOW}==================================[ AÇÃO: SCAN IGNORADO (SKIPPED) ]==================================${NC}"
+          echo -e "Modo de Operação Ativo: ${YELLOW}VivoFlow${NC}"
+          echo -e "Branch Avaliada: ${YELLOW}$BRANCH_INFO${NC}"
+          echo -e "Regras de Validação em Vigor: ${YELLOW}master, main, ${{ join(', ', parameters.vivoFlow) }}${NC}"
+          echo ""
+          echo -e "${YELLOW}MOTIVO: O scan de segurança foi intencionalmente ignorado pois o branch avaliado '$BRANCH_INFO' não corresponde a nenhuma das regras de validação ativas.${NC}"
+          echo ""
+          echo -e "${BLUE}Dica: Se este branch deveria ser validado, acione a Equipe de AppSec appsec_vivo.br@telefonica.com${NC}"
+          echo -e "${YELLOW}====================================================================================================${NC}"

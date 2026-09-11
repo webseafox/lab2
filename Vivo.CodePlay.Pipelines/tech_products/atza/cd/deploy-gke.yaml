@@ -1,0 +1,827 @@
+# ==================================================================
+# Pipeline: Deploy ATZA no GKE via Kustomize
+# -----------------------------------------------------
+# Pipeline específico do produto ATZA para deploy no Google Kubernetes
+# Engine (GKE) autenticando via Service Account da GCP e aplicando
+# manifests com Kustomize. Suporta múltiplos ambientes (dev/preprod/prod)
+# com gate de aprovação, dry-run, rollback automático e registro no
+# Event Hub para observabilidade.
+# ==================================================================
+parameters:
+  # ==================================================================
+  # Parâmetros Gerais de Execução
+  # ==================================================================
+  - name: environment
+    displayName: "Ambiente para publicar"
+    type: string
+    default: dev
+    values:
+      - dev
+      - hml
+      - prod
+
+  - name: version
+    displayName: "Versão da aplicação"
+    type: string
+    default: 'AUTO'
+
+  - name: branchStrategy
+    displayName: "Estratégia de obtenção da versão (branch strategy) para o VersionManagerVivo"
+    type: string
+    default: gitlabflow
+    values:
+      - trunkbased
+      - gitlabflow-semantic
+      - gitlabflow
+      - vivoflow
+      - releaseflow
+      - custom
+
+  - name: agentPool
+    displayName: "Pool de execução do pipeline"
+    type: string
+    default: GeneralPurposeLinuxAgents4P
+
+    # ==================================================================
+    # Configuração GCP / GKE
+    # ==================================================================
+    # PRÉ-REQUISITO: A Service Account deve ter as roles:
+    #   - roles/container.developer (para operar no cluster)
+    #   - roles/container.clusterViewer (para obter credenciais)
+    # A chave JSON da SA deve ser armazenada como segredo no AKV
+    # 'kv-azdevops-shared' com o nome configurado em gcpSaKeySecretName.
+  - name: gcpProject
+    displayName: "ID do projeto GCP por ambiente"
+    type: object
+    default:
+      dev: "dev-amazonia-atma"
+      hml: "hml-amazonia-atma"
+      prod: "pro-amazonia-atma"
+
+  - name: gkeClusterName
+    displayName: "Nome do cluster GKE por ambiente"
+    type: object
+    default:
+      dev: "dev-amazonia-atma-gke"
+      hml: "hml-amazonia-atma-gke"
+      prod: "pro-amazonia-atma-gke"
+
+  - name: gkeClusterRegion
+    displayName: "Região do cluster GKE por ambiente"
+    type: object
+    default:
+      dev: "southamerica-east1"
+      hml: "southamerica-east1"
+      prod: "southamerica-east1"
+
+    # Nome do segredo no AKV que contém o JSON completo da SA
+    # (gerado via: gcloud iam service-accounts keys create key.json --iam-account=SA_EMAIL)
+  - name: gcpSaKeySecretName
+    displayName: "Nome do segredo no AKV com a chave JSON da Service Account GCP"
+    type: string
+    default: "GCP-SA-KEY-ATZA"
+
+    # Origem das credenciais GCP:
+    # - keyvault: obtém JSON da SA via Azure Key Vault (padrão)
+    # - secretfile: baixa JSON da SA via Secure Files do Azure DevOps
+  - name: gcpCredentialSource
+    displayName: "Origem da credencial da Service Account GCP (keyvault|secretfile)"
+    type: string
+    default: secretfile
+    values:
+      - keyvault
+      - secretfile
+
+    # Nome do Secure File no Azure DevOps contendo o JSON da SA GCP por ambiente.
+    # Obrigatório somente quando gcpCredentialSource=secretfile.
+  - name: gcpSaSecretFileName
+    displayName: "Nome do Secure File com a chave JSON da Service Account GCP por ambiente"
+    type: object
+    default:
+      dev: "dev-amazonia-atma-aks-sa.json"
+      hml: "hml-amazonia-atma-aks-sa.json"
+      prod: "prd-amazonia-atma-aks-sa.json"
+
+    # ==================================================================
+    # Kubernetes Namespace
+    # ==================================================================
+  - name: k8sNamespace
+    displayName: "Namespace do Kubernetes"
+    type: string
+    default: "backend"
+
+    # ==================================================================
+    # Configuração Kustomize
+    # ==================================================================
+    # Estrutura esperada no repositório:
+    #   <kustomizeOverlayPath>/
+    #     kustomization.yaml
+    # Caminho comum gitops: [gitops]/k8s/[service]/overlays
+  - name: kustomizeOverlayPath
+    displayName: "Caminho base dos overlays Kustomize (relativo à raiz do repo)"
+    type: string
+
+    # Quando true, atualiza a tag de imagem no kustomization.yaml antes do apply.
+    # Requer que o kustomize CLI esteja instalado no agente.
+    # Requer que o kustomization.yaml do overlay tenha a seção 'images:' configurada.
+  - name: updateKustomizeImage
+    displayName: "Atualizar tag de imagem no Kustomize antes do deploy (requer kustomize CLI)"
+    type: boolean
+    default: true
+
+    # Nome do campo 'name' na seção 'images:' do kustomization.yaml
+    # Exemplo em kustomization.yaml:
+    #   images:
+    #     - name: my-app          <- este valor
+    #       newName: registry/my-app
+    #       newTag: old-tag
+  - name: kustomizeImageName
+    displayName: "Nome da imagem no campo images[].name do kustomization.yaml"
+    type: string
+    default: "IMAGE"
+
+    # Registry + nome da imagem sem a tag (newName no kustomization.yaml)
+    # Exemplo: acrsharedservices01.azurecr.io/sigla/my-app
+  - name: kustomizeImageNewName
+    displayName: "Registry e nome completo da imagem sem tag (ex: registry.io/sigla/app)"
+    type: string
+    default: "registry.telefonicabigdata.com/atma/$(Build.Repository.Name)"
+
+    # ==================================================================
+    # Capacidades Adicionais
+    # ==================================================================
+  - name: enableDryRun
+    displayName: "Modo dry-run: executar apenas kubectl diff, sem aplicar ao cluster"
+    type: boolean
+    default: false
+
+  - name: enableAutomaticRollback
+    displayName: "Habilitar rollback automático (kubectl rollout undo) em caso de falha no apply"
+    type: boolean
+    default: true
+
+  - name: deployTimeoutSeconds
+    displayName: "Timeout em segundos para kubectl apply e rollout status"
+    type: number
+    default: 300
+
+variables:
+  - name: SIGLA
+    value: $[ lower(split(variables['System.TeamProject'],' ')[0]) ]
+  - name: ENVIRONMENT
+    value: ${{ parameters.environment }}
+    # Kubeconfig isolado por build para evitar colisão entre execuções paralelas
+  - name: GKE_KUBECONFIG_PATH
+    value: $(Agent.TempDirectory)/gke-kubeconfig-$(Build.BuildId)
+  - name: KUSTOMIZE_OVERLAY_PATH
+    # value: $(Build.SourcesDirectory)/${{ parameters.kustomizeOverlayPath }}/${{ parameters.environment }}
+    value: $(Build.SourcesDirectory)/${{ parameters.kustomizeOverlayPath }}
+
+stages:
+  # ==================================================================
+  # Stage 1: Setup - Geração e compartilhamento de metadados
+  # ==================================================================
+  - stage: Setup
+    condition: succeeded()
+    jobs:
+      - job: GetMetadata
+        displayName: "Gerar e compartilhar dados entre stages"
+        steps:
+          - checkout: self
+          - bash: |
+              VERSION_FILE_TAG=$(cat VERSION)
+              echo "Versão no arquivo: $VERSION_FILE_TAG"
+
+              VERSION_PARAM_TAG="${{ parameters.version }}"
+              echo "Versão no parâmetro: $VERSION_PARAM_TAG"
+
+              if [ "$VERSION_PARAM_TAG" == "AUTO" ]; then
+                VERSION_TAG=$VERSION_FILE_TAG
+                echo "Versão do arquivo selecionada"
+              else
+                VERSION_TAG=$VERSION_PARAM_TAG
+                echo "Versão do parâmetro selecionada"
+              fi
+
+              echo "##vso[task.setvariable variable=VERSION_TAG;isOutput=true]$VERSION_TAG"
+
+            name: VersionStep
+            displayName: "Define tag de versão pelo parâmetro ou pelo arquivo VERSION"
+
+  # ==================================================================
+  # Stage 2: Preparation - Validações e preparação do deploy
+  # ==================================================================
+  - stage: Preparation
+    displayName: "Preparação (${{ parameters.environment }})"
+    pool: ${{ parameters.agentPool }}
+    dependsOn:
+      - Setup
+    condition: succeeded()
+    jobs:
+      - job: Preparation
+        displayName: "Validar e preparar deploy"
+        variables:
+          VAR_VERSION: $[ stageDependencies.Setup.GetMetadata.outputs['VersionStep.VERSION_TAG'] ]
+        steps:
+          # Exibe parâmetros do pipeline para debug quando System.Debug=true
+          - task: VivoUtilsFromVivo@1
+            displayName: "Show Pipeline Parameters"
+            condition: eq(variables['System.Debug'], 'true')
+            inputs:
+              command: "show-pipeline-parameters"
+              parameters: "${{ convertToJson(parameters) }}"
+
+          # Previne uso de valores de ambientes superiores em ambientes inferiores
+          - task: VivoUtilsFromVivo@1
+            displayName: "Validar Parâmetros de Ambiente"
+            inputs:
+              command: "validate-environment-parameters"
+              parameters: "${{ convertToJson(parameters) }}"
+              environment: "${{ parameters.environment }}"
+
+          # Tags para categorização e rastreabilidade da build
+          - script: |
+              echo "##vso[build.addbuildtag]gke"
+              echo "##vso[build.addbuildtag]kubernetes"
+              echo "##vso[build.addbuildtag]kustomize"
+              echo "##vso[build.addbuildtag]deploy-gke"
+            displayName: "Definir tags da build"
+
+          - checkout: self
+            fetchDepth: 1
+
+          - task: VersionManagerVivo@8
+            inputs:
+              branchStrategy: ${{ parameters.branchStrategy }}
+              command: "setDeployVersion"
+              version: '$(VAR_VERSION)'
+            displayName: "Definir Versão do Deploy"
+            name: VersionManagerVivo
+
+          - script: |
+              echo "##vso[build.updatebuildnumber]deploy-${VERSION}-${ENVIRONMENT}"
+              echo "##vso[build.addbuildtag]version-${VERSION}"
+              echo "##vso[build.addbuildtag]environment-${ENVIRONMENT}"
+              echo "Version to be used: ${VERSION}"
+            displayName: "Definir Número da Build e Tags"
+            env:
+              VERSION: $(VersionManagerVivo.DEPLOY_VERSION)
+              ENVIRONMENT: ${{ parameters.environment }}
+
+  # ==================================================================
+  # Stage 3: Deploy - GKE via Kustomize com gate de aprovação
+  # ==================================================================
+  - stage: Deploy
+    displayName: "Deploy GKE (${{ parameters.environment }})"
+    pool: ${{ parameters.agentPool }}
+    dependsOn:
+      - Setup
+      - Preparation
+    condition: succeeded()
+    variables:
+      ASDF_GCLOUD_VERSION: 563.0.0
+      ASDF_KUSTOMIZE_VERSION: 5.8.1
+      GCP_CREDENTIAL_SOURCE: ${{ parameters.gcpCredentialSource }}
+      ${{ if eq(parameters.gcpCredentialSource, 'keyvault') }}:
+        GCP_SA_KEY: $(${{ parameters.gcpSaKeySecretName }})
+      ${{ if eq(parameters.gcpCredentialSource, 'secretfile') }}:
+        GCP_SA_KEY_FILE: $(gcpSaSecureFile.secureFilePath)
+      GCP_PROJECT: ${{ parameters.gcpProject[parameters.environment] }}
+      GKE_CLUSTER_NAME: ${{ parameters.gkeClusterName[parameters.environment] }}
+      GKE_CLUSTER_REGION: ${{ parameters.gkeClusterRegion[parameters.environment] }}
+
+      K8S_NAMESPACE: ${{ parameters.k8sNamespace }}
+
+    jobs:
+      - deployment: deploymentJob
+        displayName: "Deploy to GKE ${{ parameters.environment }}"
+        environment:
+          name: deploy-${{ parameters.environment }} # gate de aprovação obrigatório
+        variables:
+          VAR_VERSION: $[ stageDependencies.Setup.GetMetadata.outputs['VersionStep.VERSION_TAG'] ]
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                  fetchDepth: 1
+
+                - task: VersionManagerVivo@8
+                  inputs:
+                    branchStrategy: ${{ parameters.branchStrategy }}
+                    command: "setDeployVersion"
+                    version: '$(VAR_VERSION)'
+                  displayName: "Definir Versão do Deploy"
+                  name: VersionManagerVivo
+
+                # Instala o gcloud CLI via asdf.
+                - script: | # shell
+                    set -Eeuo pipefail
+
+                    gcloud components install gke-gcloud-auth-plugin --quiet
+
+                    # Garante que o bin do Cloud SDK fique disponível para os próximos steps.
+                    GCLOUD_SDK_BIN="$(gcloud info --format='value(installation.sdk_root)')/bin"
+                    echo "##vso[task.prependpath]${GCLOUD_SDK_BIN}"
+                    echo "##vso[task.setvariable variable=USE_GKE_GCLOUD_AUTH_PLUGIN]True"
+
+                    GKE_AUTH_PLUGIN_ABS_PATH="${GCLOUD_SDK_BIN}/gke-gcloud-auth-plugin"
+                    if [ ! -x "${GKE_AUTH_PLUGIN_ABS_PATH}" ]; then
+                      echo "##[error] gke-gcloud-auth-plugin não encontrado em ${GKE_AUTH_PLUGIN_ABS_PATH}"
+                      exit 1
+                    fi
+                    echo "##vso[task.setvariable variable=GKE_AUTH_PLUGIN_ABS_PATH]${GKE_AUTH_PLUGIN_ABS_PATH}"
+                    echo "##[debug] gke-gcloud-auth-plugin: ${GKE_AUTH_PLUGIN_ABS_PATH}"
+
+                  displayName: "Garantir gcloud CLI via asdf"
+
+                # Quando keyvault: obtém chave JSON da SA no Azure Key Vault.
+                # O segredo é exposto como variável de pipeline com o mesmo nome.
+                - ${{ if eq(parameters.gcpCredentialSource, 'keyvault') }}:
+                    - task: AzureKeyVault@2
+                      displayName: "Obter chave da Service Account GCP do AKV"
+                      timeoutInMinutes: 1
+                      retryCountOnTaskFailure: 3
+                      inputs:
+                        azureSubscription: DevOpsSharedResources
+                        KeyVaultName: kv-azdevops-shared
+                        SecretsFilter: ${{ parameters.gcpSaKeySecretName }}
+
+                # Quando secretfile: valida parâmetro e baixa arquivo da SA via Secure Files.
+                - ${{ if eq(parameters.gcpCredentialSource, 'secretfile') }}:
+                    - script: |
+                        set -euo pipefail
+
+                        if [ -z "${GCP_SA_SECRET_FILE_NAME}" ]; then
+                          echo "##[error] O parâmetro gcpSaSecretFileName é obrigatório quando gcpCredentialSource=secretfile"
+                          exit 1
+                        fi
+                      displayName: "Validar Secure File da Service Account GCP"
+                      env:
+                        GCP_SA_SECRET_FILE_NAME: ${{ parameters.gcpSaSecretFileName[parameters.environment] }}
+
+                    - task: DownloadSecureFile@1
+                      name: gcpSaSecureFile
+                      displayName: "Baixar Secure File da Service Account GCP"
+                      inputs:
+                        secureFile: ${{ parameters.gcpSaSecretFileName[parameters.environment] }}
+
+                # Autentica no GCP usando a SA e obtém credenciais do cluster GKE.
+                # Segurança:
+                #   - keyvault: chave SA passada via stdin (--key-file=-), sem gravação em disco
+                #   - secretfile: chave SA baixada em arquivo temporário e removida na limpeza
+                #   - KUBECONFIG aponta para arquivo isolado por Build ID
+                #   - O kubeconfig é removido na etapa de limpeza (condition: always)
+                - script: |
+                    set -Eeuo pipefail
+                    # Loga o comando exato que falhar para facilitar troubleshooting.
+                    trap 'ec=$?; echo "##[error] Falha no comando (exit ${ec}) na linha ${LINENO}: ${BASH_COMMAND}"' ERR
+
+                    echo "##[section]Autenticando na GCP com Service Account..."
+
+                    # Aponta KUBECONFIG para arquivo temporário isolado desta execução
+                    export KUBECONFIG="${GKE_KUBECONFIG_PATH}"
+
+                    # Ativa SA no GCP de acordo com a origem configurada.
+                    if [ "${GCP_CREDENTIAL_SOURCE}" = "keyvault" ]; then
+                      # keyvault: usa stdin para evitar gravação da chave em disco
+                      printf '%s' "${GCP_SA_KEY}" \
+                        | gcloud auth activate-service-account \
+                          --key-file=- \
+                          --quiet
+                    elif [ "${GCP_CREDENTIAL_SOURCE}" = "secretfile" ]; then
+                      # secretfile: utiliza arquivo baixado pelo DownloadSecureFile@1
+                      if [ ! -f "${GCP_SA_KEY_FILE}" ]; then
+                        echo "##[error] Secure File da Service Account não encontrado em ${GCP_SA_KEY_FILE}"
+                        exit 1
+                      fi
+                      
+                      gcloud config set project "${GCP_PROJECT}"
+                      gcloud auth activate-service-account \
+                        --key-file="${GCP_SA_KEY_FILE}" \
+                        --quiet
+
+                    else
+                      echo "##[error] Valor inválido para gcpCredentialSource: ${GCP_CREDENTIAL_SOURCE}"
+                      exit 1
+                    fi
+
+                    # echo "##[debug] Clusters:"
+                    # gcloud container clusters list \
+                    #   --region "${GKE_CLUSTER_REGION}" \
+                    #   --project "${GCP_PROJECT}" \
+                    #   --format="value(name)" | awk '{print "##[debug]   " $0}'
+
+                    # Obtém credenciais do cluster GKE (grava em $KUBECONFIG)
+                    gcloud container clusters get-credentials "${GKE_CLUSTER_NAME}" \
+                      --region "${GKE_CLUSTER_REGION}" \
+                      --project "${GCP_PROJECT}" \
+                      --internal-ip \
+                      --quiet
+
+                    # Força uso de caminho absoluto no kubeconfig para evitar dependência de PATH entre steps.
+                    if [ -n "${GKE_AUTH_PLUGIN_ABS_PATH:-}" ] && [ -x "${GKE_AUTH_PLUGIN_ABS_PATH}" ]; then
+                      sed -i "s|command: gke-gcloud-auth-plugin|command: ${GKE_AUTH_PLUGIN_ABS_PATH}|g" "${KUBECONFIG}"
+                      echo "##[debug] kubeconfig ajustado para usar plugin em caminho absoluto"
+                    else
+                      echo "##[warning] GKE_AUTH_PLUGIN_ABS_PATH não disponível; kubeconfig manterá comando padrão"
+                    fi
+
+                    echo "##[debug] Cluster: ${GKE_CLUSTER_NAME} | Região: ${GKE_CLUSTER_REGION} | Projeto: ${GCP_PROJECT}"
+                  displayName: "Autenticar no GKE via Service Account GCP"
+                  env:
+                    GKE_AUTH_PLUGIN_ABS_PATH: $(GKE_AUTH_PLUGIN_ABS_PATH)
+                    USE_GKE_GCLOUD_AUTH_PLUGIN: $(USE_GKE_GCLOUD_AUTH_PLUGIN)
+                
+                # Troca para o branch de ambiente correto do gitops
+                - checkout: gitops
+
+                # Atualiza a tag de imagem no overlay Kustomize antes do apply.
+                # Requer kustomize CLI instalado no agente e campo 'images:' no kustomization.yaml.
+                # Para desabilitar: defina updateKustomizeImage=false e gerencie a tag manualmente.
+                - ${{ if eq(parameters.updateKustomizeImage, true) }}:
+                    - script: |
+                        set -Eeuo pipefail
+                        # Loga o comando exato que falhar para facilitar troubleshooting.
+                        trap 'ec=$?; echo "##[error] Falha no comando (exit ${ec}) na linha ${LINENO}: ${BASH_COMMAND}"' ERR
+
+                        echo "##[section]Atualizando tag de imagem no Kustomize..."
+
+                        if ! command -v kustomize &>/dev/null; then
+                          echo "##[error] kustomize CLI não encontrado no agente."
+                          echo "##[error] Instale o kustomize no agente ou defina updateKustomizeImage=false"
+                          echo "##[error] e gerencie a tag de imagem diretamente no kustomization.yaml do overlay."
+                          exit 1
+                        fi
+
+                        echo "##[debug] Overlay:       ${KUSTOMIZE_OVERLAY_PATH}"
+                        echo "##[debug] IMAGE_NAME:    ${IMAGE_NAME}"
+                        echo "##[debug] IMAGE_NEW_NAME: ${IMAGE_NEW_NAME}"
+                        echo "##[debug] IMAGE_TAG:     '${IMAGE_TAG}'"
+
+                        # Falha explicitamente se a tag estiver vazia — evita kustomize silenciosamente
+                        # atualizar apenas o newName e deixar o newTag antigo intacto.
+                        if [ -z "${IMAGE_TAG}" ]; then
+                          echo "##[error] IMAGE_TAG está vazio."
+                          echo "##[error] Verifique se a task VersionManagerVivo@8 rodou antes deste step"
+                          echo "##[error] e se a variável VersionManagerVivo.DEPLOY_VERSION está disponível."
+                          exit 1
+                        fi
+
+                        cd "${KUSTOMIZE_OVERLAY_PATH}"
+
+                        # Atualiza newName e newTag no campo images[] do kustomization.yaml
+                        kustomize edit set image \
+                          "${IMAGE_NAME}=${IMAGE_NEW_NAME}:${IMAGE_TAG}"
+
+                        echo "##[debug] Tag de imagem atualizada com sucesso"
+                        echo "##[debug] Conteúdo do kustomization.yaml após update:"
+                        cat "${KUSTOMIZE_OVERLAY_PATH}/kustomization.yaml"
+                      displayName: "Atualizar tag de imagem no Kustomize"
+                      env:
+                        KUSTOMIZE_OVERLAY_PATH: $(KUSTOMIZE_OVERLAY_PATH)
+                        IMAGE_NAME: ${{ parameters.kustomizeImageName }}
+                        IMAGE_NEW_NAME: ${{ parameters.kustomizeImageNewName }}
+                        IMAGE_TAG: $(VersionManagerVivo.DEPLOY_VERSION)
+
+                # Exibe diff das mudanças antes do apply. Sempre executa para visibilidade.
+                # Quando enableDryRun=true, o pipeline encerra aqui sem aplicar nada.
+                # kubectl diff retorna exit code 1 quando há diferenças (comportamento esperado).
+                - script: |
+                    set -euo pipefail
+
+                    echo "##[section]Diff das mudanças (kubectl diff)..."
+                    echo "##[debug] Namespace: ${K8S_NAMESPACE}"
+                    echo "##[debug] Overlay: ${KUSTOMIZE_OVERLAY_PATH}"
+
+                    kubectl diff -k "${KUSTOMIZE_OVERLAY_PATH}" \
+                      --namespace="${K8S_NAMESPACE}" \
+                      2>&1 \
+                      || echo "##[debug] Diferenças detectadas acima (comportamento esperado do diff)"
+
+                    echo "##[debug] Diff concluído"
+                  displayName: "Diff: visualizar mudanças antes do apply"
+                  continueOnError: true
+                  env:
+                    KUSTOMIZE_OVERLAY_PATH: $(KUSTOMIZE_OVERLAY_PATH)
+                    K8S_NAMESPACE: ${{ parameters.k8sNamespace }}
+                    KUBECONFIG: $(GKE_KUBECONFIG_PATH)
+
+                # Aplica o overlay Kustomize no cluster GKE.
+                # kubectl apply -k usa o kustomize embutido no kubectl (não requer kustomize CLI).
+                - script: |
+                    set -Eeuo pipefail
+
+                    echo "##[section]Configurando ambiente GKE..."
+                    export USE_GKE_GCLOUD_AUTH_PLUGIN="${USE_GKE_GCLOUD_AUTH_PLUGIN:-True}"
+
+                    if [ -n "${GKE_AUTH_PLUGIN_ABS_PATH:-}" ] && [ -x "${GKE_AUTH_PLUGIN_ABS_PATH}" ]; then
+                      echo "##[debug] Usando plugin em: ${GKE_AUTH_PLUGIN_ABS_PATH}"
+                    else
+                      echo "##[error] gke-gcloud-auth-plugin não encontrado em caminho absoluto"
+                      echo "##[error] Valor recebido: ${GKE_AUTH_PLUGIN_ABS_PATH:-<vazio>}"
+                      exit 1
+                    fi
+
+                    echo "##[section]Aplicando Kustomize no GKE..."
+                    echo "----------------------------------------"
+                    echo "Namespace: ${K8S_NAMESPACE}"
+                    echo "Overlay: ${KUSTOMIZE_OVERLAY_PATH}"
+                    echo "Timeout: ${DEPLOY_TIMEOUT}s"
+
+                    kubectl apply -k "${KUSTOMIZE_OVERLAY_PATH}" \
+                      --namespace="${K8S_NAMESPACE}" \
+                      --v=4 \
+                      --timeout="${DEPLOY_TIMEOUT}s"
+
+                    echo "##[debug] kubectl apply -k concluído com sucesso"
+
+                    # Extrai nomes dos Deployments do overlay para escopo do rollout e rollback.
+                    # awk: quando encontra 'kind: Deployment', ativa flag; na linha 'name:' seguinte captura o nome.
+                    APPLIED_DEPLOYMENTS=$(kubectl kustomize "${KUSTOMIZE_OVERLAY_PATH}" | \
+                      awk '/^kind: Deployment/{found=1} found && /^  name:/{print $2; found=0}')
+
+                    if [ -z "${APPLIED_DEPLOYMENTS}" ]; then
+                      echo "##[error] Nenhum Deployment encontrado no overlay ${KUSTOMIZE_OVERLAY_PATH}"
+                      echo "##[error] Verifique se o kustomization.yaml contém recursos do tipo Deployment"
+                      exit 1
+                    fi
+
+                    echo "##[debug] Deployments do overlay:"
+                    echo "${APPLIED_DEPLOYMENTS}" | awk '{print "##[debug]   - " $0}'
+                    echo "##vso[task.setvariable variable=APPLIED_DEPLOYMENTS]${APPLIED_DEPLOYMENTS}"
+                  displayName: "Aplicar manifests Kustomize no GKE"
+                  condition: and(succeeded(), ne(true, ${{ parameters.enableDryRun }}))
+                  env:
+                    KUSTOMIZE_OVERLAY_PATH: $(KUSTOMIZE_OVERLAY_PATH)
+                    KUBECONFIG: $(GKE_KUBECONFIG_PATH)
+                    DEPLOY_TIMEOUT: ${{ parameters.deployTimeoutSeconds }}
+                    GKE_AUTH_PLUGIN_ABS_PATH: $(GKE_AUTH_PLUGIN_ABS_PATH)
+                    USE_GKE_GCLOUD_AUTH_PLUGIN: $(USE_GKE_GCLOUD_AUTH_PLUGIN)
+
+                # Exibe o estado atual dos recursos após o apply para confirmar as alterações.
+                # Exibe o YAML renderizado pelo Kustomize — exatamente o que foi enviado ao cluster.
+                - script: |
+                    set -euo pipefail
+
+                    echo "##[section]YAML aplicado ao cluster (kustomize build)..."
+                    echo "##[debug] Overlay: ${KUSTOMIZE_OVERLAY_PATH}"
+
+                    kubectl kustomize "${KUSTOMIZE_OVERLAY_PATH}"
+                  displayName: "Exibir YAML aplicado (kustomize build)"
+                  condition: and(succeeded(), ne(true, ${{ parameters.enableDryRun }}))
+                  env:
+                    KUSTOMIZE_OVERLAY_PATH: $(KUSTOMIZE_OVERLAY_PATH)
+                    KUBECONFIG: $(GKE_KUBECONFIG_PATH)
+
+                # Aguarda todos os Deployments no namespace atingirem o estado 'available'.
+                # Garante que o pipeline falhe se algum pod não subir dentro do timeout.
+                # Um loop de diagnóstico periódico roda em background a cada DIAG_INTERVAL
+                # segundos, exibindo pods e eventos em tempo real enquanto o rollout aguarda.
+                # Em caso de falha, coleta também describe e logs dos pods não saudáveis.
+                - script: |
+                    set -euo pipefail
+
+                    echo "##[section]Aguardando rollout dos Deployments..."
+                    echo "##[debug] Namespace: ${K8S_NAMESPACE}"
+                    echo "##[debug] Timeout: ${DEPLOY_TIMEOUT}s"
+                    echo "##[debug] Diagnóstico periódico a cada ${DIAG_INTERVAL}s"
+
+                    # ── Loop de diagnóstico periódico (background) ─────────────────────────────
+                    # Imprime estado dos pods e últimos 30 eventos a cada DIAG_INTERVAL segundos
+                    # enquanto o rollout aguarda. Permite acompanhar o progresso em tempo real
+                    # sem esperar o timeout completo para ver o que está acontecendo.
+                    watch_pods() {
+                      local iteration=0
+                      while true; do
+                        sleep "${DIAG_INTERVAL}"
+                        iteration=$((iteration + 1))
+                        echo ""
+                        echo "##[section]Diagnóstico periódico #${iteration} (+${DIAG_INTERVAL}s)"
+                        echo "--- Pods ---"
+                        kubectl get pods \
+                          --namespace="${K8S_NAMESPACE}" \
+                          --output=wide \
+                          2>/dev/null || true
+                        echo "--- Eventos recentes (últimos 30) ---"
+                        kubectl get events \
+                          --namespace="${K8S_NAMESPACE}" \
+                          --sort-by='.lastTimestamp' \
+                          2>/dev/null | tail -30 || true
+                      done
+                    }
+
+                    watch_pods &
+                    WATCH_PID=$!
+                    # ── Fim loop periódico ──────────────────────────────────────────────────────
+
+                    # ── Diagnóstico completo em caso de falha ──────────────────────────────────
+                    dump_diagnostics() {
+                      echo ""
+                      echo "##[section]Diagnóstico: estado final dos Pods"
+                      kubectl get pods \
+                        --namespace="${K8S_NAMESPACE}" \
+                        --output=wide \
+                        2>/dev/null || true
+
+                      echo ""
+                      echo "##[section]Diagnóstico: todos os eventos do namespace (ordenados por horário)"
+                      kubectl get events \
+                        --namespace="${K8S_NAMESPACE}" \
+                        --sort-by='.lastTimestamp' \
+                        2>/dev/null || true
+
+                      echo ""
+                      echo "##[section]Diagnóstico: logs dos Pods não saudáveis"
+                      # Pods que não estão Running/Succeeded
+                      UNHEALTHY_PODS=$(kubectl get pods \
+                        --namespace="${K8S_NAMESPACE}" \
+                        --output=jsonpath='{range .items[?(@.status.phase!="Running")]}{.metadata.name}{"\n"}{end}' \
+                        2>/dev/null || true)
+
+                      # Pods Running mas com containers não prontos (CrashLoopBackOff, etc.)
+                      NOT_READY_PODS=$(kubectl get pods \
+                        --namespace="${K8S_NAMESPACE}" \
+                        --output=jsonpath='{range .items[*]}{range .status.containerStatuses[?(@.ready==false)]}{@.name}{" -> pod: "}{@/../../../metadata.name}{"\n"}{end}{end}' \
+                        2>/dev/null | awk -F'pod: ' '{print $2}' | sort -u || true)
+
+                      ALL_PODS=$(printf '%s\n%s' "${UNHEALTHY_PODS}" "${NOT_READY_PODS}" | sort -u | grep -v '^$' || true)
+
+                      if [ -z "${ALL_PODS}" ]; then
+                        echo "##[debug] Nenhum pod não saudável identificado para coletar logs."
+                      else
+                        while IFS= read -r pod; do
+                          [ -z "${pod}" ] && continue
+                          echo ""
+                          echo "━━━ Pod: ${pod} ━━━"
+                          echo "--- describe ---"
+                          kubectl describe pod "${pod}" \
+                            --namespace="${K8S_NAMESPACE}" \
+                            2>/dev/null || true
+                          echo "--- logs (tail 150) ---"
+                          kubectl logs "${pod}" \
+                            --namespace="${K8S_NAMESPACE}" \
+                            --all-containers=true \
+                            --tail=150 \
+                            2>/dev/null || true
+                          echo "--- logs --previous (tail 50) ---"
+                          kubectl logs "${pod}" \
+                            --namespace="${K8S_NAMESPACE}" \
+                            --all-containers=true \
+                            --tail=50 \
+                            --previous \
+                            2>/dev/null || echo "##[debug] Sem container anterior para ${pod}"
+                        done <<< "${ALL_PODS}"
+                      fi
+                    }
+                    # ── Fim diagnóstico completo ────────────────────────────────────────────────
+
+                    ROLLOUT_EXIT=0
+                    while IFS= read -r deploy; do
+                      [ -z "${deploy}" ] && continue
+                      echo "##[debug] Aguardando rollout: ${deploy}"
+                      kubectl rollout status deployment/${deploy} \
+                        --namespace="${K8S_NAMESPACE}" \
+                        --timeout="${DEPLOY_TIMEOUT}s" \
+                        || { ROLLOUT_EXIT=$?; break; }
+                    done <<< "${APPLIED_DEPLOYMENTS}"
+
+                    # Encerra o loop de background independente do resultado
+                    kill "${WATCH_PID}" 2>/dev/null || true
+                    wait "${WATCH_PID}" 2>/dev/null || true
+
+                    if [ "${ROLLOUT_EXIT}" -ne 0 ]; then
+                      echo "##[warning] Rollout não concluído (timeout ou falha) — coletando diagnóstico completo..."
+                      dump_diagnostics
+                      exit "${ROLLOUT_EXIT}"
+                    fi
+
+                    echo "##[debug] Todos os Deployments estão prontos"
+                  displayName: "Aguardar rollout dos Deployments"
+                  condition: and(succeeded(), ne(true, ${{ parameters.enableDryRun }}))
+                  env:
+                    APPLIED_DEPLOYMENTS: $(APPLIED_DEPLOYMENTS)
+                    K8S_NAMESPACE: $(K8S_NAMESPACE)
+                    KUBECONFIG: $(GKE_KUBECONFIG_PATH)
+                    DEPLOY_TIMEOUT: ${{ parameters.deployTimeoutSeconds }}
+                    DIAG_INTERVAL: 60
+
+                # Rollback automático executado quando o apply ou o rollout falha.
+                # Executa ANTES da limpeza de credenciais para ter acesso ao cluster.
+                # condition: failed() garante que só roda em caso de falha nos steps anteriores.
+                - ${{ if eq(parameters.enableAutomaticRollback, true) }}:
+                    - script: |
+                        set -euo pipefail
+
+                        echo "##[section]Deploy falhou — iniciando rollback automático..."
+                        echo "##[debug] Namespace: ${K8S_NAMESPACE}"
+
+                        # Executa rollout undo apenas nos Deployments do overlay
+                        while IFS= read -r deploy; do
+                          [ -z "${deploy}" ] && continue
+                          echo "##[debug] Revertendo: ${deploy}"
+                          kubectl rollout undo deployment/${deploy} \
+                            --namespace="${K8S_NAMESPACE}" \
+                            2>/dev/null || echo "##[warning] Não foi possível reverter ${deploy}"
+                        done <<< "${APPLIED_DEPLOYMENTS}"
+                      displayName: "Rollback automático em caso de falha"
+                      condition: failed()
+                      continueOnError: true
+                      env:
+                        APPLIED_DEPLOYMENTS: $(APPLIED_DEPLOYMENTS)
+                        K8S_NAMESPACE: $(K8S_NAMESPACE)
+                        KUBECONFIG: $(GKE_KUBECONFIG_PATH)
+
+                # Coleta URLs e imagens da aplicação para registro no Event Hub.
+                # continueOnError=true garante que a observabilidade não bloqueie o pipeline.
+                - script: |
+                    set -euo pipefail
+
+                    echo "##[section]Coletando informações da aplicação..."
+
+                    # Coleta hosts de Ingresses no namespace
+                    APP_URLS=$(kubectl get ingress \
+                      --namespace="${K8S_NAMESPACE}" \
+                      --output=jsonpath='{range .items[*]}{range .spec.rules[*]}{.host}{"\n"}{end}{end}' \
+                      2>/dev/null | tr '\n' ',' | sed 's/,$//' || echo "")
+
+                    # Coleta imagens distintas dos pods em execução
+                    K8S_IMAGES_LIST=$(kubectl get pods \
+                      --namespace="${K8S_NAMESPACE}" \
+                      --output=jsonpath='{range .items[*]}{range .spec.containers[*]}{.image}{"\n"}{end}{end}' \
+                      2>/dev/null | sort -u | tr '\n' ',' | sed 's/,$//' || echo "")
+
+                    echo "##vso[task.setvariable variable=K8S_APP_URL_LIST]${APP_URLS}"
+                    echo "##vso[task.setvariable variable=K8S_IMAGES]${K8S_IMAGES_LIST}"
+
+                    echo "##[debug] URLs: ${APP_URLS:-nenhuma detectada}"
+                    echo "##[debug] Imagens: ${K8S_IMAGES_LIST:-nenhuma detectada}"
+                  displayName: "Coletar informações da aplicação"
+                  condition: succeeded()
+                  continueOnError: true
+                  env:
+                    # K8S_NAMESPACE: ${{ parameters.k8sNamespace[parameters.environment] }}
+                    KUBECONFIG: $(GKE_KUBECONFIG_PATH)
+
+                # Revoga credenciais GCP e remove o kubeconfig temporário.
+                # condition: always() garante execução mesmo em caso de falha em qualquer step anterior.
+                # Nota: quando a origem é secretfile, o arquivo seguro também é removido aqui.
+                - script: |
+                    set -euo pipefail
+
+                    echo "##[section]Revogando credenciais GCP e limpando arquivos temporários..."
+
+                    # Revoga autenticação da Service Account no gcloud
+                    gcloud auth revoke --all --quiet 2>/dev/null || true
+
+                    # Remove secure file da SA quando a origem for secretfile
+                    if [ -n "${GCP_SA_KEY_FILE:-}" ] && [ -f "${GCP_SA_KEY_FILE}" ]; then
+                      rm -f "${GCP_SA_KEY_FILE}"
+                      echo "##[debug] Secure File da Service Account removido"
+                    fi
+
+                    # Remove kubeconfig temporário desta execução
+                    if [ -f "${GKE_KUBECONFIG_PATH}" ]; then
+                      rm -f "${GKE_KUBECONFIG_PATH}"
+                      echo "##[debug] Kubeconfig temporário removido"
+                    fi
+
+                    echo "##[debug] Limpeza de credenciais concluída"
+                  displayName: "Revogar credenciais GCP e limpar arquivos temporários"
+                  condition: always()
+                  env:
+                    ${{ if eq(parameters.gcpCredentialSource, 'secretfile') }}:
+                      GCP_SA_KEY_FILE: $(gcpSaSecureFile.secureFilePath)
+                    GKE_KUBECONFIG_PATH: $(GKE_KUBECONFIG_PATH)
+
+                # ==================================================================
+                # [OBRIGATÓRIO] Registro do deploy no Event Hub para observabilidade
+                # Deve ser o último step. condition: always() garante registro mesmo em falha.
+                # ==================================================================
+                - task: VivoEventHubTools@2
+                  displayName: "Registrar deploy no Event Hub"
+                  condition: always()
+                  continueOnError: true
+                  inputs:
+                    command: "deploy"
+                    eventHubConnection: "EVHCodeProd"
+                    componentVersion: "$(VersionManagerVivo.DEPLOY_VERSION)"
+                    deployArtifactName: $(K8S_IMAGES)
+                    deployArtifactType: "container"
+                    deployEnvironmentType: "kubernetes"
+                    deployEnvironmentName: "${{ parameters.environment }}"
+                    deployEnvironmentCluster: ${{ parameters.gkeClusterName[parameters.environment] }}
+                    deployEnvironmentNamespace: ${{ parameters.k8sNamespace }}
+                    deployEnvironmentAccessUrl: "$(K8S_APP_URL_LIST)"
+                    annotations: "deploy-mechanism=kustomize,cloud=gcp,gke-region=${{ parameters.gkeClusterRegion[parameters.environment] }}"
+                    pipelineType: "tech_products/atza/deploy-gke"
+
+            on:
+              failure:
+                steps:
+                  - script: |
+                      echo "##vso[task.logissue type=error]Deploy falhou no ambiente ${{ parameters.environment }}"
+                      echo "##[error] Verifique os logs do stage Deploy para detalhes."
+                      echo "##[error] Para rollback manual execute:"
+                      echo "##[error]   kubectl rollout undo deployment --all --namespace=${{ parameters.k8sNamespace }}"
+                    displayName: "Registrar falha do deploy"

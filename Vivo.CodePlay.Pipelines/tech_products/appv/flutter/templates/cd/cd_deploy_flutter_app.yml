@@ -1,0 +1,283 @@
+parameters:
+- name: qa_environment
+- name: target
+- name: skip_protect
+- name: skip_promote
+- name: release_notes
+
+stages:
+
+- stage: deploy
+  displayName: "Deploy ${{ parameters.qa_environment }}"
+  pool: $(PRIVATE_AGENT_SHARED)
+  dependsOn:
+  - tag
+  - package
+  jobs:
+
+  - job: select_package
+    displayName: "Select Package"
+    condition: |
+               and(
+                  succeeded(),
+                  in('${{ parameters.qa_environment }}', 'preprod', 'release', 'producao')
+                )
+    steps:   
+      - download: none 
+
+      - task: Bash@3
+        displayName: Select Package
+        name: export_package
+        inputs:
+          targetType: 'inline'
+          script: |           
+
+            if [[ ${{ parameters.skip_protect }} == False ]] || [[ ${{ parameters.qa_environment }} == 'release' ]] || [[ ${{ parameters.qa_environment }} == 'producao' ]]; then         
+            
+              echo "##[debug]Setting android Package Name Protected"
+              android_package_name='android_package_protected'
+              echo "##vso[task.setvariable variable=ANDROID_PACKAGE_NAME;isOutput=true;]$android_package_name"
+
+              echo "##[debug]Setting ios Package Name Protected"
+              ios_package_name='ios_package_protected'
+              echo "##vso[task.setvariable variable=IOS_PACKAGE_NAME;isOutput=true;]$ios_package_name"
+
+            else 
+
+              echo "##[debug]Setting android Package Name"
+              android_package_name='android_package'
+              echo "##vso[task.setvariable variable=ANDROID_PACKAGE_NAME;isOutput=true;]$android_package_name"
+
+              echo "##[debug]Setting ios Package Name "
+              ios_package_name='ios_package'
+              echo "##vso[task.setvariable variable=IOS_PACKAGE_NAME;isOutput=true;]$ios_package_name"
+
+            fi
+   
+  - deployment: ${{ parameters.qa_environment }}_android_googleplay
+    dependsOn:
+    - select_package    
+    condition: | 
+                and(
+                  always(), 
+                  in('${{ parameters.qa_environment }}', 'preprod', 'release', 'producao'),
+                  or(
+                    startsWith(variables['Build.SourceBranch'], 'refs/tags/PRE-'),
+                    startsWith(variables['Build.SourceBranch'], 'refs/tags/RELEASE-PRE-')
+                  ),
+                  in('${{ parameters.target }}', 'android', 'both')
+                )
+    workspace:
+      clean: all
+    displayName: Deploy Google Play (Android)
+    environment: "deploy-${{ parameters.qa_environment }}"
+    pool:
+      vmImage: 'ubuntu-latest'    
+    variables:
+      ANDROID_PACKAGE_NAME: $[ dependencies.select_package.outputs['export_package.ANDROID_PACKAGE_NAME'] ]    
+    strategy:
+      runOnce:      
+        deploy:
+          steps:
+          - download: none
+
+          - task: DownloadPipelineArtifact@2
+            displayName: 'Download Pipeline Artifact'
+            inputs:
+              buildType: current
+              artifactName: $(ANDROID_PACKAGE_NAME)
+              targetPath: '$(DEFAULT_WORKDIR_ARTIFACTS)'
+              itemPattern: '**'
+ 
+          # - task: GooglePlayRelease@4
+          #   displayName: 'Google Play - Internal'
+          #   inputs:
+          #     action: SingleBundle
+          #     bundleFile: '$(DEFAULT_WORKDIR_ARTIFACTS)/$(APP_FILE_NAME_ANDROID).aab'
+          #     serviceEndpoint: 'GooglePlay'
+          #     track: 'internal'
+          #     applicationId: $(APP_IDENTIFIER)
+          #     # isDraftRelease: true
+
+          # # Promote to Alpha if it is a release to BSIM
+          # - task: GooglePlayPromote@3
+          #   displayName: 'Google Play - Promote BSIM'
+          #   condition: eq('${{ parameters.skip_promote }}', False) 
+          #   inputs:
+          #     packageName: $(APP_IDENTIFIER)
+          #     serviceEndpoint: 'GooglePlay'
+          #     sourceTrack: 'internal'
+          #     destinationTrack: $(ANDROID_EXTERNAL_TESTERS_GROUPS)
+          #     authType: ServiceEndpoint
+          #     сleanTheSourceTrack: false
+
+          - task: Bash@3
+            displayName: 'Google Play - Skipped (commented for Firebase testing)'
+            inputs:
+              targetType: 'inline'
+              script: echo "Google Play tasks comentadas temporariamente para teste do Firebase."
+
+  - deployment: ${{ parameters.qa_environment }}_ios_testflight
+    dependsOn:
+    - select_package    
+    condition: |
+                and(
+                  always(), 
+                  in('${{ parameters.qa_environment }}', 'preprod', 'release', 'producao'),
+                  or(
+                    startsWith(variables['Build.SourceBranch'], 'refs/tags/PRE-'),
+                    startsWith(variables['Build.SourceBranch'], 'refs/tags/RELEASE-PRE-')
+                  ),
+                  in('${{ parameters.target }}', 'ios', 'both')
+                )
+    workspace:
+      clean: all
+    displayName: Deploy TestFlight (iOS)
+    environment: "deploy-${{ parameters.qa_environment }}"
+    pool:
+      vmImage: 'macOS-latest'
+    variables:
+      IOS_TESTFLIGHT_API_KEY_ID: $[ stageDependencies.package.akv_secrets.outputs['export_secrets.IOS_TESTFLIGHT_API_KEY_ID'] ]
+      IOS_TESTFLIGHT_API_ISSUER: $[ stageDependencies.package.akv_secrets.outputs['export_secrets.IOS_TESTFLIGHT_API_ISSUER'] ]
+      IOS_TESTFLIGHT_API_TOKEN: $[ stageDependencies.package.akv_secrets.outputs['export_secrets.IOS_TESTFLIGHT_API_TOKEN'] ]
+      IOS_PACKAGE_NAME: $[ dependencies.select_package.outputs['export_package.IOS_PACKAGE_NAME'] ]              
+    strategy:
+      runOnce:      
+        deploy:
+          steps:
+
+          - checkout: self
+            persistCredentials: true
+            clean: true
+            
+          - download: none          
+
+          - task: DownloadPipelineArtifact@2
+            displayName: 'Download Pipeline Artifact'
+            inputs:
+              buildType: current
+              artifactName: $(IOS_PACKAGE_NAME)
+              targetPath: '$(DEFAULT_WORKDIR_ARTIFACTS)'
+              itemPattern: '**'
+
+          # - ${{ if eq( parameters.skip_promote, False ) }}: 
+
+          #   - task: bash
+          #     displayName: 'Create Release Notes File'
+          #     inputs:
+          #       targetType: 'inline'
+          #       script: |
+                
+          #         current_branch=$(echo "$BUILD_SOURCEBRANCH" | awk -F/ '{print $NF}')
+          #         echo "Current branch is: $current_branch"      
+          #         build_reason="$BUILD_REASON"
+          #         echo "Build reason is: $build_reason"
+
+          #         if [[ "$build_reason" == "PullRequest" || "$build_reason" == "IndividualCI" ]]; then
+          #           firebase_release_notes="Current branch: $current_branch \n$BUILD_SOURCEVERSIONMESSAGE"
+          #           echo "PR & Push - Release Notes from PR or Push"
+
+          #         else 
+          #           firebase_release_notes="Current branch: $current_branch \n${{ parameters.release_notes }}"
+          #           echo "Manual - Release Notes from Current Branch and Parameters"
+
+          #         fi
+
+          #         echo "Creating release notes file..."
+          #         printf "%b\n" "$firebase_release_notes" > $(Build.SourcesDirectory)/$(RELEASE_NOTES_PATH)
+          #         echo "Release notes file created."
+          #         cat $(Build.SourcesDirectory)/$(RELEASE_NOTES_PATH)
+
+          #   - task: AppStoreRelease@1
+          #     displayName: "App Store - TestFlight"
+          #     inputs:
+          #       authType: 'ApiKey'
+          #       apiKeyId: $(IOS_TESTFLIGHT_API_KEY_ID)
+          #       apiKeyIssuerId: $(IOS_TESTFLIGHT_API_ISSUER)
+          #       apitoken: $(IOS_TESTFLIGHT_API_TOKEN)
+          #       releaseTrack: 'TestFlight'
+          #       appIdentifier: $(APP_IDENTIFIER)
+          #       appType: 'iOS'
+          #       ipaPath: '$(DEFAULT_WORKDIR_ARTIFACTS)/$(APP_FILE_NAME_IOS).ipa'
+          #       #shouldSkipWaitingForProcessing: true
+          #       #shouldSkipSubmission: true
+          #       appSpecificId: $(IOS_APP_SPECIFIC_ID)
+          #       installFastlane: false
+          #       distributedToExternalTesters: true
+          #       externalTestersGroups: $(IOS_EXTERNAL_TESTERS_GROUPS)
+          #       releaseNotes: '$(Build.SourcesDirectory)/$(RELEASE_NOTES_PATH)'
+
+          # - ${{ else }}: 
+
+          #   - task: AppStoreRelease@1
+          #     displayName: "App Store - TestFlight"
+          #     inputs:
+          #       authType: 'ApiKey'
+          #       apiKeyId: $(IOS_TESTFLIGHT_API_KEY_ID)
+          #       apiKeyIssuerId: $(IOS_TESTFLIGHT_API_ISSUER)
+          #       apitoken: $(IOS_TESTFLIGHT_API_TOKEN)
+          #       releaseTrack: 'TestFlight'
+          #       appIdentifier: $(APP_IDENTIFIER)
+          #       appType: 'iOS'
+          #       ipaPath: '$(DEFAULT_WORKDIR_ARTIFACTS)/$(APP_FILE_NAME_IOS).ipa'
+          #       shouldSkipWaitingForProcessing: true
+          #       shouldSkipSubmission: true
+          #       appSpecificId: $(IOS_APP_SPECIFIC_ID)
+          #       installFastlane: false
+
+          - task: Bash@3
+            displayName: 'TestFlight - Skipped (commented for Firebase testing)'
+            inputs:
+              targetType: 'inline'
+              script: echo "TestFlight tasks comentadas temporariamente para teste do Firebase."
+              
+
+  - job: governance_deploy
+    displayName: Governance Deploy
+    pool: $(PRIVATE_AGENT_SHARED)
+    dependsOn: 
+    - ${{ if in(parameters.target, 'android', 'both') }}:
+      - ${{ parameters.qa_environment }}_android_googleplay
+    - ${{ if in(parameters.target, 'ios', 'both') }}:
+      - ${{ parameters.qa_environment }}_ios_testflight
+    condition: |
+                and(
+                  succeeded(), 
+                  in('${{ parameters.qa_environment }}', 'producao'),
+                  startsWith(variables['Build.SourceBranch'], 'refs/tags/PRE-')
+                )    
+    steps:
+
+    - script: |
+        if [ ! -f "catalog-info.yaml" ]; then
+          echo "##vso[task.logissue type=error] Unable to find catalog-info.yaml file (path=$(pwd))."
+        fi
+
+        COMPONENT_NAME="$(yq -r 'select(documentIndex == 0) | .metadata.name | select (.!=null)' catalog-info.yaml)"
+        echo "##vso[task.setvariable variable=COMPONENT_NAME]${COMPONENT_NAME}"
+        echo "##vso[task.setvariable variable=CATALOG_INFO_FILE_CONTENT]$(cat catalog-info.yaml)"
+      name: export_catalog_info
+      displayName: Reading Catalog Info File
+
+    - bash: |
+        version=$(yq e '.version' pubspec.yaml | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+')
+        echo "##vso[task.setvariable variable=APP_VERSION]$version"
+        echo "##[debug] Exporting variable 'APP_VERSION': $version"
+      name: export_current_version
+      displayName: Extract App Version 
+
+    - task: VivoGovernance@1
+      inputs:
+        breakglass: $(GOVAPP_BREAK_GLASS)
+        cluster: "$(GOVAPP_CLUSTER)"
+        component: "$(COMPONENT_NAME)"
+        deployment: "$(COMPONENT_NAME)"
+        environment:  "${{ parameters.qa_environment }}" 
+        namespace: "$(GOVAPP_NAMESPACE)"
+        operation: "deploy"
+        serverEndpoint: $(GOVAPP_SERVICE_CONNECTION_NAME)
+        version: "$(APP_VERSION)"
+        catalogInfo: $(CATALOG_INFO_FILE_CONTENT)
+      continueOnError: true
+      condition: eq(lower(variables.GOVAPP_INTEGRATION_ENABLED), 'true')
+

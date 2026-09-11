@@ -1,0 +1,224 @@
+parameters:
+- name: blue_green
+  type: string
+  default: 'Não'
+  values:
+  - 'Não'
+  - 'Sim'
+- name: build_name
+  type: string
+- name: database_update_mode
+  type: string
+  default: NONE
+  values:
+  - NONE
+  - UPDATE
+- name: deploy_strategy
+  type: string
+  default: RECREATE
+  values:
+  - RECREATE
+  - ROLLING_UPDATE
+- name: environment_for_deploy
+  type: string
+  default: d15
+  values:
+  - p1
+  - s1
+  - s2
+  - s3
+  - d1
+  - d2
+  - d3
+  - d4
+  - d5
+  - d6
+  - d7
+  - d8
+  - d9
+  - d10
+  - d11
+  - d12
+  - d13
+  - d14
+  - d15
+
+jobs:
+- job: verificar_deploy_job
+  displayName: "${{ parameters.environment_for_deploy }} - Verificar estratégia de deploy"
+  pool:
+    name: $(PRIVATE_AGENT_DEFAULT)
+  timeoutInMinutes: 300
+  steps:
+  - checkout: none
+
+  - template: /tech_products/ecmc/sap-commerce/tasks/security/get_sap_tu_token.yaml
+    parameters:
+      displayName: 'Get SAP TU token (${{ parameters.environment_for_deploy }})'
+      exportAsOutput: true
+      stepName: 'get_sap_tu_token'
+  - bash: |
+      if [[ -z "${BUILD_NAME}"  ]]; then
+        echo "##[error]Build name não definido. Interrompendo a execução do script."
+        exit 1
+      fi
+      BUILD_NAME_LOWER=$(echo "${BUILD_NAME}" | tr '[:upper:]' '[:lower:]')
+      if [[ "${ALLOW_DEPLOY_DEV}" == "false" ]] && [[ "${BUILD_NAME_LOWER}" == *"-dev"* ]]; then
+        echo "##[error]A variável ALLOW_DEPLOY_DEV está definida como 'false' e BUILD_NAME contém '-DEV'. Interrompendo a execução do script."
+        exit 1
+      fi
+      echo "[section]Tudo ok. Seguindo script"
+    displayName: "Verificando ALLOW_DEPLOY_DEV"
+    env:
+      BUILD_NAME: ${{ replace(parameters.build_name, ' ', '') }}
+      ALLOW_DEPLOY_DEV: $(ALLOW_DEPLOY_DEV)
+
+  - bash: |
+      ACCESS_TOKEN="${SAP_TU_ACCESS_TOKEN}"
+      if [ -z "$ACCESS_TOKEN" ] || [ "$ACCESS_TOKEN" == "null" ]; then
+        echo "##[error]Access token do Technical User indisponível"
+        exit 1
+      fi
+
+      TZ='America/Sao_Paulo'
+      DATE_SAP=$(date +"%d-%m-%Y %H:%M:%S")
+      echo "[section]⚠️⚠️ Parâmetros da implantação ⚠️⚠️"
+      echo "[section] Database mode ...........: ${DATABASE_UPDATE_MODE}"
+      echo "[section] Url de deploy ...........: ${URL_SAP_DEPLOY}"
+      echo "[section] Url de build  ...........: ${URL_SAP_BUILD}?\$orderby=buildStartTimestamp%20desc&statusNot=FAIL,DELETED,BUILDING"
+      echo "[section] Build name ..............: ${BUILD_NAME}"
+      echo "[section] Ambiente ................: ${ENVIRONMENT_FOR_DEPLOY}"
+      echo "[section] Estratégia ..............: ${DEPLOY_STRATEGY}"
+
+      PAGE_SIZE=50
+      SKIP=0
+      BUILD_DATA=""
+      FOUND=FALSE
+
+      # Pagina os builds de PAGE_SIZE em PAGE_SIZE até encontrar o build ou esgotar os resultados
+      while true; do
+        SUCCESS=FALSE
+        for _ in {1..3}; do
+          RESPONSE_CODE=$(curl -s -w "%{http_code}" -o response.json \
+            --compressed \
+            --max-time $CURL_HTTP_TIMEOUT \
+            -H "x-approuter-authorization: Bearer ${ACCESS_TOKEN}" \
+            -H "Accept: application/json" \
+            -H "accept-encoding: deflate, gzip" \
+            "${URL_SAP_BUILD}?\$top=${PAGE_SIZE}&\$skip=${SKIP}&\$orderby=buildStartTimestamp%20desc&statusNot=FAIL,DELETED,BUILDING"
+          )
+          echo "[section]RESPONSE_CODE: ...... $RESPONSE_CODE (top=${PAGE_SIZE}, skip=${SKIP})"
+          if [ "$RESPONSE_CODE" != 200 ]; then
+            cat response.json
+            sleep 30
+            SUCCESS=FALSE
+          else
+            SUCCESS=TRUE
+            break
+          fi
+        done
+
+        if [ "$SUCCESS" != "TRUE" ]; then
+          echo "❌ O response code não teve resposta após 3 tentativas, api da SAP está indisponível no momento ❌"
+          exit 1
+        fi
+
+        PAGE_COUNT=$(cat response.json | jq -r '.value | length')
+
+        BUILD_DATA=$(cat response.json | jq --arg build_name "$BUILD_NAME" -r '.value[] | select(.name == $build_name)')
+        if [ -n "${BUILD_DATA}" ]; then
+          FOUND=TRUE
+          break
+        fi
+
+        # Página incompleta indica que não há mais resultados a paginar
+        if [ "${PAGE_COUNT}" -lt "${PAGE_SIZE}" ]; then
+          break
+        fi
+
+        SKIP=$((SKIP + PAGE_SIZE))
+      done
+
+      if [ "$FOUND" != "TRUE" ]; then
+        echo "##[error]Build '${BUILD_NAME}' não encontrado após paginar todos os resultados da API da SAP."
+        exit 1
+      fi
+
+      echo "##[group]Dados do build encontrado na API da SAP - Clique para expandir"
+      echo "${BUILD_DATA}" | jq .
+      echo "##[endgroup]"
+
+      CODE_FOR_DEPLOY=$(echo "${BUILD_DATA}" | jq -r '.code // empty')
+
+      if [ -z "${CODE_FOR_DEPLOY}" ]; then
+        echo "##[error]Não foi possível obter o código do build. Verifique se há conectividade com a API da SAP ou se o nome do build está correto."
+        exit 1
+      fi
+
+      BRANCH_NAME_IN_BUILD=$(echo "${BUILD_DATA}" | jq -r '.branch // empty')
+      COMMIT_HASH_IN_BUILD=$(echo "${BUILD_DATA}" | jq -r '.properties[] | select(.key == "project.repository.revision") | .value')
+
+
+      echo "[section]CODE_FOR_DEPLOY : .............. ${CODE_FOR_DEPLOY}"
+      echo "[section]BRANCH_NAME_IN_BUILD : ......... ${BRANCH_NAME_IN_BUILD}"
+      echo "[section]COMMIT_HASH_IN_BUILD : ......... ${COMMIT_HASH_IN_BUILD}"
+
+      rm -rf response.json
+
+      if [ "$BLUE_GREEN" == "Não" ]; then
+          echo "[section]  ♻️ Iniciando Deploy padrão... ♻️"
+          RESPONSE_CODE=$(curl -s --compressed -X POST ${URL_SAP_DEPLOY} -w "%{http_code}" -o green.json \
+            --max-time $CURL_HTTP_TIMEOUT \
+            -H "x-approuter-authorization: Bearer ${ACCESS_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "{\"buildCode\": \"$CODE_FOR_DEPLOY\", \"databaseUpdateMode\": \"$DATABASE_UPDATE_MODE\", \"environmentCode\": \"$ENVIRONMENT_FOR_DEPLOY\", \"strategy\": \"$DEPLOY_STRATEGY\"}"
+          )
+      else
+          echo "[section]Iniciando deploy blue/green"
+          RESPONSE_CODE=$(curl -s --compressed -X POST ${URL_SAP_DEPLOY} -w "%{http_code}" -o green.json \
+            --max-time $CURL_HTTP_TIMEOUT \
+            -H "x-approuter-authorization: Bearer ${ACCESS_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "{\"buildCode\": \"$CODE_FOR_DEPLOY\", \"databaseUpdateMode\": \"$DATABASE_UPDATE_MODE\", \"environmentCode\": \"$ENVIRONMENT_FOR_DEPLOY\", \"strategy\": \"GREEN\"}"
+          )
+          CODE_GREEN=$(cat green.json | jq -r '.previousDeploymentCode')
+      fi
+      echo "[section]⚠️ Response Code --> $RESPONSE_CODE"
+      if [ "$RESPONSE_CODE" != "201" ]; then
+        echo "##[error]Falha ao iniciar o deploy. HTTP ${RESPONSE_CODE}"
+        cat green.json
+        rm -f green.json
+        exit 1
+      fi
+
+      DEPLOY_CODE=$(cat green.json | jq -r '.code')
+      echo "[section]Deployment code = $DEPLOY_CODE"
+
+      echo "##vso[task.setvariable variable=DEPLOY_CODE;isoutput=true]$DEPLOY_CODE"
+      echo "##vso[task.setvariable variable=CODE_GREEN;isoutput=true]$CODE_GREEN"
+      echo "##vso[task.setvariable variable=BUILD_CODE_FROM_SAP;isoutput=true]${CODE_FOR_DEPLOY}"
+      echo "##vso[task.setvariable variable=BRANCH_NAME_IN_BUILD;isoutput=true]${BRANCH_NAME_IN_BUILD}"
+      echo "##vso[task.setvariable variable=COMMIT_HASH_IN_BUILD;isoutput=true]${COMMIT_HASH_IN_BUILD}"
+
+
+    displayName: "Executar Deploy"
+    name: verificar_deploy_bash
+    env:
+      DATABASE_UPDATE_MODE: ${{ parameters.database_update_mode }}
+      BUILD_NAME: ${{ replace(parameters.build_name, ' ', '') }}
+      ENVIRONMENT_FOR_DEPLOY: ${{ parameters.environment_for_deploy }}
+      DEPLOY_STRATEGY: ${{ parameters.deploy_strategy }}
+      BLUE_GREEN: ${{ parameters.blue_green }}
+      URL_SAP_DEPLOY: $(URL_SAP_DEPLOY)
+      SAP_TU_ACCESS_TOKEN: $(SAP_TU_ACCESS_TOKEN)
+      URL_SAP_BUILD: $(URL_SAP_BUILD)
+
+  - bash: |
+      echo "[section]Access token reutilizado (valor oculto)"
+      echo "##vso[task.setvariable variable=SAP_TU_ACCESS_TOKEN;issecret=true;isOutput=true]${SAP_TU_ACCESS_TOKEN}"
+      echo "##vso[task.setvariable variable=SAP_TU_TOKEN_EXPIRATION;isOutput=true]${SAP_TU_TOKEN_EXPIRATION}"
+    displayName: 'Re-export SAP TU token'
+    name: reexport_token
+    env:
+      SAP_TU_ACCESS_TOKEN: $(SAP_TU_ACCESS_TOKEN)
+      SAP_TU_TOKEN_EXPIRATION: $(SAP_TU_TOKEN_EXPIRATION)

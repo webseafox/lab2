@@ -1,0 +1,201 @@
+parameters:
+- name: repoName
+  type: string
+- name: branchSourceRef
+  type: string
+- name: newBranchName
+  type: string
+- name: selfCommitHash
+  type: string
+- name: prBranches
+  type: string
+- name: workingDirectory
+  type: string
+  default: "$(Build.SourcesDirectory)"
+- name: displayName
+  type: string
+  default: "Tombamento esteiras"
+
+
+# Cria uma branch de tombamento a partir do commit informado, faz push e abre PRs
+# para cada branch de destino informada.
+#
+# Uso - repositório único (useSubModules = false):
+#   - template: /tech_products/ecmc/shared/tasks/git/open_pr_v2.yaml
+#     parameters:
+#       repoName: ${{ parameters.targetRepo }}
+#       branchSourceRef: ${{ parameters.branchSourceRef }}
+#       newBranchName: $(NEW_BRANCH_NAME)
+#       selfCommitHash: $(SOURCE_COMMIT_FULL)
+#       prBranches: ${{ parameters.prBranches }}
+#
+# Uso - com submódulos (dentro de ${{ each repoItem in parameters.repositoriesSubModules }}):
+#   - template: /tech_products/ecmc/shared/tasks/git/open_pr_v2.yaml
+#     parameters:
+#       repoName: ${{ repoItem.name }}
+#       branchSourceRef: ${{ parameters.branchSourceRef }}
+#       newBranchName: $(NEW_BRANCH_NAME)
+#       selfCommitHash: $(SUBMODULE_HASH_${{ upper(replace(repoItem.path, '-', '_')) }})
+#       prBranches: ${{ parameters.prBranches }}
+#       workingDirectory: $(Pipeline.Workspace)/${{ repoItem.name }}
+#       displayName: "Opening PRs for ${{ repoItem.name }}"
+
+steps:
+- bash: |
+    BRANCH_SOURCE_REF="${BRANCH_SOURCE_REF#refs/heads/}"
+    ENCODED_BRANCH="${BRANCH_SOURCE_REF//\//%2F}"
+    PROJECT_PREFIX_URL="$(System.TeamFoundationCollectionUri)$(System.TeamProject)"
+    ENCODED_PROJECT_PREFIX_URL="${PROJECT_PREFIX_URL// /%20}"
+    COMMIT_URL="${ENCODED_PROJECT_PREFIX_URL}/_git/${REPO_NAME}/commit/${SELF_COMMIT_HASH}?refName=refs%2Fheads%2F${ENCODED_BRANCH}"
+    PIPELINE_URL="${ENCODED_PROJECT_PREFIX_URL}/_build/results?buildId=$(Build.BuildId)&view=results"
+
+    git checkout "${BRANCH_SOURCE_REF}"
+
+    echo "[section]SELF_COMMIT_HASH: ...... ${SELF_COMMIT_HASH}"
+    echo "[section]Commit URL: ........... ${COMMIT_URL}"
+
+    git reset --hard "${SELF_COMMIT_HASH}"
+
+    PR_BRANCHES_ARRAY=(${PR_BRANCHES//;/ })
+    echo "[section]__________________________________________________________________________________"
+    echo "[section]Variável PR_TOMBAMENTO_VERIFY_COMMIT_HASH_EXISTS .........: ${PR_TOMBAMENTO_VERIFY_COMMIT_HASH_EXISTS}"
+    echo "[section]Se PR_TOMBAMENTO_VERIFY_COMMIT_HASH_EXISTS for false, PRs de tombamento serão criados."
+    echo "[section]Se PR_TOMBAMENTO_VERIFY_COMMIT_HASH_EXISTS for true, verifica se o commit já existe e, caso exista, pula a criação do PR."
+    echo "[section]__________________________________________________________________________________"
+
+    for TARGET_PR_BRANCH in "${PR_BRANCHES_ARRAY[@]}"; do
+      TARGET_PR_BRANCH="${TARGET_PR_BRANCH#refs/heads/}"
+      echo "[section]Branch $TARGET_PR_BRANCH"
+
+      TARGET_PR_BRANCH_ALIAS="${TARGET_PR_BRANCH//\//-}"
+      echo "[section]Branch $TARGET_PR_BRANCH_ALIAS"
+
+      ACTUAL_DATE="$(date +%Y%m%d-%H%M%S)"
+      NEW_BRANCH_NAME_WITH_ALIAS="${NEW_BRANCH_NAME}-${ACTUAL_DATE}-to-${TARGET_PR_BRANCH_ALIAS}"
+
+      git checkout -b "${NEW_BRANCH_NAME_WITH_ALIAS}"
+      git commit -m "[Tombamento automático] devops: Create new branch ${NEW_BRANCH_NAME_WITH_ALIAS} for PR after deploy"
+      git push origin HEAD:${NEW_BRANCH_NAME_WITH_ALIAS}
+
+      # Ignora quando branch de destino for igual à de origem
+      if [ "${TARGET_PR_BRANCH}" == "${BRANCH_SOURCE_REF}" ]; then
+        continue
+      fi
+
+      # Ignora quando o commit já está na branch de destino
+      if [ "${PR_TOMBAMENTO_VERIFY_COMMIT_HASH_EXISTS}" == "true" ]; then
+        git fetch origin "${TARGET_PR_BRANCH}" 2>/dev/null || true
+        if git merge-base --is-ancestor "${SELF_COMMIT_HASH}" "origin/${TARGET_PR_BRANCH}" 2>/dev/null; then
+          echo "[warning]Commit ${SELF_COMMIT_HASH} já está presente na branch ${TARGET_PR_BRANCH}. Pulando criação de PR."
+          continue
+        fi
+      fi
+
+      echo "[section]Iniciando abertura de PR de ${NEW_BRANCH_NAME_WITH_ALIAS} para a branch ${TARGET_PR_BRANCH}"
+
+      PR_TITLE="[Tombamento automático] - ${TARGET_PR_BRANCH}"
+      # Recupera o template do Variable Group
+      TEMPLATE="${PR_DESCRIPTION_TEMPLATE}"
+      # Substitui os placeholders com os valores reais
+      PR_DESCRIPTION="${TEMPLATE//\{\{NEW_BRANCH_NAME_WITH_ALIAS\}\}/${NEW_BRANCH_NAME_WITH_ALIAS}}"
+      PR_DESCRIPTION="${PR_DESCRIPTION//\{\{COMMIT_URL\}\}/${COMMIT_URL}}"
+      PR_DESCRIPTION="${PR_DESCRIPTION//\{\{SELF_COMMIT_HASH\}\}/${SELF_COMMIT_HASH}}"
+      PR_DESCRIPTION="${PR_DESCRIPTION//\{\{BRANCH_SOURCE_REF\}\}/${BRANCH_SOURCE_REF}}"
+      PR_DESCRIPTION="${PR_DESCRIPTION//\{\{PIPELINE_URL\}\}/${PIPELINE_URL}}"
+
+      PR_BODY=$(jq -n \
+        --arg source "refs/heads/${NEW_BRANCH_NAME_WITH_ALIAS}" \
+        --arg target "refs/heads/${TARGET_PR_BRANCH}" \
+        --arg title "${PR_TITLE}" \
+        --arg desc "${PR_DESCRIPTION}" \
+        '{"sourceRefName": $source, "targetRefName": $target, "title": $title, "description": $desc}'
+      )
+
+      PR_RESP_FILE="$(mktemp)"
+
+      HTTP_CODE=$(curl -sS -o "${PR_RESP_FILE}" -w "%{http_code}" \
+        -X POST \
+        -H "${AUTH_HEADER}" \
+        -H "${CONTENT_HEADER}" \
+        -d "${PR_BODY}" \
+        "${API_BASE}/pullrequests?api-version=7.1")
+
+      if [ "${HTTP_CODE}" == "201" ]; then
+        PR_ID="$(jq -r '.pullRequestId // empty' "${PR_RESP_FILE}")"
+        echo "[section]Pull Request criado: De ${NEW_BRANCH_NAME_WITH_ALIAS} para ${TARGET_PR_BRANCH}. ID: ${PR_ID}"
+
+      elif [ "${HTTP_CODE}" = "409" ]; then
+        ENCODED_NEW_BRANCH="searchCriteria.sourceRefName=refs/heads/${NEW_BRANCH_NAME_WITH_ALIAS}"
+        ENCODED_TARGET_BRANCH="searchCriteria.targetRefName=refs/heads/${TARGET_PR_BRANCH}"
+        PR_URL_FIND="${API_BASE}/pullrequests?searchCriteria.status=active&${ENCODED_NEW_BRANCH}&${ENCODED_TARGET_BRANCH}&\$top=1&api-version=7.1"
+
+        echo "[warning]PR já existe de ${NEW_BRANCH_NAME_WITH_ALIAS} para ${TARGET_PR_BRANCH}. Buscando ID para atualizar."
+
+        HTTP_CODE=$(curl -sS -o "${PR_RESP_FILE}" -w "%{http_code}" \
+          -X GET \
+          -H "${AUTH_HEADER}" \
+          -H "${CONTENT_HEADER}" \
+          "${PR_URL_FIND}")
+
+        if [ "${HTTP_CODE}" != "200" ]; then
+          echo "[error]Falha ao buscar PR existente. HTTP ${HTTP_CODE}"
+          cat "${PR_RESP_FILE}"
+          rm -f "${PR_RESP_FILE}"
+          exit 1
+        fi
+
+        PR_ID=$(jq -r '.value | if length > 0 then .[0].pullRequestId else empty end' "${PR_RESP_FILE}")
+
+        if [ -z "${PR_ID}" ]; then
+          echo "[error]Não foi possível obter o ID do PR existente para ${NEW_BRANCH_NAME_WITH_ALIAS} -> ${TARGET_PR_BRANCH}."
+          rm -f "${PR_RESP_FILE}"
+          exit 1
+        fi
+
+        echo "[section]PR existente encontrado. ID: ${PR_ID}. Atualizando..."
+
+        PR_BODY_PATCH=$(jq -n \
+          --arg title "${PR_TITLE}" \
+          --arg desc "${PR_DESCRIPTION}" \
+          '{"title": $title, "description": $desc}'
+        )
+
+        HTTP_CODE=$(curl -sS -o "${PR_RESP_FILE}" -w "%{http_code}" \
+          -X PATCH \
+          -H "${AUTH_HEADER}" \
+          -H "${CONTENT_HEADER}" \
+          -d "${PR_BODY_PATCH}" \
+          "${API_BASE}/pullrequests/${PR_ID}?api-version=7.1")
+
+        if [ "${HTTP_CODE}" != "200" ]; then
+          echo "[error]Falha ao atualizar PR ${PR_ID}. HTTP ${HTTP_CODE}"
+          cat "${PR_RESP_FILE}"
+          rm -f "${PR_RESP_FILE}"
+          exit 1
+        fi
+
+        echo "[section]PR ${PR_ID} atualizado: De ${NEW_BRANCH_NAME_WITH_ALIAS} para ${TARGET_PR_BRANCH}."
+
+      else
+        echo "[error]Falha ao criar PR para ${TARGET_PR_BRANCH}. HTTP ${HTTP_CODE}"
+        cat "${PR_RESP_FILE}"
+        rm -f "${PR_RESP_FILE}"
+        exit 1
+      fi
+
+      rm -f "${PR_RESP_FILE}"
+    done
+
+  displayName: ${{ parameters.displayName }}
+  workingDirectory: ${{ parameters.workingDirectory }}
+  condition: and(succeeded(), ne(variables['FORCE_MERGE'], 'true'))
+  env:
+    REPO_NAME: ${{ parameters.repoName }}
+    BRANCH_SOURCE_REF: ${{ parameters.branchSourceRef }}
+    NEW_BRANCH_NAME: ${{ parameters.newBranchName }}
+    SELF_COMMIT_HASH: ${{ parameters.selfCommitHash }}
+    PR_BRANCHES: ${{ parameters.prBranches }}
+    API_BASE: "$(System.CollectionUri)$(System.TeamProjectId)/_apis/git/repositories/${{ parameters.repoName }}"
+    AUTH_HEADER: "Authorization: Bearer $(System.AccessToken)"
+    CONTENT_HEADER: "Content-Type: application/json"
+    PR_TOMBAMENTO_VERIFY_COMMIT_HASH_EXISTS: $(PR_TOMBAMENTO_VERIFY_COMMIT_HASH_EXISTS)

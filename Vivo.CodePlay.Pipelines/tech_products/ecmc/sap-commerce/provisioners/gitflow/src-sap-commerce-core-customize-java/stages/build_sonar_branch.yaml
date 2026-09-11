@@ -1,0 +1,300 @@
+﻿parameters:
+- name: enable_devflow_validations
+  type: boolean
+  default: False
+
+stages:
+- stage: build_sonar_branch
+  displayName: "Build & Test Sonar Branch"
+  pool:
+    name: $(PRIVATE_AGENT_SHARED)
+  dependsOn:
+    - pipeline_init
+    - ${{ if eq(variables['Build.Reason'], 'PullRequest') }}:
+      - validate_sonar_branch
+    - ${{ if and(eq(variables['Build.Reason'], 'PullRequest'), eq(parameters.enable_devflow_validations, True)) }}:
+      - repo_validations
+  jobs:
+    - job: "build_sonar_branch"
+      displayName: "Build Sonar Branch"
+      variables:
+        - name: sonarBranchCreated
+          value: $[ stageDependencies.validate_sonar_branch.validate.outputs['set_branch_exists.SONAR_BRANCH_EXISTS'] ]
+      steps:
+      - checkout: self
+        fetchDepth: 0
+        persistCredentials: true
+      - task: UniversalPackages@0
+        inputs:
+          command: 'download'
+          downloadDirectory: '$(System.DefaultWorkingDirectory)'
+          feedsToUse: 'internal'
+          vstsFeed: '3d53bc62-8749-4931-ae46-a443b73bc87a'
+          vstsFeedPackage: 'dvps-cxcomm-b2c'
+          vstsPackageVersion: '$(HYBRIS_ACCELERATOR_VERSION)'
+        displayName: 'Download: CXCOMM'
+        condition: eq(variables['sonarBranchCreated'],False)
+        env:
+          https_proxy: $(PROXY_NSKP_HTTPS)
+          http_proxy: $(PROXY_NSKP_HTTP)
+          no_proxy: $(PROXY_NSKP_NO_PROXY)
+
+      - script: |
+          echo "##[debug]Configurando informações do git"
+          git config --replace-all user.name "Azure DevOps" && git config --replace-all user.email "azuredevops@telefonicati.onmicrosoft.com" && git config --replace-all pull.ff only
+
+          BRANCH=$(echo "$(System.PullRequest.SourceBranch)" | sed 's/refs\/heads\///g')
+
+          echo "##[debug]......................................................"
+          echo "##[debug]Abrindo branches principais"
+          oficialBranches=("master" "main" "s1" "s2" "s3" "s4" "s5" "s6")
+
+          for ofcBranch in ${oficialBranches[@]};
+          do
+            git checkout $ofcBranch
+            git pull origin $ofcBranch
+          done
+          echo "##[debug]......................................................"
+
+          echo "##[debug]Movendo para a branch $BRANCH"
+          git checkout $BRANCH
+          git pull origin $BRANCH
+
+          echo "Listando branches do repositório..."
+          echo "....................................................."
+          git branch -a
+          echo "....................................................."
+
+          commits=$(git --no-pager log --decorate=short --pretty=format:"%h" -n 100)
+
+          echo "##[debug]Validando todos os commits"
+
+          for comm in $commits
+          do
+            allBranches=$(git branch --contains "${comm}" | cut -c 3-)
+            IFS=""
+            echo "> Commit  [${comm}]"
+            IFS='
+            '
+
+            # echo "branches - $bran <<<"
+            for bran in ${allBranches[@]}
+            do
+              echo ">>> Branch -> [${bran}]"
+              if [[ ${oficialBranches[@]} =~ ${bran} ]];
+              then
+                echo "Commit selecionado -> [${comm}]"
+                git reset --hard ${comm}
+                git log -1
+
+
+                echo "##[debug]Validando Build Number do Hybris"
+                echo "..............................................................................."
+                cat $(System.DefaultWorkingDirectory)/hybris/bin/platform/build.number
+                echo "..............................................................................."
+
+
+                echo "##[debug]Renomeando pasta de configuração"
+                echo "..............................................................................."
+                cd $(Build.SourcesDirectory)/hybris
+                mv -v config config_old
+                echo "..............................................................................."
+
+
+                echo "##[debug]Recriando pasta de configuração"
+                echo "..............................................................................."
+                cd $(Build.SourcesDirectory)/hybris/bin/platform
+                source ./setantenv.sh
+                echo | ant
+                echo "..............................................................................."
+
+
+                echo "##[debug]Atualizando arquivos de configuração"
+                echo "..............................................................................."
+                cp -r $(System.DefaultWorkingDirectory)/hybris/config_old/environments/pipeextensions.xml $(System.DefaultWorkingDirectory)/hybris/config/localextensions.xml
+                cp -r $(System.DefaultWorkingDirectory)/hybris/config_old/local.properties $(System.DefaultWorkingDirectory)/hybris/config/
+                cp -rf $(System.DefaultWorkingDirectory)/hybris/config_old/customize/ $(System.DefaultWorkingDirectory)/hybris/config/
+                cp -rf $(System.DefaultWorkingDirectory)/hybris/config_old/ant/ $(System.DefaultWorkingDirectory)/hybris/config/
+                ls -la $(System.DefaultWorkingDirectory)/hybris/config/
+                echo "..............................................................................."
+
+
+                echo "##[debug]Validando arquivos de configuração"
+                echo "..............................................................................."
+                echo "##[section] ####### localextensions.xml #######"
+                cat $(System.DefaultWorkingDirectory)/hybris/config/localextensions.xml
+                echo
+
+                echo "##[section] ####### local.properties #######"
+                cat $(System.DefaultWorkingDirectory)/hybris/config/local.properties
+                echo
+
+                echo "##[section] ####### Pasta hybris/config #######"
+                ls -la $(System.DefaultWorkingDirectory)/hybris/config/
+                echo
+
+                echo "##[section] ####### Pasta hybris/config/customize #######"
+                ls -la $(System.DefaultWorkingDirectory)/hybris/config/customize
+                echo
+
+                echo "##[section] ####### Pasta hybris/config/ant #######"
+                ls -la $(System.DefaultWorkingDirectory)/hybris/config/ant
+                echo "..............................................................................."
+
+
+                echo "##[debug]Executando comandos ant"
+                echo "..............................................................................."
+                cd $(Build.SourcesDirectory)/hybris/bin/platform
+
+                sed -i "2i export ANT_MEM_OPTS=\"$(BUILD_ANT_MEM_OPTS)\"" ./setantenv.sh
+                export ANT_MEM_OPTS="$(BUILD_ANT_MEM_OPTS)"
+
+                echo "##[section] ####### ant customize #######"
+                ant customize
+
+                echo "##[section] ####### ant clean #######"
+                ant clean
+
+                echo "##[section] ####### ant all #######"
+                ant all
+
+                echo "##[section] ####### ant yunitinit #######"
+                ant yunitinit
+
+                echo "##[section] ####### ant jacocoalltests #######"
+                ant jacocoalltests
+
+                BRANCH=$(echo "$(System.PullRequest.SourceBranch)" | sed 's/refs\/heads\///g')
+                echo "##[section] ####### ant sonarcheck -Dsonar.branch.name=$BRANCH -Dsonar.projectVersion=$(SONARQUBE_PROJECT_VERSION) -Dsonar.login=*** #######"
+                ant sonarcheck -Dsonar.branch.name=$BRANCH -Dsonar.projectVersion=$(SONARQUBE_PROJECT_VERSION) -Dsonar.login=$(SONARQUBE_TOKEN_SCC)
+                echo "..............................................................................."
+                exit 0
+              fi
+              bran=""
+            done
+            IFS=''
+          done
+        displayName: 'Validate Hybris Directory'
+        condition: eq(variables['sonarBranchCreated'],False)
+        env:
+          SYSTEM_ACCESS_TOKEN: $(System.AccessToken)
+
+      #- script: |
+      #    cd $(System.DefaultWorkingDirectory)
+      #    cat $(System.DefaultWorkingDirectory)/hybris/bin/platform/build.number
+      #  displayName: 'Validate Hybris Directory'
+      #  condition: eq(variables['sonarBranchCreated'],False)
+
+      #- script: |
+      #    cd $(Build.SourcesDirectory)/hybris
+      #    mv -v config config_old
+      #  displayName: "Renaming config folder"
+      #  condition: eq(variables['sonarBranchCreated'],False)
+
+      #- script: |
+      #    git log -1
+      #    cd $(Build.SourcesDirectory)/hybris/bin/platform
+      #    source ./setantenv.sh
+      #    echo | ant
+      #  displayName: "Recreating config folder"
+      #  condition: eq(variables['sonarBranchCreated'],False)
+
+      #- script: |
+      #    git log -1
+      #    cp -r $(System.DefaultWorkingDirectory)/hybris/config_old/environments/pipeextensions.xml $(System.DefaultWorkingDirectory)/hybris/config/localextensions.xml
+      #    cp -r $(System.DefaultWorkingDirectory)/hybris/config_old/local.properties $(System.DefaultWorkingDirectory)/hybris/config/
+      #    cp -rf $(System.DefaultWorkingDirectory)/hybris/config_old/customize/ $(System.DefaultWorkingDirectory)/hybris/config/
+      #    cp -rf $(System.DefaultWorkingDirectory)/hybris/config_old/ant/ $(System.DefaultWorkingDirectory)/hybris/config/
+      #  displayName: "Updating config files"
+      #  condition: eq(variables['sonarBranchCreated'],False)
+
+      #- script: |
+      #    git log -1
+      #    echo "##[section] ####### localextensions.xml #######"
+      #    cat $(System.DefaultWorkingDirectory)/hybris/config/localextensions.xml
+      #    echo
+
+      #    echo "##[section] ####### local.properties #######"
+      #    cat $(System.DefaultWorkingDirectory)/hybris/config/local.properties
+      #    echo
+
+      #    echo "##[section] ####### Pasta hybris/config #######"
+      #    ls -la $(System.DefaultWorkingDirectory)/hybris/config/
+      #    echo
+
+      #    echo "##[section] ####### Pasta hybris/config/customize #######"
+      #    ls -la $(System.DefaultWorkingDirectory)/hybris/config/customize
+      #    echo
+
+      #    echo "##[section] ####### Pasta hybris/config/ant #######"
+      #    ls -la $(System.DefaultWorkingDirectory)/hybris/config/ant
+      #  displayName: "Validate config files"
+      #  condition: eq(variables['sonarBranchCreated'],False)
+
+      #- script: |
+      #    git log -1
+      #    cd $(Build.SourcesDirectory)/hybris/bin/platform
+      #    sed -i '2i export ANT_MEM_OPTS="-Xmx6G"' ./setantenv.sh
+      #    export ANT_MEM_OPTS="-Xmx6G"
+      #    source ./setantenv.sh
+
+      #    ant customize
+      #  displayName: "ant customize"
+      #  condition: eq(variables['sonarBranchCreated'],False)
+
+      #- script: |
+      #    git log -1
+      #    cd $(Build.SourcesDirectory)/hybris/bin/platform
+      #    sed -i '2i export ANT_MEM_OPTS="-Xmx6G"' ./setantenv.sh
+      #    export ANT_MEM_OPTS="-Xmx6G"
+      #    source ./setantenv.sh
+
+      #    ant clean
+      #  displayName: "ant clean"
+      #  condition: eq(variables['sonarBranchCreated'],False)
+
+      #- script: |
+      #    git log -1
+      #    cd $(Build.SourcesDirectory)/hybris/bin/platform
+      #    sed -i '2i export ANT_MEM_OPTS="-Xmx6G"' ./setantenv.sh
+      #    export ANT_MEM_OPTS="-Xmx6G"
+      #    source ./setantenv.sh
+
+      #    ant all
+      #  displayName: "ant all"
+      #  condition: eq(variables['sonarBranchCreated'],False)
+
+      #- script: |
+      #    git log -1
+      #    cd $(Build.SourcesDirectory)/hybris/bin/platform
+      #    sed -i '2i export ANT_MEM_OPTS="-Xmx6G"' ./setantenv.sh
+      #    export ANT_MEM_OPTS="-Xmx6G"
+      #    source ./setantenv.sh
+
+      #    ant yunitinit
+      #  displayName: "ant yunitinit"
+      #  condition: eq(variables['sonarBranchCreated'],False)
+
+      #- script: |
+      #    git log -1
+      #    cd $(Build.SourcesDirectory)/hybris/bin/platform
+      #    sed -i '2i export ANT_MEM_OPTS="-Xmx6G"' ./setantenv.sh
+      #    export ANT_MEM_OPTS="-Xmx6G"
+      #    source ./setantenv.sh
+
+      #    ant jacocoalltests
+      #  displayName: "ant jacocoalltests"
+      #  condition: eq(variables['sonarBranchCreated'],False)
+
+      #- script: |
+      #    git log -1
+      #    cd $(Build.SourcesDirectory)/hybris/bin/platform
+      #    sed -i '2i export ANT_MEM_OPTS="-Xmx6G"' ./setantenv.sh
+      #    export ANT_MEM_OPTS="-Xmx6G"
+      #    source ./setantenv.sh
+
+      #    BRANCH=$(echo "$(Build.SourceBranch)" | sed 's/refs\/heads\///g')
+
+      #    ant sonarcheck -Dsonar.branch.name=$BRANCH -Dsonar.projectVersion=$(SONARQUBE_PROJECT_VERSION) -Dsonar.login=$(SONARQUBE_TOKEN_SCC)
+      #  displayName: "ant sonarcheck"
+      #  condition: eq(variables['sonarBranchCreated'],False)

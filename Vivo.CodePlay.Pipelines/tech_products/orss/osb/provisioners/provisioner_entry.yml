@@ -1,0 +1,89 @@
+parameters:
+- name: qa_environment
+  type: string
+- name: preserve
+  type: string
+
+stages:
+- ${{ if eq(variables['Build.Reason'], 'PullRequest') }}:
+  - stage: Build_and_Package
+    displayName: Build and Package
+    pool: $(PRIVATE_AGENT_DEFAULT_CI)
+    jobs:
+    - job: init
+      displayName: Init
+      steps:
+      - checkout: self  # self represents the repo where the initial Pipelines YAML file was found
+        submodules: true
+        persistCredentials: true
+        clean: false
+      
+      - task: Bash@3
+        name: identify_commits
+        displayName: "Identify commits"
+        inputs:
+          targetType: 'inline'
+          script: |
+            echo 'Fetch and Log'
+            git fetch
+            SOURCE_BRANCH_NAME=`echo $(System.PullRequest.SourceBranch) | sed 's|refs/heads/||g'`
+            echo "##vso[task.setvariable variable=SOURCE_BRANCH_NAME]$SOURCE_BRANCH_NAME"
+            HASH_LIST=`git log --oneline --no-merges --pretty=format:'%h' origin/$(System.PullRequest.TargetBranchName)..origin/$SOURCE_BRANCH_NAME | sed '1!G;h;$!d' | paste -sd','`
+            echo "##vso[task.setvariable variable=HASH_LIST;isOutput=true]$HASH_LIST"
+
+      # CHECK PR TYPE: SERVICE OR CUSTOMIZATION_FILE
+      - template: /tech_products/orss/osb/tasks/check_pr_type.yml
+
+    - job: build_service
+      displayName: Build and package sbconfig.jar
+      condition: and(succeeded(), eq(variables['TYPE_PR'], 'service'))
+      dependsOn:
+      - init
+      variables:
+        TYPE_PR: $[ dependencies.init.outputs['check_pr_type.TYPE_PR'] ]
+        HASH_LIST: $[ dependencies.init.outputs['identify_commits.HASH_LIST'] ]
+      steps:
+        # BUILD JAR SERVICE TYPE
+        - template: /tech_products/orss/osb/tasks/build_service_type.yml
+
+    - job: build_customization_files
+      displayName: Package Customization Files
+      condition: and(succeeded(), eq(variables['TYPE_PR'], 'customization'))
+      dependsOn:
+      - init
+      variables:
+        TYPE_PR: $[ dependencies.init.outputs['check_pr_type.TYPE_PR'] ]
+        FILES_LIST: $[ dependencies.init.outputs['check_pr_type.FILES_LIST'] ]
+      steps:
+        # BUILD CUSTOMIZATION FILE TYPE
+        - template: /tech_products/orss/osb/tasks/build_customization_type.yml
+        
+- ${{ elseif and(startsWith(variables['Build.SourceBranch'], 'refs/tags/'), eq(parameters.qa_environment, 'producao')) }}:
+
+  - template: /tech_products/orss/osb/tasks/deploy_package_prod.yml
+    parameters:
+      preserve: ${{ parameters.preserve }}
+   
+- ${{ elseif and(startsWith(variables['Build.SourceBranch'], 'refs/tags/'), startsWith(variables['Build.SourceBranchName'], 'CUST')) }}:
+  
+  - template: /tech_products/orss/osb/tasks/deploy_customization_file.yml
+    parameters:
+      qa_environment: ${{ parameters.qa_environment }}
+
+- ${{ elseif startsWith(variables['Build.SourceBranch'], 'refs/tags/') }}:
+  
+  - template: /tech_products/orss/osb/tasks/deploy_osb_package.yml
+    parameters:
+      qa_environment: ${{ parameters.qa_environment }}
+      preserve: ${{ parameters.preserve }}
+
+- ${{ else }}:
+  - stage: Error
+    jobs:
+    - job: Error
+      steps:  
+      - bash: |
+          echo "##vso[task.logissue type=error;]Do Not Run Pipelines Without a Pull Request"
+          echo "##vso[task.complete result=Failed;]Text"
+        displayName: "Message"
+              
